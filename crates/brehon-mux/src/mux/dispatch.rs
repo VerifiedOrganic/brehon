@@ -559,7 +559,8 @@ impl Mux {
         let queued_prompt_id = prompt_id.clone();
 
         Ok(AsyncGatewayPromptDispatch::Started(rt.spawn(async move {
-            match brehon_ports::AgentGateway::send_prompt(&gateway, &session_id, prompt_turn).await {
+            match brehon_ports::AgentGateway::send_prompt(&gateway, &session_id, prompt_turn).await
+            {
                 Ok(_) => Ok(PromptDeliveryAttempt::Delivered {
                     prompt_id,
                     generation,

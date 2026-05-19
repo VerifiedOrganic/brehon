@@ -8,12 +8,12 @@
 //! The `message` action delivers messages to target agents via Claude Code's
 //! native Teams inbox files at `~/.claude/teams/{team}/inboxes/{target}.json`.
 
+use async_trait::async_trait;
 use brehon_mux::{PromptQueueEntry, SessionScopedQueue};
 use brehon_types::{
     build_advisor_startup_prompt, build_worker_protocol, infer_task_completion_mode,
     parse_task_completion_mode, WorkerBootstrapMode,
 };
-use async_trait::async_trait;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::time::Duration;

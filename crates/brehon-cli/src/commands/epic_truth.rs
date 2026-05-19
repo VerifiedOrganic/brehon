@@ -2,8 +2,8 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use brehon_types::task::normalize_task_status;
 use anyhow::{anyhow, Context, Result};
+use brehon_types::task::normalize_task_status;
 use git2::{Oid, Repository, Sort};
 use serde::{Deserialize, Serialize};
 

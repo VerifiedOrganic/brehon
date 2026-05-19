@@ -782,9 +782,9 @@ pub fn create_gateway_with_config(config: SessionConfig) -> AcpGateway {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
     use brehon_adapter_sdk::{AdapterError, AdapterKind, AdapterResult, PromptResult};
     use brehon_ports::AgentGateway;
-    use async_trait::async_trait;
     use chrono::Utc;
     use std::any::Any;
     use std::sync::Mutex;

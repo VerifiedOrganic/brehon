@@ -1146,7 +1146,8 @@ fn display_cursor_position_for_rows(
 fn is_supervisor_structured_block_start(line: &str) -> bool {
     let sanitized = strip_terminal_control_sequences(line);
     let line = sanitized.trim();
-    line.contains("brehon - task (MCP)(action:") || line.contains("mcp__brehon__agent action=whoami")
+    line.contains("brehon - task (MCP)(action:")
+        || line.contains("mcp__brehon__agent action=whoami")
 }
 
 fn is_supervisor_structured_block_complete(block: &str) -> bool {

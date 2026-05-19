@@ -265,11 +265,11 @@ fn unix_timestamp_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
     use brehon_ports::PortError;
     use brehon_types::{
         DetectionEvent, RuntimeEventKind, RuntimeEventMeta, RuntimeSource, RuntimeTextSpan,
     };
-    use async_trait::async_trait;
     use tokio::sync::Mutex;
 
     fn detection(rule_id: &str, severity: DetectionSeverity) -> RuntimeEvent {

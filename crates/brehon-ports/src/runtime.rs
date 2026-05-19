@@ -3,12 +3,12 @@
 //! These traits define the boundary between the mux, future daemon, semantic
 //! detectors, policy gates, workflows, and terminal-host adapters.
 
+use async_trait::async_trait;
 use brehon_types::{
     RuntimeCommand, RuntimeCommandResult, RuntimeEvent, RuntimePolicyContext,
     RuntimePolicyDecision, RuntimePolicyRequest, TerminalHostCapabilities, TerminalPaneHandle,
     TerminalPaneSpawnSpec, TerminalResize,
 };
-use async_trait::async_trait;
 
 use crate::PortError;
 

@@ -1097,7 +1097,10 @@ mod tests {
         let env = runtime_tool_env(&["NATIVE_AGENT_TEST_KEEP".to_string()]);
         let lookup = env.into_iter().collect::<HashMap<_, _>>();
 
-        assert_eq!(lookup.get("BREHON_TEST_KEEP").map(String::as_str), Some("1"));
+        assert_eq!(
+            lookup.get("BREHON_TEST_KEEP").map(String::as_str),
+            Some("1")
+        );
         assert_eq!(
             lookup.get("NATIVE_AGENT_TEST_KEEP").map(String::as_str),
             Some("2")

@@ -28,7 +28,9 @@ fn clean_gitignore(project_path: &Path) -> Result<bool> {
         .lines()
         .filter(|line| {
             let trimmed = line.trim();
-            trimmed != ".brehon/" && trimmed != ".brehon" && trimmed != "# Brehon orchestration data"
+            trimmed != ".brehon/"
+                && trimmed != ".brehon"
+                && trimmed != "# Brehon orchestration data"
         })
         .collect();
 

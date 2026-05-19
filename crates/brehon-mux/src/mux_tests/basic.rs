@@ -651,7 +651,9 @@ async fn test_policy_gate_denies_terminal_input_to_dead_pane() {
     let mut rx = bus.subscribe();
     let mut mux = Mux::new(24, 80);
     mux.set_runtime_event_sink(bus);
-    mux.set_policy_gate(std::sync::Arc::new(brehon_policy::BasicPolicyGate::default()));
+    mux.set_policy_gate(std::sync::Arc::new(
+        brehon_policy::BasicPolicyGate::default(),
+    ));
     mux.add_pane(Pane::director("pane1", 24, 80).unwrap());
     mux.quarantine("pane1", DeathReason::Quarantined("manual".to_string()));
 

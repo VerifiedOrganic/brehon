@@ -1156,7 +1156,8 @@ impl Mux {
         };
 
         for (pane_id, session_id) in gateway_sessions {
-            if let Err(err) = brehon_ports::AgentGateway::kill_session(&gateway, &session_id).await {
+            if let Err(err) = brehon_ports::AgentGateway::kill_session(&gateway, &session_id).await
+            {
                 let err_text = err.to_string();
                 let lower = err_text.to_ascii_lowercase();
                 if !(lower.contains("not found") || lower.contains("unknown session")) {

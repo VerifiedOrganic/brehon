@@ -831,7 +831,10 @@ fn checkpoint_cwd_guard_rejects_default_branch() {
     // check is skipped — we need the branch check to be the one that
     // catches this.
     let other_project = TempDir::new().unwrap();
-    let _env = ScopedEnv::set(&[("BREHON_PROJECT_ROOT", other_project.path().to_str().unwrap())]);
+    let _env = ScopedEnv::set(&[(
+        "BREHON_PROJECT_ROOT",
+        other_project.path().to_str().unwrap(),
+    )]);
 
     let err = ensure_checkpoint_cwd_is_isolated(workspace.path()).unwrap_err();
     assert!(
@@ -848,7 +851,10 @@ fn checkpoint_cwd_guard_accepts_isolated_worker_worktree() {
     let workspace = TempDir::new().unwrap();
     init_git_workspace(workspace.path()); // leaves HEAD on worker/test
     let other_project = TempDir::new().unwrap();
-    let _env = ScopedEnv::set(&[("BREHON_PROJECT_ROOT", other_project.path().to_str().unwrap())]);
+    let _env = ScopedEnv::set(&[(
+        "BREHON_PROJECT_ROOT",
+        other_project.path().to_str().unwrap(),
+    )]);
 
     ensure_checkpoint_cwd_is_isolated(workspace.path())
         .expect("guard should accept isolated worker worktree on a worker branch");
@@ -872,7 +878,12 @@ fn write_review_metadata_with_commits(
     commits: &[&str],
 ) {
     write_review_metadata_with_commits_and_empty_flag(
-        brehon_root, task_id, status, commit, commits, false,
+        brehon_root,
+        task_id,
+        status,
+        commit,
+        commits,
+        false,
     );
 }
 
@@ -5013,7 +5024,12 @@ async fn test_close_by_supervisor_rejects_merge_when_reviewed_commit_not_on_main
     ]);
     let tool = TaskActionsTool::new();
     write_test_task(&brehon_root, "T-feature-review", "approved", "task");
-    write_review_metadata(&brehon_root, "T-feature-review", "approved", &feature_commit);
+    write_review_metadata(
+        &brehon_root,
+        "T-feature-review",
+        "approved",
+        &feature_commit,
+    );
 
     let result = tool
         .execute(serde_json::json!({
@@ -10380,13 +10396,15 @@ async fn test_abort_integration_rejects_worker_role() {
     assert!(extract_text(&result)
         .contains("Only supervisors can abort integration in an epic worktree."));
 
-    let saw_notification = read_queued_prompts(&brehon_root).into_iter().any(|payload| {
-        payload["target"] == "sup-1"
-            && payload["message"]
-                .as_str()
-                .unwrap_or("")
-                .contains("task action=abort-integration id=T-abort-auth")
-    });
+    let saw_notification = read_queued_prompts(&brehon_root)
+        .into_iter()
+        .any(|payload| {
+            payload["target"] == "sup-1"
+                && payload["message"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("task action=abort-integration id=T-abort-auth")
+        });
     assert!(
         saw_notification,
         "supervisor should be notified about unauthorized abort-integration attempt"

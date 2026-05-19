@@ -158,7 +158,9 @@ pub(crate) fn write_worker_recycle_ack(
 /// supervisor feedback cache into `.brehon/runtime/feedback/{task_id}.json`.
 /// Returns `None` when the file is missing or malformed; the TUI then
 /// renders no feedback section rather than spurious "missing" placeholders.
-pub(crate) fn read_feedback_summary_for(task_id: &str) -> Option<brehon_types::FeedbackTaskSummary> {
+pub(crate) fn read_feedback_summary_for(
+    task_id: &str,
+) -> Option<brehon_types::FeedbackTaskSummary> {
     read_runtime_summary_for(task_id, "feedback")
 }
 

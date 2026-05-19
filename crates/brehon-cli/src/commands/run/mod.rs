@@ -3166,7 +3166,10 @@ mod tests {
             registry.panes[0].state,
             brehon_types::RuntimePaneState::Ready
         );
-        assert_eq!(registry.panes[0].kind, brehon_types::RuntimePaneKind::Worker);
+        assert_eq!(
+            registry.panes[0].kind,
+            brehon_types::RuntimePaneKind::Worker
+        );
 
         let result = daemon
             .route_command(
@@ -3337,7 +3340,11 @@ mod tests {
                 brehon_types::RuntimePaneKind::Supervisor,
                 "supervisor",
             ),
-            ("worker-1", brehon_types::RuntimePaneKind::Worker, "worker-1"),
+            (
+                "worker-1",
+                brehon_types::RuntimePaneKind::Worker,
+                "worker-1",
+            ),
             (
                 "reviewer-1",
                 brehon_types::RuntimePaneKind::Reviewer,
@@ -3442,7 +3449,8 @@ mod tests {
 
     #[tokio::test]
     async fn terminal_host_agent_factory_rejects_blocked_plan() {
-        let daemon = brehon_daemon::RuntimeDaemon::new(brehon_daemon::RuntimeDaemonConfig::default());
+        let daemon =
+            brehon_daemon::RuntimeDaemon::new(brehon_daemon::RuntimeDaemonConfig::default());
         let plan = brehon_mux::TerminalHostAgentFactoryPlan {
             total_panes: 1,
             launch_specs: Vec::new(),
@@ -3463,7 +3471,8 @@ mod tests {
 
     #[tokio::test]
     async fn terminal_host_agent_factory_rejects_session_mismatch() {
-        let daemon = brehon_daemon::RuntimeDaemon::new(brehon_daemon::RuntimeDaemonConfig::default());
+        let daemon =
+            brehon_daemon::RuntimeDaemon::new(brehon_daemon::RuntimeDaemonConfig::default());
         let launch = match brehon_mux::AgentTerminalLaunchPlan::from_pty_config(
             "other-session",
             "worker-1",
@@ -3571,7 +3580,10 @@ mod tests {
         );
         let registry = daemon.pane_registry_snapshot().await;
         assert_eq!(registry.panes.len(), 1);
-        assert_eq!(registry.panes[0].state, brehon_types::RuntimePaneState::Dead);
+        assert_eq!(
+            registry.panes[0].state,
+            brehon_types::RuntimePaneState::Dead
+        );
 
         runtime_terminal_host
             .as_ref()
@@ -3828,7 +3840,8 @@ mod tests {
                 pane_ownership: brehon_types::RuntimeTerminalHostPaneOwnership::Mux,
                 agent_factory: brehon_daemon::RuntimeTerminalHostAgentFactoryRouting::Mux,
                 capabilities: None,
-                promotion_readiness: brehon_daemon::RuntimeTerminalHostPromotionReadiness::default(),
+                promotion_readiness: brehon_daemon::RuntimeTerminalHostPromotionReadiness::default(
+                ),
                 session_name: Some("session-1".to_string()),
                 socket_name: None,
                 socket_dir: None,
@@ -3861,9 +3874,10 @@ mod tests {
             .join("runtime")
             .join("audit")
             .join("session-1.jsonl");
-        let path = write_runtime_daemon_summary(&brehon_root, "session-1", &audit_log_path, &daemon)
-            .await
-            .unwrap();
+        let path =
+            write_runtime_daemon_summary(&brehon_root, "session-1", &audit_log_path, &daemon)
+                .await
+                .unwrap();
         let summary: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
 
@@ -3893,9 +3907,10 @@ mod tests {
             .join("runtime")
             .join("audit")
             .join("session-1.jsonl");
-        let path = write_runtime_daemon_summary(&brehon_root, "session-1", &audit_log_path, &daemon)
-            .await
-            .unwrap();
+        let path =
+            write_runtime_daemon_summary(&brehon_root, "session-1", &audit_log_path, &daemon)
+                .await
+                .unwrap();
         let summary: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
 

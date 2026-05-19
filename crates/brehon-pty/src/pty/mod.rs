@@ -1054,10 +1054,9 @@ mod tests {
                 .any(|(k, v)| k == "BREHON_FACTORY_WORKER_CLI" && v == "goose")
         );
         assert!(
-            config
-                .env
-                .iter()
-                .any(|(k, v)| { k == "BREHON_ROOT" && v == brehon_root.to_string_lossy().as_ref() })
+            config.env.iter().any(|(k, v)| {
+                k == "BREHON_ROOT" && v == brehon_root.to_string_lossy().as_ref()
+            })
         );
 
         let _ = std::fs::remove_dir_all(workdir);
@@ -1650,7 +1649,10 @@ key = "oauth/kimi-code"
         let env = &mcp_json["mcpServers"]["brehon"]["env"];
         assert_eq!(env["BREHON_AGENT_NAME"], "kimi-worker");
         assert_eq!(env["BREHON_AGENT_ROLE"], "worker");
-        assert_eq!(env["BREHON_ROOT"], brehon_root.to_string_lossy().to_string());
+        assert_eq!(
+            env["BREHON_ROOT"],
+            brehon_root.to_string_lossy().to_string()
+        );
         assert_eq!(
             env["BREHON_WORKSPACE_ROOT"],
             workdir.to_string_lossy().to_string()
@@ -2032,7 +2034,9 @@ key = "oauth/kimi-code"
             None,
         );
 
-        assert!(prompt.contains("Do NOT proactively discover, reconnect, or call Brehon MCP tools"));
+        assert!(
+            prompt.contains("Do NOT proactively discover, reconnect, or call Brehon MCP tools")
+        );
         assert!(prompt.contains("emit at most one short readiness line"));
         assert!(prompt.contains("Do not narrate MCP bootstrap/tool calls"));
         assert!(prompt.contains("instead of polling, sleeping, or running shell commands"));

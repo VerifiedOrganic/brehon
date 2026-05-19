@@ -515,7 +515,8 @@ fn deliver_queued_prompt_via_terminal_host(
             ctx.last_activity.insert(target.to_string(), Instant::now());
             clear_prompt_retry_meta(path);
             if let Some(id) = prompt_id {
-                if let Err(err) = write_prompt_delivery_ack(brehon_root, id, target, "terminal_host")
+                if let Err(err) =
+                    write_prompt_delivery_ack(brehon_root, id, target, "terminal_host")
                 {
                     tracing::warn!(
                         target = %target,
@@ -736,7 +737,8 @@ fn queue_queued_prompt_delivery_via_daemon(
 }
 
 pub(super) fn deliver_pending_prompts(ctx: &mut EventLoopCtx, brehon_root: &std::path::Path) {
-    for pq_dir in runtime_prompt_queue_sweep_dirs(brehon_root, ctx.runtime_session_name.as_deref()) {
+    for pq_dir in runtime_prompt_queue_sweep_dirs(brehon_root, ctx.runtime_session_name.as_deref())
+    {
         let Ok(entries) = std::fs::read_dir(&pq_dir) else {
             continue;
         };

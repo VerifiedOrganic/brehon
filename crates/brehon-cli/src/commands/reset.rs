@@ -29,7 +29,9 @@ use anyhow::Result;
 
 use crate::ui;
 
-use super::clean::{delete_branch, is_git_repo, list_branches_with_prefix, remove_brehon_worktrees};
+use super::clean::{
+    delete_branch, is_git_repo, list_branches_with_prefix, remove_brehon_worktrees,
+};
 
 /// Allowlist of top-level entries inside `.brehon/` that `reset` is permitted
 /// to delete. Anything not on this list is preserved — this is the contract

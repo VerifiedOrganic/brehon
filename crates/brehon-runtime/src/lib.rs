@@ -5,9 +5,9 @@
 //! in-process event bus. A future daemon can use the same semantics at its
 //! process boundary.
 
+use async_trait::async_trait;
 use brehon_ports::{PortError, RuntimeEventSink, RuntimeEventStream};
 use brehon_types::RuntimeEvent;
-use async_trait::async_trait;
 use tokio::sync::broadcast;
 
 /// Default runtime event capacity per subscriber.

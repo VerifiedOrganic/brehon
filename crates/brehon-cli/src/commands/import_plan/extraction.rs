@@ -1262,7 +1262,10 @@ mod timeout_resolution_tests {
         let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _env = ScopedEnv::set(&[
             ("BREHON_PLAN_EXTRACT_TIMEOUT_SECS", Some("0")),
-            ("BREHON_PLAN_EXTRACT_IDLE_TIMEOUT_SECS", Some("not-a-number")),
+            (
+                "BREHON_PLAN_EXTRACT_IDLE_TIMEOUT_SECS",
+                Some("not-a-number"),
+            ),
             ("BREHON_PLAN_EXTRACT_MAX_TIMEOUT_SECS", Some("")),
         ]);
         let bounds = extractor_bounds();

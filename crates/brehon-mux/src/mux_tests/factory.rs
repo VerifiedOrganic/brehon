@@ -15,8 +15,10 @@ use std::path::PathBuf;
 #[test]
 fn test_factory_uses_isolated_supervisor_and_reviewer_cwds() {
     let project_root = super::fresh_temp_dir("brehon-mux-isolated-cwds");
-    let supervisor_cwd =
-        super::setup_fake_linked_worktree(&project_root, ".brehon/worktrees/supervisor/claude-code");
+    let supervisor_cwd = super::setup_fake_linked_worktree(
+        &project_root,
+        ".brehon/worktrees/supervisor/claude-code",
+    );
     let reviewer_cwd =
         super::setup_fake_linked_worktree(&project_root, ".brehon/worktrees/reviewer/reviewer-1");
     let worker_cwd = super::setup_fake_linked_worktree(&project_root, ".brehon/worktrees/worker-1");

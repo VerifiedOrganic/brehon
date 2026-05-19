@@ -190,7 +190,10 @@ pub(super) fn task_reviews_path(task_id: &str) -> Option<PathBuf> {
 }
 
 pub(super) fn archive_dir(kind: &str) -> Option<PathBuf> {
-    let dir = brehon_root_dir()?.join("runtime").join("archive").join(kind);
+    let dir = brehon_root_dir()?
+        .join("runtime")
+        .join("archive")
+        .join(kind);
     std::fs::create_dir_all(&dir).ok()?;
     Some(dir)
 }

@@ -243,7 +243,8 @@ fn load_project_config_value(project_path: &Path) -> Result<Option<Value>, Confi
     // Accept both forms: the project root (contains `.brehon/`) or the
     // `.brehon` directory itself. Silent fallback to defaults when callers
     // pass the wrong form was the root cause of a codex reviewer reset bug.
-    let config_path = if project_path.file_name().and_then(|name| name.to_str()) == Some(".brehon") {
+    let config_path = if project_path.file_name().and_then(|name| name.to_str()) == Some(".brehon")
+    {
         project_path.join("config.yaml")
     } else {
         project_path.join(".brehon/config.yaml")

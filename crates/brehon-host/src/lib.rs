@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use async_trait::async_trait;
 use brehon_ports::{
     PortError, RuntimeCommandPort, RuntimeEventSink, TerminalHostAdapter, TerminalHostEventObserver,
 };
@@ -20,7 +21,6 @@ use brehon_types::{
     RuntimeTerminalHostKind, TerminalHostCapabilities, TerminalPaneHandle, TerminalPaneSpawnSpec,
     TerminalResize,
 };
-use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{RwLock, watch};
 
@@ -1121,12 +1121,12 @@ fn trim_events(events: &mut Vec<RuntimeEvent>, max_events: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
     use brehon_ports::{RuntimeCommandPort, RuntimeEventSink};
     use brehon_types::{
         AgentTurnEvent, PromptDeliveryMode, RuntimeCommandTarget, RuntimeEventMeta,
         RuntimePolicyContext, RuntimeSource,
     };
-    use async_trait::async_trait;
 
     fn spawn_spec() -> TerminalPaneSpawnSpec {
         TerminalPaneSpawnSpec {

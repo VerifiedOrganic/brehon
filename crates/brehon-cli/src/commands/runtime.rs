@@ -5,6 +5,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use anyhow::{bail, Context, Result};
 use brehon_daemon::{
     ApprovalStoreSnapshot, PendingApprovalEntry, RuntimeCommandInboxRequest,
     RuntimeCommandInboxResult, RuntimeDaemonStatus, RuntimeTerminalHostAgentFactoryRouting,
@@ -14,7 +15,6 @@ use brehon_types::{
     RuntimeCommand, RuntimeCommandKind, RuntimeCommandTarget, RuntimePaneState,
     RuntimePolicyContext, RuntimeSource, RuntimeTerminalHostKind, RuntimeTerminalHostPaneOwnership,
 };
-use anyhow::{bail, Context, Result};
 
 const STALE_RUNTIME_STATUS_AFTER_MS: u64 = 15_000;
 
@@ -691,7 +691,8 @@ mod tests {
                     out_of_process_lifecycle: true,
                     replay: false,
                 }),
-                promotion_readiness: brehon_daemon::RuntimeTerminalHostPromotionReadiness::default(),
+                promotion_readiness: brehon_daemon::RuntimeTerminalHostPromotionReadiness::default(
+                ),
                 session_name: Some("brehon-session".to_string()),
                 socket_name: None,
                 socket_dir: None,

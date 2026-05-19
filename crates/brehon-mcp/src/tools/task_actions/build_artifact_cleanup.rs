@@ -286,7 +286,11 @@ mod tests {
 
     impl EnvGuard {
         fn set(vars: &[(&'static str, &str)]) -> Self {
-            let keys = ["BREHON_ROOT", "BREHON_PROJECT_ROOT", "BREHON_WORKSPACE_ROOT"];
+            let keys = [
+                "BREHON_ROOT",
+                "BREHON_PROJECT_ROOT",
+                "BREHON_WORKSPACE_ROOT",
+            ];
             let mut saved = Vec::new();
             for key in keys {
                 saved.push((key, std::env::var_os(key)));

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-use brehon_types::{BrehonConfig, WorkerAssignmentMode};
 use anyhow::Result;
+use brehon_types::{BrehonConfig, WorkerAssignmentMode};
 
 pub(crate) fn resolve_worker_pool_counts(
     config: &BrehonConfig,

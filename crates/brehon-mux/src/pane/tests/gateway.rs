@@ -1041,7 +1041,8 @@ fn test_custom_pty_supervisor_uses_pty_launch_contract() {
 
 #[test]
 fn test_custom_acp_sidecar_supervisor_has_pty_and_gateway_contract() {
-    let cwd = std::env::temp_dir().join(format!("brehon-acp-sidecar-pane-{}", uuid::Uuid::new_v4()));
+    let cwd =
+        std::env::temp_dir().join(format!("brehon-acp-sidecar-pane-{}", uuid::Uuid::new_v4()));
     let brehon_root = cwd.join(".brehon");
     std::fs::create_dir_all(&brehon_root).expect("create brehon root");
     let adapter = AgentAdapter::Custom(CustomAgentConfig {

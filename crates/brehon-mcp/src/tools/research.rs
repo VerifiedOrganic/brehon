@@ -10,11 +10,11 @@ use std::collections::BTreeMap;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use async_trait::async_trait;
 use brehon_types::{
     BrehonConfig, ResearchConfig, ResearchJobTemplateConfig, ResearchOutputSchema,
     ResearchPoolConfig, ResearchRouteConfig, ResearchRouteMatchConfig, ResearchTrigger,
 };
-use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

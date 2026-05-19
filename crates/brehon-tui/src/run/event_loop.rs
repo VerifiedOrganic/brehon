@@ -3006,7 +3006,9 @@ pub(super) fn run(ctx: &mut EventLoopCtx) -> io::Result<()> {
                 } else {
                     ctx.advisor_ids.len()
                 }
-                .max(advisor_room_count(dashboard_snapshot.brehon_root.as_deref()));
+                .max(advisor_room_count(
+                    dashboard_snapshot.brehon_root.as_deref(),
+                ));
                 let visible_research_count =
                     research_room_count(dashboard_snapshot.brehon_root.as_deref());
 

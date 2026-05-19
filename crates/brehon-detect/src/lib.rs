@@ -7,12 +7,12 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 
+use async_trait::async_trait;
 use brehon_ports::{DetectionEngine, PortError, RuntimeEventSink, RuntimeEventStream};
 use brehon_types::{
     DetectionEvent, DetectionSeverity, PaneOutputEvent, RuntimeEvent, RuntimeEventKind,
     RuntimeEventMeta, RuntimeSource, RuntimeTextSpan,
 };
-use async_trait::async_trait;
 
 /// Default number of normalized output lines retained per pane.
 pub const DEFAULT_MAX_LINES_PER_PANE: usize = 512;

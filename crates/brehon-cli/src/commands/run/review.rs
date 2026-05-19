@@ -1,8 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use brehon_types::{config::ReviewLeaseMode, BrehonConfig};
 use anyhow::Result;
+use brehon_types::{config::ReviewLeaseMode, BrehonConfig};
 use serde::{Deserialize, Serialize};
 
 use super::IMPLICIT_PANEL_ID;
@@ -1583,7 +1583,10 @@ mod tests {
         std::fs::create_dir_all(brehon_root.join("runtime").join("prompt-queue")).unwrap();
 
         std::fs::write(
-            brehon_root.join("runtime").join("tasks").join("T-term.json"),
+            brehon_root
+                .join("runtime")
+                .join("tasks")
+                .join("T-term.json"),
             serde_json::json!({
                 "task_id": "T-term",
                 "title": "Terminal Task",

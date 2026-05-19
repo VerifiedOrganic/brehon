@@ -181,7 +181,10 @@ mod tests {
                 "Should find skills matching 'supervisor'"
             );
             assert!(
-                response.skills.iter().any(|s| s.name == "brehon-supervisor"),
+                response
+                    .skills
+                    .iter()
+                    .any(|s| s.name == "brehon-supervisor"),
                 "Should include brehon-supervisor skill"
             );
         }

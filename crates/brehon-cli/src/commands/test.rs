@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use brehon_ports::{RuntimeCommandPort, RuntimeEventSink};
 use anyhow::{bail, Context, Result};
+use brehon_ports::{RuntimeCommandPort, RuntimeEventSink};
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
 pub enum TerminalHostSmokeKind {
@@ -364,7 +364,8 @@ pub async fn run_runtime_daemon_smoke(
                 pane_ownership: brehon_types::RuntimeTerminalHostPaneOwnership::Host,
                 agent_factory: brehon_daemon::RuntimeTerminalHostAgentFactoryRouting::Mux,
                 capabilities: Some(capabilities.clone()),
-                promotion_readiness: brehon_daemon::RuntimeTerminalHostPromotionReadiness::default(),
+                promotion_readiness: brehon_daemon::RuntimeTerminalHostPromotionReadiness::default(
+                ),
                 session_name: host_identity.session_name,
                 socket_name: host_identity.socket_name,
                 socket_dir: host_identity.socket_dir,

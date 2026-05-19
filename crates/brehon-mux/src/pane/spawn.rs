@@ -308,7 +308,10 @@ fn build_gateway_metadata_env(
     ];
 
     if let Some(root) = brehon_root {
-        env.push(("BREHON_ROOT".to_string(), root.to_string_lossy().to_string()));
+        env.push((
+            "BREHON_ROOT".to_string(),
+            root.to_string_lossy().to_string(),
+        ));
         if root.file_name().and_then(|name| name.to_str()) == Some(".brehon") {
             if let Some(project_root) = root.parent().filter(|path| !path.as_os_str().is_empty()) {
                 env.push((

@@ -5,9 +5,9 @@
 
 use std::sync::Arc;
 
+use anyhow::Result;
 use brehon_ports::EventStore;
 use brehon_types::{EventKind, TaskStatus};
-use anyhow::Result;
 
 pub struct RecoveryReport {
     pub orphaned_tasks: Vec<String>,

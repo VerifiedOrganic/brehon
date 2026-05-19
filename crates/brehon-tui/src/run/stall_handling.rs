@@ -371,7 +371,13 @@ fn recover_stale_reviewer_obligations(
             }
         }
         queue_reviewer_obligation_reset(
-            ctx, brehon_root, &reviewer, obligation, idle_mins, pane_dead, now,
+            ctx,
+            brehon_root,
+            &reviewer,
+            obligation,
+            idle_mins,
+            pane_dead,
+            now,
         );
     }
 }

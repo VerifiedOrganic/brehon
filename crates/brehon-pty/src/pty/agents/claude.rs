@@ -41,7 +41,10 @@ fn claude_brehon_mcp_env(
     let mut env = vec![
         ("BREHON_AGENT_NAME".to_string(), name.to_string()),
         ("BREHON_AGENT_ROLE".to_string(), role.to_string()),
-        ("BREHON_AGENT_TYPE".to_string(), brehon_agent_type.to_string()),
+        (
+            "BREHON_AGENT_TYPE".to_string(),
+            brehon_agent_type.to_string(),
+        ),
         ("BREHON_SESSION_ID".to_string(), session_id.to_string()),
         (
             "BREHON_CLONE_PATH".to_string(),
@@ -209,7 +212,10 @@ impl PtyConfig {
         let mut env = vec![
             ("BREHON_AGENT_NAME".to_string(), name.to_string()),
             ("BREHON_AGENT_ROLE".to_string(), role.to_string()),
-            ("BREHON_AGENT_TYPE".to_string(), brehon_agent_type.to_string()),
+            (
+                "BREHON_AGENT_TYPE".to_string(),
+                brehon_agent_type.to_string(),
+            ),
             // Provide session ID so Brehon MCP server can self-register without hooks
             ("BREHON_SESSION_ID".to_string(), session_id.clone()),
             // Set clone path so subagents know the worktree directory

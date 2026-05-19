@@ -8,6 +8,7 @@ mod stability;
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use brehon_adapter_sdk::{
     AdapterError, AdapterErrorKind, AdapterEvent, AdapterResult, AgentAdapter, PromptResult,
 };
@@ -15,7 +16,6 @@ use brehon_types::{
     AdapterKind, AgentCapabilities, HealthStatus, PromptHandle, PromptId, PromptTurn, SessionId,
     SessionInfo, SessionSpec, TerminalId, ToolCallStreaming,
 };
-use async_trait::async_trait;
 use tokio::sync::{mpsc, Mutex};
 use tracing::warn;
 

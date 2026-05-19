@@ -2,9 +2,9 @@
 //!
 //! Tools for searching, creating, listing, and deleting memories.
 
+use async_trait::async_trait;
 use brehon_ports::{EventStore, SearchIndex};
 use brehon_types::{Event, EventKind, SearchEntry};
-use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

@@ -953,12 +953,9 @@ async fn import_normalized_plan_persists_task_packet_fields() {
     assert!(file_hints
         .iter()
         .any(|hint| hint == "Task details packet: docs/task-packets/1.1-first-task.md"));
-    assert!(
-        file_hints
-            .iter()
-            .any(|hint| hint
-                == "Required reading: crates/brehon-cli/src/commands/import_plan/types.rs")
-    );
+    assert!(file_hints.iter().any(
+        |hint| hint == "Required reading: crates/brehon-cli/src/commands/import_plan/types.rs"
+    ));
     assert!(imported["implementation_notes"]
         .as_str()
         .unwrap()

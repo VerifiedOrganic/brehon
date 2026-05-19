@@ -12,6 +12,7 @@ use std::sync::{
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use async_trait::async_trait;
 use brehon_detect::{DetectionLoopStats, PatternDetectionEngine, run_detection_loop};
 use brehon_ports::{
     DetectionEngine, PolicyGate, PortError, RuntimeCommandPort, RuntimeCommandRouter,
@@ -26,7 +27,6 @@ use brehon_types::{
     TerminalHostCapabilities,
 };
 use brehon_workflow::{WorkflowEngine, WorkflowLoopStats};
-use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex, RwLock};

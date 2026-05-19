@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use brehon_adapter_sdk::process::ProcessError;
 use brehon_adapter_sdk::{
     AdapterError, AdapterEvent, AdapterResult, AgentAdapter, AgentProcess, PromptResult,
@@ -14,7 +15,6 @@ use brehon_types::{
     AgentCapabilities, HealthStatus, PromptHandle, PromptId, PromptTurn, SessionId, SessionInfo,
     SessionSpec, TerminalId, ToolCallStreaming,
 };
-use async_trait::async_trait;
 use tokio::sync::RwLock;
 use tokio::time::{sleep, timeout};
 use tracing::{debug, warn};
@@ -93,7 +93,10 @@ impl JunieSessionConfig {
         brehon_adapter_sdk::push_workspace_root_env(&mut env, &params.cwd);
 
         if let Some(ref root) = params.brehon_root {
-            env.push(("BREHON_ROOT".to_string(), root.to_string_lossy().to_string()));
+            env.push((
+                "BREHON_ROOT".to_string(),
+                root.to_string_lossy().to_string(),
+            ));
         }
 
         if let Some(ref sup) = params.supervisor_name {

@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use anyhow::{Context, Result};
 use brehon_ports::GitOperations;
 use brehon_types::{is_terminal_task_status, normalize_task_status, BrehonConfig};
-use anyhow::{Context, Result};
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -656,7 +656,10 @@ pub(crate) fn default_initiative_integration_branch(task_id: &str, title: &str) 
     }
 }
 
-pub(crate) fn default_initiative_integration_worktree(brehon_root: &Path, task_id: &str) -> PathBuf {
+pub(crate) fn default_initiative_integration_worktree(
+    brehon_root: &Path,
+    task_id: &str,
+) -> PathBuf {
     brehon_root
         .join("worktrees")
         .join("initiative")
@@ -1881,7 +1884,10 @@ mod tests {
         );
 
         let adapter = agent_to_adapter("claude-reviewer", &config);
-        assert_eq!(adapter.as_builtin(), Some(brehon_mux::SupervisorCli::Claude));
+        assert_eq!(
+            adapter.as_builtin(),
+            Some(brehon_mux::SupervisorCli::Claude)
+        );
     }
 
     #[test]
@@ -1915,7 +1921,10 @@ mod tests {
         );
 
         let adapter = agent_to_adapter("claude-ollama-worker", &config);
-        assert_eq!(adapter.as_builtin(), Some(brehon_mux::SupervisorCli::Claude));
+        assert_eq!(
+            adapter.as_builtin(),
+            Some(brehon_mux::SupervisorCli::Claude)
+        );
     }
 
     #[test]
@@ -2504,7 +2513,10 @@ mod tests {
         std::fs::create_dir_all(brehon_root.join("runtime").join("tasks")).unwrap();
 
         std::fs::write(
-            brehon_root.join("runtime").join("tasks").join("T-init.json"),
+            brehon_root
+                .join("runtime")
+                .join("tasks")
+                .join("T-init.json"),
             serde_json::json!({
                 "task_id": "T-init",
                 "title": "Program Alpha",
@@ -2516,7 +2528,10 @@ mod tests {
         .unwrap();
 
         std::fs::write(
-            brehon_root.join("runtime").join("tasks").join("T-epic.json"),
+            brehon_root
+                .join("runtime")
+                .join("tasks")
+                .join("T-epic.json"),
             serde_json::json!({
                 "task_id": "T-epic",
                 "title": "Phase 1",
@@ -2535,8 +2550,13 @@ mod tests {
         assert_eq!(repaired.len(), 1);
 
         let initiative: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(brehon_root.join("runtime").join("tasks").join("T-init.json"))
-                .unwrap(),
+            &std::fs::read_to_string(
+                brehon_root
+                    .join("runtime")
+                    .join("tasks")
+                    .join("T-init.json"),
+            )
+            .unwrap(),
         )
         .unwrap();
 
@@ -3240,7 +3260,9 @@ mod tests {
             std::fs::read_to_string(instructions_dir.join("codex-advisor-instructions.md"))
                 .unwrap();
 
-        assert!(worker.contains("Do NOT proactively call `mcp__brehon__agent action=session_start`"));
+        assert!(
+            worker.contains("Do NOT proactively call `mcp__brehon__agent action=session_start`")
+        );
         assert!(worker.contains("mcp__brehon__task action=progress"));
         assert!(reviewer.contains("action=submit_review"));
         assert!(supervisor.contains("mcp__brehon__task action=ready"));

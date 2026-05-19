@@ -3,12 +3,12 @@
 //! Policies are deliberately evaluated before command execution. They do not
 //! mutate mux state; they return a decision that callers must audit and honor.
 
+use async_trait::async_trait;
 use brehon_ports::{PolicyGate, PortError};
 use brehon_types::{
     PromptDeliveryMode, RuntimeCommandKind, RuntimePaneState, RuntimePolicyDecision,
     RuntimePolicyRequest,
 };
-use async_trait::async_trait;
 
 /// Conservative defaults for local long-running sessions.
 #[derive(Debug, Clone, PartialEq, Eq)]

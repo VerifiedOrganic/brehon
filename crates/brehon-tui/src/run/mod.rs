@@ -4276,7 +4276,13 @@ mod tests {
                 false,
                 0,
             ),
-            ("supervisor", brehon_mux::PaneKind::Supervisor, None, true, 0),
+            (
+                "supervisor",
+                brehon_mux::PaneKind::Supervisor,
+                None,
+                true,
+                0,
+            ),
             (
                 "reviewer",
                 brehon_mux::PaneKind::Reviewer,

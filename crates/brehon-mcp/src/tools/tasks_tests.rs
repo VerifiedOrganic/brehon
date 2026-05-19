@@ -131,7 +131,10 @@ async fn task_context_reads_durable_run_events_review_and_freshness() {
             "updated_at": "2026-05-16T00:00:00Z"
         }),
     );
-    let review_dir = brehon_root.join("runtime").join("reviews").join("T-durable");
+    let review_dir = brehon_root
+        .join("runtime")
+        .join("reviews")
+        .join("T-durable");
     fs::create_dir_all(&review_dir).unwrap();
     fs::write(
         review_dir.join("state.json"),
