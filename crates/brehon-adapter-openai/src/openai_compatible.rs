@@ -7,8 +7,8 @@ use std::time::Duration;
 use brehon_adapter_sdk::direct_tools::{CodingToolBridge, CompositeToolBridge, DirectToolBridge};
 use brehon_adapter_sdk::AdapterEvent;
 use brehon_types::{
-    AgentCapabilities, HealthStatus, PromptHandle, PromptId, PromptTurn, SessionId, SessionInfo,
-    SessionSpec, ToolCallStreaming,
+    build_native_agent_system_prompt, AgentCapabilities, HealthStatus, PromptHandle, PromptId,
+    PromptTurn, SessionId, SessionInfo, SessionSpec, ToolCallStreaming,
 };
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use reqwest::Client;
@@ -651,18 +651,29 @@ fn trim_messages(messages: &mut Vec<Value>) {
 }
 
 fn system_message(spec: &SessionSpec, tool_prefix: &str) -> Value {
+    // Delegate to the shared role-protocol builder so chat-completions clients
+    // see the same worktree/task-lifecycle rules CLI agents receive as their
+    // startup user message. Without this, models behind an OpenAI-compatible
+    // endpoint only get a paragraph of vague guidance and routinely violate
+    // worktree containment (cd outside, checkout main, etc.).
+    //
+    // `supervisor_name` and `project_policy` aren't on `SessionSpec` today;
+    // plumb them through `OpenAiCompatibleConfig` if per-pool overrides land.
+    let agent_name = spec.agent_id.as_str();
+    let agent_type = "openai-compatible";
+    let supervisor_name = "supervisor";
+    let content = build_native_agent_system_prompt(
+        &spec.role,
+        agent_name,
+        agent_type,
+        &spec.worktree_path,
+        tool_prefix,
+        supervisor_name,
+        None,
+    );
     json!({
         "role": "system",
-        "content": format!(
-            "You are an Brehon {} agent operating inside the worktree '{}'. \
-    Use the provided function tools for repo work and Brehon coordination. \
-    Use {}* tools for session/task/review/factory state. \
-    Use read_file, search_text, list_files, write_file, replace_in_file, and bash for coding work. \
-    Stay inside the current worktree. Do not invent tool results or claim commands ran if they did not.",
-            spec.role,
-            spec.worktree_path,
-            tool_prefix,
-        )
+        "content": content,
     })
 }
 
