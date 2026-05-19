@@ -1,3 +1,4 @@
+pub mod claude_hook;
 pub mod clean;
 pub mod config;
 pub mod doctor;

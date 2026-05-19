@@ -21,13 +21,15 @@ use review::{
     build_planned_review_panel_seats, build_reviewer_panels, reconcile_review_runtime_for_run,
 };
 use setup::{
-    activate_protected_branch_guard, agent_to_adapter, cleanup_scoped_worktrees,
-    ensure_codex_instruction_files, ensure_mcp_config, ensure_protected_branch_hooks,
-    ensure_shared_root_on_default_branch, prepare_scoped_worktrees_with_progress,
-    reconcile_initiative_hierarchy_for_run, reconcile_orphaned_worker_assignments_for_run,
-    restore_shared_root_branch,
+    activate_claude_worktree_hook, activate_protected_branch_guard, agent_to_adapter,
+    cleanup_scoped_worktrees, ensure_claude_worktree_hook, ensure_codex_instruction_files,
+    ensure_mcp_config, ensure_protected_branch_hooks, ensure_shared_root_on_default_branch,
+    prepare_scoped_worktrees_with_progress, reconcile_initiative_hierarchy_for_run,
+    reconcile_orphaned_worker_assignments_for_run, restore_shared_root_branch,
 };
-pub(crate) use setup::{protected_branch_hooks_installed, remove_protected_branch_hooks};
+pub(crate) use setup::{
+    protected_branch_hooks_installed, remove_claude_worktree_hook, remove_protected_branch_hooks,
+};
 use workers::{push_runtime_dashboard_event, resolve_worker_pool_counts};
 
 const IMPLICIT_PANEL_ID: &str = "default-panel";
@@ -1351,6 +1353,22 @@ pub async fn execute(
         tracing::warn!("Failed to ensure MCP config: {:?}", e);
         splash.record(format!("MCP configuration warning: {e}"));
     }
+    // Install the Claude PreToolUse worktree-containment hook. Tied to the
+    // session lifetime via `_claude_hook_activation` below — when Brehon
+    // exits (or panics), Drop removes the active marker and the hook turns
+    // into a no-op until the next `brehon run`.
+    splash.record("Installing Claude worktree-containment hook".to_string());
+    if let Err(e) = ensure_claude_worktree_hook(&cwd) {
+        tracing::warn!("Failed to install Claude worktree hook: {:?}", e);
+        splash.record(format!("Claude hook install warning: {e}"));
+    }
+    let _claude_hook_activation = match activate_claude_worktree_hook(&cwd) {
+        Ok(activation) => Some(activation),
+        Err(e) => {
+            tracing::warn!("Failed to activate Claude worktree hook: {:?}", e);
+            None
+        }
+    };
     splash.record("Ensuring Codex instruction files".to_string());
     ensure_codex_instruction_files(&cwd, &config)?;
 

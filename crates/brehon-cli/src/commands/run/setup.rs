@@ -1011,6 +1011,212 @@ pub(crate) fn git_is_clean(cwd: &Path) -> Result<bool> {
     Ok(statuses.is_empty())
 }
 
+/// Relative path (under cwd) of the Claude Code settings file Brehon edits.
+const CLAUDE_SETTINGS_RELATIVE: &str = ".claude/settings.local.json";
+
+/// Marker token Brehon embeds in the hook command so it can be located and
+/// removed cleanly without disturbing user-added hooks.
+const CLAUDE_HOOK_MARKER: &str = "brehon claude-hook";
+
+/// Relative path (under cwd) of the runtime marker file the `claude-hook`
+/// binary checks before applying its policy. When this file is absent, the
+/// hook falls through — that's how we keep the hook a no-op outside an
+/// active `brehon run`.
+const CLAUDE_HOOK_ACTIVE_MARKER_RELATIVE: &str = ".brehon/runtime/claude-hook-active";
+
+/// Install a Claude Code `PreToolUse` hook pointing at `brehon claude-hook`.
+///
+/// Idempotent. Preserves any existing `hooks.PreToolUse` entries the user or
+/// other tools added; we only touch the entry whose command contains
+/// [`CLAUDE_HOOK_MARKER`].
+pub(crate) fn ensure_claude_worktree_hook(cwd: &Path) -> Result<()> {
+    let brehon_bin = std::env::current_exe().context(
+        "Failed to resolve current brehon binary path; Claude worktree hook cannot be installed",
+    )?;
+    let hook_command = format!("{} {}", brehon_bin.display(), "claude-hook");
+
+    let settings_path = cwd.join(CLAUDE_SETTINGS_RELATIVE);
+    if let Some(parent) = settings_path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "Failed to create directory '{}' for Claude settings",
+                parent.display()
+            )
+        })?;
+    }
+
+    let mut doc: serde_json::Value = if settings_path.exists() {
+        let content = std::fs::read_to_string(&settings_path).with_context(|| {
+            format!(
+                "Failed to read Claude settings at '{}'",
+                settings_path.display()
+            )
+        })?;
+        serde_json::from_str(&content).unwrap_or_else(|_| serde_json::json!({}))
+    } else {
+        serde_json::json!({})
+    };
+
+    // Walk: doc.hooks.PreToolUse — create as needed.
+    let root = doc.as_object_mut().ok_or_else(|| {
+        anyhow::anyhow!(
+            "Claude settings at '{}' is not a JSON object",
+            settings_path.display()
+        )
+    })?;
+    let hooks_root = root
+        .entry("hooks")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("Claude settings `hooks` key is not an object"))?;
+    let pretooluse = hooks_root
+        .entry("PreToolUse")
+        .or_insert_with(|| serde_json::json!([]))
+        .as_array_mut()
+        .ok_or_else(|| anyhow::anyhow!("Claude settings `hooks.PreToolUse` is not an array"))?;
+
+    // Remove any prior Brehon-owned entry so we re-install with the current
+    // binary path. Prevents drift when the brehon binary is rebuilt to a
+    // different location between runs.
+    pretooluse.retain(|entry| {
+        !entry_contains_brehon_marker(entry)
+    });
+
+    pretooluse.push(serde_json::json!({
+        "matcher": "Bash",
+        "hooks": [
+            { "type": "command", "command": hook_command }
+        ]
+    }));
+
+    std::fs::write(&settings_path, serde_json::to_string_pretty(&doc)?).with_context(|| {
+        format!(
+            "Failed to write Claude settings at '{}'",
+            settings_path.display()
+        )
+    })?;
+    tracing::info!(
+        path = %settings_path.display(),
+        "Installed Brehon Claude PreToolUse hook"
+    );
+    Ok(())
+}
+
+fn entry_contains_brehon_marker(entry: &serde_json::Value) -> bool {
+    let inner = entry.get("hooks").and_then(|h| h.as_array());
+    if let Some(arr) = inner {
+        for h in arr {
+            if let Some(cmd) = h.get("command").and_then(|c| c.as_str()) {
+                if cmd.contains(CLAUDE_HOOK_MARKER) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// RAII guard that activates the Claude worktree hook by writing the active
+/// marker. Drops the marker on drop so the hook becomes a no-op as soon as
+/// `brehon run` exits (graceful or otherwise — Drop runs on panic too).
+pub(crate) struct ClaudeWorktreeHookActivation {
+    marker_path: PathBuf,
+}
+
+impl Drop for ClaudeWorktreeHookActivation {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.marker_path);
+    }
+}
+
+pub(crate) fn activate_claude_worktree_hook(cwd: &Path) -> Result<ClaudeWorktreeHookActivation> {
+    let marker_path = cwd.join(CLAUDE_HOOK_ACTIVE_MARKER_RELATIVE);
+    if let Some(parent) = marker_path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "Failed to create Claude hook marker directory '{}'",
+                parent.display()
+            )
+        })?;
+    }
+    let body = format!(
+        "pid={}\nstarted_at={}\n",
+        std::process::id(),
+        chrono::Utc::now().to_rfc3339()
+    );
+    std::fs::write(&marker_path, body).with_context(|| {
+        format!(
+            "Failed to write Claude hook active marker '{}'",
+            marker_path.display()
+        )
+    })?;
+    Ok(ClaudeWorktreeHookActivation { marker_path })
+}
+
+/// Remove Brehon's Claude `PreToolUse` hook entry from settings and delete
+/// the active marker. Called from `brehon clean` / `brehon reset`. Idempotent.
+pub(crate) fn remove_claude_worktree_hook(cwd: &Path) -> Result<()> {
+    // Marker first — easy, always safe.
+    let marker_path = cwd.join(CLAUDE_HOOK_ACTIVE_MARKER_RELATIVE);
+    let _ = std::fs::remove_file(&marker_path);
+
+    let settings_path = cwd.join(CLAUDE_SETTINGS_RELATIVE);
+    if !settings_path.exists() {
+        return Ok(());
+    }
+    let content = std::fs::read_to_string(&settings_path).with_context(|| {
+        format!(
+            "Failed to read Claude settings at '{}' while removing Brehon hook",
+            settings_path.display()
+        )
+    })?;
+    let mut doc: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(_) => return Ok(()),
+    };
+
+    let mut changed = false;
+    if let Some(pretooluse) = doc
+        .get_mut("hooks")
+        .and_then(|h| h.get_mut("PreToolUse"))
+        .and_then(|p| p.as_array_mut())
+    {
+        let before = pretooluse.len();
+        pretooluse.retain(|entry| !entry_contains_brehon_marker(entry));
+        if pretooluse.len() != before {
+            changed = true;
+        }
+        // Clean up empty containers so we don't leave noise in settings.
+        if pretooluse.is_empty() {
+            if let Some(hooks_obj) = doc.get_mut("hooks").and_then(|h| h.as_object_mut()) {
+                hooks_obj.remove("PreToolUse");
+            }
+        }
+    }
+    if let Some(hooks_obj) = doc.get("hooks").and_then(|h| h.as_object()) {
+        if hooks_obj.is_empty() {
+            if let Some(root) = doc.as_object_mut() {
+                root.remove("hooks");
+            }
+            changed = true;
+        }
+    }
+
+    if changed {
+        std::fs::write(&settings_path, serde_json::to_string_pretty(&doc)?).with_context(|| {
+            format!(
+                "Failed to rewrite Claude settings at '{}' after removing Brehon hook",
+                settings_path.display()
+            )
+        })?;
+        tracing::info!(
+            path = %settings_path.display(),
+            "Removed Brehon Claude PreToolUse hook"
+        );
+    }
+    Ok(())
+}
+
 pub(crate) fn ensure_protected_branch_hooks(cwd: &Path, default_branch: &str) -> Result<()> {
     let hooks_dir = git_common_dir(cwd)?.join("hooks");
     std::fs::create_dir_all(&hooks_dir).with_context(|| {

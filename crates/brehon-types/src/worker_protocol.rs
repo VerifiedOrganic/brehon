@@ -31,6 +31,32 @@ pub fn build_worker_protocol(
     };
 
     let steps = vec![
+        // ── Worktree containment (rules 1-3) ──────────────────────────────
+        // These run first because they're the most-violated and most-damaging
+        // when ignored. A worker that drifts off the worker branch or out of
+        // the worktree produces empty commits and stranded changes — the
+        // damage is silent and only surfaces at review time.
+        format!(
+            "WORKTREE RULE: Work from the current worktree directory and stay on your dedicated \
+             worker branch. NEVER run `git checkout`, `git switch`, `git reset --hard`, or \
+             `git restore --source=...` against `main`, `master`, `develop`, `trunk`, or the \
+             task's `merge_target` branch from this pane. If you find yourself on any of those \
+             branches, that is a bug — call `{task_cmd} action=update id=<task> status=blocked` \
+             and message the supervisor instead of proceeding."
+        ),
+        "WORKTREE RULE: Never `cd` to the shared repo root, `BREHON_PROJECT_ROOT`, or any path \
+         outside the current worktree. Do not use absolute filesystem paths outside the current \
+         worktree even for comparison, testing, or read-only inspection unless the supervisor \
+         explicitly tells you to stop and wait for manual intervention."
+            .to_string(),
+        "WORKTREE RULE: If a shell/tool command is denied because it would access an external \
+         directory or requires approval, treat that denial as a hard constraint. Do NOT wait \
+         for approval, do NOT retry the same command, and do NOT keep probing other \
+         outside-worktree paths. Continue using only the current worktree, or mark the task \
+         blocked and message the supervisor with the denied command and why you thought it \
+         was needed."
+            .to_string(),
+        // ── Bootstrap and task lifecycle ──────────────────────────────────
         bootstrap_step,
         format!(
             "If this pane already shows an assigned task, or a real assignment prompt arrives, \
@@ -45,21 +71,9 @@ pub fn build_worker_protocol(
              state is active."
         ),
         format!(
-            "Work from the current worktree directory and stay on your dedicated worker branch. \
-             Do NOT checkout `main` or the task's `merge_target` branch in this pane. Use Brehon \
-             MCP tools for task/state coordination, and normal shell/CLI commands for repo work."
+            "Use Brehon MCP tools for task/state coordination, and normal shell/CLI commands \
+             for repo work — always within the current worktree (see worktree rules above)."
         ),
-        "Never `cd` to the shared repo root, `BREHON_PROJECT_ROOT`, or any path outside the \
-         current worktree. Do not use absolute filesystem paths outside the current worktree \
-         even for comparison, testing, or read-only inspection unless the supervisor explicitly \
-         tells you to stop and wait for manual intervention."
-            .to_string(),
-        "If a shell/tool command is denied because it would access an external directory or \
-         requires approval, treat that denial as a hard constraint. Do NOT wait for approval, \
-         do NOT retry the same command, and do NOT keep probing other outside-worktree paths. \
-         Continue using only the current worktree, or mark the task blocked and message the \
-         supervisor with the denied command and why you thought it was needed."
-            .to_string(),
         "Do not do supervisor planning work. Do not brainstorm implementation plans, create epics, or decompose tasks. Only the supervisor does that.".to_string(),
         format!(
             "Report progress early and whenever the work phase changes: `{task_cmd} action=progress \
@@ -109,6 +123,17 @@ pub fn build_worker_protocol(
              you are still working, use neutral language (\"tests passing\", \"investigating\", \
              \"75% through the fix list\") and report percent<100 until the fix is truly ready."
         ),
+        // ── Closing reminder ─────────────────────────────────────────────
+        // Repeated at the end of the protocol because models with weaker
+        // long-range instruction following (the reason this protocol exists
+        // at all) tend to honor whatever they read most recently. The earlier
+        // worktree rules state the same thing; this is intentional repetition.
+        "REMINDER: every command you run executes in your dedicated worktree. Never `cd` out of \
+         it. Never `git checkout main` (or master / develop / trunk / the task's merge_target). \
+         If you do work on the wrong branch, your commit will be empty and your progress will \
+         silently disappear. When in doubt, run `git rev-parse --abbrev-ref HEAD` and confirm \
+         you are on your worker branch before editing."
+            .to_string(),
     ];
 
     steps
@@ -139,5 +164,38 @@ mod tests {
         assert!(protocol.contains("The supervisor owns reviewer assignment"));
         assert!(protocol.contains("Never `cd` to the shared repo root"));
         assert!(protocol.contains("Do NOT wait for approval"));
+    }
+
+    #[test]
+    fn worktree_rules_appear_first_and_repeat_at_end() {
+        let protocol = build_worker_protocol(
+            WorkerBootstrapMode::IdleStartup,
+            "agent",
+            "task",
+            "supervisor",
+        );
+
+        // Worktree containment must be the first thing the model reads —
+        // ordering matters because weaker instruction-followers anchor on
+        // the opening of the prompt.
+        let first_line = protocol.lines().next().unwrap_or("");
+        assert!(
+            first_line.contains("WORKTREE RULE"),
+            "first protocol step must be a worktree rule, got: {first_line}"
+        );
+
+        // And repeat at the end so recency-biased models see it again.
+        let last_line = protocol.lines().last().unwrap_or("");
+        assert!(
+            last_line.contains("REMINDER")
+                && last_line.contains("worker branch"),
+            "last protocol step must repeat the worktree reminder, got: {last_line}"
+        );
+
+        // Explicit list of forbidden checkout targets so the model can't
+        // wriggle out via "main is not main, it's origin/main".
+        assert!(protocol.contains("`main`, `master`, `develop`, `trunk`"));
+        assert!(protocol.contains("`merge_target`"));
+        assert!(protocol.contains("git reset --hard"));
     }
 }

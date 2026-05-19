@@ -15,8 +15,8 @@ use clap::{Parser, Subcommand};
 use tracing::info;
 
 use crate::commands::{
-    clean, config, doctor, epic_truth, factory, import_plan, init, process, reset, run, runtime,
-    serve, task, test as test_cmd,
+    claude_hook, clean, config, doctor, epic_truth, factory, import_plan, init, process, reset,
+    run, runtime, serve, task, test as test_cmd,
 };
 
 fn absolutize_project_root(path: &Path) -> Option<PathBuf> {
@@ -182,6 +182,12 @@ enum Commands {
     /// Start the MCP server (used by agents to access Brehon tools)
     #[command(name = "serve")]
     Serve,
+
+    /// Claude Code PreToolUse hook. Reads tool-call JSON on stdin and
+    /// enforces worktree containment. Wired up automatically during
+    /// `brehon run`; not intended for direct invocation.
+    #[command(name = "claude-hook", hide = true)]
+    ClaudeHook,
 
     /// Remove all brehon artifacts from the project
     #[command(name = "clean")]
@@ -538,6 +544,7 @@ async fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Some(Commands::ClaudeHook) => claude_hook::execute(),
         Some(Commands::Clean { force }) => {
             let path = project_path.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
             match clean::execute(&path, force) {
