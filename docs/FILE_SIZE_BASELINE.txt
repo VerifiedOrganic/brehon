@@ -10,14 +10,14 @@
 1275 crates/brehon-adapter-copilot/src/copilot.rs
 1680 crates/brehon-adapter-gemini/src/gemini.rs
 1724 crates/brehon-adapter-kimi/src/kimi.rs
-1461 crates/brehon-adapter-openai/src/openai_compatible.rs
+1472 crates/brehon-adapter-openai/src/openai_compatible.rs
 2242 crates/brehon-adapter-opencode/src/opencode.rs
 1301 crates/brehon-cli/src/commands/import_plan/extraction.rs
 1240 crates/brehon-cli/src/commands/import_plan/tests.rs
 1063 crates/brehon-cli/src/commands/init.rs
-3934 crates/brehon-cli/src/commands/run/mod.rs
+3952 crates/brehon-cli/src/commands/run/mod.rs
 1823 crates/brehon-cli/src/commands/run/review.rs
-3443 crates/brehon-cli/src/commands/run/setup.rs
+3647 crates/brehon-cli/src/commands/run/setup.rs
 1242 crates/brehon-cli/src/ui.rs
 1446 crates/brehon-config/src/lib.rs
 2450 crates/brehon-config/src/validate.rs
@@ -29,7 +29,7 @@
 1032 crates/brehon-git/src/worktree.rs
 1794 crates/brehon-host/src/lib.rs
 2188 crates/brehon-mcp/src/tools/agent.rs
-2335 crates/brehon-mcp/src/tools/factory/tool_tests.rs
+2336 crates/brehon-mcp/src/tools/factory/tool_tests.rs
 1248 crates/brehon-mcp/src/tools/factory/tool.rs
 1155 crates/brehon-mcp/src/tools/memory.rs
 1909 crates/brehon-mcp/src/tools/research.rs

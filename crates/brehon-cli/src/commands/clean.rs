@@ -340,9 +340,7 @@ pub fn execute(project_path: &Path, force: bool) -> Result<()> {
     // .claude/settings.local.json (and the runtime active marker).
     match super::run::remove_claude_worktree_hook(project_path) {
         Ok(()) => ui::print_success("Removed Claude worktree-containment hook"),
-        Err(e) => {
-            ui::print_warning(&format!("Could not remove Claude worktree hook: {}", e))
-        }
+        Err(e) => ui::print_warning(&format!("Could not remove Claude worktree hook: {}", e)),
     }
 
     // Remove branches

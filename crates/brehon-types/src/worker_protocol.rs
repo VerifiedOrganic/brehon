@@ -187,8 +187,7 @@ mod tests {
         // And repeat at the end so recency-biased models see it again.
         let last_line = protocol.lines().last().unwrap_or("");
         assert!(
-            last_line.contains("REMINDER")
-                && last_line.contains("worker branch"),
+            last_line.contains("REMINDER") && last_line.contains("worker branch"),
             "last protocol step must repeat the worktree reminder, got: {last_line}"
         );
 

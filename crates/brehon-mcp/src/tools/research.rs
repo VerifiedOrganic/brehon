@@ -1775,7 +1775,7 @@ research:
 
     #[tokio::test]
     async fn request_claim_and_submit_attaches_research_context_without_blocking_task() {
-        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let temp = tempfile::tempdir().expect("tempdir");
         let brehon_root = temp.path().join(".brehon");
         let config_home = temp.path().join("xdg-config");
@@ -1847,7 +1847,7 @@ research:
 
     #[test]
     fn automatic_routes_are_deduplicated_and_non_blocking() {
-        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let temp = tempfile::tempdir().expect("tempdir");
         let brehon_root = temp.path().join(".brehon");
         let config_home = temp.path().join("xdg-config");

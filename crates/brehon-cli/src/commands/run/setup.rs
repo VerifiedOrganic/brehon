@@ -1078,9 +1078,7 @@ pub(crate) fn ensure_claude_worktree_hook(cwd: &Path) -> Result<()> {
     // Remove any prior Brehon-owned entry so we re-install with the current
     // binary path. Prevents drift when the brehon binary is rebuilt to a
     // different location between runs.
-    pretooluse.retain(|entry| {
-        !entry_contains_brehon_marker(entry)
-    });
+    pretooluse.retain(|entry| !entry_contains_brehon_marker(entry));
 
     pretooluse.push(serde_json::json!({
         "matcher": "Bash",

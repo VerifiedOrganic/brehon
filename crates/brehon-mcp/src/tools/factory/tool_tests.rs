@@ -176,6 +176,7 @@ fn run_git(path: &Path, args: &[&str]) -> String {
 fn make_git_repo_with_brehon_root() -> TempDir {
     let repo_root = tempfile::tempdir().unwrap();
     run_git(repo_root.path(), &["init"]);
+    run_git(repo_root.path(), &["branch", "-M", "main"]);
     run_git(repo_root.path(), &["config", "user.name", "Test"]);
     run_git(
         repo_root.path(),

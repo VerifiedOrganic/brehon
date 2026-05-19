@@ -31,7 +31,7 @@
 //! Exit 0 = allow. Exit 2 = block (Claude surfaces the message we print to
 //! stderr to the model). Anything else is treated as "non-blocking error."
 //!
-//! Reference: https://docs.claude.com/en/docs/claude-code/hooks
+//! Reference: <https://docs.claude.com/en/docs/claude-code/hooks>
 
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -133,7 +133,9 @@ impl PolicyContext {
             worktree_root: std::env::var("BREHON_WORKSPACE_ROOT")
                 .ok()
                 .map(PathBuf::from),
-            merge_target: std::env::var("BREHON_MERGE_TARGET").ok().filter(|s| !s.is_empty()),
+            merge_target: std::env::var("BREHON_MERGE_TARGET")
+                .ok()
+                .filter(|s| !s.is_empty()),
         }
     }
 
@@ -187,8 +189,7 @@ fn check_git_branch_change(segment: &str, ctx: &PolicyContext) -> Decision {
     }
     let subcommand = tokens[1];
 
-    let mentions_protected =
-        |args: &[&str]| -> Option<String> { protected_token_in(args, ctx) };
+    let mentions_protected = |args: &[&str]| -> Option<String> { protected_token_in(args, ctx) };
 
     let block = |branch: String, reason: &str| -> Decision {
         Decision::Block(format!(
@@ -204,29 +205,27 @@ fn check_git_branch_change(segment: &str, ctx: &PolicyContext) -> Decision {
                 return block(branch, &format!("`git {subcommand}` to a protected branch"));
             }
         }
-        "reset" => {
+        "reset" if tokens.contains(&"--hard") => {
             // Block `git reset --hard <protected>` (destroys worker branch state).
-            if tokens.contains(&"--hard") {
-                if let Some(branch) = mentions_protected(&tokens[2..]) {
-                    return block(branch, "`git reset --hard` against a protected branch");
-                }
+            if let Some(branch) = mentions_protected(&tokens[2..]) {
+                return block(branch, "`git reset --hard` against a protected branch");
             }
         }
         "restore" => {
             // Block `git restore --source=<protected> ...` (pulls protected
             // tree into the worker branch's working tree).
             for token in &tokens[2..] {
-                let source = token.strip_prefix("--source=").or_else(|| {
-                    token.strip_prefix("-s=").or_else(|| {
-                        // bare `--source <ref>` is two tokens; we don't bother
-                        // with that variant — clippy-tier completeness is for
-                        // a follow-up.
-                        None
-                    })
-                });
+                // Bare `--source <ref>` is two tokens; follow-up completeness
+                // can handle that variant if needed.
+                let source = token
+                    .strip_prefix("--source=")
+                    .or_else(|| token.strip_prefix("-s="));
                 if let Some(src) = source {
                     if ctx.protected_branches().contains(&src) {
-                        return block(src.to_string(), "`git restore --source=` from a protected branch");
+                        return block(
+                            src.to_string(),
+                            "`git restore --source=` from a protected branch",
+                        );
                     }
                 }
             }
@@ -276,7 +275,9 @@ fn check_cd_outside_worktree(segment: &str, ctx: &PolicyContext) -> Decision {
         Some(p) => p,
         None => return Decision::Allow,
     };
-    let stripped = segment.trim_start_matches("builtin ").trim_start_matches("command ");
+    let stripped = segment
+        .trim_start_matches("builtin ")
+        .trim_start_matches("command ");
     let tokens: Vec<&str> = stripped.split_whitespace().collect();
     if tokens.is_empty() || tokens[0] != "cd" {
         return Decision::Allow;
@@ -395,21 +396,13 @@ mod tests {
 
     #[test]
     fn blocks_git_checkout_main() {
-        let decision = evaluate(
-            "Bash",
-            &bash("git checkout main"),
-            &ctx_with("/work", None),
-        );
+        let decision = evaluate("Bash", &bash("git checkout main"), &ctx_with("/work", None));
         assert!(matches!(decision, Decision::Block(_)));
     }
 
     #[test]
     fn blocks_git_switch_master() {
-        let decision = evaluate(
-            "Bash",
-            &bash("git switch master"),
-            &ctx_with("/work", None),
-        );
+        let decision = evaluate("Bash", &bash("git switch master"), &ctx_with("/work", None));
         assert!(matches!(decision, Decision::Block(_)));
     }
 
@@ -466,11 +459,7 @@ mod tests {
 
     #[test]
     fn blocks_cd_to_parent_outside_worktree() {
-        let decision = evaluate(
-            "Bash",
-            &bash("cd .."),
-            &ctx_with("/work/sub", None),
-        );
+        let decision = evaluate("Bash", &bash("cd .."), &ctx_with("/work/sub", None));
         assert!(matches!(decision, Decision::Block(_)));
     }
 
@@ -482,11 +471,7 @@ mod tests {
 
     #[test]
     fn allows_cd_inside_worktree() {
-        let decision = evaluate(
-            "Bash",
-            &bash("cd src/foo"),
-            &ctx_with("/work", None),
-        );
+        let decision = evaluate("Bash", &bash("cd src/foo"), &ctx_with("/work", None));
         assert_eq!(decision, Decision::Allow);
     }
 
@@ -494,11 +479,7 @@ mod tests {
     fn allows_cd_with_shell_variable() {
         // We can't resolve $VAR safely, so we let it through. The worker
         // prompt still tells the model not to do this.
-        let decision = evaluate(
-            "Bash",
-            &bash("cd $HOME"),
-            &ctx_with("/work", None),
-        );
+        let decision = evaluate("Bash", &bash("cd $HOME"), &ctx_with("/work", None));
         assert_eq!(decision, Decision::Allow);
     }
 

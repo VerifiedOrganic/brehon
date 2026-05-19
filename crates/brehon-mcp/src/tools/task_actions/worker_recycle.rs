@@ -137,7 +137,7 @@ pub(crate) fn enqueue_worker_session_recycle_surfacing(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use brehon_mux::{Mux, MuxConfig, PromptQueueEntry};
+    use brehon_mux::{AgentPaneMaterialization, Mux, MuxConfig, PromptQueueEntry};
     use serde::{Deserialize, Serialize};
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -222,6 +222,7 @@ mod tests {
             session_name: Some("session-B".to_string()),
             workers: 0,
             include_director: false,
+            pane_materialization: AgentPaneMaterialization::PlanOnly,
             ..MuxConfig::default()
         };
         mux_config.worker_names.clear();
