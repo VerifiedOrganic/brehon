@@ -14,6 +14,7 @@ on:
 permissions:
   contents: read
   issues: write  # rustsec/audit-check opens an issue when a new advisory lands
+  checks: write  # required to post advisory annotations as a check run
 
 concurrency:
   group: audit-${{ github.ref }}

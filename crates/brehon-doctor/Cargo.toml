@@ -15,7 +15,7 @@ serde_json = { workspace = true }
 chrono = { workspace = true }
 thiserror = { workspace = true }
 
-git2 = "0.19"
+git2 = "0.20"
 libc = "0.2"
 
 [dev-dependencies]
