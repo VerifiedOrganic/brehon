@@ -150,6 +150,12 @@ install -m 0755 target/release/brehon ~/.local/bin/brehon
 cd /path/to/your/project
 brehon init
 
+# Load a plan document into the task board.
+# (See "Loading a plan" below for what PLAN.md needs to look like
+# and why this is split into two commands.)
+brehon extract-plan PLAN.md --output .brehon/plan.json
+brehon import-plan .brehon/plan.json
+
 # Run the orchestrator with the default configuration
 brehon run
 
@@ -162,6 +168,100 @@ brehon runtime dashboard
 # Diagnose missing agents, malformed config, broken worktrees, etc.
 brehon doctor
 ```
+
+If you don't have a plan document yet and just want to drive Brehon via an
+external agent talking to its MCP server, you can skip the extract/import
+steps — `brehon run` will spin up with an empty board, and tasks can be
+created through the MCP `task` tool.
+
+## Loading a plan
+
+The realistic on-ramp into Brehon is a **plan document** — a structured
+description of the work, broken into phases, epics, and concrete tasks with
+dependencies, sizes, and gate conditions. Without one, the orchestrator has
+nothing to dispatch (other than what an external agent pushes in over MCP),
+so for most users this is the first real step after `brehon init`.
+
+Two commands handle plan ingestion. They share extraction logic and a
+`--mode` flag, but split *what they do with the result*:
+
+- **`brehon extract-plan FILE`** — Parse or LLM-extract a plan document into
+  a normalized JSON form. Prints to stdout by default, or to `--output PATH`.
+  Does **not** touch the task board.
+- **`brehon import-plan FILE`** — Take a plan (either the original source
+  document, or already-extracted JSON) and create the corresponding
+  `initiative → phase-epics → tasks` tree on the task board, including the
+  final hardening epic. Use `--dry-run` to preview what would be imported
+  without writing anything.
+
+### The three extraction modes
+
+| Mode | What it does | When to use |
+| ---- | ------------ | ----------- |
+| `direct` | Parse the markdown directly with Brehon's built-in parser. Deterministic, free, instant. | Your plan already follows the structure below. |
+| `supervisor` | Feed the document to the configured supervisor lane's CLI (claude / codex / gemini / opencode) under a JSON schema, and let it normalize the result into a `PlanDocument`. **This is the expensive path** — at minimum one LLM call, often one per phase or even per task for chunkable documents. | Your plan is free-form, hand-written, or follows a different convention. |
+| `auto` (default) | Try direct first; fall back to supervisor only if direct parsing fails. | You don't know which one applies and want the cheapest viable option. |
+
+The supervisor mode reads the supervisor lane out of `.brehon/config.yaml`
+and requires it to be an ACP-style subprocess launcher (`claude`, `codex`,
+`gemini`, or `opencode`). If the supervisor lane is configured differently,
+the command will refuse rather than silently change behavior.
+
+Timeouts are tunable via env vars: `BREHON_PLAN_EXTRACT_IDLE_TIMEOUT_SECS`
+(how long the extractor may go silent before being killed) and
+`BREHON_PLAN_EXTRACT_MAX_TIMEOUT_SECS` (wall-clock ceiling). The legacy
+single-value `BREHON_PLAN_EXTRACT_TIMEOUT_SECS` is still honored for
+back-compat.
+
+### The recommended pattern: extract once, import many times
+
+```bash
+# One expensive LLM pass to normalize a free-form plan into JSON.
+brehon extract-plan PLAN.md --mode supervisor --output .brehon/plan.json
+
+# Review or hand-edit .brehon/plan.json if you want — it's a checked-in
+# artifact you can keep alongside the source markdown.
+
+# Cheap, deterministic, re-runnable import from the normalized form.
+brehon import-plan .brehon/plan.json
+```
+
+This split is the main reason both commands exist. Extraction over an LLM
+can take minutes and cost real money; you don't want to redo it every time
+you tweak something. The normalized JSON is the cache.
+
+### What the direct parser expects
+
+If you want to skip the LLM and use `--mode direct`, your markdown needs to
+look like this (slightly simplified — see
+`crates/brehon-cli/src/commands/import_plan/tests.rs` for canonical
+examples):
+
+```markdown
+# My Plan Title
+
+**Project:** My Project
+**Stack:** Rust + Tokio
+**Target:** Linux x86_64
+
+## Phase 1: Foundations
+
+### Phase 1.1: Wire up the storage layer
+
+| ID    | Title                    | Dependencies | Size | Gate          | Status |
+| ----- | ------------------------ | ------------ | ---- | ------------- | ------ |
+| T-101 | Define event types       |              | S    | unit tests    | Open   |
+| T-102 | Implement append path    | T-101        | M    | smoke test    | Open   |
+
+### Phase 1 gate: Tests and acceptance
+
+| ID    | Title              | Dependencies | Size | Gate        | Status |
+| ----- | ------------------ | ------------ | ---- | ----------- | ------ |
+| T-1G  | Phase 1 sign-off   | T-101,T-102  | S    | all pass    | Open   |
+```
+
+If your existing plan format is close but not identical, run `extract-plan`
+with `--mode supervisor` once, save the JSON, and import from there.
 
 ## Configuration
 
@@ -232,7 +332,8 @@ authoritative form.
 | `brehon ps` / `brehon kill`   | Process inspection for in-flight runs.                               |
 | `brehon task <subcmd>`        | Direct task-board operations (list, get, transition).                |
 | `brehon factory <subcmd>`     | Factory-mode worker lifecycle.                                       |
-| `brehon import-plan FILE`     | Import an external task plan (JSON) into the board.                  |
+| `brehon extract-plan FILE`    | Normalize a plan document into JSON (direct parse or LLM-extract).   |
+| `brehon import-plan FILE`     | Import a plan (markdown or normalized JSON) into the task board.     |
 | `brehon process <subcmd>`     | Low-level process control.                                           |
 | `brehon reset`                | Reset runtime state. Guarded against destroying `main`/`master`.     |
 | `brehon clean`                | Clean up stale worktrees and runtime directories.                    |

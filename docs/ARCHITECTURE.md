@@ -353,10 +353,40 @@ See [ADR-0002](adr/0002-acp-and-mcp.md).
 | `task <subcmd>` | Direct task-board ops. |
 | `factory <subcmd>` | Factory worker lifecycle. |
 | `process <subcmd>` | Low-level process control. |
-| `import-plan FILE [--path P]` | Import an external task plan (JSON). |
+| `extract-plan FILE [--output P] [--mode M]` | Normalize a plan document into a `PlanDocument` JSON. No board writes. |
+| `import-plan FILE [--dry-run] [--mode M]` | Import a plan (markdown source or normalized JSON) into the task board. |
 | `reset` | Reset runtime state (with branch guards). |
 | `clean` | Clean stale worktrees and runtime state. |
 | `epic-truth` | Report current epic-branch ground truth. |
+
+### Plan ingestion pipeline
+
+`extract-plan` and `import-plan` share a single extraction core in
+`crates/brehon-cli/src/commands/import_plan/`. The pipeline has two layers:
+
+1. **Extraction** (`extraction.rs`): turns a source document into a
+   `PlanDocument` — a normalized tree of phases → epics → tasks with
+   dependencies, sizes, gates, and source status. Three modes:
+   - `Direct`: parse markdown deterministically against a fixed structure
+     (`## Phase N`, `### Phase N.M`, 6-column task tables).
+   - `Supervisor`: feed the document to the configured supervisor lane's
+     CLI (must be one of `claude`, `codex`, `gemini`, `opencode`) under a
+     JSON schema, with chunking for large documents (one LLM call per
+     phase, or per task when phases are themselves chunked).
+   - `Auto`: try `Direct`, fall back to `Supervisor` on parse failure.
+2. **Dispatch** (`dispatch.rs`): for `import-plan`, walks the
+   `PlanDocument` and creates the corresponding tree via the
+   `TaskActionsTool` from `brehon-mcp` — initiative, one epic per phase,
+   one task per source task, plus a final hardening epic seeded with a
+   fixed task count. For `extract-plan`, dispatch is skipped; the
+   normalized JSON is serialized to stdout or `--output PATH`.
+
+The split between `extract` and `import` exists because supervisor
+extraction is the single most expensive operation in the system — multi-LLM
+calls per document, with idle and wall-clock timeouts controlled by
+`BREHON_PLAN_EXTRACT_IDLE_TIMEOUT_SECS` and `BREHON_PLAN_EXTRACT_MAX_TIMEOUT_SECS`.
+Persisting the normalized JSON lets users re-import deterministically
+without re-paying that cost.
 
 ---
 
