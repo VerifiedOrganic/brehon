@@ -1,0 +1,56 @@
+[package]
+name = "brehon-test-harness"
+version = "0.1.0"
+edition = "2021"
+description = "Test infrastructure and fixtures for the Brehon workspace"
+license = "MIT"
+
+[dependencies]
+brehon-types = { path = "../brehon-types" }
+brehon-ports = { path = "../brehon-ports" }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+rand = "0.8"
+parking_lot = "0.12"
+futures = "0.3"
+nix = { version = "0.29", features = ["signal"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros"] }
+tempfile = "3"
+brehon-pty = { path = "../brehon-pty" }
+
+[[test]]
+name = "chaos_tests"
+path = "tests/chaos/mod.rs"
+
+[[test]]
+name = "crash_tests"
+path = "tests/crash/mod.rs"
+
+[[test]]
+name = "git_tests"
+path = "tests/git/mod.rs"
+
+[[test]]
+name = "scenarios_tests"
+path = "tests/scenarios/mod.rs"
+
+[[test]]
+name = "stress_tests"
+path = "tests/stress/mod.rs"
+
+[[test]]
+name = "soak_tests"
+path = "tests/soak/mod.rs"
+
+[[test]]
+name = "epic_integration_tests"
+path = "tests/epic_integration_tests.rs"

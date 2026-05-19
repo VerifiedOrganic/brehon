@@ -1,0 +1,9 @@
+---
+source: crates/agora-tui/src/run/mod.rs
+expression: snapshot
+---
+worker     [▰]@rgb(100,149,237) [● ⠋ running]@rgb(255,200,80)
+supervisor [◉]@rgb(255,200,80) [◐ starting]@rgb(110,185,255)
+reviewer   [⬡]@rgb(80,200,120) [○ idle]@rgb(120,120,130)
+director   [◆]@rgb(180,130,255) [✗ error]@rgb(255,100,100)
+shell      [▫]@rgb(180,180,180) [○ idle]@rgb(120,120,130)

@@ -1,0 +1,97 @@
+# ─── Rust / Cargo ────────────────────────────────────────────────
+/target/
+**/*.rs.bk
+
+# ─── Zig (vendored ghostty submodule builds) ─────────────────────
+**/.zig-cache/
+
+# ─── Coverage & profiling ────────────────────────────────────────
+*.profraw
+*.profdata
+lcov.info
+tarpaulin-report.*
+coverage/
+
+# ─── Compiler crashes ────────────────────────────────────────────
+rustc-ice-*.txt
+
+# ─── Brehon runtime state (created by `brehon run`) ──────────────
+.brehon/
+**/.brehon/
+brehon-*.log
+
+# ─── Internal planning / research / scratch (not for OSS) ────────
+.planning/
+.archive/
+tmp/
+scratch/
+notes/
+
+# ─── AI coding tool configs (local-only) ─────────────────────────
+# Claude Code
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
+# Cursor
+.cursor/
+.cursorrules.local
+# Aider
+.aider*
+# Gemini
+.gemini/
+# Codex (OpenAI)
+.codex/
+# OpenCode
+.opencode/
+# Roo / Cline / Windsurf
+.roomodes
+.rooignore
+.clinerules
+.windsurfrules
+
+# ─── MCP local config (paths are machine-specific) ───────────────
+.mcp.json
+!.mcp.json.example
+
+# ─── Editor — Vim / Neovim ───────────────────────────────────────
+*.swp
+*.swo
+*~
+
+# ─── Editor — VS Code ────────────────────────────────────────────
+.vscode/
+!.vscode/extensions.json
+
+# ─── Editor — JetBrains ──────────────────────────────────────────
+.idea/
+*.iml
+*.iws
+*.ipr
+out/
+cmake-build-*/
+
+# ─── Editor — Helix / Zed ────────────────────────────────────────
+.helix/
+.zed/
+
+# ─── OS ──────────────────────────────────────────────────────────
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# ─── Environment & secrets ───────────────────────────────────────
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+
+# ─── Logs ────────────────────────────────────────────────────────
+*.log
+logs/
+
+# ─── Other tooling cruft ─────────────────────────────────────────
+.pantheon/

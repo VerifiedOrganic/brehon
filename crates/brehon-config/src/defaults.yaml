@@ -1,0 +1,382 @@
+version: 1
+
+launchers:
+  claude:
+    adapter: Acp
+    command: claude
+    args: []
+  codex:
+    adapter: Acp
+    command: codex
+    args:
+      - "app-server"
+  gemini:
+    adapter: Acp
+    command: gemini
+    args:
+      - "--acp"
+  opencode:
+    adapter: Acp
+    command: opencode
+    args: []
+
+lanes:
+  claude-supervisor:
+    launcher: claude
+    model:
+      provider: anthropic
+      name: claude-sonnet-4-6
+  codex-worker:
+    launcher: codex
+    model:
+      provider: openai
+      name: gpt-5.3-codex
+  codex-hardening:
+    launcher: codex
+    model:
+      provider: openai
+      name: gpt-5.5
+    reasoning_effort: xhigh
+  claude-reviewer:
+    launcher: claude
+    model:
+      provider: anthropic
+      name: claude-opus-4-6
+    system_prompt: |
+      You are a reviewer. Your job is to evaluate the submitted work, not to implement it.
+      Treat active review obligations as your source of truth even when no tasks are assigned.
+      Review panels are leased to tasks. If your panel is leased, the same task keeps that panel
+      across changes-requested rereview cycles until the task is terminal or the panel is explicitly released.
+      A review is only complete after a successful structured submit_review call.
+      Do not waive, dismiss, or summarize away legitimate nitpicks; submit each real nitpick as
+      a structured finding with severity nitpick.
+      Treat missing or insufficient tests as a real review gap unless tests are explicitly waived.
+      Do not report idle or ready while any review obligation remains.
+  codex-reviewer:
+    launcher: codex
+    model:
+      provider: openai
+      name: gpt-5.4
+    system_prompt: |
+      You are a reviewer. Your job is to evaluate the submitted work, not to implement it.
+      Treat active review obligations as your source of truth even when no tasks are assigned.
+      Review panels are leased to tasks. If your panel is leased, the same task keeps that panel
+      across changes-requested rereview cycles until the task is terminal or the panel is explicitly released.
+      A review is only complete after a successful structured submit_review call.
+      Do not waive, dismiss, or summarize away legitimate nitpicks; submit each real nitpick as
+      a structured finding with severity nitpick.
+      Treat missing or insufficient tests as a real review gap unless tests are explicitly waived.
+      Do not report idle or ready while any review obligation remains.
+  gemini-reviewer:
+    launcher: gemini
+    model:
+      provider: google
+      name: gemini-3.1-pro-preview
+    system_prompt: |
+      You are a reviewer. Your job is to evaluate the submitted work, not to implement it.
+      Treat active review obligations as your source of truth even when no tasks are assigned.
+      Review panels are leased to tasks. If your panel is leased, the same task keeps that panel
+      across changes-requested rereview cycles until the task is terminal or the panel is explicitly released.
+      A review is only complete after a successful structured submit_review call.
+      Do not waive, dismiss, or summarize away legitimate nitpicks; submit each real nitpick as
+      a structured finding with severity nitpick.
+      Treat missing or insufficient tests as a real review gap unless tests are explicitly waived.
+      Do not report idle or ready while any review obligation remains.
+
+prompt_fragments:
+  architecture.hexagonal:
+    applies_to:
+      - all
+    priority: 50
+    text: |
+      Prefer ports-and-adapters boundaries.
+      Keep domain logic independent from transport, storage, and framework code.
+      New integrations should enter through explicit interfaces or ports.
+  process.tdd:
+    applies_to:
+      - worker
+      - reviewer
+    priority: 60
+    text: |
+      Add or update tests with each change.
+      Prefer failing-test-first when practical.
+      Reviewers should treat missing tests as a real gap unless the task explicitly waives them.
+
+prompt_policy:
+  enabled: []
+
+roles:
+  supervisor:
+    name: claude-supervisor
+    kind: Supervisor
+    description: "Coordinates work, assigns tasks, provides guidance"
+    permissions:
+      - CreateTasks
+      - AssignTasks
+      - SendMessage
+      - Broadcast
+      - ContextReadWrite
+      - ManageAgents
+      - ManageRoles
+    system_prompt: |
+      You are a senior engineering lead coordinating a team.
+      You plan work, assign tasks, and guide workers.
+      Ordinary implementation belongs to workers.
+      You may directly resolve supervisor-owned integration conflicts or control-plane repairs
+      when the task graph cannot safely advance without direct intervention.
+  workers:
+    - lane: codex-worker
+      min: 1
+      max: 5
+    - lane: codex-hardening
+      assignment_mode: reserved
+      accepts:
+        - final_hardening
+      min: 1
+      max: 1
+  reviewers:
+    - lane: claude-reviewer
+      min: 1
+      max: 3
+    - lane: codex-reviewer
+      min: 1
+      max: 3
+    - lane: gemini-reviewer
+      min: 1
+      max: 3
+
+# Optional config-level routing. Explicit task execution_policy wins; otherwise
+# first matching rule supplies an effective execution policy at assignment time.
+# Use a cheap/default lane for bounded S/M work and route high-risk or large
+# tasks to stronger lanes. Rename lanes to match your roles.workers entries.
+# routing:
+#   default_worker_lane: cheap-worker
+#   escalation_lane: codex-worker
+#   rules:
+#     - id: high-risk-or-large
+#       match:
+#         text_any:
+#           - "Imported size estimate: L"
+#           - phase gate
+#           - controller
+#           - reconcile
+#           - interop
+#           - chaos
+#           - release
+#           - security
+#       policy:
+#         preferred_lane: codex-worker
+#         strict: false
+
+# Optional multi-agent advisor rooms for live brainstorming. These agents are
+# read-only by design: they can discuss, compare, and synthesize, but not take
+# worker/reviewer task ownership or edit repository state.
+# advisors:
+#   enabled: false
+#   response_timeout_secs: 45
+#   default_turn_mode: open_chat
+#   pools:
+#     - lane: codex-worker
+#       min: 1
+#       max: 2
+#       permissions: read_only
+#       rooms:
+#         - release-war-room
+#   rooms:
+#     - id: release-war-room
+#       title: Release War Room
+#       turn_mode: debate
+#       participants:
+#         - codex-worker
+#       context:
+#         docs:
+#           - docs/PHASE5_COMPLETION_HANDOFF.md
+#         tasks:
+#           - status: ready
+
+# Optional read-only research agents for async context gathering. Research jobs
+# never block worker assignment or review; completed artifacts are attached to
+# task.research_context for workers and reviewers to verify.
+# research:
+#   enabled: false
+#   defaults:
+#     max_parallel_jobs: 4
+#     job_timeout_secs: 180
+#     require_citations: true
+#   worker_requests:
+#     enabled: true
+#     max_requests_per_task: 3
+#     max_cost_units_per_task: 6
+#     max_cost_units_per_request: 3
+#     allowed_roles:
+#       - normative_requirements
+#       - code_map
+#   pools:
+#     - id: spec-research
+#       lane: cheap-worker
+#       instruction_profile: "Find primary sources, cite exact sections, and summarize only task-relevant facts."
+#       role: normative_requirements
+#       min: 0
+#       max: 2
+#       cost_units: 1
+#       permissions: read_only
+#       output_schema: spec_brief
+#   routes:
+#     - id: specs-for-protocol-work
+#       trigger: before_assignment
+#       continue: true
+#       match:
+#         text_any:
+#           - RFC
+#           - protocol
+#           - 5G
+#           - PFCP
+#           - NGAP
+#       jobs:
+#         - id: normative-requirements
+#           pool: spec-research
+#           prompt_template: |
+#             Task {{task_id}}: {{title}}
+#             Summarize normative requirements and cite primary sources.
+#             File hints:
+#             {{file_hints}}
+
+review:
+  policy:
+    min_average_score: 7
+    min_individual_score: 6
+    blocking_score: 5
+    min_approvals: 2
+    require_blocking_feedback_resolution: true
+    max_review_rounds: 3
+  timeout_minutes: 30
+  auto_assign: true
+  default_reviewers:
+    - claude-reviewer
+    - codex-reviewer
+    - gemini-reviewer
+  panel_mode: full_council
+  lease_mode: exclusive
+  panels:
+    - id: primary
+      reviewers:
+        - claude-reviewer
+        - codex-reviewer
+        - gemini-reviewer
+  max_diff_tokens: 8000
+  chunk_strategy: ByDirectory
+  stale_detection:
+    enabled: true
+    ignore_files:
+      - Cargo.lock
+      - package-lock.json
+      - .gitignore
+    strategy: DeltaReview
+
+supervisor:
+  autonomy: Guided
+  heartbeat_minutes: 15
+  stuck_detection:
+    time_threshold_minutes: 10
+    operation_aware: true
+    pattern_detection: true
+  nudge:
+    soft_after_minutes: 5
+    guidance_after_minutes: 10
+
+orchestration:
+  max_active_workers: 5
+  worktree_isolation: true
+  branch_prefix: "brehon/"
+  auto_cleanup_worktrees: true
+  worker_idle_behavior: SelfImprove
+  allow_mutating_idle_work: false
+  self_improve_tasks:
+    - run_tests
+    - lint_check
+    - collect_review_notes
+  # spawn_workers: null  # Override total spawned workers; if null, uses sum of pool.min
+
+runtime:
+  enabled_workflows: []
+  retry:
+    enabled: true
+    max_attempts: 2
+    base_delay_ms: 10000
+    max_delay_ms: 60000
+    jitter_ms: 250
+  continuation:
+    enabled: true
+    max_turns_per_run: 5
+    idle_prompt_after_secs: 300
+  terminal_host:
+    kind: embedded
+    preview_pane: false
+    pane_ownership: mux
+
+escalation:
+  human_in_loop: true
+  notify_via: Terminal
+  escalation_timeout_minutes: 15
+
+budget:
+  max_total_cost: null
+  max_cost_per_task: null
+  max_tokens_per_agent: null
+  alert_threshold_percent: 80
+  enforcement: Soft
+
+context:
+  db_path: ".brehon/brehon.db"
+  search_index_path: ".brehon/indexes/tantivy"
+  memory_ttl_days: null
+  max_memories: 10000
+  agents_md: Auto
+  retrieval:
+    default_limit: 5
+    max_limit: 20
+    snippet_chars: 240
+  compression:
+    enabled: false
+    mode: deterministic_terse
+    store_raw: true
+    compact_memories: true
+    compact_rules: true
+    compact_tasks: true
+
+tui:
+  default_layout: Balanced
+  terminal_mode: Auto
+  notifications:
+    toast_duration_seconds: 5
+    flash_tabs: true
+    modal_on_critical: true
+  keybindings: default
+
+retention:
+  max_events: 100000
+  idempotency_ttl_hours: 168
+  max_completed_tasks: 10000
+  max_assignment_history: 1000
+  max_tasks: 10000
+  sweep_interval_secs: 60
+
+security:
+  sandbox_profile: OsDefault
+  persist_transcripts: true
+  redact_patterns: []
+  env_allowlist:
+    - PATH
+    - HOME
+    - USER
+    - SHELL
+
+permissions:
+  "*": Ask
+  bash:
+    "*": Ask
+    "git *": Allow
+    "cargo test *": Allow
+    "rm -rf *": Deny
+  edit:
+    "*": Allow

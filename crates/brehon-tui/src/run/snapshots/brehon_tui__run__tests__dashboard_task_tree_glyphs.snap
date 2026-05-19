@@ -1,0 +1,15 @@
+---
+source: crates/agora-tui/src/run/mod.rs
+assertion_line: 4640
+expression: snapshot
+---
+╭─ Tasks ──────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│  Required 2  Completed 0  Open 2  Active 1  Review 1  Blocked 0  Follow-ups 0                                        │
+│                                                                                                                      │
+│  ▼ I-1           pending         Initiative [0/2]                                                                    │
+│    ──▶ E-1           pending         Collapsed epic                                                                  │
+│    └ T-1           in_progress     ▰ worker-1        Expanded child task                                             │
+│                                                                                                                      │
+│  T-2           review_ready    ⬡ reviewer-1      Reviewer owned task                                                 │
+│                                                                                                                      │
+│                                                                                                                      │

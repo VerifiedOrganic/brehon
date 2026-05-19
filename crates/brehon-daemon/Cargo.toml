@@ -1,0 +1,24 @@
+[package]
+name = "brehon-daemon"
+version = "0.1.0"
+edition = "2024"
+description = "Runtime daemon coordination plane for Brehon"
+license = "MIT"
+
+[dependencies]
+brehon-ports = { path = "../brehon-ports" }
+brehon-runtime = { path = "../brehon-runtime" }
+brehon-types = { path = "../brehon-types" }
+brehon-detect = { path = "../brehon-detect" }
+brehon-workflow = { path = "../brehon-workflow" }
+
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+brehon-policy = { path = "../brehon-policy" }
+tempfile = "3"

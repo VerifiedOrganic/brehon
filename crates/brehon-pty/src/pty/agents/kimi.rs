@@ -1,0 +1,119 @@
+use std::path::PathBuf;
+
+use crate::pty::config::PtyConfig;
+use crate::pty::prompts::{
+    build_reviewer_startup_prompt, build_supervisor_startup_prompt, build_worker_startup_prompt,
+    project_policy_for_role,
+};
+
+impl PtyConfig {
+    /// Create config for an interactive Kimi CLI session.
+    #[allow(clippy::too_many_arguments)]
+    pub fn kimi(
+        name: &str,
+        role: &str,
+        cwd: PathBuf,
+        brehon_root: Option<&PathBuf>,
+        supervisor_name: Option<&str>,
+        factory_worker_cli: Option<&str>,
+        model: Option<&str>,
+        reasoning_effort: Option<&str>,
+    ) -> Self {
+        let mut config = brehon_adapter_kimi::build_kimi_spawn_config(
+            name,
+            role,
+            cwd,
+            brehon_root,
+            supervisor_name,
+            factory_worker_cli,
+            model,
+            reasoning_effort,
+        );
+
+        if role == "worker" {
+            let project_policy = project_policy_for_role(brehon_root, role);
+            let startup_prompt = build_worker_startup_prompt(
+                name,
+                supervisor_name.unwrap_or("supervisor"),
+                "mcp_brehon_agent",
+                "mcp_brehon_task",
+                project_policy.as_deref(),
+            );
+            config.args.push("--prompt".to_string());
+            config.args.push(startup_prompt);
+        } else if role == "supervisor" {
+            let project_policy = project_policy_for_role(brehon_root, role);
+            let startup_prompt = build_supervisor_startup_prompt(
+                name,
+                "mcp_brehon_agent",
+                "mcp_brehon_task",
+                project_policy.as_deref(),
+            );
+            config.args.push("--prompt".to_string());
+            config.args.push(startup_prompt);
+        } else if role == "reviewer" {
+            let project_policy = project_policy_for_role(brehon_root, role);
+            let startup_prompt = build_reviewer_startup_prompt(
+                name,
+                "mcp_brehon_agent",
+                "mcp_brehon_verification",
+                project_policy.as_deref(),
+            );
+            config.args.push("--prompt".to_string());
+            config.args.push(startup_prompt);
+        }
+
+        if let Some(reasoning_effort) = reasoning_effort {
+            config.args.push(
+                if brehon_adapter_kimi::kimi::kimi_thinking_enabled(reasoning_effort) {
+                    "--thinking".to_string()
+                } else {
+                    "--no-thinking".to_string()
+                },
+            );
+        }
+
+        Self {
+            command: config.command,
+            args: config.args,
+            cwd: config.cwd,
+            env: config.env,
+            rows: config.rows,
+            cols: config.cols,
+        }
+    }
+
+    /// Create config for a Kimi CLI ACP session.
+    #[allow(clippy::too_many_arguments)]
+    pub fn kimi_acp(
+        name: &str,
+        role: &str,
+        cwd: PathBuf,
+        brehon_root: Option<&PathBuf>,
+        supervisor_name: Option<&str>,
+        factory_worker_cli: Option<&str>,
+        model: Option<&str>,
+        reasoning_effort: Option<&str>,
+    ) -> Self {
+        let mut config = Self::kimi(
+            name,
+            role,
+            cwd,
+            brehon_root,
+            supervisor_name,
+            factory_worker_cli,
+            model,
+            reasoning_effort,
+        );
+        config.args = vec!["acp".to_string()];
+        config
+    }
+}
+
+// Re-export Kimi runtime helpers so existing callers in brehon-pty keep working.
+// Re-export Kimi runtime helpers so existing callers in brehon-pty keep working.
+#[allow(unused_imports)]
+pub use brehon_adapter_kimi::{
+    desired_kimi_mcp_config, kimi_share_dir, prepare_local_kimi_runtime,
+    prepare_local_kimi_runtime_with_global_share,
+};

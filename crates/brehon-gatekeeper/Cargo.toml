@@ -1,0 +1,21 @@
+[package]
+name = "brehon-gatekeeper"
+version = "0.1.0"
+edition = "2021"
+description = "Epic-level gating pipeline for Brehon"
+license = "MIT"
+
+[dependencies]
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+thiserror = { workspace = true }
+tempfile = "3"
+tokio = { workspace = true }
+brehon-git = { path = "../brehon-git" }
+git2 = "0.19"
+
+[dev-dependencies]
+brehon-git = { path = "../brehon-git", features = ["test-fixtures"] }

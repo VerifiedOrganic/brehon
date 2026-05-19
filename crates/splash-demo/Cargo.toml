@@ -1,0 +1,13 @@
+[package]
+name = "splash-demo"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Local visual sanity-check for the brehon startup splash (dev tool only)"
+
+[[bin]]
+name = "splash-demo"
+path = "src/main.rs"
+
+[dependencies]
+crossterm = { workspace = true }

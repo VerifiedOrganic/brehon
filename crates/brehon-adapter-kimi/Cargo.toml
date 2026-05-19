@@ -1,0 +1,24 @@
+[package]
+name = "brehon-adapter-kimi"
+version = "0.1.0"
+edition = "2021"
+description = "Kimi Code CLI adapter for Brehon"
+license = "MIT"
+
+[dependencies]
+brehon-adapter-sdk = { path = "../brehon-adapter-sdk" }
+brehon-types = { path = "../brehon-types" }
+brehon-ports = { path = "../brehon-ports" }
+
+tokio = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+dirs = "6"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

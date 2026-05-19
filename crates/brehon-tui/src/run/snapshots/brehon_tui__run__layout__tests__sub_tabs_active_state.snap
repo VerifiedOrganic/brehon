@@ -1,0 +1,8 @@
+---
+source: crates/agora-tui/src/run/layout.rs
+assertion_line: 566
+expression: "snapshot_rows(terminal.backend().buffer(), 0..3)"
+---
+[────────────────────────────────────────────────────────────]@rgb(50,58,74)
+[   ]@reset[worker-a]@white[   ]@reset[worker-b]@rgb(160,160,170)
+[     ]@reset[━]@rgb(60,211,255)[━]@rgb(121,152,255)[━]@rgb(182,92,255)

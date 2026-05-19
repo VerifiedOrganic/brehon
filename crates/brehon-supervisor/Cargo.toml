@@ -1,0 +1,23 @@
+[package]
+name = "brehon-supervisor"
+version = "0.1.0"
+edition = "2021"
+description = "Lightweight Rust-native supervisor for multi-agent worker management"
+license = "MIT"
+
+[dependencies]
+brehon-types = { path = "../brehon-types" }
+brehon-ports = { path = "../brehon-ports" }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+parking_lot = "0.12"
+
+[dev-dependencies]
+brehon-test-harness = { path = "../brehon-test-harness" }
+tempfile = "3"

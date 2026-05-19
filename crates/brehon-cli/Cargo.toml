@@ -1,0 +1,51 @@
+[package]
+name = "brehon-cli"
+version = "0.1.0"
+edition = "2021"
+description = "Command-line interface for launching and managing Brehon sessions"
+license = "MIT"
+
+[[bin]]
+name = "brehon"
+path = "src/main.rs"
+
+[dependencies]
+brehon-types = { path = "../brehon-types" }
+brehon-ports = { path = "../brehon-ports" }
+brehon-config = { path = "../brehon-config" }
+brehon-store-fjall = { path = "../brehon-store-fjall" }
+brehon-search-tantivy = { path = "../brehon-search-tantivy" }
+brehon-acp = { path = "../brehon-acp" }
+brehon-pty = { path = "../brehon-pty" }
+brehon-mux = { path = "../brehon-mux" }
+brehon-git = { path = "../brehon-git" }
+brehon-mcp = { path = "../brehon-mcp" }
+brehon-tui = { path = "../brehon-tui" }
+brehon-doctor = { path = "../brehon-doctor" }
+brehon-policy = { path = "../brehon-policy" }
+brehon-daemon = { path = "../brehon-daemon" }
+brehon-host = { path = "../brehon-host" }
+crossterm = { workspace = true }
+brehon-supervisor = { path = "../brehon-supervisor" }
+brehon-orchestrator = { path = "../brehon-orchestrator" }
+brehon-review = { path = "../brehon-review" }
+brehon-test-harness = { path = "../brehon-test-harness" }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+directories = { workspace = true }
+anyhow = { workspace = true }
+which = "7"
+ctrlc = "3.4"
+git2 = "0.19"
+
+[dev-dependencies]
+tempfile = "3"

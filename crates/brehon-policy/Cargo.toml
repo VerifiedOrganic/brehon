@@ -1,0 +1,14 @@
+[package]
+name = "brehon-policy"
+version = "0.1.0"
+edition = "2024"
+description = "Runtime policy gates for Brehon mutating operations"
+license = "MIT"
+
+[dependencies]
+brehon-ports = { path = "../brehon-ports" }
+brehon-types = { path = "../brehon-types" }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

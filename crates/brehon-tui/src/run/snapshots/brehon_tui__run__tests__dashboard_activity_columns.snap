@@ -1,0 +1,12 @@
+---
+source: crates/agora-tui/src/run/mod.rs
+expression: snapshot
+---
+│╭─ Activity ─────────────────────────────────────────────────────────────────────────────────────────────────────────╮│
+││  00:05  ✗  gateway delivery failed for worker-3                                                                    ││
+││  00:04  ⚠  warning: stale queued prompt                                                                            ││
+││  00:03  ◆  planned launch for reviewer pool                                                                        ││
+││  00:02  ⟳  reset worker pane-2 after provider/runtime failure                                                      ││
+││  00:01  ✓  worker ready at pane-1                                                                                  ││
+││                                                                                                                    ││
+│╰────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯│

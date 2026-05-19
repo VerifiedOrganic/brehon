@@ -1,0 +1,6 @@
+---
+source: crates/agora-tui/src/run/mod.rs
+assertion_line: 5277
+expression: status_row
+---
+ C-q:Quit  •  C-]:Next  •  C-d:Dash  •  C-o:Compose  •  C-t:Runtime  •  C-a:Advisors  •  C-w:Workers  •  C-e:Reviewers  •  C-s:Supervisor  •  C-v:Struct  •  C-r:Reset  •  1 panes  •  reviewer-opus (copilot-reviewer-opus)

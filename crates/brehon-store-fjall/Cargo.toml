@@ -1,0 +1,23 @@
+[package]
+name = "brehon-store-fjall"
+version = "0.1.0"
+edition = "2021"
+description = "Persistent key-value storage adapter using Fjall"
+license = "MIT"
+
+[dependencies]
+brehon-types = { path = "../brehon-types" }
+brehon-ports = { path = "../brehon-ports" }
+fjall = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+brehon-test-harness = { path = "../brehon-test-harness" }
