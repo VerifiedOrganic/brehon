@@ -1,0 +1,200 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (e.g. v0.1.0). The tag must already exist."
+        required: true
+        type: string
+
+permissions:
+  contents: write  # required to create the GitHub Release and upload assets
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+  ZIG_VERSION: "0.15.2"
+  BIN_PRIMARY: brehon
+  BIN_AGENT: brehon-native-agent
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Resolve the version/tag once, then fan out to per-target builds.
+  # ---------------------------------------------------------------------------
+  prepare:
+    name: Prepare release metadata
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - id: meta
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+          fi
+          VERSION="${TAG#v}"
+          echo "tag=$TAG"         >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Releasing $TAG (version $VERSION)"
+
+  # ---------------------------------------------------------------------------
+  # Build release binaries natively on each target's matching runner.
+  # Cross-compiling fails for ghostty_vt_sys because its Zig build script
+  # produces a static lib for the host triple — so we use native runners.
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build (${{ matrix.target }})
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            archive: tar.gz
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            archive: tar.gz
+          - target: x86_64-apple-darwin
+            runner: macos-13
+            archive: tar.gz
+          - target: aarch64-apple-darwin
+            runner: macos-14
+            archive: tar.gz
+          # Windows is currently unsupported (Zig build + PTY stack not validated
+          # on MSVC). Uncomment when ready:
+          # - target: x86_64-pc-windows-msvc
+          #   runner: windows-latest
+          #   archive: zip
+
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+          submodules: recursive
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-${{ matrix.target }}
+
+      - name: Build release binaries
+        shell: bash
+        run: |
+          cargo build \
+            --release \
+            --target ${{ matrix.target }} \
+            --package brehon-cli \
+            --package brehon-native-agent
+
+      - name: Stage release archive
+        id: stage
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.prepare.outputs.version }}"
+          TARGET="${{ matrix.target }}"
+          NAME="brehon-${VERSION}-${TARGET}"
+          STAGE="dist/${NAME}"
+          mkdir -p "${STAGE}"
+
+          EXT=""
+          if [[ "${TARGET}" == *windows* ]]; then EXT=".exe"; fi
+
+          cp "target/${TARGET}/release/${BIN_PRIMARY}${EXT}" "${STAGE}/"
+          cp "target/${TARGET}/release/${BIN_AGENT}${EXT}"   "${STAGE}/"
+          cp LICENSE README.md "${STAGE}/" || true
+
+          cd dist
+          if [[ "${{ matrix.archive }}" == "zip" ]]; then
+            ARCHIVE="${NAME}.zip"
+            7z a -tzip "${ARCHIVE}" "${NAME}" >/dev/null
+          else
+            ARCHIVE="${NAME}.tar.gz"
+            tar -czf "${ARCHIVE}" "${NAME}"
+          fi
+
+          # SHA256 alongside the archive
+          if command -v shasum >/dev/null; then
+            shasum -a 256 "${ARCHIVE}" > "${ARCHIVE}.sha256"
+          else
+            sha256sum "${ARCHIVE}" > "${ARCHIVE}.sha256"
+          fi
+
+          echo "archive=dist/${ARCHIVE}"        >> "$GITHUB_OUTPUT"
+          echo "sha=dist/${ARCHIVE}.sha256"     >> "$GITHUB_OUTPUT"
+          echo "name=${NAME}"                   >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.stage.outputs.name }}
+          path: |
+            ${{ steps.stage.outputs.archive }}
+            ${{ steps.stage.outputs.sha }}
+          if-no-files-found: error
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # Collect every per-target archive into a single GitHub Release.
+  # ---------------------------------------------------------------------------
+  publish:
+    name: Publish GitHub Release
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate combined checksum manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          # Per-file .sha256 files were created on the build runners; concatenate
+          # them into one SHASUMS256.txt for convenience.
+          : > SHASUMS256.txt
+          for f in *.sha256; do
+            cat "$f" >> SHASUMS256.txt
+          done
+          ls -la
+
+      - name: Create / update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          name: ${{ needs.prepare.outputs.tag }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sha256
+            dist/SHASUMS256.txt
