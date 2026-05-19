@@ -52,6 +52,48 @@ fn gateway_protocol_for(cli_type: &AgentAdapter) -> GatewayProtocol {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn spawn_config_for_pty_spawn(config: &PtyConfig) -> PtyConfig {
+    let mut config = config.clone();
+    apply_test_pty_spawn_fallback(&mut config);
+    config
+}
+
+#[cfg(not(test))]
+pub(crate) fn spawn_config_for_pty_spawn(config: &PtyConfig) -> PtyConfig {
+    config.clone()
+}
+
+#[cfg(test)]
+fn apply_test_pty_spawn_fallback(config: &mut PtyConfig) {
+    if !is_test_pty_fallback_candidate(&config.command) || command_exists(&config.command) {
+        return;
+    }
+
+    config.command = "sh".to_string();
+    config.args = vec!["-c".to_string(), "cat".to_string()];
+}
+
+#[cfg(test)]
+fn is_test_pty_fallback_candidate(command: &str) -> bool {
+    matches!(
+        command,
+        "claude" | "codex" | "copilot" | "gemini" | "gh" | "junie" | "kimi" | "opencode"
+    )
+}
+
+#[cfg(test)]
+fn command_exists(command: &str) -> bool {
+    let path = std::path::Path::new(command);
+    if path.components().count() > 1 {
+        return path.is_file();
+    }
+
+    std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(command).is_file()))
+        .unwrap_or(false)
+}
+
 fn allocate_loopback_port() -> Result<u16> {
     let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
         .map_err(|err| Error::pty(format!("Failed to allocate loopback port: {err}")))?;
@@ -468,9 +510,11 @@ impl Pane {
         // first resize can be delivered.
         config.rows = rows;
         config.cols = cols;
+        let stored_config = config.clone();
         let mut pane = match materialization {
             AgentPaneMaterialization::Spawn => {
-                let pty = Pty::spawn(name, config.clone())?;
+                let spawn_config = spawn_config_for_pty_spawn(&config);
+                let pty = Pty::spawn(name, spawn_config)?;
                 Self::with_pty_cli(name, kind, pty, rows, cols, cli_type)?
             }
             AgentPaneMaterialization::PlanOnly => {
@@ -489,7 +533,7 @@ impl Pane {
         };
         pane.set_agent_session_id(session_id);
         pane.set_configured_agent_type(configured_agent_type.or(Some(adapter_name)));
-        pane.set_pty_spawn_config(config);
+        pane.set_pty_spawn_config(stored_config);
         pane.set_notify_socket_path(brehon_root, name);
         Ok(pane)
     }

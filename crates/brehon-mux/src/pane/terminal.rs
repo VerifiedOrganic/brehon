@@ -2,6 +2,7 @@
 
 use crate::error::{Error, Result};
 use crate::pane::activity::ActivityBuffer;
+use crate::pane::spawn::spawn_config_for_pty_spawn;
 use crate::pane::style::{cell_style_to_ratatui, debug_log_enabled, styles_equal};
 use crate::pane::types::{
     BufferedMessage, ClaudePromptState, GatewaySpawnConfig, Pane, PaneBackend, PaneKind,
@@ -63,7 +64,8 @@ impl Pane {
             pty.kill();
         }
 
-        let pty = Pty::spawn(self.id.clone(), config.clone())?;
+        let spawn_config = spawn_config_for_pty_spawn(&config);
+        let pty = Pty::spawn(self.id.clone(), spawn_config)?;
         self.backend = PaneBackend::Pty(pty);
         self.pty_spawn_config = Some(config);
         self.agent_session_id = new_session_id;

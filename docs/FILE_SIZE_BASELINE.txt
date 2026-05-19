@@ -49,8 +49,8 @@
 1030 crates/brehon-mux/src/mux/events.rs
 1209 crates/brehon-mux/src/mux/lifecycle.rs
 1111 crates/brehon-mux/src/pane/activity.rs
-2432 crates/brehon-mux/src/pane/spawn.rs
-1405 crates/brehon-mux/src/pane/terminal.rs
+2476 crates/brehon-mux/src/pane/spawn.rs
+1407 crates/brehon-mux/src/pane/terminal.rs
 1337 crates/brehon-mux/src/pane/tests/gateway.rs
 1213 crates/brehon-mux/src/teams.rs
 984 crates/brehon-native-agent/src/agent_runtime/runner.rs
