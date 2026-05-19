@@ -85,13 +85,12 @@ fn main() {
 
     // Link the static library
     let lib_dir = zig_out.join("lib");
-    let archive_path = lib_dir.join("libghostty_vt.a");
 
     // Zig 0.15.2 produces misaligned mach-o archives on macOS, which ld rejects:
     //   "64-bit mach-o member 'libghostty_vt_zcu.o' not 8-byte aligned"
     // Re-pack with the system ar to restore correct alignment.
     #[cfg(target_os = "macos")]
-    fix_archive_alignment(&archive_path);
+    fix_archive_alignment(&lib_dir.join("libghostty_vt.a"));
 
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
     println!("cargo:rustc-link-lib=static=ghostty_vt");

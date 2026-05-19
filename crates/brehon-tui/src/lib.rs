@@ -13,7 +13,9 @@ pub mod theme;
 
 mod run;
 
+pub use run::research::ProjectConfigLoader;
 pub use run::{
-    run_dashboard_tui, run_tui, run_tui_with_panels, run_tui_with_panels_and_runtime_commands,
-    AgentInfo, DashboardData, EventInfo, ReviewerPanel, TaskInfo,
+    no_project_config_loader, run_dashboard_tui, run_tui, run_tui_with_panels,
+    run_tui_with_panels_and_runtime_commands, AgentInfo, DashboardData, EventInfo, ReviewerPanel,
+    TaskInfo,
 };

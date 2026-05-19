@@ -2512,6 +2512,16 @@ pub async fn execute(
         let tui_shutdown = shutdown_flag.clone();
         let tui_dashboard = dashboard_data.clone();
         let tui_orchestration = config.orchestration.clone();
+        let project_config_loader: brehon_tui::ProjectConfigLoader =
+            std::sync::Arc::new(|brehon_root: &std::path::Path| {
+                let project_root =
+                    if brehon_root.file_name().and_then(|n| n.to_str()) == Some(".brehon") {
+                        brehon_root.parent().unwrap_or(brehon_root)
+                    } else {
+                        brehon_root
+                    };
+                brehon_config::load_config(Some(project_root)).ok()
+            });
         tokio::task::spawn_blocking(move || {
             if let Err(e) = brehon_tui::run_tui_with_panels_and_runtime_commands(
                 tui_shutdown,
@@ -2525,6 +2535,7 @@ pub async fn execute(
                 Some(runtime_command_router),
                 host_owns_agent_panes,
                 terminal_host_absolute_resize,
+                project_config_loader,
             ) {
                 tracing::error!("TUI error: {:?}", e);
             }

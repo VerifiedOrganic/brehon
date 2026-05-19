@@ -51,7 +51,7 @@ mod proof_detail;
 mod recovery;
 mod refresh;
 mod rendering;
-mod research;
+pub mod research;
 mod reviewer_selection;
 mod run_state_detail;
 mod self_improvement;
@@ -139,6 +139,13 @@ use terminal_guard::{restore_terminal_session, TerminalSessionGuard};
 // ── Main loop ───────────────────────────────────────────────────────────────
 
 /// Run the TUI with default settings (no reviewer panels, empty dashboard).
+/// Build a `ProjectConfigLoader` that always returns `None`. Used by callers
+/// that never reach research/config-dependent code paths (dashboards, demos,
+/// internal test helpers).
+pub fn no_project_config_loader() -> research::ProjectConfigLoader {
+    Arc::new(|_| None)
+}
+
 pub fn run_tui(shutdown: Arc<AtomicBool>, mux: Mux, rt: tokio::runtime::Handle) -> io::Result<()> {
     let dashboard = Arc::new(std::sync::Mutex::new(DashboardData::default()));
     run_tui_with_panels(
@@ -185,6 +192,7 @@ pub fn run_tui_with_panels(
         None,
         false,
         false,
+        no_project_config_loader(),
     )
 }
 
@@ -223,6 +231,7 @@ pub fn run_dashboard_tui(
         None,
         true,
         false,
+        no_project_config_loader(),
     )
 }
 
@@ -239,6 +248,7 @@ pub fn run_tui_with_panels_and_runtime_commands(
     runtime_command_router: Option<Arc<dyn RuntimeCommandRouter>>,
     runtime_agent_factory_host_owned: bool,
     runtime_terminal_host_absolute_resize: bool,
+    project_config_loader: research::ProjectConfigLoader,
 ) -> io::Result<()> {
     enable_raw_mode()?;
     let mut terminal_guard = TerminalSessionGuard::new();
@@ -471,6 +481,7 @@ pub fn run_tui_with_panels_and_runtime_commands(
         recent_runtime_commands,
         pending_runtime_approval_resolutions,
         entry_chrome_fade_complete: false,
+        project_config_loader,
         needs_redraw: true,
     };
 

@@ -1,6 +1,7 @@
 //! Research room rendering and operator request enqueueing.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use brehon_types::{BrehonConfig, ResearchConfig, ResearchPoolConfig};
 use chrono::{DateTime, Utc};
@@ -22,6 +23,16 @@ use super::advisors::{
 use super::composer::enqueue_composer_message;
 use super::rendering::truncate_to;
 use super::types::ResearchRoomViewState;
+
+/// Loads the merged `BrehonConfig` for a project given its `.brehon` root.
+///
+/// brehon-tui cannot depend on `brehon-config` (per the dependency-boundary
+/// policy), so the loader is injected from `brehon-cli` at startup. The
+/// closure should handle stripping `.brehon` from the path before consulting
+/// the config layers. Returns `None` if the config file is missing or fails
+/// to parse — callers fall back to sensible defaults so the TUI keeps
+/// rendering rather than crashing.
+pub type ProjectConfigLoader = Arc<dyn Fn(&Path) -> Option<BrehonConfig> + Send + Sync>;
 
 const JOB_STATUS_QUEUED: &str = "queued";
 const JOB_STATUS_RUNNING: &str = "running";
@@ -130,12 +141,18 @@ fn default_requested_by() -> String {
     "operator".to_string()
 }
 
-pub(crate) fn research_room_count(brehon_root: Option<&Path>) -> usize {
-    read_research_rooms(brehon_root).len()
+pub(crate) fn research_room_count(
+    brehon_root: Option<&Path>,
+    loader: &ProjectConfigLoader,
+) -> usize {
+    read_research_rooms(brehon_root, loader).len()
 }
 
-pub(crate) fn active_research_room_task_id(brehon_root: Option<&Path>) -> Option<String> {
-    read_research_rooms(brehon_root)
+pub(crate) fn active_research_room_task_id(
+    brehon_root: Option<&Path>,
+    loader: &ProjectConfigLoader,
+) -> Option<String> {
+    read_research_rooms(brehon_root, loader)
         .into_iter()
         .next()
         .map(|room| room.task_id)
@@ -143,11 +160,17 @@ pub(crate) fn active_research_room_task_id(brehon_root: Option<&Path>) -> Option
 
 pub(crate) fn post_operator_research_request(
     brehon_root: &Path,
+    loader: &ProjectConfigLoader,
     default_task_id: Option<&str>,
     content: &str,
     session_name: Option<&str>,
 ) -> Result<ResearchPostResult, String> {
-    let config = load_project_config(brehon_root)?;
+    let config = loader(brehon_root).ok_or_else(|| {
+        format!(
+            "failed to load project config from {}",
+            brehon_root.display()
+        )
+    })?;
     if !config.research.enabled {
         return Err(
             "research.enabled is false; enable research before posting requests".to_string(),
@@ -204,9 +227,10 @@ pub(crate) fn render_research_view(
     frame: &mut Frame,
     area: Rect,
     brehon_root: Option<&Path>,
+    loader: &ProjectConfigLoader,
     state: &mut ResearchRoomViewState,
 ) {
-    let mut rooms = read_research_rooms(brehon_root);
+    let mut rooms = read_research_rooms(brehon_root, loader);
     if let (Some(root), Some(task_id)) = (brehon_root, state.selected_task_id.as_deref()) {
         if !rooms.iter().any(|room| room.task_id == task_id) {
             rooms.push(ResearchRoomFile {
@@ -233,7 +257,7 @@ pub(crate) fn render_research_view(
         state.area = inner;
         state.max_scroll = 0;
         state.scroll = 0;
-        let lines = empty_state_lines(brehon_root, inner.width);
+        let lines = empty_state_lines(brehon_root, loader, inner.width);
         frame.render_widget(Paragraph::new(lines), inner);
         return;
     }
@@ -263,8 +287,12 @@ pub(crate) fn render_research_view(
     render_room_detail(frame, detail, selected, brehon_root, state);
 }
 
-fn empty_state_lines(brehon_root: Option<&Path>, width: u16) -> Vec<Line<'static>> {
-    let config_hint = match brehon_root.and_then(|root| load_project_config(root).ok()) {
+fn empty_state_lines(
+    brehon_root: Option<&Path>,
+    loader: &ProjectConfigLoader,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let config_hint = match brehon_root.and_then(|root| loader(root)) {
         Some(config) if config.research.enabled && config.research.pools.is_empty() => {
             "research.enabled is true, but no pools are configured."
         }
@@ -591,11 +619,14 @@ fn artifact_content(
     content
 }
 
-fn read_research_rooms(brehon_root: Option<&Path>) -> Vec<ResearchRoomFile> {
+fn read_research_rooms(
+    brehon_root: Option<&Path>,
+    loader: &ProjectConfigLoader,
+) -> Vec<ResearchRoomFile> {
     let Some(brehon_root) = brehon_root else {
         return Vec::new();
     };
-    let root = research_root_for_reading(brehon_root);
+    let root = research_root_for_reading(brehon_root, loader);
     let Ok(entries) = std::fs::read_dir(&root) else {
         return Vec::new();
     };
@@ -863,9 +894,8 @@ fn atomic_write(path: &Path, payload: &[u8]) -> Result<(), String> {
         .map_err(|err| format!("failed to install {}: {err}", path.display()))
 }
 
-fn research_root_for_reading(brehon_root: &Path) -> PathBuf {
-    load_project_config(brehon_root)
-        .ok()
+fn research_root_for_reading(brehon_root: &Path, loader: &ProjectConfigLoader) -> PathBuf {
+    loader(brehon_root)
         .and_then(|config| research_root_from_config(brehon_root, &config.research).ok())
         .unwrap_or_else(|| brehon_root.join("runtime").join("research"))
 }
@@ -880,16 +910,6 @@ fn research_root_from_config(
         return Ok(path);
     }
     Ok(project_root.join(path))
-}
-
-fn load_project_config(brehon_root: &Path) -> Result<BrehonConfig, String> {
-    let project_root = project_root_from_brehon_root(brehon_root);
-    brehon_config::load_config(Some(&project_root)).map_err(|err| {
-        format!(
-            "failed to load project config from {}: {err}",
-            project_root.display()
-        )
-    })
 }
 
 fn project_root_from_brehon_root(brehon_root: &Path) -> PathBuf {
@@ -965,6 +985,21 @@ mod tests {
     use super::*;
     use ratatui::{backend::TestBackend, buffer::Buffer, Terminal};
 
+    /// Build a `ProjectConfigLoader` that calls into `brehon-config` exactly
+    /// the way `brehon-cli` will at runtime. Kept in the test module so the
+    /// production crate doesn't pick up a `brehon-config` dependency.
+    fn test_loader() -> ProjectConfigLoader {
+        Arc::new(|brehon_root: &Path| {
+            let project_root =
+                if brehon_root.file_name().and_then(|n| n.to_str()) == Some(".brehon") {
+                    brehon_root.parent().unwrap_or(brehon_root)
+                } else {
+                    brehon_root
+                };
+            brehon_config::load_config(Some(project_root)).ok()
+        })
+    }
+
     fn buffer_text(buffer: &Buffer) -> String {
         let mut rows = Vec::new();
         for row in 0..buffer.area.height {
@@ -1019,8 +1054,10 @@ research:
         let brehon_root = temp.path().join(".brehon");
         write_task(&brehon_root, "T-1");
 
+        let loader = test_loader();
         let result = post_operator_research_request(
             &brehon_root,
+            &loader,
             Some("T-1"),
             "Find the relevant RFC sections.",
             Some("brehon-test"),
@@ -1028,8 +1065,8 @@ research:
         .unwrap();
 
         assert_eq!(result.task_id, "T-1");
-        assert_eq!(research_room_count(Some(&brehon_root)), 1);
-        let rooms = read_research_rooms(Some(&brehon_root));
+        assert_eq!(research_room_count(Some(&brehon_root), &loader), 1);
+        let rooms = read_research_rooms(Some(&brehon_root), &loader);
         assert_eq!(rooms[0].jobs[0].status, JOB_STATUS_QUEUED);
         assert!(rooms[0].jobs[0].prompt.contains("RFC sections"));
     }
@@ -1043,6 +1080,7 @@ research:
 
         let result = post_operator_research_request(
             &brehon_root,
+            &test_loader(),
             None,
             "/task T-2 Map the code paths.",
             Some("brehon-test"),
@@ -1110,7 +1148,15 @@ research:
         let mut terminal = Terminal::new(TestBackend::new(100, 22)).unwrap();
         let mut state = ResearchRoomViewState::default();
         terminal
-            .draw(|frame| render_research_view(frame, frame.area(), Some(&brehon_root), &mut state))
+            .draw(|frame| {
+                render_research_view(
+                    frame,
+                    frame.area(),
+                    Some(&brehon_root),
+                    &test_loader(),
+                    &mut state,
+                )
+            })
             .unwrap();
 
         let rendered = buffer_text(terminal.backend().buffer());
@@ -1133,7 +1179,15 @@ research:
         };
 
         terminal
-            .draw(|frame| render_research_view(frame, frame.area(), Some(&brehon_root), &mut state))
+            .draw(|frame| {
+                render_research_view(
+                    frame,
+                    frame.area(),
+                    Some(&brehon_root),
+                    &test_loader(),
+                    &mut state,
+                )
+            })
             .unwrap();
 
         let rendered = buffer_text(terminal.backend().buffer());

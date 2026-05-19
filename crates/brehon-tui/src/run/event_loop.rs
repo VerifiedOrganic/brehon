@@ -206,6 +206,10 @@ pub(crate) struct EventLoopCtx {
     pub pending_runtime_approval_resolutions: Vec<PendingRuntimeApprovalResolution>,
     pub entry_chrome_fade_complete: bool,
 
+    /// Loads the merged project `BrehonConfig` on demand. Injected from
+    /// `brehon-cli` so this crate can stay free of a `brehon-config` dep.
+    pub project_config_loader: super::research::ProjectConfigLoader,
+
     pub needs_redraw: bool,
 }
 
@@ -569,11 +573,9 @@ fn open_composer(ctx: &mut EventLoopCtx) {
 
     if ctx.group_tab == GroupTab::Research {
         let brehon_root = ctx.dashboard_data.lock().unwrap().brehon_root.clone();
-        let task_id = ctx
-            .research_room_view
-            .selected_task_id
-            .clone()
-            .or_else(|| active_research_room_task_id(brehon_root.as_deref()));
+        let task_id = ctx.research_room_view.selected_task_id.clone().or_else(|| {
+            active_research_room_task_id(brehon_root.as_deref(), &ctx.project_config_loader)
+        });
         ctx.selection = None;
         ctx.pending_down = None;
         ctx.click_regions.clear();
@@ -728,6 +730,7 @@ This is a notification only: do not change task ownership, do not join the advis
         };
         match post_operator_research_request(
             &brehon_root,
+            &ctx.project_config_loader,
             state.research_task_id(),
             &message,
             ctx.runtime_session_name.as_deref(),
@@ -3006,8 +3009,10 @@ pub(super) fn run(ctx: &mut EventLoopCtx) -> io::Result<()> {
                 .max(advisor_room_count(
                     dashboard_snapshot.brehon_root.as_deref(),
                 ));
-                let visible_research_count =
-                    research_room_count(dashboard_snapshot.brehon_root.as_deref());
+                let visible_research_count = research_room_count(
+                    dashboard_snapshot.brehon_root.as_deref(),
+                    &ctx.project_config_loader,
+                );
 
                 // 1. Group tab bar
                 let gr = render_group_tabs(
@@ -3181,6 +3186,7 @@ pub(super) fn run(ctx: &mut EventLoopCtx) -> io::Result<()> {
                         f,
                         areas.left_content,
                         dashboard_snapshot.brehon_root.as_deref(),
+                        &ctx.project_config_loader,
                         &mut ctx.research_room_view,
                     );
                 } else if let Some(ref left_id) = active_left_id {
@@ -3622,6 +3628,7 @@ mod tests {
                 recent_runtime_commands: Vec::new(),
                 pending_runtime_approval_resolutions: Vec::new(),
                 entry_chrome_fade_complete: false,
+                project_config_loader: crate::run::no_project_config_loader(),
                 needs_redraw: false,
                 runtime_agent_factory_host_owned: host_owned,
                 runtime_terminal_host_absolute_resize: false,
