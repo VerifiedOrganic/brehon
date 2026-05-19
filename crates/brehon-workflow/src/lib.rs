@@ -15,16 +15,11 @@ use brehon_types::{
 };
 
 /// Workflow execution mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum WorkflowMode {
     /// Emit audit events only.
+    #[default]
     DryRun,
-}
-
-impl Default for WorkflowMode {
-    fn default() -> Self {
-        Self::DryRun
-    }
 }
 
 /// One proposed workflow action.

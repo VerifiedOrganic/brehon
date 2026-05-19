@@ -613,7 +613,7 @@ mod tests {
 
         let report = build_report("EPIC-1", Some(fixture.root())).expect("report");
 
-        assert_eq!(report.default_branch_advancement.advanced, false);
+        assert!(!report.default_branch_advancement.advanced);
         assert_eq!(report.default_branch_advancement.commit_count, 0);
         assert!(report
             .default_branch_advancement

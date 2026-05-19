@@ -1295,7 +1295,7 @@ fn read_all_manifests() -> Result<Vec<ResearchManifest>, String> {
             manifests.push(manifest);
         }
     }
-    manifests.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+    manifests.sort_by_key(|m| std::cmp::Reverse(m.updated_at));
     Ok(manifests)
 }
 

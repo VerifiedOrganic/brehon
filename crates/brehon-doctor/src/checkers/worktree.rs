@@ -670,7 +670,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let brehon_root = root.path().join(".brehon");
         let runtime = brehon_root.join("runtime");
-        std::fs::create_dir_all(&runtime.join("tasks")).unwrap();
+        std::fs::create_dir_all(runtime.join("tasks")).unwrap();
 
         let checker = WorktreeChecker::new(&brehon_root);
         let findings = checker.check_branch_drift().unwrap();

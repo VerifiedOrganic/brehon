@@ -433,7 +433,7 @@ pub(crate) fn normalize_extracted_phase_id_text(text: &str) -> String {
 
     remainder
         .trim()
-        .trim_start_matches(|ch: char| matches!(ch, '-' | '_' | ':'))
+        .trim_start_matches(['-', '_', ':'])
         .to_string()
 }
 

@@ -613,8 +613,7 @@ pub(super) async fn execute_ready(args: &Value) -> Result<ToolResult, McpError> 
             }
             true
         })
-        .cloned()
-        .map(|task| ready_queue_task(&task, project_config.as_ref()))
+        .map(|task| ready_queue_task(task, project_config.as_ref()))
         .collect();
     let review_ready_tasks: Vec<Value> = all_tasks
         .iter()
@@ -638,8 +637,7 @@ pub(super) async fn execute_ready(args: &Value) -> Result<ToolResult, McpError> 
             }
             true
         })
-        .cloned()
-        .map(|task| ready_queue_task(&task, project_config.as_ref()))
+        .map(|task| ready_queue_task(task, project_config.as_ref()))
         .collect();
     let changes_requested_tasks: Vec<Value> = all_tasks
         .iter()
@@ -669,8 +667,7 @@ pub(super) async fn execute_ready(args: &Value) -> Result<ToolResult, McpError> 
             }
             true
         })
-        .cloned()
-        .map(|task| ready_queue_task(&task, project_config.as_ref()))
+        .map(|task| ready_queue_task(task, project_config.as_ref()))
         .collect();
     let stalled_tasks: Vec<Value> = all_tasks
         .iter()
@@ -702,8 +699,7 @@ pub(super) async fn execute_ready(args: &Value) -> Result<ToolResult, McpError> 
             }
             true
         })
-        .cloned()
-        .map(|task| ready_queue_task(&task, project_config.as_ref()))
+        .map(|task| ready_queue_task(task, project_config.as_ref()))
         .collect();
     let followup_source_tasks: Vec<Value> = all_tasks
         .iter()
@@ -729,8 +725,7 @@ pub(super) async fn execute_ready(args: &Value) -> Result<ToolResult, McpError> 
                 .unwrap_or(0)
                 > 0
         })
-        .cloned()
-        .map(|task| ready_queue_task(&task, project_config.as_ref()))
+        .map(|task| ready_queue_task(task, project_config.as_ref()))
         .collect();
 
     let count = tasks.len();

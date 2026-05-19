@@ -253,7 +253,7 @@ impl PermissionPolicy {
     pub(crate) fn from_config(config: &PermissionsConfig) -> Self {
         let mut rules = Vec::new();
         let mut categories = config.categories.iter().collect::<Vec<_>>();
-        categories.sort_by(|(left, _), (right, _)| left.cmp(right));
+        categories.sort_by_key(|(left, _)| *left);
 
         for (category, permission) in categories {
             match permission {
@@ -267,7 +267,7 @@ impl PermissionPolicy {
                 }
                 PermissionCategory::Nested(patterns) => {
                     let mut patterns = patterns.iter().collect::<Vec<_>>();
-                    patterns.sort_by(|(left, _), (right, _)| left.cmp(right));
+                    patterns.sort_by_key(|(left, _)| *left);
                     for (pattern, value) in patterns {
                         rules.push(PermissionRule::new(
                             category.clone(),
@@ -828,10 +828,7 @@ fn strip_shell_wrappers(command: &str) -> (String, Vec<String>) {
     let mut tokens = shell_words(command);
     let mut wrappers = Vec::new();
 
-    loop {
-        let Some(first) = tokens.first().map(String::as_str) else {
-            break;
-        };
+    while let Some(first) = tokens.first().map(String::as_str) {
         match first {
             "timeout" => {
                 wrappers.push(tokens.remove(0));

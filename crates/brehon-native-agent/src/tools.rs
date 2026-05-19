@@ -84,6 +84,7 @@ impl NativeTools {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_tool_env(
         worktree_root: PathBuf,
         env: Vec<(String, String)>,
@@ -587,6 +588,9 @@ struct BrehonMcpToolBridge {
 }
 
 impl BrehonMcpToolBridge {
+    // Returns Arc<dyn _> for the same reason as the bridges in
+    // brehon-adapter-sdk: callers compose bridges via the trait object.
+    #[allow(clippy::new_ret_no_self)]
     fn new(env: Vec<(String, String)>, tool_prefix: &str) -> Arc<dyn DirectToolBridge> {
         let mut server = McpServer::new("brehon-native-agent-tools", env!("CARGO_PKG_VERSION"));
         server.register_builtin_tools();

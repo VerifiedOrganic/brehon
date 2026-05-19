@@ -115,16 +115,11 @@ async fn soak_queue_event_store_bounded_with_appends() {
         }
 
         // Drain the queue
-        loop {
-            match store
-                .claim_next(&queue_name, "drainer", Duration::from_secs(60))
-                .await
-            {
-                Ok(Some(claim)) => {
-                    let _ = store.ack_claim(&claim.claim_id).await;
-                }
-                _ => break,
-            }
+        while let Ok(Some(claim)) = store
+            .claim_next(&queue_name, "drainer", Duration::from_secs(60))
+            .await
+        {
+            let _ = store.ack_claim(&claim.claim_id).await;
         }
 
         // Store must remain bounded (no duplicate events from idempotency reuse)

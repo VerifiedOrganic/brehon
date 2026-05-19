@@ -432,6 +432,7 @@ pub fn dedup_triggers(
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn make_trigger(
     kind: FeedbackTriggerKind,
     task_id: Option<TaskId>,

@@ -1,7 +1,7 @@
 //! Claude CLI adapter for Brehon — PTY-native hooks path.
 //!
 //! This crate contains claude-specific harness configuration, hook
-//! definitions, and the [`AgentAdapter`] implementation that governs how
+//! definitions, and the [`AgentAdapter`](brehon_adapter_sdk::AgentAdapter) implementation that governs how
 //! Brehon interacts with the Claude Code CLI over its native hooks protocol.
 //!
 //! # Architecture
@@ -22,7 +22,7 @@ use brehon_adapter_sdk::{
 /// Claude-specific session configuration.
 ///
 /// Captures everything the Claude adapter needs to spawn and manage a
-/// Claude Code CLI session beyond what the generic [`SessionSpec`]
+/// Claude Code CLI session beyond what the generic [`SessionSpec`](brehon_types::SessionSpec)
 /// already carries.
 #[derive(Debug, Clone)]
 pub struct ClaudeSessionConfig {
@@ -216,7 +216,7 @@ impl ClaudeSpawnParams {
 
 /// Native Agent Teams configuration for Claude CLI.
 ///
-/// Mirrors the [`TeamsSpawnConfig`](brehon_pty::TeamsSpawnConfig) from
+/// Mirrors the `TeamsSpawnConfig` from
 /// `brehon-pty`, kept in this crate to avoid `brehon-pty` depending on
 /// `brehon-adapter-claude`.
 #[derive(Debug, Clone)]
@@ -243,7 +243,7 @@ pub struct ClaudeTeamsConfig {
 ///
 /// The full [`brehon_adapter_sdk::AgentAdapter`] implementation for
 /// Claude's PTY/native-hooks lifecycle is not yet wired; spawning
-/// is currently handled directly by [`brehon_pty`].
+/// is currently handled directly by `brehon-pty`.
 pub struct ClaudeAdapter;
 
 impl ClaudeAdapter {

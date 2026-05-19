@@ -13,6 +13,9 @@ static TOOL_ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 pub(crate) struct BrehonDirectToolBridgeFactory;
 
 impl BrehonDirectToolBridgeFactory {
+    // Returns Arc<dyn _> so callers can store the factory as a trait object
+    // without naming the concrete type.
+    #[allow(clippy::new_ret_no_self)]
     pub(crate) fn new() -> Arc<dyn DirectToolBridgeFactory> {
         Arc::new(Self)
     }
@@ -36,6 +39,8 @@ struct BrehonMcpToolBridge {
 }
 
 impl BrehonMcpToolBridge {
+    // Returns Arc<dyn _> for the same reason as BrehonDirectToolBridgeFactory::new.
+    #[allow(clippy::new_ret_no_self)]
     fn new(env: Vec<(String, String)>, tool_prefix: &str) -> Arc<dyn DirectToolBridge> {
         let env = with_derived_env(env);
         let mut server = attach_durable_backing(

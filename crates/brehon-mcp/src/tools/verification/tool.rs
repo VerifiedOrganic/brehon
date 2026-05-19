@@ -910,7 +910,7 @@ impl VerificationTool {
         let mut seen_reviewers = HashSet::new();
         let mut members = Vec::with_capacity(seat.members.len());
 
-        for (slot_agent, member) in panel.reviewers.iter().zip(seat.members.into_iter()) {
+        for (slot_agent, member) in panel.reviewers.iter().zip(seat.members) {
             if member.slot_agent != *slot_agent {
                 return None;
             }

@@ -148,7 +148,7 @@ pub(crate) fn restore_nulled_assignees_in_tasks_dir() {
 
     for entry in entries.flatten() {
         let path = entry.path();
-        if !path.extension().is_some_and(|ext| ext == "json")
+        if path.extension().is_none_or(|ext| ext != "json")
             || entry.file_name().to_string_lossy().starts_with('.')
         {
             continue;
@@ -213,7 +213,7 @@ pub(crate) fn migrate_legacy_integration_conflicts_in_tasks_dir() {
 
     for entry in entries.flatten() {
         let path = entry.path();
-        if !path.extension().is_some_and(|ext| ext == "json")
+        if path.extension().is_none_or(|ext| ext != "json")
             || entry.file_name().to_string_lossy().starts_with('.')
         {
             continue;

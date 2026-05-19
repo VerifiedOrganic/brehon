@@ -501,9 +501,8 @@ pub fn refresh_runtime_stability_counters(brehon_root: &Path) -> IoResult<Stabil
             let Some(task) = read_json::<serde_json::Value>(&path) else {
                 continue;
             };
-            match task.get("status").and_then(|value| value.as_str()) {
-                Some("merged") => counters.completed_tasks += 1,
-                _ => {}
+            if let Some("merged") = task.get("status").and_then(|value| value.as_str()) {
+                counters.completed_tasks += 1;
             }
         }
     }

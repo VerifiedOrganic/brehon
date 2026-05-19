@@ -274,7 +274,7 @@ impl ViewManager {
                 review_view.updated_at = event.timestamp;
 
                 if let Some(task_id) =
-                    Self::task_id_for_review(&review_to_task, review_views, review_id)
+                    Self::task_id_for_review(review_to_task, review_views, review_id)
                 {
                     let task_view = task_views
                         .entry(task_id.clone())
@@ -293,7 +293,7 @@ impl ViewManager {
                 review_view.updated_at = event.timestamp;
 
                 if let Some(task_id) =
-                    Self::task_id_for_review(&review_to_task, review_views, review_id)
+                    Self::task_id_for_review(review_to_task, review_views, review_id)
                 {
                     let task_view = task_views
                         .entry(task_id.clone())
@@ -312,7 +312,7 @@ impl ViewManager {
                 review_view.updated_at = event.timestamp;
 
                 if let Some(task_id) =
-                    Self::task_id_for_review(&review_to_task, review_views, review_id)
+                    Self::task_id_for_review(review_to_task, review_views, review_id)
                 {
                     let task_view = task_views
                         .entry(task_id.clone())

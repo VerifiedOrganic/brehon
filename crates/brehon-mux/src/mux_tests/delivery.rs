@@ -2014,7 +2014,7 @@ fn test_per_pane_prompt_queue_keeps_single_in_flight_under_random_interleavings(
 
         let mut seed = scenario.wrapping_add(0x9E37_79B9_7F4A_7C15);
         for step in 0..96u64 {
-            let target = if lcg_next(&mut seed) % 2 == 0 {
+            let target = if lcg_next(&mut seed).is_multiple_of(2) {
                 "codex-reviewer-a"
             } else {
                 "codex-reviewer-b"

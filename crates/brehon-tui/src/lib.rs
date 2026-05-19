@@ -3,6 +3,11 @@
 //! Split layout: always-visible supervisor on the right,
 //! tabbed workers/reviewers on the left with panel grouping.
 
+// TUI render and key-handling functions naturally take many state references;
+// breaking them into argument structs would obscure the call sites without
+// changing behaviour.
+#![allow(clippy::too_many_arguments)]
+
 pub mod components;
 pub mod theme;
 

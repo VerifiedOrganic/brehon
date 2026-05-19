@@ -395,7 +395,7 @@ fn final_hardening_epics_for_initiative(initiative_id: &str) -> Vec<String> {
             task.get("parent_id").and_then(|value| value.as_str()) == Some(initiative_id)
         })
         .filter(|task| task.get("task_type").and_then(|value| value.as_str()) == Some("epic"))
-        .filter(|task| is_final_hardening_epic(task))
+        .filter(is_final_hardening_epic)
         .filter_map(|task| {
             task.get("task_id")
                 .and_then(|value| value.as_str())

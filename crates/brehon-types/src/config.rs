@@ -1646,7 +1646,12 @@ pub enum SandboxProfile {
 }
 
 /// Retention and boundedness configuration.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+///
+/// `Default` returns zero/`None` for every field so merge logic can distinguish
+/// "explicitly set" from "fall back to base/default". Serde deserialization
+/// still applies the non-zero defaults via the per-field `serde(default = ...)`
+/// attributes.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RetentionConfig {
     /// Maximum number of events to retain in the hot event log.
     /// When the log exceeds this count, oldest events are pruned
@@ -1689,22 +1694,6 @@ fn default_max_tasks() -> u64 {
 
 fn default_sweep_interval_secs() -> u64 {
     DEFAULT_RETENTION_SWEEP_INTERVAL_SECS
-}
-
-impl Default for RetentionConfig {
-    fn default() -> Self {
-        Self {
-            max_events: None,
-            idempotency_ttl_hours: None,
-            // Scalar fields default to 0 so that merge can distinguish
-            // "explicitly set" from "use base/default". Serde deserialization
-            // still applies the non-zero defaults via `serde(default = ...)`.
-            max_completed_tasks: 0,
-            max_assignment_history: 0,
-            max_tasks: 0,
-            sweep_interval_secs: 0,
-        }
-    }
 }
 
 #[cfg(test)]

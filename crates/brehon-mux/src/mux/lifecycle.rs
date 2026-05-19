@@ -85,15 +85,12 @@ impl Mux {
         // Scale event channel capacity and poll limit with worker count to
         // prevent backpressure deadlocks under high throughput.
         let extra_capacity = config.workers.saturating_mul(EVENTS_PER_WORKER);
-        let channel_capacity = (DEFAULT_EVENT_CHANNEL_CAPACITY + extra_capacity)
-            .max(512)
-            .min(4096);
+        let channel_capacity = (DEFAULT_EVENT_CHANNEL_CAPACITY + extra_capacity).clamp(512, 4096);
         let (event_tx, event_rx) = mpsc::channel(channel_capacity);
         mux.event_tx = event_tx;
         mux.event_rx = event_rx;
-        mux.max_queued_events_per_poll = (DEFAULT_MAX_QUEUED_EVENTS_PER_POLL + extra_capacity)
-            .max(512)
-            .min(4096);
+        mux.max_queued_events_per_poll =
+            (DEFAULT_MAX_QUEUED_EVENTS_PER_POLL + extra_capacity).clamp(512, 4096);
 
         // Calculate pane sizes based on layout
         //

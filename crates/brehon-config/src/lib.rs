@@ -316,25 +316,18 @@ fn validate_required_structure_layer(value: &Value) -> Result<(), ConfigError> {
             for (key, values) in roles {
                 if let Some(key) = key.as_str() {
                     match key {
-                        "workers" => {
-                            if values
-                                .as_sequence()
-                                .map_or(false, |values| values.is_empty())
-                            {
-                                violations.push(
-                                    "must not set 'roles.workers' to an empty list".to_string(),
-                                );
-                            }
+                        "workers"
+                            if values.as_sequence().is_some_and(|values| values.is_empty()) =>
+                        {
+                            violations
+                                .push("must not set 'roles.workers' to an empty list".to_string());
                         }
-                        "reviewers" => {
-                            if values
-                                .as_sequence()
-                                .map_or(false, |values| values.is_empty())
-                            {
-                                violations.push(
-                                    "must not set 'roles.reviewers' to an empty list".to_string(),
-                                );
-                            }
+                        "reviewers"
+                            if values.as_sequence().is_some_and(|values| values.is_empty()) =>
+                        {
+                            violations.push(
+                                "must not set 'roles.reviewers' to an empty list".to_string(),
+                            );
                         }
                         _ => {}
                     }

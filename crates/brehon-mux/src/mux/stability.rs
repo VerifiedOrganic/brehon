@@ -131,19 +131,17 @@ impl Mux {
             return Err(err);
         }
 
-        if is_gateway_backed {
-            if let Some(session_id) = gateway_session_id
-                && let Some(gateway) = self.gateway.as_ref()
-                && let Err(err) =
-                    brehon_ports::AgentGateway::kill_session(gateway, &session_id).await
-            {
-                let err_text = err.to_string();
-                let lower = err_text.to_ascii_lowercase();
-                if !(lower.contains("not found") || lower.contains("unknown session")) {
-                    return Err(Error::pty(format!(
-                        "Failed to kill reviewer gateway session for {pane_id}: {err_text}"
-                    )));
-                }
+        if is_gateway_backed
+            && let Some(session_id) = gateway_session_id
+            && let Some(gateway) = self.gateway.as_ref()
+            && let Err(err) = brehon_ports::AgentGateway::kill_session(gateway, &session_id).await
+        {
+            let err_text = err.to_string();
+            let lower = err_text.to_ascii_lowercase();
+            if !(lower.contains("not found") || lower.contains("unknown session")) {
+                return Err(Error::pty(format!(
+                    "Failed to kill reviewer gateway session for {pane_id}: {err_text}"
+                )));
             }
         }
 
@@ -285,19 +283,17 @@ impl Mux {
             return Err(err);
         }
 
-        if is_gateway_backed {
-            if let Some(session_id) = gateway_session_id
-                && let Some(gateway) = self.gateway.as_ref()
-                && let Err(err) =
-                    brehon_ports::AgentGateway::kill_session(gateway, &session_id).await
-            {
-                let err_text = err.to_string();
-                let lower = err_text.to_ascii_lowercase();
-                if !(lower.contains("not found") || lower.contains("unknown session")) {
-                    return Err(Error::pty(format!(
-                        "Failed to kill supervisor gateway session for {pane_id}: {err_text}"
-                    )));
-                }
+        if is_gateway_backed
+            && let Some(session_id) = gateway_session_id
+            && let Some(gateway) = self.gateway.as_ref()
+            && let Err(err) = brehon_ports::AgentGateway::kill_session(gateway, &session_id).await
+        {
+            let err_text = err.to_string();
+            let lower = err_text.to_ascii_lowercase();
+            if !(lower.contains("not found") || lower.contains("unknown session")) {
+                return Err(Error::pty(format!(
+                    "Failed to kill supervisor gateway session for {pane_id}: {err_text}"
+                )));
             }
         }
 

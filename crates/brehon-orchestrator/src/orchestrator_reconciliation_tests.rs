@@ -19,8 +19,10 @@ async fn tick_reconciliation_happens_before_dispatch() {
     let store = Arc::new(InMemoryEventStore::new());
     let gateway = Arc::new(MockGateway::new());
 
-    let mut config = OrchestratorConfig::default();
-    config.worktree_isolation = false;
+    let config = OrchestratorConfig {
+        worktree_isolation: false,
+        ..OrchestratorConfig::default()
+    };
 
     let deps = OrchestratorDeps {
         event_store: store.clone(),
@@ -143,8 +145,10 @@ async fn retry_queued_not_due_is_ignored_by_reconciliation() {
     queued.retry_reason = Some("retry later".into());
     run_store.create_run(queued.clone()).await.unwrap();
 
-    let mut config = OrchestratorConfig::default();
-    config.worktree_isolation = false;
+    let config = OrchestratorConfig {
+        worktree_isolation: false,
+        ..OrchestratorConfig::default()
+    };
     let deps = OrchestratorDeps {
         event_store,
         gateway: Arc::new(MockGateway::new()),
@@ -187,8 +191,10 @@ async fn dispatch_skips_task_with_retry_queued_not_due() {
     queued.retry_reason = Some("retry later".into());
     run_store.create_run(queued).await.unwrap();
 
-    let mut config = OrchestratorConfig::default();
-    config.worktree_isolation = false;
+    let config = OrchestratorConfig {
+        worktree_isolation: false,
+        ..OrchestratorConfig::default()
+    };
     let deps = OrchestratorDeps {
         event_store,
         gateway: gateway.clone(),
@@ -238,8 +244,10 @@ async fn retry_queued_due_creates_new_attempt() {
     queued.retry_reason = Some("retry now".into());
     run_store.create_run(queued.clone()).await.unwrap();
 
-    let mut config = OrchestratorConfig::default();
-    config.worktree_isolation = false;
+    let config = OrchestratorConfig {
+        worktree_isolation: false,
+        ..OrchestratorConfig::default()
+    };
     let deps = OrchestratorDeps {
         event_store,
         gateway: Arc::new(MockGateway::new()),
@@ -288,8 +296,10 @@ async fn failed_retryable_run_moves_to_retry_queued() {
     running.claimed_at = Some(now - ChronoDuration::minutes(4));
     run_store.create_run(running.clone()).await.unwrap();
 
-    let mut config = OrchestratorConfig::default();
-    config.worktree_isolation = false;
+    let config = OrchestratorConfig {
+        worktree_isolation: false,
+        ..OrchestratorConfig::default()
+    };
     let deps = OrchestratorDeps {
         event_store,
         gateway: Arc::new(MockGateway::new()),

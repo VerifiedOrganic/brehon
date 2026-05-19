@@ -266,7 +266,6 @@ mod tests {
             agent_type: "test".to_string(),
             kind: WorkerKind::Worker,
             worktree_base: "/tmp/test".to_string(),
-            ..Default::default()
         };
 
         let mut initial_pool = WorkerPool::new(config, gateway.clone());
@@ -297,7 +296,6 @@ mod tests {
             agent_type: "test".to_string(),
             kind: WorkerKind::Worker,
             worktree_base: "/tmp/test".to_string(),
-            ..Default::default()
         };
 
         let pool = Arc::new(parking_lot::RwLock::new(WorkerPool::new(
@@ -331,7 +329,6 @@ mod tests {
             agent_type: "test".to_string(),
             kind: WorkerKind::Worker,
             worktree_base: "/tmp/test".to_string(),
-            ..Default::default()
         };
 
         let mut initial_pool = WorkerPool::new(config, gateway.clone());
@@ -375,7 +372,6 @@ mod tests {
             agent_type: "test".to_string(),
             kind: WorkerKind::Worker,
             worktree_base: "/tmp/test".to_string(),
-            ..Default::default()
         };
 
         let mut initial_pool = WorkerPool::new(config, gateway.clone());
@@ -407,7 +403,6 @@ mod tests {
             agent_type: "test".to_string(),
             kind: WorkerKind::Worker,
             worktree_base: "/tmp/test".to_string(),
-            ..Default::default()
         };
 
         let mut initial_pool = WorkerPool::new(config, gateway.clone());

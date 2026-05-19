@@ -217,12 +217,14 @@ mod tests {
         let temp = tempfile::tempdir().expect("create temp queue root");
         let shared_queue_root = temp.path();
 
-        let mut mux_config = MuxConfig::default();
-        mux_config.cwd = shared_queue_root.to_path_buf();
-        mux_config.session_name = Some("session-B".to_string());
-        mux_config.workers = 0;
+        let mut mux_config = MuxConfig {
+            cwd: shared_queue_root.to_path_buf(),
+            session_name: Some("session-B".to_string()),
+            workers: 0,
+            include_director: false,
+            ..MuxConfig::default()
+        };
         mux_config.worker_names.clear();
-        mux_config.include_director = false;
         let mux = Mux::factory(mux_config).expect("create mux for session-B");
         assert_eq!(mux.session_name(), Some("session-B"));
         assert_eq!(

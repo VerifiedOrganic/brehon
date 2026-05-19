@@ -78,90 +78,6 @@ fn enqueue_reviewer_reset_with_logging(task_id: &str, review_id: &str, reviewer:
     }
 }
 
-#[cfg(test)]
-mod handoff_context_tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn handoff_context_caps_large_review_feedback_sections() {
-        let blocking: Vec<_> = (0..30)
-            .map(|idx| {
-                json!({
-                    "severity": "blocking",
-                    "file": format!("src/file_{idx}.rs"),
-                    "line": idx + 1,
-                    "description": format!("blocking issue {idx}"),
-                    "suggestion": "apply the targeted fix"
-                })
-            })
-            .collect();
-        let nitpicks: Vec<_> = (0..12)
-            .map(|idx| {
-                json!({
-                    "severity": "nit",
-                    "description": format!("nitpick {idx}")
-                })
-            })
-            .collect();
-        let task = json!({
-            "status": "changes_requested",
-            "title": "Review handoff cap test",
-            "notes": "n".repeat(HANDOFF_FREEFORM_MAX_CHARS + 100),
-            "review_feedback": {
-                "review_id": "REV-old",
-                "round": 3,
-                "outcome": "changes_requested",
-                "threshold_reason": "r".repeat(HANDOFF_METADATA_VALUE_MAX_CHARS + 100),
-                "blocking": blocking,
-                "nitpicks": nitpicks
-            }
-        });
-
-        let context = build_review_handoff_context(
-            &task,
-            &"supervisor context ".repeat(HANDOFF_SUPERVISOR_CONTEXT_MAX_CHARS / 10),
-        );
-
-        assert!(context.contains("Previous review feedback to verify"));
-        assert!(context.contains("blocking issue 0"));
-        assert!(context.contains("... 6 more omitted from handoff"));
-        assert!(context.contains("... 4 more omitted from handoff"));
-        assert!(context.contains("chars omitted"));
-        assert!(!context.contains("blocking issue 29"));
-    }
-
-    #[test]
-    fn handoff_context_global_cap_preserves_prior_blockers() {
-        let file_hints: Vec<_> = (0..100)
-            .map(|idx| format!("large file hint {idx} {}", "x".repeat(400)))
-            .collect();
-        let task = json!({
-            "status": "changes_requested",
-            "file_hints": file_hints,
-            "review_feedback": {
-                "review_id": "REV-old",
-                "blocking": [{
-                    "severity": "blocking",
-                    "file": "src/critical.rs",
-                    "line": 42,
-                    "description": "critical prior blocker"
-                }]
-            }
-        });
-
-        let context = build_review_handoff_context(
-            &task,
-            &"supervisor context ".repeat(HANDOFF_SUPERVISOR_CONTEXT_MAX_CHARS / 10),
-        );
-
-        assert!(context.contains("critical prior blocker"));
-        assert!(context.contains("omitted from review handoff"));
-        assert!(!context.contains("large file hint 99"));
-        assert!(context.chars().count() <= HANDOFF_TOTAL_MAX_CHARS + 140);
-    }
-}
-
 fn task_str<'a>(task: &'a Value, key: &str) -> Option<&'a str> {
     task.get(key)
         .and_then(|value| value.as_str())
@@ -2515,5 +2431,89 @@ impl VerificationTool {
             )),
             None => Ok(error_result("Could not build calibration data")),
         }
+    }
+}
+
+#[cfg(test)]
+mod handoff_context_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn handoff_context_caps_large_review_feedback_sections() {
+        let blocking: Vec<_> = (0..30)
+            .map(|idx| {
+                json!({
+                    "severity": "blocking",
+                    "file": format!("src/file_{idx}.rs"),
+                    "line": idx + 1,
+                    "description": format!("blocking issue {idx}"),
+                    "suggestion": "apply the targeted fix"
+                })
+            })
+            .collect();
+        let nitpicks: Vec<_> = (0..12)
+            .map(|idx| {
+                json!({
+                    "severity": "nit",
+                    "description": format!("nitpick {idx}")
+                })
+            })
+            .collect();
+        let task = json!({
+            "status": "changes_requested",
+            "title": "Review handoff cap test",
+            "notes": "n".repeat(HANDOFF_FREEFORM_MAX_CHARS + 100),
+            "review_feedback": {
+                "review_id": "REV-old",
+                "round": 3,
+                "outcome": "changes_requested",
+                "threshold_reason": "r".repeat(HANDOFF_METADATA_VALUE_MAX_CHARS + 100),
+                "blocking": blocking,
+                "nitpicks": nitpicks
+            }
+        });
+
+        let context = build_review_handoff_context(
+            &task,
+            &"supervisor context ".repeat(HANDOFF_SUPERVISOR_CONTEXT_MAX_CHARS / 10),
+        );
+
+        assert!(context.contains("Previous review feedback to verify"));
+        assert!(context.contains("blocking issue 0"));
+        assert!(context.contains("... 6 more omitted from handoff"));
+        assert!(context.contains("... 4 more omitted from handoff"));
+        assert!(context.contains("chars omitted"));
+        assert!(!context.contains("blocking issue 29"));
+    }
+
+    #[test]
+    fn handoff_context_global_cap_preserves_prior_blockers() {
+        let file_hints: Vec<_> = (0..100)
+            .map(|idx| format!("large file hint {idx} {}", "x".repeat(400)))
+            .collect();
+        let task = json!({
+            "status": "changes_requested",
+            "file_hints": file_hints,
+            "review_feedback": {
+                "review_id": "REV-old",
+                "blocking": [{
+                    "severity": "blocking",
+                    "file": "src/critical.rs",
+                    "line": 42,
+                    "description": "critical prior blocker"
+                }]
+            }
+        });
+
+        let context = build_review_handoff_context(
+            &task,
+            &"supervisor context ".repeat(HANDOFF_SUPERVISOR_CONTEXT_MAX_CHARS / 10),
+        );
+
+        assert!(context.contains("critical prior blocker"));
+        assert!(context.contains("omitted from review handoff"));
+        assert!(!context.contains("large file hint 99"));
+        assert!(context.chars().count() <= HANDOFF_TOTAL_MAX_CHARS + 140);
     }
 }

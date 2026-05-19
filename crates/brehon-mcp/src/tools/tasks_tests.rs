@@ -49,7 +49,7 @@ fn write_task(brehon_root: &Path, task: &serde_json::Value) {
 fn setup_brehon_root() -> (TempDir, PathBuf) {
     let temp = TempDir::new().unwrap();
     let brehon_root = temp.path().join(".brehon");
-    fs::create_dir_all(&brehon_root.join("runtime").join("tasks")).unwrap();
+    fs::create_dir_all(brehon_root.join("runtime").join("tasks")).unwrap();
     (temp, brehon_root)
 }
 

@@ -1388,22 +1388,18 @@ mod tests {
         let mut saw_output = false;
         for _ in 0..8 {
             match rx.recv().await {
-                Some(AdapterEvent::ToolCallStarted { tool_name, .. }) => {
-                    if tool_name == "read_file" {
-                        saw_tool_start = true;
-                    }
+                Some(AdapterEvent::ToolCallStarted { tool_name, .. })
+                    if tool_name == "read_file" =>
+                {
+                    saw_tool_start = true;
                 }
                 Some(AdapterEvent::ToolCallCompleted {
                     tool_name, status, ..
-                }) => {
-                    if tool_name == "read_file" && status == "success" {
-                        saw_tool_complete = true;
-                    }
+                }) if tool_name == "read_file" && status == "success" => {
+                    saw_tool_complete = true;
                 }
-                Some(AdapterEvent::Output { text, .. }) => {
-                    if text.contains("finished") {
-                        saw_output = true;
-                    }
+                Some(AdapterEvent::Output { text, .. }) if text.contains("finished") => {
+                    saw_output = true;
                 }
                 _ => {}
             }

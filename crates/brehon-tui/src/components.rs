@@ -259,9 +259,7 @@ impl<'a> Panel<'a> {
                 (right_x, "╮"),
             ];
 
-            for ((cell_x, symbol), span) in overlay_positions
-                .into_iter()
-                .zip(corner_gradient.spans.into_iter())
+            for ((cell_x, symbol), span) in overlay_positions.into_iter().zip(corner_gradient.spans)
             {
                 let style = if let Some(bg) = self.bg {
                     span.style.bg(bg)

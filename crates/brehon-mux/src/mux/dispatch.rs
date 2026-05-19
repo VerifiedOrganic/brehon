@@ -393,10 +393,8 @@ impl Mux {
         let clear_pending_inbox_nudge =
             pane.should_clear_pending_inbox_nudge_on_manual_input(&data);
 
-        if clear_pending_inbox_nudge {
-            if let Some(pane) = self.panes.get_mut(pane_id) {
-                pane.set_pending_inbox_nudge(false);
-            }
+        if clear_pending_inbox_nudge && let Some(pane) = self.panes.get_mut(pane_id) {
+            pane.set_pending_inbox_nudge(false);
         }
 
         let Some(pane) = self.panes.get(pane_id) else {
@@ -1045,12 +1043,12 @@ impl Mux {
         generation: Generation,
     ) -> Result<PromptDeliveryAttempt> {
         let teams = self.teams.clone();
-        if let (Some(teams), Some(pane)) = (teams, self.panes.get(pane_id)) {
-            if self.pane_uses_teams(pane) {
-                return self
-                    .attempt_teams_delivery(pane_id, prompt, from, prompt_id, generation, &teams)
-                    .await;
-            }
+        if let (Some(teams), Some(pane)) = (teams, self.panes.get(pane_id))
+            && self.pane_uses_teams(pane)
+        {
+            return self
+                .attempt_teams_delivery(pane_id, prompt, from, prompt_id, generation, &teams)
+                .await;
         }
         self.attempt_pty_delivery(pane_id, prompt, from, prompt_id, generation)
             .await
@@ -1069,13 +1067,12 @@ impl Mux {
             .panes
             .get(pane_id)
             .and_then(|pane| pane.inbox_nudge_not_before())
+            && Instant::now() < inject_after
         {
-            if Instant::now() < inject_after {
-                return Ok(PromptDeliveryAttempt::Queued {
-                    prompt_id,
-                    ahead_of: self.pane_prompt_backlog(pane_id).saturating_add(1),
-                });
-            }
+            return Ok(PromptDeliveryAttempt::Queued {
+                prompt_id,
+                ahead_of: self.pane_prompt_backlog(pane_id).saturating_add(1),
+            });
         }
 
         let sender = from.unwrap_or(teams::DIRECTOR_AGENT_NAME);
@@ -1426,12 +1423,12 @@ impl Mux {
         pane_id: &str,
         result: std::result::Result<(), AsyncGatewayPromptDeliveryError>,
     ) {
-        if let Err(err) = result {
-            if let Some(pane) = self.panes.get_mut(pane_id) {
-                pane.set_pending_inbox_nudge(false);
-                let err_msg = format!("\x1b[1;31mPrompt delivery failed: {}\x1b[0m\r\n", err.error);
-                let _ = pane.append_output(err_msg.as_bytes());
-            }
+        if let Err(err) = result
+            && let Some(pane) = self.panes.get_mut(pane_id)
+        {
+            pane.set_pending_inbox_nudge(false);
+            let err_msg = format!("\x1b[1;31mPrompt delivery failed: {}\x1b[0m\r\n", err.error);
+            let _ = pane.append_output(err_msg.as_bytes());
         }
     }
 

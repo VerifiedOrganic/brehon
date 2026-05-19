@@ -303,6 +303,12 @@ pub struct StartupSplash {
     frame_row_budget: usize,
 }
 
+impl Default for StartupSplash {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl StartupSplash {
     pub fn new() -> Self {
         let mut stdout = std::io::stdout();
@@ -555,11 +561,12 @@ impl StartupSplash {
         let left_run = (inner.saturating_sub(label_visible)) / 2;
         let right_run = inner.saturating_sub(label_visible).saturating_sub(left_run);
         let top_line = format!(
-            "{}{}{}{}",
+            "{}{}{}{}{}",
             "╭",
             "─".repeat(left_run),
             label,
-            format!("{}{}", "─".repeat(right_run), "╮"),
+            "─".repeat(right_run),
+            "╮",
         );
         self.write_line(format!("{}{}", left_pad, truecolor(DIM_RULE, &top_line)));
 
@@ -1023,10 +1030,9 @@ impl ShutdownProgress {
             return;
         }
         eprintln!(
-            "  {} {}  {} ({:.1}s)",
+            "  {} {}  Shutdown complete ({:.1}s)",
             dim(&self.elapsed_label()),
             green("✓"),
-            "Shutdown complete",
             self.started_at.elapsed().as_secs_f64()
         );
         self.active = false;

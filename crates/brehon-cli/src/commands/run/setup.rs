@@ -271,7 +271,7 @@ pub(crate) fn detect_builtin_cli(
         agent_config.command_str().unwrap_or_default(),
         args.as_slice(),
     ) {
-        ("claude", args) if args.is_empty() => Some(SupervisorCli::Claude),
+        ("claude", []) => Some(SupervisorCli::Claude),
         ("codex", args) if args == vec!["app-server"] => Some(SupervisorCli::Codex),
         ("gemini", ["--acp"]) | ("gemini", ["--experimental-acp"]) => Some(SupervisorCli::Gemini),
         ("kimi", args) if args == vec!["acp"] => Some(SupervisorCli::Kimi),
@@ -280,8 +280,8 @@ pub(crate) fn detect_builtin_cli(
         | ("opencode", ["acp", "--cwd", "."])
         | ("opencode", ["serve"])
         | ("opencode", ["serve", "--pure"]) => Some(SupervisorCli::OpenCode),
-        ("junie", args) if args.is_empty() => Some(SupervisorCli::Junie),
-        ("copilot", args) if args.is_empty() || args.iter().any(|arg| *arg == "--acp") => {
+        ("junie", []) => Some(SupervisorCli::Junie),
+        ("copilot", args) if args.is_empty() || args.contains(&"--acp") => {
             Some(SupervisorCli::Copilot)
         }
         _ => None,
@@ -767,9 +767,7 @@ fn task_has_unconsolidated_review_round(brehon_root: &Path, task_id: &str) -> bo
         if !path.is_dir() {
             return None;
         }
-        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-            return None;
-        };
+        let name = path.file_name().and_then(|name| name.to_str())?;
         let round = name
             .strip_prefix("round-")
             .and_then(|suffix| suffix.parse::<u32>().ok())?;
@@ -1365,7 +1363,7 @@ fn shell_double_quote_fragment(value: &str) -> String {
 fn protected_branch_fallback(default_branch: &str) -> String {
     let mut branches = Vec::new();
     for branch in [default_branch, "main", "master", "develop"] {
-        if !branch.trim().is_empty() && !branches.iter().any(|existing| *existing == branch) {
+        if !branch.trim().is_empty() && !branches.contains(&branch) {
             branches.push(branch);
         }
     }

@@ -1,3 +1,9 @@
+// Same env-serialization pattern as the lib tests — see lib.rs.
+#![allow(clippy::await_holding_lock)]
+// Tests construct config structs by mutating fields after `default()` to keep
+// diffs tight when new fields land.
+#![allow(clippy::field_reassign_with_default)]
+
 //! Integration test for the full review flow.
 //!
 //! Tests the end-to-end review pipeline in an isolated temp directory:
@@ -1227,7 +1233,7 @@ async fn test_share_after_submit_keeps_reviewer_reserved_until_reset_ack() {
     write_reviewer_reset_ack(
         &env.root,
         &env.task_id,
-        &first_json["review_id"].as_str().unwrap(),
+        first_json["review_id"].as_str().unwrap(),
         "reviewer-alpha",
     );
 
@@ -5141,7 +5147,7 @@ async fn test_review_state_consistent_after_approved_review() {
     assert_eq!(task["status"], "approved");
 
     // Verify updated_at was set on task
-    assert!(task["updated_at"].as_str().unwrap().len() > 0);
+    assert!(!task["updated_at"].as_str().unwrap().is_empty());
 }
 
 /// Test that concurrent close while review is collecting rejects the close.

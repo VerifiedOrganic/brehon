@@ -219,15 +219,15 @@ pub fn terminal_host_diagnostics(
     }
 
     let mut diagnostics = Vec::new();
-    if let Some(binary_path) = host.binary_path.as_deref() {
-        if terminal_host_binary_path_is_missing(binary_path) {
-            diagnostics.push(RuntimeTerminalHostDiagnostic {
-                severity: RuntimeTerminalHostDiagnosticSeverity::Error,
-                code: "terminal_host_binary_missing".to_string(),
-                message: format!("terminal host binary '{binary_path}' does not exist"),
-                action: Some("set the terminal-host binary path to a valid executable".to_string()),
-            });
-        }
+    if let Some(binary_path) = host.binary_path.as_deref()
+        && terminal_host_binary_path_is_missing(binary_path)
+    {
+        diagnostics.push(RuntimeTerminalHostDiagnostic {
+            severity: RuntimeTerminalHostDiagnosticSeverity::Error,
+            code: "terminal_host_binary_missing".to_string(),
+            message: format!("terminal host binary '{binary_path}' does not exist"),
+            action: Some("set the terminal-host binary path to a valid executable".to_string()),
+        });
     }
 
     if host
@@ -3343,16 +3343,15 @@ mod tests {
         while tokio::time::Instant::now() < deadline {
             if let Ok(Ok(Some(event))) =
                 tokio::time::timeout(std::time::Duration::from_millis(100), rx.next_event()).await
-            {
-                if matches!(
+                && matches!(
                     event.kind,
                     RuntimeEventKind::WorkflowAction(ref action)
                         if action.workflow_id == "rate_limit.quarantine_recommendation"
                             && action.status == WorkflowActionStatus::Requested
                             && action.command_id.is_some()
-                ) {
-                    saw_requested_action = true;
-                }
+                )
+            {
+                saw_requested_action = true;
             }
 
             if saw_requested_action && !recording_port.commands.lock().await.is_empty() {

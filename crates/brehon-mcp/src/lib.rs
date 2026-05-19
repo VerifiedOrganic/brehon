@@ -2,6 +2,14 @@
 // brushes against the default macro recursion limit as it grows. Bump it
 // here so adding a parameter does not turn into a cryptic macro error.
 #![recursion_limit = "256"]
+// Many tests in this crate hold a `std::sync::Mutex` env-serialization guard
+// across `.await` to prevent parallel tests from racing on env vars. The lock
+// is test-only and short-lived; tokio's async-aware Mutex isn't a fit because
+// it's also used from sync helpers.
+#![allow(clippy::await_holding_lock)]
+// MCP tool handlers accept many state/context refs; bundling them into context
+// structs is a separate refactor.
+#![allow(clippy::too_many_arguments)]
 
 //! MCP (Model Context Protocol) server for Brehon.
 //!

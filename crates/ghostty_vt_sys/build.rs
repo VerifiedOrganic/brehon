@@ -169,12 +169,13 @@ fn fix_archive_alignment(archive_path: &Path) {
         let mut perms = fs::metadata(obj)
             .expect("Failed to read object metadata")
             .permissions();
-        perms.set_readonly(false);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             perms.set_mode(perms.mode() | 0o644);
         }
+        #[cfg(not(unix))]
+        perms.set_readonly(false);
         fs::set_permissions(obj, perms).expect("Failed to chmod object file");
     }
 
@@ -447,10 +448,7 @@ fn zig_version(zig: &Path) -> Option<ZigVersion> {
 }
 
 fn parse_zig_version(version: &str) -> Option<ZigVersion> {
-    let version = version
-        .split(|ch| ch == '-' || ch == '+')
-        .next()
-        .unwrap_or(version);
+    let version = version.split(['-', '+']).next().unwrap_or(version);
     let mut parts = version.split('.');
 
     Some(ZigVersion {

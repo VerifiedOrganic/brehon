@@ -33,6 +33,9 @@ pub struct CompositeToolBridge {
 }
 
 impl CompositeToolBridge {
+    // Returns Arc<dyn _> rather than Self so callers can compose bridges
+    // without having to name the concrete type.
+    #[allow(clippy::new_ret_no_self)]
     pub fn new(bridges: Vec<Arc<dyn DirectToolBridge>>) -> Arc<dyn DirectToolBridge> {
         Arc::new(Self { bridges })
     }
@@ -68,6 +71,8 @@ pub struct CodingToolBridge {
 }
 
 impl CodingToolBridge {
+    // Returns Arc<dyn _> for the same reason as CompositeToolBridge::new above.
+    #[allow(clippy::new_ret_no_self)]
     pub fn new(worktree_root: PathBuf) -> Arc<dyn DirectToolBridge> {
         Arc::new(Self { worktree_root })
     }

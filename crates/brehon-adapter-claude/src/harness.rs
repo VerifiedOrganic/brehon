@@ -21,8 +21,8 @@ pub const CLAUDE_TOOL_PREFIX: &str = "mcp__brehon__";
 ///
 /// This is the canonical source of truth for Claude's capabilities;
 /// it mirrors the values in
-/// [`SupervisorCli::Claude.capabilities()`] but is available
-/// without going through the enum.
+/// [`SupervisorCli::capabilities`](brehon_adapter_sdk::SupervisorCli::capabilities)
+/// for the `Claude` variant but is available without going through the enum.
 pub fn claude_capabilities() -> HarnessCapabilities {
     HarnessCapabilities {
         supports_hooks: true,

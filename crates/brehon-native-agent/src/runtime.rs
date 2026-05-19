@@ -733,7 +733,7 @@ fn should_nudge_text_only_first_turn(include_brehon_tools: bool, role: &str, pro
 }
 
 fn is_reviewer_idle_startup_prompt(role: &str, prompt: &str) -> bool {
-    if role.trim().to_ascii_lowercase() != "reviewer" {
+    if !role.trim().eq_ignore_ascii_case("reviewer") {
         return false;
     }
 
@@ -761,6 +761,7 @@ fn runtime_tool_env(allowlist: &[String]) -> Vec<(String, String)> {
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn runtime_session_env(
     base: &[(String, String)],
     session_id: &str,

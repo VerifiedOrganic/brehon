@@ -1,3 +1,7 @@
+// Many tests use `let mut x = T::default(); x.field = ...;` instead of struct
+// literals to keep diffs tight when new fields land. Lint is style-only.
+#![allow(clippy::field_reassign_with_default)]
+
 pub mod commands;
 pub mod names;
 pub mod recovery;

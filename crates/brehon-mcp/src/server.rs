@@ -629,13 +629,16 @@ impl ServerHandler for BrehonService {
     }
 }
 
+type BoundedWriteHalf<W> =
+    Arc<Mutex<Option<FramedWrite<W, JsonRpcMessageCodec<TxJsonRpcMessage<RoleServer>>>>>>;
+
 struct BoundedServerTransport<R, W>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
     read: FramedRead<R, JsonRpcMessageCodec<RxJsonRpcMessage<RoleServer>>>,
-    write: Arc<Mutex<Option<FramedWrite<W, JsonRpcMessageCodec<TxJsonRpcMessage<RoleServer>>>>>>,
+    write: BoundedWriteHalf<W>,
 }
 
 impl<R, W> BoundedServerTransport<R, W>
@@ -683,6 +686,9 @@ where
         }
     }
 
+    // Signature must match `rmcp::Transport::receive`, which returns
+    // `impl Future + Send` rather than using `async fn`.
+    #[allow(clippy::manual_async_fn)]
     fn receive(&mut self) -> impl Future<Output = Option<RxJsonRpcMessage<RoleServer>>> + Send {
         async move {
             // `tokio_util::FramedRead` yields exactly one `None` after a codec error as a

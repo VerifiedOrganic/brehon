@@ -19,7 +19,12 @@ pub struct ValidatedOutcome {
 }
 
 /// Result of validating a raw outcome.
+///
+/// `Accepted` is intentionally larger than `Rejected`; this enum is only
+/// produced once per feedback round and is consumed immediately, so the
+/// size delta has no measurable cost.
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum OutcomeValidation {
     Accepted(ValidatedOutcome),
     Rejected {
@@ -162,40 +167,33 @@ impl OutcomeValidation {
 fn required_fields_missing(outcome: &FeedbackOutcome) -> Option<String> {
     match outcome.kind {
         FeedbackOutcomeKind::PromoteReviewerFollowup
-        | FeedbackOutcomeKind::WaiveReviewerFollowup => {
+        | FeedbackOutcomeKind::WaiveReviewerFollowup
             if outcome
                 .followup_id
                 .as_deref()
                 .map(str::trim)
                 .map(str::is_empty)
-                .unwrap_or(true)
-            {
-                return Some(format!(
-                    "Outcome kind {} requires a non-empty followup_id.",
-                    outcome.kind.as_str()
-                ));
-            }
+                .unwrap_or(true) =>
+        {
+            return Some(format!(
+                "Outcome kind {} requires a non-empty followup_id.",
+                outcome.kind.as_str()
+            ));
         }
-        FeedbackOutcomeKind::RetryRun => {
-            if outcome.run_id.is_none() && outcome.task_id.is_none() {
-                return Some(
-                    "Outcome kind retry_run requires either run_id or task_id.".to_string(),
-                );
-            }
+        FeedbackOutcomeKind::RetryRun if outcome.run_id.is_none() && outcome.task_id.is_none() => {
+            return Some("Outcome kind retry_run requires either run_id or task_id.".to_string());
         }
-        FeedbackOutcomeKind::RequestRework => {
-            if outcome.task_id.is_none() {
-                return Some("Outcome kind request_rework requires task_id.".to_string());
-            }
+        FeedbackOutcomeKind::RequestRework if outcome.task_id.is_none() => {
+            return Some("Outcome kind request_rework requires task_id.".to_string());
         }
         FeedbackOutcomeKind::QueueConflictResolution
-        | FeedbackOutcomeKind::RequestIntegrationRepair => {
-            if outcome.task_id.is_none() {
-                return Some(format!(
-                    "Outcome kind {} requires task_id of the conflicting task.",
-                    outcome.kind.as_str()
-                ));
-            }
+        | FeedbackOutcomeKind::RequestIntegrationRepair
+            if outcome.task_id.is_none() =>
+        {
+            return Some(format!(
+                "Outcome kind {} requires task_id of the conflicting task.",
+                outcome.kind.as_str()
+            ));
         }
         _ => {}
     }

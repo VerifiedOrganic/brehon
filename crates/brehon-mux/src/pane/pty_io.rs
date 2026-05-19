@@ -574,7 +574,7 @@ impl Pane {
 
     /// Inject a prompt with viewport-echo verification before submit.
     ///
-    /// See [`PaneInjector::inject_prompt_echo_verified`] for details. The
+    /// See `PaneInjector::inject_prompt_echo_verified` for details. The
     /// caller must ensure the input box is in an empty state — otherwise the
     /// typed text will append to whatever draft is already there.
     pub async fn inject_prompt_echo_verified(&self, prompt: &str) -> Result<()> {

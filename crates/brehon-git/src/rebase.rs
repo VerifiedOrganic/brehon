@@ -349,10 +349,10 @@ impl<'a> RebaseOps<'a> {
         for commit_id in &commits_to_pick {
             let commit = self.repo.find_commit(*commit_id)?;
 
-            let mut merge_opts = MergeOptions::new();
-            let result =
-                self.repo
-                    .cherrypick_commit(&commit, &current_head, 0, Some(&mut merge_opts));
+            let merge_opts = MergeOptions::new();
+            let result = self
+                .repo
+                .cherrypick_commit(&commit, &current_head, 0, Some(&merge_opts));
 
             match result {
                 Ok(mut index) => {

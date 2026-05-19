@@ -57,69 +57,6 @@ fn host_prompt_policy_context(ctx: &EventLoopCtx, target: &str) -> RuntimePolicy
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn write_task(root: &Path, task_id: &str, status: &str, assignee: Option<&str>) {
-        let tasks_dir = root.join("runtime").join("tasks");
-        std::fs::create_dir_all(&tasks_dir).unwrap();
-        let mut task = serde_json::json!({
-            "task_id": task_id,
-            "title": "Example",
-            "status": status,
-        });
-        if let Some(assignee) = assignee {
-            task["assignee"] = serde_json::Value::String(assignee.to_string());
-        }
-        std::fs::write(
-            tasks_dir.join(format!("{task_id}.json")),
-            serde_json::to_string_pretty(&task).unwrap(),
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn role_alias_prompt_target_resolves_to_active_task_assignee() {
-        let temp = tempfile::tempdir().unwrap();
-        write_task(temp.path(), "T-1", "in_progress", Some("safe-ewe-30"));
-
-        let prompt = "Review complete for task T-1\n\
-                      Review ID: REV-1\n\
-                      Outcome: CHANGES_REQUESTED\n";
-
-        assert_eq!(
-            resolve_role_alias_prompt_target(temp.path(), "worker", prompt).unwrap(),
-            Some("safe-ewe-30".to_string())
-        );
-    }
-
-    #[test]
-    fn role_alias_prompt_target_drops_terminal_task_reports() {
-        let temp = tempfile::tempdir().unwrap();
-        write_task(temp.path(), "T-1", "closed", Some("safe-ewe-30"));
-
-        let prompt = "Review complete for task T-1\n\
-                      Review ID: REV-1\n\
-                      Outcome: APPROVED\n";
-
-        assert_eq!(
-            resolve_role_alias_prompt_target(temp.path(), "worker", prompt).unwrap(),
-            None
-        );
-    }
-
-    #[test]
-    fn explicit_prompt_target_is_left_unchanged() {
-        let temp = tempfile::tempdir().unwrap();
-
-        assert_eq!(
-            resolve_role_alias_prompt_target(temp.path(), "firm-hen-20", "Ping").unwrap(),
-            Some("firm-hen-20".to_string())
-        );
-    }
-}
-
 fn is_role_alias_prompt_target(target: &str) -> bool {
     matches!(
         target.trim().to_ascii_lowercase().as_str(),
@@ -1469,5 +1406,68 @@ pub(super) fn deliver_pending_prompts(ctx: &mut EventLoopCtx, brehon_root: &std:
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_task(root: &Path, task_id: &str, status: &str, assignee: Option<&str>) {
+        let tasks_dir = root.join("runtime").join("tasks");
+        std::fs::create_dir_all(&tasks_dir).unwrap();
+        let mut task = serde_json::json!({
+            "task_id": task_id,
+            "title": "Example",
+            "status": status,
+        });
+        if let Some(assignee) = assignee {
+            task["assignee"] = serde_json::Value::String(assignee.to_string());
+        }
+        std::fs::write(
+            tasks_dir.join(format!("{task_id}.json")),
+            serde_json::to_string_pretty(&task).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn role_alias_prompt_target_resolves_to_active_task_assignee() {
+        let temp = tempfile::tempdir().unwrap();
+        write_task(temp.path(), "T-1", "in_progress", Some("safe-ewe-30"));
+
+        let prompt = "Review complete for task T-1\n\
+                      Review ID: REV-1\n\
+                      Outcome: CHANGES_REQUESTED\n";
+
+        assert_eq!(
+            resolve_role_alias_prompt_target(temp.path(), "worker", prompt).unwrap(),
+            Some("safe-ewe-30".to_string())
+        );
+    }
+
+    #[test]
+    fn role_alias_prompt_target_drops_terminal_task_reports() {
+        let temp = tempfile::tempdir().unwrap();
+        write_task(temp.path(), "T-1", "closed", Some("safe-ewe-30"));
+
+        let prompt = "Review complete for task T-1\n\
+                      Review ID: REV-1\n\
+                      Outcome: APPROVED\n";
+
+        assert_eq!(
+            resolve_role_alias_prompt_target(temp.path(), "worker", prompt).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn explicit_prompt_target_is_left_unchanged() {
+        let temp = tempfile::tempdir().unwrap();
+
+        assert_eq!(
+            resolve_role_alias_prompt_target(temp.path(), "firm-hen-20", "Ping").unwrap(),
+            Some("firm-hen-20".to_string())
+        );
     }
 }

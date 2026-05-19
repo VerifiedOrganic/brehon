@@ -570,7 +570,7 @@ pub(crate) fn advisor_author_color(author: &str, role: &str) -> Color {
 }
 
 pub(crate) fn message_bubble_width(width: usize) -> usize {
-    width.saturating_sub(2).min(96).max(1)
+    width.saturating_sub(2).clamp(1, 96)
 }
 
 fn pad_to_width(value: &str, width: usize) -> String {

@@ -961,7 +961,7 @@ async fn forward_codex_notification(
                             let _ = sender.send(result);
                         }
 
-                        record_prompt_result_tokens(&inner, &prompt_id, tokens_used).await;
+                        record_prompt_result_tokens(inner, &prompt_id, tokens_used).await;
                         clear_active_prompt_state(&mut active_prompt_id, &prompt_id);
                         active_prompt_turn_id.take();
                         handled_turn = true;
@@ -1911,6 +1911,130 @@ fn turn_response_text(params: Option<&serde_json::Value>) -> Option<String> {
     (!combined.is_empty()).then_some(combined)
 }
 
+#[async_trait::async_trait]
+impl AgentAdapter for CodexWsSession {
+    async fn spawn(&self, _spec: SessionSpec) -> AdapterResult<SessionId> {
+        Err(AdapterError::unsupported_operation(
+            "CodexWsSession must be constructed via spawn_with_env; AgentAdapter::spawn is not supported",
+        ))
+    }
+
+    async fn send_prompt(&self, prompt: PromptTurn) -> AdapterResult<PromptHandle> {
+        self.send_prompt(prompt)
+            .await
+            .map_err(|e| AdapterError::new(AdapterErrorKind::SendFailed, e.to_string()))
+    }
+
+    async fn wait_for_response(
+        &self,
+        prompt_id: &PromptId,
+        timeout_ms: u64,
+    ) -> AdapterResult<PromptResult> {
+        self.wait_for_response(prompt_id, timeout_ms)
+            .await
+            .map_err(|e| {
+                let kind = match e {
+                    CodexError::Timeout => AdapterErrorKind::TimedOut,
+                    _ => AdapterErrorKind::SendFailed,
+                };
+                AdapterError::new(kind, e.to_string())
+            })
+    }
+
+    fn events(&self) -> mpsc::Receiver<AdapterEvent> {
+        let broadcast = self.inner.adapter_event_broadcast.lock().unwrap();
+        let (mpsc_tx, mpsc_rx) = mpsc::channel(64);
+        if let Some(broadcast) = broadcast.as_ref() {
+            let mut broadcast_rx = broadcast.subscribe();
+            tokio::spawn(async move {
+                loop {
+                    match broadcast_rx.recv().await {
+                        Ok(event) => {
+                            if mpsc_tx.send(event).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                            warn!("Broadcast receiver lagged by {} messages", skipped);
+                            continue;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            });
+        }
+        mpsc_rx
+    }
+
+    async fn terminate(&self) -> AdapterResult<()> {
+        self.kill()
+            .await
+            .map_err(|e| AdapterError::new(AdapterErrorKind::TransportClosed, e.to_string()))
+    }
+
+    fn kind(&self) -> AdapterKind {
+        AdapterKind::Codex
+    }
+
+    async fn capabilities(&self) -> AdapterResult<AgentCapabilities> {
+        Ok(self.capabilities())
+    }
+
+    async fn session_id(&self) -> SessionId {
+        self.session_id().clone()
+    }
+
+    async fn session_info(&self) -> SessionInfo {
+        self.session_info()
+    }
+
+    async fn stability_counters(&self) -> brehon_types::StabilityCounters {
+        self.stability_counters().await
+    }
+
+    async fn set_config(&self, option: &str, value: &str) -> AdapterResult<()> {
+        self.set_config(option, value)
+            .await
+            .map_err(|e| AdapterError::new(AdapterErrorKind::SendFailed, e.to_string()))
+    }
+
+    async fn cancel_prompt(&self, prompt: &PromptId) -> AdapterResult<()> {
+        self.cancel_prompt(prompt)
+            .await
+            .map_err(|e| AdapterError::new(AdapterErrorKind::SendFailed, e.to_string()))
+    }
+
+    async fn health_check(&self) -> AdapterResult<HealthStatus> {
+        self.health_check()
+            .await
+            .map_err(|e| AdapterError::new(AdapterErrorKind::SendFailed, e.to_string()))
+    }
+
+    async fn attach_terminal(&self, _cols: u16, _rows: u16) -> AdapterResult<Option<TerminalId>> {
+        Ok(None)
+    }
+
+    async fn send_terminal_input(
+        &self,
+        _terminal: &TerminalId,
+        _input: Vec<u8>,
+    ) -> AdapterResult<()> {
+        Err(AdapterError::unsupported_operation(
+            "Terminal input is not supported for Codex websocket sessions",
+        ))
+    }
+
+    async fn resolve_permission(&self, _permission_id: &str, _approved: bool) -> AdapterResult<()> {
+        Err(AdapterError::unsupported_operation(
+            "Permission resolution is not supported for Codex websocket sessions",
+        ))
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2717,129 +2841,5 @@ mod tests {
         let _ = session.kill().await;
         server_handle.abort();
         let _ = server_handle.await;
-    }
-}
-
-#[async_trait::async_trait]
-impl AgentAdapter for CodexWsSession {
-    async fn spawn(&self, _spec: SessionSpec) -> AdapterResult<SessionId> {
-        Err(AdapterError::unsupported_operation(
-            "CodexWsSession must be constructed via spawn_with_env; AgentAdapter::spawn is not supported",
-        ))
-    }
-
-    async fn send_prompt(&self, prompt: PromptTurn) -> AdapterResult<PromptHandle> {
-        self.send_prompt(prompt)
-            .await
-            .map_err(|e| AdapterError::new(AdapterErrorKind::SendFailed, e.to_string()))
-    }
-
-    async fn wait_for_response(
-        &self,
-        prompt_id: &PromptId,
-        timeout_ms: u64,
-    ) -> AdapterResult<PromptResult> {
-        self.wait_for_response(prompt_id, timeout_ms)
-            .await
-            .map_err(|e| {
-                let kind = match e {
-                    CodexError::Timeout => AdapterErrorKind::TimedOut,
-                    _ => AdapterErrorKind::SendFailed,
-                };
-                AdapterError::new(kind, e.to_string())
-            })
-    }
-
-    fn events(&self) -> mpsc::Receiver<AdapterEvent> {
-        let broadcast = self.inner.adapter_event_broadcast.lock().unwrap();
-        let (mpsc_tx, mpsc_rx) = mpsc::channel(64);
-        if let Some(broadcast) = broadcast.as_ref() {
-            let mut broadcast_rx = broadcast.subscribe();
-            tokio::spawn(async move {
-                loop {
-                    match broadcast_rx.recv().await {
-                        Ok(event) => {
-                            if mpsc_tx.send(event).await.is_err() {
-                                break;
-                            }
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                            warn!("Broadcast receiver lagged by {} messages", skipped);
-                            continue;
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                    }
-                }
-            });
-        }
-        mpsc_rx
-    }
-
-    async fn terminate(&self) -> AdapterResult<()> {
-        self.kill()
-            .await
-            .map_err(|e| AdapterError::new(AdapterErrorKind::TransportClosed, e.to_string()))
-    }
-
-    fn kind(&self) -> AdapterKind {
-        AdapterKind::Codex
-    }
-
-    async fn capabilities(&self) -> AdapterResult<AgentCapabilities> {
-        Ok(self.capabilities())
-    }
-
-    async fn session_id(&self) -> SessionId {
-        self.session_id().clone()
-    }
-
-    async fn session_info(&self) -> SessionInfo {
-        self.session_info()
-    }
-
-    async fn stability_counters(&self) -> brehon_types::StabilityCounters {
-        self.stability_counters().await
-    }
-
-    async fn set_config(&self, option: &str, value: &str) -> AdapterResult<()> {
-        self.set_config(option, value)
-            .await
-            .map_err(|e| AdapterError::new(AdapterErrorKind::SendFailed, e.to_string()))
-    }
-
-    async fn cancel_prompt(&self, prompt: &PromptId) -> AdapterResult<()> {
-        self.cancel_prompt(prompt)
-            .await
-            .map_err(|e| AdapterError::new(AdapterErrorKind::SendFailed, e.to_string()))
-    }
-
-    async fn health_check(&self) -> AdapterResult<HealthStatus> {
-        self.health_check()
-            .await
-            .map_err(|e| AdapterError::new(AdapterErrorKind::SendFailed, e.to_string()))
-    }
-
-    async fn attach_terminal(&self, _cols: u16, _rows: u16) -> AdapterResult<Option<TerminalId>> {
-        Ok(None)
-    }
-
-    async fn send_terminal_input(
-        &self,
-        _terminal: &TerminalId,
-        _input: Vec<u8>,
-    ) -> AdapterResult<()> {
-        Err(AdapterError::unsupported_operation(
-            "Terminal input is not supported for Codex websocket sessions",
-        ))
-    }
-
-    async fn resolve_permission(&self, _permission_id: &str, _approved: bool) -> AdapterResult<()> {
-        Err(AdapterError::unsupported_operation(
-            "Permission resolution is not supported for Codex websocket sessions",
-        ))
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
     }
 }

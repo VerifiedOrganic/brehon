@@ -386,9 +386,7 @@ fn task_has_unconsolidated_review_round(task_id: &str) -> bool {
         if !path.is_dir() {
             return None;
         }
-        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-            return None;
-        };
+        let name = path.file_name().and_then(|name| name.to_str())?;
         let round = name
             .strip_prefix("round-")
             .and_then(|suffix| suffix.parse::<u32>().ok())?;

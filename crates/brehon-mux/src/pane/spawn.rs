@@ -312,13 +312,13 @@ fn build_gateway_metadata_env(
             "BREHON_ROOT".to_string(),
             root.to_string_lossy().to_string(),
         ));
-        if root.file_name().and_then(|name| name.to_str()) == Some(".brehon") {
-            if let Some(project_root) = root.parent().filter(|path| !path.as_os_str().is_empty()) {
-                env.push((
-                    "BREHON_PROJECT_ROOT".to_string(),
-                    project_root.to_string_lossy().to_string(),
-                ));
-            }
+        if root.file_name().and_then(|name| name.to_str()) == Some(".brehon")
+            && let Some(project_root) = root.parent().filter(|path| !path.as_os_str().is_empty())
+        {
+            env.push((
+                "BREHON_PROJECT_ROOT".to_string(),
+                project_root.to_string_lossy().to_string(),
+            ));
         }
     }
     env.push((
@@ -449,6 +449,7 @@ impl Pane {
         self.pty_spawn_config = Some(config);
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn pty_pane_from_config(
         name: &str,
         kind: PaneKind,
@@ -619,6 +620,7 @@ impl Pane {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn gateway_pane_from_spawn_config(
         name: &str,
         kind: PaneKind,

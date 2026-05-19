@@ -207,7 +207,7 @@ fn test_queue_lease_detects_orphaned_claim() {
         monotonic_deadline_ms: None,
     };
     queue
-        .insert(b"lease:c1", &serde_json::to_vec(&claim).unwrap())
+        .insert(b"lease:c1", serde_json::to_vec(&claim).unwrap())
         .unwrap();
     let checker = StoreSearchChecker::new(&brehon_root);
     let findings = checker.check_queue_lease_consistency(&queue).unwrap();

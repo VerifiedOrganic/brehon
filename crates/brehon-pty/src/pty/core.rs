@@ -837,27 +837,26 @@ impl SyncOutputFilter {
             let remaining = bytes.len() - i;
 
             // Enforce safety valves before matching more markers.
-            if self.in_sync {
-                if self.buffer.len() > MAX_SYNC_BUFFER_BYTES
+            if self.in_sync
+                && (self.buffer.len() > MAX_SYNC_BUFFER_BYTES
                     || self
                         .sync_started_at
                         .map(|start| start.elapsed() > MAX_SYNC_DURATION)
-                        .unwrap_or(false)
-                {
-                    tracing::warn!(
-                        buffered = self.buffer.len(),
-                        elapsed_ms = self
-                            .sync_started_at
-                            .map(|s| s.elapsed().as_millis())
-                            .unwrap_or(0),
-                        "Synchronized-output block exceeded safety limits; flushing early"
-                    );
-                    if !self.buffer.is_empty() {
-                        frames.push(std::mem::take(&mut self.buffer));
-                    }
-                    self.in_sync = false;
-                    self.sync_started_at = None;
+                        .unwrap_or(false))
+            {
+                tracing::warn!(
+                    buffered = self.buffer.len(),
+                    elapsed_ms = self
+                        .sync_started_at
+                        .map(|s| s.elapsed().as_millis())
+                        .unwrap_or(0),
+                    "Synchronized-output block exceeded safety limits; flushing early"
+                );
+                if !self.buffer.is_empty() {
+                    frames.push(std::mem::take(&mut self.buffer));
                 }
+                self.in_sync = false;
+                self.sync_started_at = None;
             }
 
             // Try to match a sync-begin marker.

@@ -363,7 +363,7 @@ fn test_ink_echo_detection_15_concurrent_panes() {
     // independently and verify each detects its own echo without
     // interfering with others.
     let mut panes: Vec<Pane> = (0..15)
-        .map(|i| Pane::director(&format!("worker-{i}"), 24, 80).expect("create pane"))
+        .map(|i| Pane::director(format!("worker-{i}"), 24, 80).expect("create pane"))
         .collect();
     let deadline = Instant::now() + Duration::from_secs(10);
 

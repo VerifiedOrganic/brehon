@@ -16,4 +16,7 @@ pub enum ExtractMode {
 
 #[cfg(test)]
 #[path = "tests.rs"]
+// Tests use a `std::sync::Mutex` env-serialization guard held across `.await`
+// to keep parallel tests from racing on env vars.
+#[allow(clippy::await_holding_lock)]
 mod tests;

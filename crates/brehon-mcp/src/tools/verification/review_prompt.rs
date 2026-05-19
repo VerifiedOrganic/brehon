@@ -135,12 +135,10 @@ pub(crate) fn build_review_request_prompt(input: &ReviewRequestPromptInput<'_>) 
     if let Some(proof) = proof_summary {
         out.push_str("\nRecorded proof of work so far:\n");
         out.push_str(&indent_block(&proof.render_text(), "  "));
-        if !proof.absent {
-            if !proof.missing.is_empty() {
-                out.push_str("\nMissing or incomplete evidence reported by the proof bundle:\n");
-                for note in &proof.missing {
-                    out.push_str(&format!("- {note}\n"));
-                }
+        if !proof.absent && !proof.missing.is_empty() {
+            out.push_str("\nMissing or incomplete evidence reported by the proof bundle:\n");
+            for note in &proof.missing {
+                out.push_str(&format!("- {note}\n"));
             }
         }
         out.push_str(

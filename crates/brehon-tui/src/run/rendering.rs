@@ -656,24 +656,6 @@ fn activity_visible_range(
     (start, end)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::activity_visible_range;
-
-    #[test]
-    fn activity_visible_range_scrolls_expanded_structured_content() {
-        assert_eq!(activity_visible_range(120, 20, 0), (100, 120));
-        assert_eq!(activity_visible_range(120, 20, 30), (70, 90));
-        assert_eq!(activity_visible_range(120, 20, usize::MAX), (0, 20));
-    }
-
-    #[test]
-    fn activity_visible_range_handles_short_or_empty_viewports() {
-        assert_eq!(activity_visible_range(5, 20, 10), (0, 5));
-        assert_eq!(activity_visible_range(5, 0, 10), (0, 0));
-    }
-}
-
 pub(crate) fn format_duration(duration: std::time::Duration) -> String {
     let millis = duration.as_millis();
     if millis < 1000 {
@@ -722,7 +704,7 @@ fn render_structured_pane_with_padding(
     right_label_padding: usize,
     expanded_activity_rows: &HashSet<(String, String)>,
     structured_scroll_offset: Option<usize>,
-    mut activity_click_regions: Option<&mut Vec<ClickRegion>>,
+    activity_click_regions: Option<&mut Vec<ClickRegion>>,
 ) {
     let footer_text = pane_footer_text(pane, Some(activity_buffer));
     let inner = render_pane_panel(
@@ -1083,7 +1065,7 @@ fn render_structured_pane_with_padding(
         structured_scroll_offset.unwrap_or_else(|| pane.display_scroll_offset() as usize);
     let (start, end) = activity_visible_range(total_lines, inner_height, scroll_back);
 
-    if let Some(regions) = activity_click_regions.as_deref_mut() {
+    if let Some(regions) = activity_click_regions {
         for (visible_row, line) in lines[start..end].iter().enumerate() {
             if let Some(key) = line.key.as_ref() {
                 regions.push(ClickRegion {
@@ -1149,7 +1131,7 @@ pub(crate) fn render_pane_in_area_with_activity_regions(
     structured_mode: bool,
     expanded_activity_rows: &HashSet<(String, String)>,
     structured_scroll_offset: Option<usize>,
-    mut activity_click_regions: Option<&mut Vec<ClickRegion>>,
+    activity_click_regions: Option<&mut Vec<ClickRegion>>,
 ) -> Option<Rect> {
     if let Some(pane) = mux.get(pane_id) {
         let is_gateway = pane.is_gateway_backed();
@@ -1177,7 +1159,7 @@ pub(crate) fn render_pane_in_area_with_activity_regions(
                     reset_padding,
                     expanded_activity_rows,
                     structured_scroll_offset,
-                    activity_click_regions.as_deref_mut(),
+                    activity_click_regions,
                 );
             } else {
                 let footer_text = pane_footer_text(pane, None);
@@ -1289,9 +1271,7 @@ pub(crate) fn render_host_owned_pane_in_area(
     focused: bool,
     runtime_status: Option<&RuntimeDaemonDashboardStatus>,
 ) -> Option<Rect> {
-    let Some(pane) = mux.get(pane_id) else {
-        return None;
-    };
+    let pane = mux.get(pane_id)?;
 
     let can_manual_reset = match pane.kind() {
         PaneKind::Worker => true,
@@ -1628,4 +1608,22 @@ pub(crate) fn render_status_bar(
     ]);
     let status = Line::from(spans);
     frame.render_widget(Paragraph::new(status).style(Style::default().bg(BG)), area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::activity_visible_range;
+
+    #[test]
+    fn activity_visible_range_scrolls_expanded_structured_content() {
+        assert_eq!(activity_visible_range(120, 20, 0), (100, 120));
+        assert_eq!(activity_visible_range(120, 20, 30), (70, 90));
+        assert_eq!(activity_visible_range(120, 20, usize::MAX), (0, 20));
+    }
+
+    #[test]
+    fn activity_visible_range_handles_short_or_empty_viewports() {
+        assert_eq!(activity_visible_range(5, 20, 10), (0, 5));
+        assert_eq!(activity_visible_range(5, 0, 10), (0, 0));
+    }
 }

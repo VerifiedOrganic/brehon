@@ -184,8 +184,7 @@ impl TeamsPaths {
     /// Path to a specific member inbox file for this session.
     pub(crate) fn inbox_for(&self, member_name: &str) -> anyhow::Result<PathBuf> {
         anyhow::ensure!(
-            !member_name.is_empty()
-                && !member_name.contains(|c: char| c == '/' || c == '\\' || c == '\0'),
+            !member_name.is_empty() && !member_name.contains(['/', '\\', '\0']),
             "member name must be a simple file stem, got: {member_name}"
         );
         Ok(self.inboxes_dir().join(format!("{member_name}.json")))
@@ -571,18 +570,17 @@ impl TeamsManager {
     }
 
     fn resolve_member_name(&self, name: &str) -> String {
-        if let Ok(direct_inbox) = self.paths.inbox_for(name) {
-            if direct_inbox.exists() {
-                return name.to_string();
-            }
+        if let Ok(direct_inbox) = self.paths.inbox_for(name)
+            && direct_inbox.exists()
+        {
+            return name.to_string();
         }
 
-        if let Some(alias) = normalized_member_alias(name) {
-            if let Ok(alias_inbox) = self.paths.inbox_for(alias) {
-                if alias_inbox.exists() {
-                    return alias.to_string();
-                }
-            }
+        if let Some(alias) = normalized_member_alias(name)
+            && let Ok(alias_inbox) = self.paths.inbox_for(alias)
+            && alias_inbox.exists()
+        {
+            return alias.to_string();
         }
 
         let agent_id = self.agent_id_for(name);

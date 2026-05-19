@@ -1596,9 +1596,9 @@ pub async fn execute(
     let is_claude = |a: &brehon_mux::AgentAdapter| a.as_builtin() == Some(SupervisorCli::Claude);
 
     let has_claude_agents = is_claude(&supervisor_adapter)
-        || worker_cli_map.values().any(|a| is_claude(a))
-        || reviewer_cli_map.values().any(|a| is_claude(a))
-        || advisor_cli_map.values().any(|a| is_claude(a));
+        || worker_cli_map.values().any(&is_claude)
+        || reviewer_cli_map.values().any(&is_claude)
+        || advisor_cli_map.values().any(&is_claude);
 
     let mut teams_configs = std::collections::HashMap::new();
     let teams_lead_session_id = uuid::Uuid::new_v4().to_string();
@@ -1609,11 +1609,7 @@ pub async fn execute(
         // Claude Code workers
         let mut claude_idx = 0usize;
         for name in &worker_names {
-            if worker_cli_map
-                .get(name)
-                .map(|a| is_claude(a))
-                .unwrap_or(false)
-            {
+            if worker_cli_map.get(name).map(&is_claude).unwrap_or(false) {
                 teams_configs.insert(
                     name.clone(),
                     teams_mgr.spawn_config_for(
@@ -1644,11 +1640,7 @@ pub async fn execute(
 
         // Claude Code reviewers
         for name in &reviewer_names {
-            if reviewer_cli_map
-                .get(name)
-                .map(|a| is_claude(a))
-                .unwrap_or(false)
-            {
+            if reviewer_cli_map.get(name).map(&is_claude).unwrap_or(false) {
                 teams_configs.insert(
                     name.clone(),
                     teams_mgr.spawn_config_for(
@@ -1665,11 +1657,7 @@ pub async fn execute(
 
         // Claude Code advisors
         for name in &advisor_names {
-            if advisor_cli_map
-                .get(name)
-                .map(|a| is_claude(a))
-                .unwrap_or(false)
-            {
+            if advisor_cli_map.get(name).map(&is_claude).unwrap_or(false) {
                 teams_configs.insert(
                     name.clone(),
                     teams_mgr.spawn_config_for(
@@ -2165,9 +2153,10 @@ pub async fn execute(
                 }
             }
             None => {
-                splash.record(format!(
+                splash.record(
                     "terminal-host preview ignored because runtime.terminal_host.kind is embedded"
-                ));
+                        .to_string(),
+                );
                 None
             }
         };
@@ -2909,7 +2898,6 @@ mod tests {
             kind: Some(brehon_types::RuntimeTerminalHostKind::Headless),
             preview_pane: Some(true),
             pane_ownership: Some(brehon_types::RuntimeTerminalHostPaneOwnership::Mux),
-            ..Default::default()
         };
 
         assert!(!eager_gateway_bootstrap_enabled_from_parts(
@@ -2933,7 +2921,6 @@ mod tests {
             kind: Some(brehon_types::RuntimeTerminalHostKind::Headless),
             preview_pane: Some(true),
             pane_ownership: Some(brehon_types::RuntimeTerminalHostPaneOwnership::Host),
-            ..Default::default()
         };
         assert!(eager_gateway_bootstrap_enabled_from_parts(
             &host_owned,

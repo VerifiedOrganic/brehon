@@ -243,10 +243,7 @@ impl FjallEventStore {
     fn load_high_water_mark(events: &PartitionHandle) -> Result<u64, StoreError> {
         let last_log_entry = events
             .prefix(b"log:")
-            // log_key() formats keys as log:{:020}, so lexicographic key order
-            // matches numeric order and rev().next() returns the max durable seq.
-            .rev()
-            .next()
+            .next_back()
             .transpose()
             .map_err(|e| StoreError::Storage(e.to_string()))?;
 
@@ -816,9 +813,9 @@ impl EventStore for FjallEventStore {
     async fn expire_idempotency_keys(&self, older_than: Duration) -> Result<usize, PortError> {
         let cutoff = chrono::Utc::now()
             .checked_sub_signed(
-                chrono::Duration::from_std(older_than).unwrap_or_else(|_| chrono::Duration::MAX),
+                chrono::Duration::from_std(older_than).unwrap_or(chrono::Duration::MAX),
             )
-            .unwrap_or_else(|| chrono::DateTime::<chrono::Utc>::MIN_UTC);
+            .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC);
 
         let mut removed = 0usize;
         let prefix = b"meta:idempotency:";
@@ -921,7 +918,7 @@ mod tests {
             .inner
             .meta
             .insert(
-                &idempotency_key("replay:event"),
+                idempotency_key("replay:event"),
                 existing_id.as_u64().to_be_bytes(),
             )
             .unwrap();
@@ -1125,7 +1122,7 @@ mod tests {
             .queue
             .insert(
                 lease_key.as_bytes(),
-                &serde_json::to_vec(&persisted).unwrap(),
+                serde_json::to_vec(&persisted).unwrap(),
             )
             .unwrap();
         initial_store.persist().unwrap();
@@ -1693,13 +1690,13 @@ mod tests {
                 .inner
                 .view_manager
                 .views
-                .insert(&task_view_key("T-rebuild"), b"{not-json")
+                .insert(task_view_key("T-rebuild"), b"{not-json")
                 .unwrap();
             store
                 .inner
                 .view_manager
                 .views
-                .insert(&review_view_key("R-rebuild"), b"{not-json")
+                .insert(review_view_key("R-rebuild"), b"{not-json")
                 .unwrap();
             store.persist().unwrap();
         }
@@ -1785,13 +1782,13 @@ mod tests {
                 .inner
                 .view_manager
                 .views
-                .insert(&task_view_key("T-rejected"), b"{not-json")
+                .insert(task_view_key("T-rejected"), b"{not-json")
                 .unwrap();
             store
                 .inner
                 .view_manager
                 .views
-                .insert(&review_view_key("R-rejected"), b"{not-json")
+                .insert(review_view_key("R-rejected"), b"{not-json")
                 .unwrap();
             store.persist().unwrap();
         }
@@ -1861,13 +1858,13 @@ mod tests {
                 .inner
                 .view_manager
                 .views
-                .insert(&task_view_key("T-changes"), b"{not-json")
+                .insert(task_view_key("T-changes"), b"{not-json")
                 .unwrap();
             store
                 .inner
                 .view_manager
                 .views
-                .insert(&review_view_key("R-changes"), b"{not-json")
+                .insert(review_view_key("R-changes"), b"{not-json")
                 .unwrap();
             store.persist().unwrap();
         }
@@ -2516,7 +2513,7 @@ mod tests {
         assert!(store
             .inner
             .meta
-            .get(&idempotency_key("idem-1"))
+            .get(idempotency_key("idem-1"))
             .unwrap()
             .is_some());
 
@@ -2529,7 +2526,7 @@ mod tests {
         assert!(store
             .inner
             .meta
-            .get(&idempotency_key("idem-1"))
+            .get(idempotency_key("idem-1"))
             .unwrap()
             .is_none());
     }

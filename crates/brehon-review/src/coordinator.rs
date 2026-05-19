@@ -337,7 +337,7 @@ impl ReviewCoordinator {
             }
         }
 
-        completed_indices.sort_by(|a, b| b.0.cmp(&a.0));
+        completed_indices.sort_by_key(|entry| std::cmp::Reverse(entry.0));
         completed_indices.dedup();
 
         for (idx, approved) in completed_indices.into_iter() {

@@ -154,7 +154,7 @@ fn filter_commits_that_become_empty_when_replayed(
         return commits.to_vec();
     }
 
-    sweep_stale_preflight_worktrees(&repo_root, &preflight_base, task_id);
+    sweep_stale_preflight_worktrees(repo_root, &preflight_base, task_id);
     let temp_worktree = preflight_base.join(format!(
         "{}-resolve-{}",
         task_id,

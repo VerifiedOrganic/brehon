@@ -43,7 +43,7 @@
 //! # Memory ownership
 //!
 //! Functions that return variable-length data from the C library (e.g.
-//! `dump_viewport`, `row_cell_styles`) use the [`GhosttyBytes`] RAII type in
+//! `dump_viewport`, `row_cell_styles`) use the [`GhosttyBytes`](ghostty_vt_sys::GhosttyBytes) RAII type in
 //! the low-level `ghostty_vt_sys` crate. The high-level wrapper copies data
 //! into Rust-owned `String`/`Vec` values before returning, so callers do not
 //! need to manage C-allocated memory.

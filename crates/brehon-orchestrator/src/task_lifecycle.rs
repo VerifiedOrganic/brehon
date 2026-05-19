@@ -1,7 +1,7 @@
 //! Task lifecycle state machine.
 //!
 //! Valid transitions:
-//! - [*] → Pending (task created)
+//! - \[*\] → Pending (task created)
 //! - Pending → Assigned (supervisor assigns)
 //! - Assigned → InProgress (worker starts)
 //! - InProgress → InReview (worker marks complete)
@@ -9,7 +9,7 @@
 //! - ChangesRequested → InProgress (worker iterates)
 //! - InReview → Approved (score threshold met)
 //! - Approved → Merged (supervisor merges to main)
-//! - Merged → [*] (terminal)
+//! - Merged → \[*\] (terminal)
 //! - InProgress → Blocked (dependency unmet / stuck)
 //! - Blocked → Pending (dependency resolved)
 //! - InProgress → Pending (worker dies / reassigned)

@@ -628,7 +628,7 @@ mod tests {
             let value = serde_json::to_value(kind).unwrap();
             let back: FeedbackOutcomeKind = serde_json::from_value(value).unwrap();
             assert_eq!(*kind, back);
-            assert_eq!(kind.as_str().len() > 0, true);
+            assert!(!kind.as_str().is_empty());
         }
     }
 

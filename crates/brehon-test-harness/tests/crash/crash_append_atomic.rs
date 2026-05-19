@@ -153,10 +153,7 @@ async fn crash_tearing_detects_partial_commit() {
 
     // Events 2 and 3 were discarded
     assert_eq!(discarded.len(), 2, "2 unflushed events should be discarded");
-    assert!(
-        discarded.iter().any(|id| *id == id2),
-        "id2 should be in discarded set"
-    );
+    assert!(discarded.contains(&id2), "id2 should be in discarded set");
 
     // The batch is detected as torn (partial commit visible)
     let is_torn = detect_torn_batch(&store, task_id, 3).await;

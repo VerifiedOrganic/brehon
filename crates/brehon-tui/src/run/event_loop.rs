@@ -97,6 +97,12 @@ use super::types::{
     STALE_ACTIVE_TOOL_THRESHOLD,
 };
 
+pub(crate) type PendingRuntimeApprovalResolution = tokio::task::JoinHandle<(
+    String,
+    bool,
+    Result<brehon_types::RuntimeCommandResult, brehon_ports::PortError>,
+)>;
+
 pub(crate) struct EventLoopCtx {
     pub shutdown: Arc<AtomicBool>,
     pub mux: Mux,
@@ -197,13 +203,7 @@ pub(crate) struct EventLoopCtx {
     pub pending_queued_gateway_prompt_deliveries: Vec<AsyncQueuedGatewayPromptDeliveryTask>,
     pub pending_runtime_commands: Vec<PendingRuntimeCommandTask>,
     pub recent_runtime_commands: Vec<RuntimeCommandActivity>,
-    pub pending_runtime_approval_resolutions: Vec<
-        tokio::task::JoinHandle<(
-            String,
-            bool,
-            Result<brehon_types::RuntimeCommandResult, brehon_ports::PortError>,
-        )>,
-    >,
+    pub pending_runtime_approval_resolutions: Vec<PendingRuntimeApprovalResolution>,
     pub entry_chrome_fade_complete: bool,
 
     pub needs_redraw: bool,
@@ -319,9 +319,7 @@ fn perform_manual_reset_request(ctx: &mut EventLoopCtx, pane_id: &str) -> bool {
 }
 
 fn manual_reset_plan(ctx: &EventLoopCtx, pane_id: &str) -> Option<(Option<String>, String)> {
-    let Some(pane) = ctx.mux.get(pane_id) else {
-        return None;
-    };
+    let pane = ctx.mux.get(pane_id)?;
 
     match pane.kind() {
         PaneKind::Worker => {
@@ -2063,7 +2061,7 @@ fn drain_pending_input(
                     forward_buf.extend_from_slice(&bytes);
                 }
             }
-            Event::Mouse(mouse) => {
+            Event::Mouse(mouse)
                 if !handle_composer_mouse_event(mouse, &mut ctx.input_mode)
                     && !handle_keybind_overlay_mouse_event(mouse, &mut ctx.input_mode)
                     && !handle_task_detail_mouse_event(
@@ -2071,49 +2069,48 @@ fn drain_pending_input(
                         &mut ctx.task_detail,
                         &mut ctx.selection,
                         &mut ctx.pending_down,
-                    )
-                {
-                    let regions_stale = handle_mouse_input(
-                        mouse,
-                        &ctx.click_regions,
-                        &mut ctx.mux,
-                        &mut ctx.group_tab,
-                        &mut ctx.selected_worker,
-                        &mut ctx.selected_panel,
-                        &mut ctx.selected_member,
-                        &ctx.worker_ids,
-                        &ctx.all_reviewer_ids,
-                        &ctx.panels,
-                        &ctx.supervisor_id,
-                        active_left_id,
-                        &mut ctx.expanded_epics,
-                        &mut ctx.expanded_activity_rows,
-                        ctx.left_pane_area,
-                        ctx.supervisor_pane_area,
-                        &mut ctx.selection,
-                        &mut ctx.pending_down,
-                        &mut ctx.task_detail,
-                        &mut ctx.advisor_room_view,
-                        &mut ctx.research_room_view,
-                        &mut ctx.dashboard_agent_list,
-                        &mut ctx.dashboard_task_list,
-                        &ctx.structured_mode,
-                        &mut ctx.structured_scroll_offsets,
-                        ctx.runtime_agent_factory_host_owned,
-                        &mut external_terminal_tab_request,
-                        &mut manual_reset_request,
-                        &mut runtime_approval_request,
-                    );
-                    if regions_stale {
-                        ctx.click_regions.clear();
-                    }
-                    capture_reviewer_selection_state(
-                        &ctx.panels,
-                        ctx.selected_panel,
-                        &ctx.selected_member,
-                        &mut ctx.reviewer_selection,
-                    );
+                    ) =>
+            {
+                let regions_stale = handle_mouse_input(
+                    mouse,
+                    &ctx.click_regions,
+                    &mut ctx.mux,
+                    &mut ctx.group_tab,
+                    &mut ctx.selected_worker,
+                    &mut ctx.selected_panel,
+                    &mut ctx.selected_member,
+                    &ctx.worker_ids,
+                    &ctx.all_reviewer_ids,
+                    &ctx.panels,
+                    &ctx.supervisor_id,
+                    active_left_id,
+                    &mut ctx.expanded_epics,
+                    &mut ctx.expanded_activity_rows,
+                    ctx.left_pane_area,
+                    ctx.supervisor_pane_area,
+                    &mut ctx.selection,
+                    &mut ctx.pending_down,
+                    &mut ctx.task_detail,
+                    &mut ctx.advisor_room_view,
+                    &mut ctx.research_room_view,
+                    &mut ctx.dashboard_agent_list,
+                    &mut ctx.dashboard_task_list,
+                    &ctx.structured_mode,
+                    &mut ctx.structured_scroll_offsets,
+                    ctx.runtime_agent_factory_host_owned,
+                    &mut external_terminal_tab_request,
+                    &mut manual_reset_request,
+                    &mut runtime_approval_request,
+                );
+                if regions_stale {
+                    ctx.click_regions.clear();
                 }
+                capture_reviewer_selection_state(
+                    &ctx.panels,
+                    ctx.selected_panel,
+                    &ctx.selected_member,
+                    &mut ctx.reviewer_selection,
+                );
             }
             Event::Paste(text) => {
                 if handle_composer_paste(&text, &mut ctx.input_mode) {

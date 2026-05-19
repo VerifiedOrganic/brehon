@@ -62,7 +62,7 @@ impl StoreSearchChecker {
         queue: &PartitionHandle,
     ) -> Result<Vec<DiagnosticFinding>, anyhow::Error> {
         let mut findings = Vec::new();
-        let state = scan_queue_state(&queue)?;
+        let state = scan_queue_state(queue)?;
 
         for malformed in &state.malformed_claimed_values {
             findings.push(
@@ -264,8 +264,8 @@ impl StoreSearchChecker {
         views: &PartitionHandle,
     ) -> Result<Vec<DiagnosticFinding>, anyhow::Error> {
         let mut findings = Vec::new();
-        let (expected_tasks, expected_reviews) = rebuild_views_from_events(&events)?;
-        let (stored_tasks, stored_reviews) = load_persisted_views(&views)?;
+        let (expected_tasks, expected_reviews) = rebuild_views_from_events(events)?;
+        let (stored_tasks, stored_reviews) = load_persisted_views(views)?;
 
         let mut task_ids = BTreeSet::new();
         task_ids.extend(expected_tasks.keys().cloned());
@@ -634,9 +634,7 @@ fn parse_queue_key(key: &str) -> Option<String> {
     let rest = &key["queue:".len()..];
     let delimiter = rest.rfind(':')?;
     let queue_name = &rest[..delimiter];
-    if rest[delimiter + 1..].parse::<u64>().ok().is_none() {
-        return None;
-    }
+    rest[delimiter + 1..].parse::<u64>().ok()?;
     Some(queue_name.to_string())
 }
 
@@ -868,9 +866,9 @@ fn review_views_equivalent(expected: &ReviewView, observed: &ReviewView) -> bool
         && expected.panel == observed.panel
 }
 
-fn rebuild_views_from_events(
-    events: &PartitionHandle,
-) -> Result<(HashMap<String, TaskView>, HashMap<String, ReviewView>), anyhow::Error> {
+type ViewMaps = (HashMap<String, TaskView>, HashMap<String, ReviewView>);
+
+fn rebuild_views_from_events(events: &PartitionHandle) -> Result<ViewMaps, anyhow::Error> {
     let mut state = RebuildViewsState::default();
 
     let iter = events.iter();
@@ -885,9 +883,7 @@ fn rebuild_views_from_events(
     Ok((state.task_views, state.review_views))
 }
 
-fn load_persisted_views(
-    views: &PartitionHandle,
-) -> Result<(HashMap<String, TaskView>, HashMap<String, ReviewView>), anyhow::Error> {
+fn load_persisted_views(views: &PartitionHandle) -> Result<ViewMaps, anyhow::Error> {
     let mut task_views = HashMap::new();
     let mut review_views = HashMap::new();
 

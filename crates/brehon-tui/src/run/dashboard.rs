@@ -291,8 +291,7 @@ pub(crate) fn render_dashboard(
     let max_agents_height = inner
         .height
         .saturating_sub(13 + runtime_height)
-        .max(6)
-        .min(12);
+        .clamp(6, 12);
     let agents_height = desired_agents_height.min(max_agents_height).max(6);
     let mut regions = Vec::new();
 
@@ -1696,7 +1695,7 @@ impl RuntimeRegistryColumns {
     fn new(total: usize) -> Self {
         let total = total.max(20);
         let content = total.saturating_sub(2);
-        let pane = content.saturating_sub(55).max(20).min(34);
+        let pane = content.saturating_sub(55).clamp(20, 34);
         let generation = 5;
         let kind = 10;
         let state = 8;

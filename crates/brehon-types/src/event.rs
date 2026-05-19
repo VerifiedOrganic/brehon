@@ -626,7 +626,7 @@ pub fn deserialize_event_envelope(bytes: &[u8]) -> Result<EventEnvelope, serde_j
         }
         Ok(wrapped.envelope)
     } else {
-        serde_json::from_value(payload).map_err(serde_json::Error::from)
+        serde_json::from_value(payload)
     }
 }
 /// Filter for querying events.

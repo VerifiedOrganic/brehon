@@ -481,10 +481,8 @@ fn resolve_task_record(task_id: Option<&str>) -> Option<serde_json::Map<String, 
             .collect::<Vec<_>>();
         if !assigned.is_empty() {
             assigned.sort_by(|left, right| {
-                let left_updated =
-                    read_string_field(left, "updated_at").unwrap_or_else(String::new);
-                let right_updated =
-                    read_string_field(right, "updated_at").unwrap_or_else(String::new);
+                let left_updated = read_string_field(left, "updated_at").unwrap_or_default();
+                let right_updated = read_string_field(right, "updated_at").unwrap_or_default();
                 right_updated.cmp(&left_updated).then_with(|| {
                     read_string_field(left, "task_id").cmp(&read_string_field(right, "task_id"))
                 })
@@ -497,8 +495,8 @@ fn resolve_task_record(task_id: Option<&str>) -> Option<serde_json::Map<String, 
 
     let mut tasks = tasks;
     tasks.sort_by(|left, right| {
-        let left_updated = read_string_field(left, "updated_at").unwrap_or_else(String::new);
-        let right_updated = read_string_field(right, "updated_at").unwrap_or_else(String::new);
+        let left_updated = read_string_field(left, "updated_at").unwrap_or_default();
+        let right_updated = read_string_field(right, "updated_at").unwrap_or_default();
         right_updated.cmp(&left_updated).then_with(|| {
             read_string_field(left, "task_id").cmp(&read_string_field(right, "task_id"))
         })
@@ -721,7 +719,7 @@ async fn resolve_active_run_summary(
     match store.runs_for_task(&TaskId::new(task_id)).await {
         Ok(mut runs) => {
             runs.retain(RunRecord::is_active);
-            runs.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+            runs.sort_by_key(|r| std::cmp::Reverse(r.updated_at));
             runs.into_iter().next().map(run_summary)
         }
         Err(err) => {
@@ -855,8 +853,8 @@ fn list_runtime_tasks(
     }
 
     tasks.sort_by(|left, right| {
-        let left_updated = read_string_field(left, "updated_at").unwrap_or_else(String::new);
-        let right_updated = read_string_field(right, "updated_at").unwrap_or_else(String::new);
+        let left_updated = read_string_field(left, "updated_at").unwrap_or_default();
+        let right_updated = read_string_field(right, "updated_at").unwrap_or_default();
         right_updated.cmp(&left_updated).then_with(|| {
             read_string_field(left, "task_id").cmp(&read_string_field(right, "task_id"))
         })

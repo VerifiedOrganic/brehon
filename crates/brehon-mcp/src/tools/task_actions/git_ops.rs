@@ -646,8 +646,8 @@ pub(super) fn tree_matches_after(wt: &Path, sha: &str, branch: &str) -> Result<b
     let mut exact_match = true;
     let mut content_present = true;
     for file in &expected_files {
-        let expected = blob_bytes_at(wt, sha, &file)?;
-        let actual = blob_bytes_at(wt, branch, &file)?;
+        let expected = blob_bytes_at(wt, sha, file)?;
+        let actual = blob_bytes_at(wt, branch, file)?;
         if expected != actual {
             exact_match = false;
             content_present &= match (expected.as_deref(), actual.as_deref()) {

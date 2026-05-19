@@ -1,6 +1,6 @@
 //! GitHub Copilot CLI adapter for Brehon.
 //!
-//! This crate implements the [`AgentAdapter`] trait for the GitHub Copilot CLI,
+//! This crate implements the [`AgentAdapter`](brehon_adapter_sdk::AgentAdapter) trait for the GitHub Copilot CLI,
 //! enabling Brehon to spawn Copilot sessions, send prompts, and receive events
 //! through the standard adapter SDK interface. Copilot communicates via ACP
 //! (Agent Client Protocol) over stdio.

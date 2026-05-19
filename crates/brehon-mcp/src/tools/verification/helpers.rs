@@ -155,7 +155,7 @@ fn is_process_alive(pid: u32) -> bool {
         // all Unix platforms (macOS uses __error, Linux uses __errno_location).
         // ESRCH means the process does not exist; any other error (e.g. EPERM)
         // means the process *does* exist, so conservatively treat it as alive.
-        std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH as i32)
+        std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
     }
 }
 

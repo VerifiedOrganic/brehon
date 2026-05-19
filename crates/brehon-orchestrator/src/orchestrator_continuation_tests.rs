@@ -192,8 +192,10 @@ fn continuation_orchestrator(
     gateway: Arc<MockGateway>,
     max_turns_per_run: u32,
 ) -> Orchestrator {
-    let mut config = OrchestratorConfig::default();
-    config.worktree_isolation = false;
+    let mut config = OrchestratorConfig {
+        worktree_isolation: false,
+        ..OrchestratorConfig::default()
+    };
     config.continuation_policy.idle_prompt_after_secs = 1;
     config.continuation_policy.max_turns_per_run = max_turns_per_run;
 

@@ -901,7 +901,7 @@ fn launcher_invokes_builtin_supervisor(launcher: &brehon_types::AgentConnectionC
         | ("opencode", ["acp", "--cwd", "."])
         | ("opencode", ["serve"])
         | ("opencode", ["serve", "--pure"]) => true,
-        ("junie", args) if args.is_empty() => true,
+        ("junie", []) => true,
         ("copilot", args) if args.is_empty() || args.contains(&"--acp") => true,
         _ => false,
     }

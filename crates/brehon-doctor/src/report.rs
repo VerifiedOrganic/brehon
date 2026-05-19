@@ -62,7 +62,7 @@ impl fmt::Display for DiagnosticReport {
 
             // Sort by severity within category
             let mut sorted = category_findings.clone();
-            sorted.sort_by(|a, b| b.severity.cmp(&a.severity));
+            sorted.sort_by_key(|f| std::cmp::Reverse(f.severity));
 
             for finding in sorted {
                 Self::format_finding(f, finding)?;

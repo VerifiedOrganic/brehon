@@ -628,7 +628,7 @@ mod tests {
         persisted.expires_at = Utc::now() - chrono::Duration::hours(1);
         manager
             .queue
-            .insert(&lease_key, &serde_json::to_vec(&persisted).unwrap())
+            .insert(&lease_key, serde_json::to_vec(&persisted).unwrap())
             .unwrap();
 
         let second = manager

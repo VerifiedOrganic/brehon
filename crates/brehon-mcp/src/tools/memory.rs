@@ -626,17 +626,13 @@ pub struct GetMemoriesParams {
 /// Memory body representation requested by `get_memories`.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum MemoryRepresentation {
     /// Compact model-oriented representation.
+    #[default]
     Compact,
     /// Raw stored content.
     Raw,
-}
-
-impl Default for MemoryRepresentation {
-    fn default() -> Self {
-        Self::Compact
-    }
 }
 
 /// A fetched memory body.
@@ -931,15 +927,15 @@ impl Tool for ListMemoriesTool {
 
         let tag_filter = params.tag.as_deref().map(str::to_lowercase);
         let mut memories = load_memory_store()?.memories;
-        memories.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+        memories.sort_by_key(|m| std::cmp::Reverse(m.created_at));
 
         let memories = memories
             .into_iter()
             .filter(|memory| {
-                let tag_matches = tag_filter.as_ref().map_or(true, |filter| {
+                let tag_matches = tag_filter.as_ref().is_none_or(|filter| {
                     memory.tags.iter().any(|tag| tag.to_lowercase() == *filter)
                 });
-                let since_matches = since.map_or(true, |since| memory.created_at >= since);
+                let since_matches = since.is_none_or(|since| memory.created_at >= since);
                 tag_matches && since_matches
             })
             .take(limit)

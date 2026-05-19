@@ -907,21 +907,13 @@ pub(crate) fn handle_task_detail_mouse_event(
             }
             true
         }
-        MouseEventKind::ScrollUp => {
-            if detail.area.contains(pos) {
-                detail.scroll = detail.scroll.saturating_sub(3);
-                true
-            } else {
-                false
-            }
+        MouseEventKind::ScrollUp if detail.area.contains(pos) => {
+            detail.scroll = detail.scroll.saturating_sub(3);
+            true
         }
-        MouseEventKind::ScrollDown => {
-            if detail.area.contains(pos) {
-                detail.scroll = (detail.scroll + 3).min(detail.max_scroll);
-                true
-            } else {
-                false
-            }
+        MouseEventKind::ScrollDown if detail.area.contains(pos) => {
+            detail.scroll = (detail.scroll + 3).min(detail.max_scroll);
+            true
         }
         MouseEventKind::Up(MouseButton::Left)
         | MouseEventKind::Drag(MouseButton::Left)

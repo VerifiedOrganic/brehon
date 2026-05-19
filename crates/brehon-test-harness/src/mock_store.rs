@@ -1,7 +1,7 @@
 //! In-memory EventStore implementation for testing.
 //!
 //! This implementation models atomic claims and replayable ordering,
-//! NOT a naive Vec<Event> append.
+//! NOT a naive `Vec<Event>` append.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -33,7 +33,7 @@ struct ClaimState {
 
 /// In-memory event store with proper atomic claim semantics.
 ///
-/// This is NOT a naive Vec<Event>. It properly models:
+/// This is NOT a naive `Vec<Event>`. It properly models:
 /// - Monotonic sequence numbers
 /// - Atomic claims with durable lease semantics
 /// - Idempotent appends
@@ -579,8 +579,8 @@ impl EventStore for InMemoryEventStore {
     }
 
     async fn expire_idempotency_keys(&self, older_than: Duration) -> Result<usize, PortError> {
-        let cutoff = Utc::now()
-            - chrono::Duration::from_std(older_than).unwrap_or_else(|_| chrono::Duration::MAX);
+        let cutoff =
+            Utc::now() - chrono::Duration::from_std(older_than).unwrap_or(chrono::Duration::MAX);
         let mut inner = self.inner.write();
         let before_len = inner.idempotency_keys.len();
         let event_timestamps: std::collections::HashMap<EventId, chrono::DateTime<chrono::Utc>> =
@@ -592,7 +592,7 @@ impl EventStore for InMemoryEventStore {
         inner.idempotency_keys.retain(|_, event_id| {
             event_timestamps
                 .get(event_id)
-                .map_or(false, |ts| *ts >= cutoff)
+                .is_some_and(|ts| *ts >= cutoff)
         });
         let removed = before_len - inner.idempotency_keys.len();
         Ok(removed)

@@ -227,10 +227,11 @@ mod worker_failure_tests {
     }
 
     fn policy(max_attempts: u32, enabled: bool) -> RetryPolicyConfig {
-        let mut policy = RetryPolicyConfig::default();
-        policy.enabled = enabled;
-        policy.max_attempts = max_attempts;
-        policy
+        RetryPolicyConfig {
+            enabled,
+            max_attempts,
+            ..RetryPolicyConfig::default()
+        }
     }
 
     #[test]

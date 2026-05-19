@@ -89,7 +89,7 @@ pub(crate) fn is_safe_brehon_branch(name: &str) -> bool {
     if !trimmed.starts_with("brehon/") {
         return false;
     }
-    if PROTECTED_BRANCH_NAMES.iter().any(|p| *p == trimmed) {
+    if PROTECTED_BRANCH_NAMES.contains(&trimmed) {
         return false;
     }
     if trimmed.contains("..") || trimmed.contains(char::is_whitespace) {

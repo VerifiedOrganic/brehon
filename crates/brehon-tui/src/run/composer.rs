@@ -32,6 +32,9 @@ pub(crate) struct EnqueuedComposerMessage {
     pub prompt_id: Option<String>,
 }
 
+// `Submitted` is intentionally larger than the unit variants — this enum is
+// only produced inside the key-handler and matched immediately by the caller.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ComposerKeyAction {
     Ignored,
@@ -133,11 +136,7 @@ pub(crate) fn handle_composer_paste(text: &str, input_mode: &mut InputMode) -> b
 }
 
 pub(crate) fn handle_composer_mouse_event(_mouse: MouseEvent, input_mode: &mut InputMode) -> bool {
-    if matches!(input_mode, InputMode::Composer(_)) {
-        true
-    } else {
-        false
-    }
+    matches!(input_mode, InputMode::Composer(_))
 }
 
 pub(crate) fn render_composer(frame: &mut Frame, area: Rect, state: &mut ComposerState) {
@@ -357,7 +356,7 @@ fn composer_drawer_rect(area: Rect) -> Rect {
     }
 
     let width = ((area.width as u32 * 42) / 100) as u16;
-    let width = width.max(52).min(88).min(area.width.saturating_sub(4));
+    let width = width.clamp(52, 88).min(area.width.saturating_sub(4));
     let height = area.height.saturating_sub(4);
     let x = area.x + area.width.saturating_sub(width).saturating_sub(2);
     let y = area.y + 1;

@@ -1,6 +1,6 @@
 //! Kimi Code CLI adapter for Brehon.
 //!
-//! This crate implements the [`AgentAdapter`] trait for the Kimi CLI,
+//! This crate implements the [`AgentAdapter`](brehon_adapter_sdk::AgentAdapter) trait for the Kimi CLI,
 //! enabling Brehon to manage Kimi sessions through a structured adapter
 //! interface. It also hosts the Kimi-specific runtime configuration helpers
 //! previously in `brehon-pty`.

@@ -7,6 +7,10 @@ use brehon_mcp::tools::task_actions::TaskActionsTool;
 use brehon_mcp::tools::Tool;
 use serde_json::{json, Value};
 
+// Clap-derived subcommand enums naturally have differently-sized variants for
+// commands with many vs few options; boxing every variant just for size parity
+// would obscure the CLI structure.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, clap::Subcommand)]
 pub enum TaskCommand {
     #[command(name = "create")]
