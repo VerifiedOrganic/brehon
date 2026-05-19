@@ -22,6 +22,28 @@ A lightweight Rust supervisor watches the whole process by reading an event stor
 Tokens are only spent when human-style judgment is needed; everything else is
 free deterministic logic.
 
+## Heads up before you dive in
+
+- **This is something I built around my own workflow.** It's the fifth
+  internal rewrite of this idea. I've been running the current version 24/7
+  for weeks, and lived on earlier iterations for months before that — under
+  a different name, since I renamed the project right before open-sourcing it.
+  Long story short: it works for me, and it's been hammered on enough that
+  the obvious bugs are out. But the *shape* of it — the lane model, the
+  panel-judges-panel structure, the assumptions about how a session flows —
+  was tuned to how I work. It might be a perfect fit for you, it might be
+  ridiculous overkill, it might be subtly wrong for your style. Treat this
+  repo as a data point. I'm publishing it because the design choices might
+  be useful to look at, not because I'm claiming it's the way to do this.
+- **It can be expensive.** A panel of N reviewers means every "ready for
+  review" event triggers N independent agent calls, each of which reads the
+  diff and may pull in surrounding context. Multiply by retry rounds, multiply
+  again if your worker lane is also a paid model. A long session with three
+  reviewers and a couple of revision rounds can burn through tokens fast.
+  The `brehon-supervisor` tracks budgets and the config lets you cap rounds
+  and panel size, but the defaults are tuned for *quality of verdict*, not
+  for thrift — turn the dials down before you turn it loose on a real epic.
+
 ## What's in the box
 
 This is a 36-crate Rust workspace (~230k LOC, 1,100+ tests) implementing:

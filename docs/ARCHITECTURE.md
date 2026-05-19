@@ -7,6 +7,18 @@ you can read yourself. Decisions are recorded individually under [`adr/`](adr/).
 Audience: contributors and reviewers who need to understand the system at the
 level required to make changes, debug a stuck run, or extend an adapter.
 
+A note on provenance, because it affects how to read what follows: this is
+the fifth internal version of this system. Most of the structural choices
+here — the hexagonal seam, the append-only event store as the source of truth,
+the panel-as-a-bound-unit, the worktree-per-worker discipline, the decision
+to run everything in one process under one Tokio runtime — exist because
+earlier versions tried the opposite and failed in specific ways. Where a
+choice looks excessive, it usually isn't: it's repaying a debt from a
+prior iteration. The ADRs under [`adr/`](adr/) capture those failures one
+decision at a time. The current version has been running 24/7 on real work
+for weeks; the obvious bugs are out, but the *shape* is still opinionated
+and tuned to a specific way of working. Read accordingly.
+
 ---
 
 ## 1. One process, many components

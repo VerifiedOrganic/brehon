@@ -1,6 +1,42 @@
 # Contributing to Brehon
 
-Thank you for your interest in contributing to Brehon! This document provides guidelines and instructions for contributing.
+First, the honest framing: **Brehon is a solo project that I built around my
+own workflow and have been running on real work daily for months.** I'm happy
+people are interested enough to look at the code, and I'm open to
+contributions, but it's worth knowing what you're walking into before you
+spend time on a PR.
+
+**What's likely to land easily:**
+
+- Bug fixes with a failing test that becomes a passing test.
+- Adapter fixes, especially for Junie (which I haven't used) and for the
+  adapters I've put less mileage on. I've run every adapter except Junie
+  at some point, but my day-to-day driving tends to favor a subset, so
+  patches from people who lean on the others — with a repro — are
+  genuinely valuable.
+- Documentation corrections, typos, broken examples.
+- Targeted performance fixes with a benchmark to back them up.
+- Small, contained features that don't change the shape of the system.
+
+**What's likely to bounce, or at least get a long discussion first:**
+
+- Anything that changes the lane / panel / scoring model. Those shapes are
+  what they are because I've tried five versions of this and these are the
+  ones that survived. I'm not closed to changing them, but the bar is high
+  and the discussion comes before the code.
+- Refactors that "clean up" or restructure crates without a concrete
+  problem they're solving. The hexagonal layout is intentional and load-bearing.
+- New configuration options that exist to support a workflow other than
+  the one Brehon is built around. I'd rather keep the surface small.
+- Backwards-compatibility shims for unreleased shapes. This is pre-1.0;
+  things move.
+
+**Response times will be uneven.** I have a day job and this isn't it. If a
+PR sits for a while, it's not personal — ping the issue.
+
+If you're about to spend more than an hour on something non-trivial, open an
+issue first and let's talk about whether the change makes sense. That's not
+a gate, it's a kindness to your time.
 
 ## Code of Conduct
 
@@ -355,10 +391,13 @@ respawns the entire panel to maintain panel affinity.
 
 ### Review Process
 
-1. All PRs require at least one approval
-2. CI must pass (fmt, clippy, tests)
-3. Address all review feedback
-4. Maintainers will squash and merge
+1. CI must pass (fmt, clippy, tests). This is non-negotiable.
+2. I'll review when I can; see the note up top about response times.
+3. Expect feedback. Even good PRs usually get notes — partly taste, partly
+   because the system has invariants that aren't always obvious from the
+   diff. Treat review comments as a conversation, not a verdict.
+4. Merges are squash-and-merge with a rewritten commit message in
+   Conventional Commits form (see below).
 
 ### Review Score Thresholds
 
