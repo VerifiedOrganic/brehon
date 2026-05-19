@@ -31,6 +31,27 @@ pub enum ProcessError {
 
 static PROCESS_COUNTER: AtomicU64 = AtomicU64::new(1);
 
+#[cfg(unix)]
+fn signal_process_tree(pid: u32, signal: libc::c_int) {
+    let pid = pid as libc::pid_t;
+    // Prefer the process group created in pre_exec, but also signal the direct
+    // child. Some runners can leave the group unavailable even though the child
+    // itself is still alive.
+    let group_result = unsafe { libc::kill(-pid, signal) };
+    let group_error = (group_result != 0).then(|| std::io::Error::last_os_error().to_string());
+    let child_result = unsafe { libc::kill(pid, signal) };
+    let child_error = (child_result != 0).then(|| std::io::Error::last_os_error().to_string());
+    if group_result != 0 && child_result != 0 {
+        warn!(
+            pid,
+            signal,
+            ?group_error,
+            ?child_error,
+            "Failed to signal agent process"
+        );
+    }
+}
+
 /// Tracked spawned task handles for an agent process.
 ///
 /// Shutdown uses ownership-based semantics:
@@ -291,10 +312,7 @@ impl AgentProcess {
         if let Some(pid) = self.pid {
             #[cfg(unix)]
             {
-                let _ = std::process::Command::new("kill")
-                    .arg("-TERM")
-                    .arg(format!("-{}", pid))
-                    .status();
+                signal_process_tree(pid, libc::SIGTERM);
             }
 
             #[cfg(windows)]
@@ -321,10 +339,7 @@ impl AgentProcess {
             if let Some(pid) = self.pid {
                 #[cfg(unix)]
                 {
-                    let _ = std::process::Command::new("kill")
-                        .arg("-KILL")
-                        .arg(format!("-{}", pid))
-                        .status();
+                    signal_process_tree(pid, libc::SIGKILL);
                 }
 
                 #[cfg(windows)]

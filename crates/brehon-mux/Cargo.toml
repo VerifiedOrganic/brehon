@@ -5,6 +5,9 @@ edition = "2024"
 description = "Terminal multiplexer for Brehon factory mode"
 license = "MIT"
 
+[features]
+test-pty-fallback = []
+
 [dependencies]
 ghostty_vt = { path = "../ghostty_vt" }
 brehon-recording = { path = "../brehon-recording" }

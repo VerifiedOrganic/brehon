@@ -52,19 +52,19 @@ fn gateway_protocol_for(cli_type: &AgentAdapter) -> GatewayProtocol {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-pty-fallback"))]
 pub(crate) fn spawn_config_for_pty_spawn(config: &PtyConfig) -> PtyConfig {
     let mut config = config.clone();
     apply_test_pty_spawn_fallback(&mut config);
     config
 }
 
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "test-pty-fallback")))]
 pub(crate) fn spawn_config_for_pty_spawn(config: &PtyConfig) -> PtyConfig {
     config.clone()
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-pty-fallback"))]
 fn apply_test_pty_spawn_fallback(config: &mut PtyConfig) {
     if !is_test_pty_fallback_candidate(&config.command) || command_exists(&config.command) {
         return;
@@ -74,7 +74,7 @@ fn apply_test_pty_spawn_fallback(config: &mut PtyConfig) {
     config.args = vec!["-c".to_string(), "cat".to_string()];
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-pty-fallback"))]
 fn is_test_pty_fallback_candidate(command: &str) -> bool {
     matches!(
         command,
@@ -82,7 +82,7 @@ fn is_test_pty_fallback_candidate(command: &str) -> bool {
     )
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-pty-fallback"))]
 fn command_exists(command: &str) -> bool {
     let path = std::path::Path::new(command);
     if path.components().count() > 1 {
