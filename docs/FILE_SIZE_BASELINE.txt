@@ -21,7 +21,7 @@
 1242 crates/brehon-cli/src/ui.rs
 1446 crates/brehon-config/src/lib.rs
 2450 crates/brehon-config/src/validate.rs
-3420 crates/brehon-daemon/src/lib.rs
+3421 crates/brehon-daemon/src/lib.rs
 974 crates/brehon-doctor/src/checkers/runtime.rs
 935 crates/brehon-doctor/src/checkers/store_search.rs
 973 crates/brehon-git/src/rebase.rs

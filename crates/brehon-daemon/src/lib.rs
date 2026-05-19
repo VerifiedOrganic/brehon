@@ -1212,7 +1212,7 @@ impl RuntimeDaemon {
             return;
         }
 
-        let encoded = match serde_json::to_vec(event) {
+        let mut encoded = match serde_json::to_vec(event) {
             Ok(encoded) => encoded,
             Err(err) => {
                 self.count_audit_error().await;
@@ -1220,6 +1220,7 @@ impl RuntimeDaemon {
                 return;
             }
         };
+        encoded.push(b'\n');
 
         let mut file = match tokio::fs::OpenOptions::new()
             .create(true)
@@ -1248,12 +1249,12 @@ impl RuntimeDaemon {
             );
             return;
         }
-        if let Err(err) = file.write_all(b"\n").await {
+        if let Err(err) = file.flush().await {
             self.count_audit_error().await;
             tracing::warn!(
                 path = %path.display(),
                 error = %err,
-                "Failed to terminate runtime audit event"
+                "Failed to flush runtime audit event"
             );
         }
     }
