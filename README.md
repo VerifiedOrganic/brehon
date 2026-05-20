@@ -72,32 +72,7 @@ choice.
 
 ## How a session runs
 
-```
-                          ┌───────────────────────────────┐
-                          │      brehon-cli  (TUI)        │
-                          └──────────────┬────────────────┘
-                                         │
-        ┌────────────────────────────────┼────────────────────────────────┐
-        │                                │                                │
-┌───────▼────────┐              ┌────────▼────────┐              ┌────────▼────────┐
-│  Orchestrator  │              │   Supervisor    │              │   MCP Server    │
-│  task board +  │              │   event-store   │              │  50+ tools for  │
-│  DAG + pool    │              │   reader; AI    │              │  agents to call │
-│  reconciler    │              │   only on call  │              │                 │
-└───────┬────────┘              └────────┬────────┘              └────────┬────────┘
-        │                                │                                │
-        │      ┌─────────────────────────┴────────────────────────────────┘
-        │      │                                  ↑
-┌───────▼──────▼─────┐                  ┌─────────┴──────────┐
-│   Mux (panes)      │  PTY ◀──────────▶│  Reviewer Panel    │
-│   ghostty_vt +     │  worktree        │  brehon-review     │
-│   ratatui          │  per worker      │  scoring + gates   │
-└───────┬────────────┘                  └────────────────────┘
-        │
-   ┌────┴────┬────────┬─────────┬────────┐
-   ▼         ▼        ▼         ▼        ▼
- Claude   Codex   Gemini    Kimi    OpenCode  (and others)
-```
+![Brehon Architecture](docs/images/architecture.svg)
 
 1. `brehon run` loads config, opens the fjall event store, and reconciles any
    in-flight state from the previous session.

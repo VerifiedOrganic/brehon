@@ -47,34 +47,7 @@ only on trait definitions in `brehon-ports`; all I/O — storage, search, git,
 agent communication, terminal control, notifications — is reached through
 those traits. Adapter crates provide concrete implementations.
 
-```
-                            ┌─────────────────────┐
-                            │     brehon-cli      │
-                            │   (entry point)     │
-                            └──────────┬──────────┘
-                                       │
-            ┌──────────────────────────┼──────────────────────────┐
-            │                                                     │
-   ┌────────▼────────┐                                  ┌─────────▼─────────┐
-   │   CORE          │                                  │    ADAPTERS       │
-   │                 │   depends only on traits         │                   │
-   │  brehon-types   │ ────────────────────────────▶    │ brehon-store-fjall│
-   │  brehon-ports   │                                  │ brehon-search-    │
-   │  brehon-config  │                                  │   tantivy         │
-   │  brehon-        │                                  │ brehon-git        │
-   │   orchestrator  │                                  │ brehon-acp        │
-   │  brehon-        │                                  │ brehon-mcp        │
-   │   supervisor    │                                  │ brehon-mux        │
-   │  brehon-review  │                                  │ brehon-pty        │
-   │  brehon-detect  │                                  │ brehon-tui        │
-   │  brehon-policy  │                                  │ brehon-recording  │
-   │  brehon-runtime │                                  │ brehon-host       │
-   │  brehon-workflow│                                  │ brehon-doctor     │
-   │  brehon-protocol│                                  │ brehon-daemon     │
-   │  brehon-        │                                  │ brehon-gatekeeper │
-   │   gatekeeper    │                                  │ brehon-adapter-*  │
-   └─────────────────┘                                  └───────────────────┘
-```
+![Hexagonal Layout](images/hexagonal_layout.svg)
 
 The ports defined in `crates/brehon-ports/src/` are:
 
