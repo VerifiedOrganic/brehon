@@ -293,15 +293,13 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn shell_runner_does_not_use_login_shell_startup() {
-        use std::io::Write;
         use std::os::unix::fs::PermissionsExt;
 
         let temp = tempfile::tempdir().unwrap();
         let shell_path = temp.path().join("fake-shell");
-        let mut shell = std::fs::File::create(&shell_path).unwrap();
-        shell
-            .write_all(
-                br#"#!/bin/sh
+        std::fs::write(
+            &shell_path,
+            br#"#!/bin/sh
 if [ "$1" = "-lc" ]; then
   sleep 5
   exit 42
@@ -312,8 +310,8 @@ if [ "$1" = "-c" ]; then
 fi
 exit 43
 "#,
-            )
-            .unwrap();
+        )
+        .unwrap();
         let mut permissions = std::fs::metadata(&shell_path).unwrap().permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(&shell_path, permissions).unwrap();
