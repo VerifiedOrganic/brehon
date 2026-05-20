@@ -465,6 +465,7 @@ fn supervisor_instructions(
            using factory action=assign_workers.\n\
         7. Call task action=ready to see the current frontier. It returns both:\n\
             - `integration_conflict_tasks`: supervisor-owned integration conflicts that must be resolved or explicitly triaged before any other queue\n\
+            - `recoverable_blocked_tasks`: blocked worker handoffs that already have `latest_commit` recorded and can be moved to `review_ready` by the supervisor\n\
             - `tasks`: unassigned pending worker tasks\n\
             - `review_ready_tasks`: tasks awaiting formal `request_review`\n\
             - `changes_requested_tasks`: unassigned revision tasks that need worker reassignment\n\
@@ -472,6 +473,7 @@ fn supervisor_instructions(
             - `approved_tasks`: approved merge-flow tasks awaiting supervisor `task action=integrate`\n\
             - `followup_source_tasks`: tasks with open approved-review followups that should usually be promoted into real cleanup tasks\n\
             If `integration_conflict_tasks` is non-empty, resolve or explicitly triage those before requesting review, integrating approved work, or dispatching new worker tasks.\n\
+            If `recoverable_blocked_tasks` is non-empty, run `ready.next_action` exactly, usually `task action=update id=<task-id> status=review_ready`, then call `task action=ready` again.\n\
             If `review_ready_tasks` is non-empty, request review for those before treating the frontier as empty.\n\
             If `changes_requested_tasks` is non-empty, reassign those revision tasks to idle workers before pulling new pending work.\n\
             If `stalled_tasks` is non-empty, investigate before re-nudging — call `agent action=delivery_status prompt_id=<id>` with the prompt_id of your last message to that worker to see whether it was injected or dead-lettered, and `factory action=worker_status` to see the worker's `nudge.nudge_delivery_state` (`Delivered` → `Acknowledged` → `ActedOn` or `TimedOut`). If the nudge never acknowledged, the worker never saw it; if acknowledged but not acted on, the worker saw it and ignored it — reassign rather than re-nudging.\n\
@@ -605,6 +607,9 @@ fn supervisor_instructions(
         25a. If task action=ready reports `integration_conflict_tasks`, or task action=conflicts \
              returns any items, prioritize them before assigning new feature work. \
              Supervisor-owned integration conflicts are not ordinary worker tasks.\n\
+        25aa. If task action=ready reports `recoverable_blocked_tasks`, run the returned \
+             `next_action` exactly and call task action=ready again. Do not recycle all workers \
+             or declare the frontier blocked before this recovery action has been attempted.\n\
         25b. Integration state-machine recovery. `task action=integrate` is driven by an explicit \
              state machine (phases: null → cherry_picking → resolved → complete, plus aborted). \
              If a call returns phase=cherry_picking with conflicting_files, resolve them in the \

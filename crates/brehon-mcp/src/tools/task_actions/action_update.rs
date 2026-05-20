@@ -14,7 +14,9 @@ use crate::tools::verification::{
 };
 use crate::tools::{error_result, text_result};
 
-use super::dependencies::{parse_task_id_list_arg, write_string_list_field};
+use super::dependencies::{
+    parse_task_id_list_arg, task_has_recoverable_worker_state_blocker_text, write_string_list_field,
+};
 use super::epic::{
     apply_integration_conflict_cleanup, container_base_branch_for_parent,
     ensure_container_integration_worktree, read_parent_task, remove_container_integration_worktree,
@@ -268,6 +270,40 @@ fn caller_owns_started_pending_task(args: &Value, task: &serde_json::Map<String,
         return false;
     };
     assignee == caller_name(args, "worker") && task_has_started_worker_execution(task)
+}
+
+fn task_has_recorded_worker_handoff_commit(task: &serde_json::Map<String, Value>) -> bool {
+    task.get("latest_commit")
+        .and_then(|value| value.as_str())
+        .is_some_and(|value| !value.trim().is_empty())
+}
+
+fn supervisor_worker_state_review_recovery_allowed(
+    caller_role: &str,
+    current_status: &str,
+    normalized_target: &str,
+    task: &serde_json::Map<String, Value>,
+) -> bool {
+    caller_role == "supervisor"
+        && normalize_task_status(current_status) == Some("blocked")
+        && normalized_target == "review_ready"
+        && task_has_recoverable_worker_state_blocker_text(task)
+        && task_has_recorded_worker_handoff_commit(task)
+}
+
+fn apply_worker_state_review_recovery_cleanup(task: &mut serde_json::Map<String, Value>) {
+    task.remove("blockers");
+    task.insert(
+        "percent".into(),
+        Value::Number(serde_json::Number::from(100_u64)),
+    );
+    task.insert(
+        "activity".into(),
+        Value::String("awaiting_review".to_string()),
+    );
+    task.insert("assignee".into(), Value::Null);
+    task.insert("review_owner".into(), Value::Null);
+    task.insert("inbox_delivered".into(), Value::Bool(false));
 }
 
 pub(super) async fn execute_complete(
@@ -692,6 +728,7 @@ pub(super) async fn execute_update(
     let completion_mode = task_completion_mode_from_task(&task);
 
     // If status is being changed, enforce the state machine
+    let mut worker_state_review_recovery = false;
     let normalized_status = if let Some(new_status) = args.get("status").and_then(|v| v.as_str()) {
         let current_status = task
             .get("status")
@@ -745,7 +782,29 @@ pub(super) async fn execute_update(
             && normalize_task_status(current_status) == Some("blocked")
             && normalized == "review_ready"
             && task_has_integration_conflict_recovery_marker(&task);
-        if !integration_conflict_review_recovery {
+        worker_state_review_recovery = supervisor_worker_state_review_recovery_allowed(
+            &caller_role,
+            current_status,
+            &normalized,
+            &task,
+        );
+        if normalize_task_status(current_status) == Some("blocked")
+            && normalized == "review_ready"
+            && task_has_recoverable_worker_state_blocker_text(&task)
+            && !worker_state_review_recovery
+        {
+            if caller_role != "supervisor" {
+                return Ok(error_result(format!(
+                    "Task {id} has a recoverable blocked worker handoff, but only the supervisor may recover it. Supervisor next action: task action=update id={id} status=review_ready."
+                )));
+            }
+            if !task_has_recorded_worker_handoff_commit(&task) {
+                return Ok(error_result(format!(
+                    "Task {id} has a recoverable blocked worker handoff marker, but Brehon cannot safely move it to review_ready because latest_commit is empty. Inspect the worker pane/proof, rerun or reassign the worker to create a checkpoint commit, then call task action=ready again."
+                )));
+            }
+        }
+        if !integration_conflict_review_recovery && !worker_state_review_recovery {
             if let Err(msg) = validate_status_transition(
                 current_status,
                 new_status,
@@ -766,6 +825,15 @@ pub(super) async fn execute_update(
         if status == "review_ready" && task_has_integration_conflict_recovery_marker(&task) {
             apply_integration_conflict_cleanup(&mut task);
             updated_fields.push("integration_conflict");
+        }
+        if worker_state_review_recovery {
+            apply_worker_state_review_recovery_cleanup(&mut task);
+            updated_fields.push("blockers");
+            updated_fields.push("percent");
+            updated_fields.push("activity");
+            updated_fields.push("assignee");
+            updated_fields.push("review_owner");
+            updated_fields.push("inbox_delivered");
         }
         task.insert("status".into(), Value::String(status.clone()));
         updated_fields.push("status");

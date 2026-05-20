@@ -10,6 +10,7 @@ use crate::tools::routing::routing_summary;
 use crate::tools::verification::{find_panel_lease_by_task, read_review_state, read_round_request};
 use crate::tools::{error_result, text_result};
 
+use super::dependencies::task_has_recoverable_worker_state_blocker_text;
 use super::epic::{
     check_child_completion, check_epic_integration_status, task_has_supervisor_integration_conflict,
 };
@@ -584,6 +585,38 @@ pub(super) async fn execute_ready(args: &Value) -> Result<ToolResult, McpError> 
     let project_config =
         project_root().and_then(|root| brehon_config::load_config(Some(&root)).ok());
     let integration_conflict_tasks = supervisor_integration_conflicts_from_tasks(&all_tasks);
+    let recoverable_blocked_tasks: Vec<Value> = all_tasks
+        .iter()
+        .filter(|t| {
+            let status = t.get("status").and_then(|v| v.as_str()).unwrap_or("");
+            let task_type = t
+                .get("task_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("task");
+            let has_commit = t
+                .get("latest_commit")
+                .and_then(|v| v.as_str())
+                .is_some_and(|value| !value.trim().is_empty());
+            if task_has_supervisor_integration_conflict(t) {
+                return false;
+            }
+            if status != "blocked"
+                || task_type != "task"
+                || !has_commit
+                || !task_has_recoverable_worker_state_blocker_text(t)
+            {
+                return false;
+            }
+            if ancestor_chain_has_closed_parent(&all_tasks, t) {
+                return false;
+            }
+            if control_plane_scope_issue_for_task(t).is_some() {
+                return false;
+            }
+            true
+        })
+        .map(|task| ready_queue_task(task, project_config.as_ref()))
+        .collect();
     let tasks: Vec<Value> = all_tasks
         .iter()
         .filter(|t| {
@@ -730,6 +763,7 @@ pub(super) async fn execute_ready(args: &Value) -> Result<ToolResult, McpError> 
 
     let count = tasks.len();
     let integration_conflict_count = integration_conflict_tasks.len();
+    let recoverable_blocked_count = recoverable_blocked_tasks.len();
     let review_ready_count = review_ready_tasks.len();
     let changes_requested_count = changes_requested_tasks.len();
     let approved_count = approved_tasks.len();
@@ -739,6 +773,11 @@ pub(super) async fn execute_ready(args: &Value) -> Result<ToolResult, McpError> 
     if integration_conflict_count > 0 {
         priority_notes.push(format!(
             "{integration_conflict_count} supervisor-owned integration conflict(s) require immediate resolution"
+        ));
+    }
+    if recoverable_blocked_count > 0 {
+        priority_notes.push(format!(
+            "{recoverable_blocked_count} blocked task(s) have recoverable worker handoff state and should be moved to review_ready"
         ));
     }
     if stalled_count > 0 {
@@ -773,6 +812,17 @@ pub(super) async fn execute_ready(args: &Value) -> Result<ToolResult, McpError> 
             "tool": "task",
             "args": {
                 "action": "conflicts"
+            }
+        })
+    } else if let Some(task_id) = recoverable_blocked_tasks.first().and_then(queued_task_id) {
+        serde_json::json!({
+            "kind": "recover_blocked_review_ready",
+            "tool": "task",
+            "description": "Recover a blocked worker handoff that already has latest_commit recorded. Call this exact update, then call task action=ready again.",
+            "args": {
+                "action": "update",
+                "id": task_id,
+                "status": "review_ready"
             }
         })
     } else if let Some(task_id) = review_ready_tasks.first().and_then(queued_task_id) {
@@ -851,6 +901,8 @@ pub(super) async fn execute_ready(args: &Value) -> Result<ToolResult, McpError> 
         "count": count,
         "integration_conflict_tasks": integration_conflict_tasks,
         "integration_conflict_count": integration_conflict_count,
+        "recoverable_blocked_tasks": recoverable_blocked_tasks,
+        "recoverable_blocked_count": recoverable_blocked_count,
         "review_ready_tasks": review_ready_tasks,
         "review_ready_count": review_ready_count,
         "changes_requested_tasks": changes_requested_tasks,
@@ -868,6 +920,8 @@ pub(super) async fn execute_ready(args: &Value) -> Result<ToolResult, McpError> 
                 priority_notes.join("; "),
                 if integration_conflict_count > 0 {
                     "Resolve supervisor-owned integration conflicts before review, integration, or new assignment work."
+                } else if recoverable_blocked_count > 0 {
+                    "Recover blocked handoff tasks before declaring the frontier blocked."
                 } else {
                     "Treat these queues before declaring the frontier blocked."
                 }

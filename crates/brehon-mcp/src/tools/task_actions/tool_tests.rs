@@ -2079,11 +2079,103 @@ async fn test_blocked_without_integration_conflict_cannot_jump_to_review_ready()
 
     assert_eq!(result.is_error, Some(true));
     assert!(
-        extract_text(&result).contains("Invalid status transition"),
+        extract_text(&result).contains("latest_commit is empty"),
         "{}",
         extract_text(&result)
     );
     let after = read_test_task(root.path(), "T-manual-blocked");
+    assert_eq!(after["status"], "blocked");
+}
+
+#[tokio::test]
+async fn test_supervisor_can_recover_blocked_worker_handoff_to_review_ready() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let root = make_test_root();
+    let _env = ScopedEnv::set(&[
+        ("BREHON_ROOT", root.path().to_str().unwrap()),
+        ("BREHON_AGENT_ROLE", "supervisor"),
+    ]);
+    let tool = TaskActionsTool::new();
+
+    write_test_task(root.path(), "T-blocked-handoff", "blocked", "task");
+    let mut task = read_test_task(root.path(), "T-blocked-handoff");
+    task["latest_commit"] = Value::String("deadbeef".to_string());
+    task["percent"] = Value::Number(serde_json::Number::from(95_u64));
+    task["blockers"] = Value::String(
+        "Checkpoint succeeded, but task action=complete could not move it to review_ready: \
+         Invalid status transition: 'blocked' → 'in_progress'. Valid transitions from 'blocked': pending."
+            .to_string(),
+    );
+    std::fs::write(
+        root.path()
+            .join("runtime")
+            .join("tasks")
+            .join("T-blocked-handoff.json"),
+        serde_json::to_string_pretty(&task).unwrap(),
+    )
+    .unwrap();
+
+    let result = tool
+        .execute(serde_json::json!({
+            "action": "update",
+            "id": "T-blocked-handoff",
+            "status": "review_ready"
+        }))
+        .await
+        .unwrap();
+
+    assert!(result.is_error.is_none(), "{}", extract_text(&result));
+    let after = read_test_task(root.path(), "T-blocked-handoff");
+    assert_eq!(after["status"], "review_ready");
+    assert_eq!(after["percent"], 100);
+    assert_eq!(after["activity"], "awaiting_review");
+    assert!(after.get("blockers").is_none());
+    assert_eq!(after["assignee"], Value::Null);
+    assert_eq!(after["review_owner"], Value::Null);
+}
+
+#[tokio::test]
+async fn test_supervisor_cannot_recover_blocked_worker_handoff_without_commit() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let root = make_test_root();
+    let _env = ScopedEnv::set(&[
+        ("BREHON_ROOT", root.path().to_str().unwrap()),
+        ("BREHON_AGENT_ROLE", "supervisor"),
+    ]);
+    let tool = TaskActionsTool::new();
+
+    write_test_task(root.path(), "T-blocked-no-commit", "blocked", "task");
+    let mut task = read_test_task(root.path(), "T-blocked-no-commit");
+    task["blockers"] = Value::String(
+        "Checkpoint succeeded, but task action=complete could not move it to review_ready: \
+         Invalid status transition: 'blocked' → 'in_progress'. Valid transitions from 'blocked': pending."
+            .to_string(),
+    );
+    std::fs::write(
+        root.path()
+            .join("runtime")
+            .join("tasks")
+            .join("T-blocked-no-commit.json"),
+        serde_json::to_string_pretty(&task).unwrap(),
+    )
+    .unwrap();
+
+    let result = tool
+        .execute(serde_json::json!({
+            "action": "update",
+            "id": "T-blocked-no-commit",
+            "status": "review_ready"
+        }))
+        .await
+        .unwrap();
+
+    assert_eq!(result.is_error, Some(true));
+    assert!(
+        extract_text(&result).contains("latest_commit is empty"),
+        "{}",
+        extract_text(&result)
+    );
+    let after = read_test_task(root.path(), "T-blocked-no-commit");
     assert_eq!(after["status"], "blocked");
 }
 
@@ -2216,6 +2308,57 @@ async fn test_ready_surfaces_unassigned_changes_requested_tasks_separately() {
         payload["changes_requested_tasks"][0]["task_id"],
         "T-revision"
     );
+}
+
+#[tokio::test]
+async fn test_ready_surfaces_recoverable_blocked_worker_handoffs() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let root = make_test_root();
+    let _env = ScopedEnv::set(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
+    let tool = TaskActionsTool::new();
+
+    write_test_task(root.path(), "T-handoff", "blocked", "task");
+    let mut task = read_test_task(root.path(), "T-handoff");
+    task["latest_commit"] = Value::String("deadbeef".to_string());
+    task["blockers"] = Value::String(
+        "Checkpoint succeeded, but task action=complete could not move it to review_ready: \
+         Invalid status transition: 'blocked' → 'in_progress'. Valid transitions from 'blocked': pending."
+            .to_string(),
+    );
+    std::fs::write(
+        root.path()
+            .join("runtime")
+            .join("tasks")
+            .join("T-handoff.json"),
+        serde_json::to_string_pretty(&task).unwrap(),
+    )
+    .unwrap();
+
+    let ready = tool
+        .execute(serde_json::json!({"action": "ready"}))
+        .await
+        .unwrap();
+    let payload: Value = serde_json::from_str(&extract_text(&ready)).unwrap();
+    assert_eq!(payload["recoverable_blocked_count"], 1, "{payload}");
+    assert_eq!(
+        payload["recoverable_blocked_tasks"][0]["task_id"],
+        "T-handoff"
+    );
+    assert_eq!(
+        payload["next_action"]["kind"],
+        "recover_blocked_review_ready"
+    );
+    assert_eq!(payload["next_action"]["tool"], "task");
+    assert!(
+        payload["next_action"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("Call this exact update"),
+        "{payload}"
+    );
+    assert_eq!(payload["next_action"]["args"]["action"], "update");
+    assert_eq!(payload["next_action"]["args"]["id"], "T-handoff");
+    assert_eq!(payload["next_action"]["args"]["status"], "review_ready");
 }
 
 #[tokio::test]

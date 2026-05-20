@@ -156,8 +156,14 @@ pub(super) fn task_has_recoverable_worker_state_blocker_text(
         || (blockers_lower.contains("invalid status transition")
             && blockers_lower.contains("'pending'")
             && blockers_lower.contains("'in_progress'"))
+        || (blockers_lower.contains("invalid status transition")
+            && blockers_lower.contains("'blocked'")
+            && blockers_lower.contains("'in_progress'"))
         || (blockers_lower.contains("invalid transition")
             && blockers_lower.contains("pending")
+            && blockers_lower.contains("in_progress"))
+        || (blockers_lower.contains("invalid transition")
+            && blockers_lower.contains("blocked")
             && blockers_lower.contains("in_progress"))
 }
 

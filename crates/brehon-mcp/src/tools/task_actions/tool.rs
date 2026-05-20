@@ -64,7 +64,7 @@ impl Tool for TaskActionsTool {
     }
 
     fn description(&self) -> &str {
-        "Task management - create, list, progress, checkpoint, complete, integrate, abort-integration, close, archive, update tasks, and ensure final hardening epics."
+        "Task lifecycle management. Supervisors should call action=ready and follow its next_action before guessing workflow steps; workers use checkpoint/complete/progress, supervisors use request_review/integrate/close/update recovery paths."
     }
 
     fn input_schema(&self) -> Value {
@@ -73,7 +73,7 @@ impl Tool for TaskActionsTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "description": "Action: list, mine, ready, checkpoint, complete, close, archive, integrate, abort-integration, progress, update, create, subtasks, children, conflicts, followups, promote_followups, waive_followups, ensure_final_hardening"
+                    "description": "Action: list, mine, ready, checkpoint, complete, close, archive, integrate, abort-integration, progress, update, create, subtasks, children, conflicts, followups, promote_followups, waive_followups, ensure_final_hardening. Supervisors: call ready first; ready returns priority queues plus next_action. If next_action.kind=recover_blocked_review_ready, call task action=update with that id and status=review_ready exactly."
                 },
                 "id": {
                     "type": "string",
@@ -94,7 +94,7 @@ impl Tool for TaskActionsTool {
                 },
                 "status": {
                     "type": "string",
-                    "description": "Task status or filter"
+                    "description": "Task status or filter. Do not guess status transitions. Workers finish with action=complete; supervisors start reviews with verification action=request_review. Supervisor action=update status=review_ready is allowed only for recovery cases returned by ready.recoverable_blocked_tasks or integration-conflict recovery."
                 },
                 "include_closed": {
                     "type": "boolean",
@@ -171,7 +171,7 @@ impl Tool for TaskActionsTool {
                 },
                 "blockers": {
                     "type": "string",
-                    "description": "Blocker description"
+                    "description": "Blocker description. For blocked tasks, action=ready classifies recoverable worker handoff blockers separately and may return a next_action to recover them."
                 },
                 "agent_name": {
                     "type": "string",

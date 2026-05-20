@@ -58,11 +58,12 @@ If the current phase changes, switch skills. Do not carry discovery behavior int
 Always process queues in this order:
 
 1. Supervisor-owned integration conflicts from `task action=conflicts` or `ready.integration_conflict_tasks`.
-2. `review_ready_tasks`: request review with `mcp__brehon__verification action=request_review`.
-3. `approved_tasks`: integrate or close using `mcp__brehon__task action=integrate` or `action=close`.
-4. `changes_requested_tasks`: reassign to a worker with the stored review feedback.
-5. `followup_source_tasks`: inspect with `task action=followups`, then promote or explicitly waive.
-6. Pending `tasks`: assign to idle workers.
+2. `recoverable_blocked_tasks`: run `ready.next_action` exactly, usually `mcp__brehon__task action=update id=<task-id> status=review_ready`, then call `task action=ready` again.
+3. `review_ready_tasks`: request review with `mcp__brehon__verification action=request_review`.
+4. `approved_tasks`: integrate or close using `mcp__brehon__task action=integrate` or `action=close`.
+5. `changes_requested_tasks`: reassign to a worker with the stored review feedback.
+6. `followup_source_tasks`: inspect with `task action=followups`, then promote or explicitly waive.
+7. Pending `tasks`: assign to idle workers.
 
 After any action that can change the frontier, call `mcp__brehon__task action=ready` again before ending your turn.
 

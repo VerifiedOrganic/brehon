@@ -546,10 +546,7 @@ async fn reconcile_dependency_states_inner(
 
         let started_worker_execution = task_has_started_worker_execution(&task);
         let normalized_status = normalize_task_status(&current_status);
-        if unmet.is_empty()
-            && (task_has_dependency_scoped_blocker_text(&task)
-                || task_has_recoverable_worker_state_blocker_text(&task))
-        {
+        if unmet.is_empty() && task_has_dependency_scoped_blocker_text(&task) {
             task.remove("blockers");
             changed = true;
         }
@@ -568,7 +565,11 @@ async fn reconcile_dependency_states_inner(
         let next_status = match normalized_status {
             Some("pending") if !unmet.is_empty() => Some("blocked"),
             Some("pending") if unmet.is_empty() && started_worker_execution => Some("in_progress"),
-            Some("blocked") if unmet.is_empty() && !task_has_manual_blockers(&task) => {
+            Some("blocked")
+                if unmet.is_empty()
+                    && !task_has_manual_blockers(&task)
+                    && !task_has_recoverable_worker_state_blocker_text(&task) =>
+            {
                 if started_worker_execution {
                     Some("in_progress")
                 } else {
