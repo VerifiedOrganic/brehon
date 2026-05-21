@@ -299,6 +299,45 @@ fn apply_runtime_model_metadata(
     }
 }
 
+fn current_brehon_exe() -> String {
+    std::env::current_exe()
+        .map(|path| path.to_string_lossy().to_string())
+        .unwrap_or_else(|_| "brehon".to_string())
+}
+
+fn command_basename(command: &str) -> &str {
+    std::path::Path::new(command)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(command)
+}
+
+fn is_grok_agent_stdio(command: &str, args: &[String]) -> bool {
+    command_basename(command) == "grok"
+        && args.iter().any(|arg| arg == "agent")
+        && args.iter().any(|arg| arg == "stdio")
+}
+
+fn apply_grok_acp_mcp_servers(env: &mut Vec<(String, String)>, command: &str, args: &[String]) {
+    if !is_grok_agent_stdio(command, args) {
+        return;
+    }
+
+    let server_env = env
+        .iter()
+        .filter(|(key, _)| key.starts_with("BREHON_"))
+        .map(|(name, value)| serde_json::json!({ "name": name, "value": value }))
+        .collect::<Vec<_>>();
+    let mcp_servers = serde_json::json!([{
+        "name": "brehon",
+        "type": "stdio",
+        "command": current_brehon_exe(),
+        "args": ["serve"],
+        "env": server_env,
+    }]);
+    set_config_env_value(env, "BREHON_ACP_MCP_SERVERS_JSON", &mcp_servers.to_string());
+}
+
 fn apply_runtime_session_name(env: &mut Vec<(String, String)>, session_name: Option<&str>) {
     let Some(session_name) = session_name
         .map(str::trim)
@@ -880,6 +919,7 @@ impl Pane {
                     apply_configured_agent_type(&mut config, configured_agent_type);
                     merge_launcher_env(&mut config.env, launcher_env);
                     apply_runtime_model_metadata(&mut config.env, model, reasoning_effort);
+                    apply_grok_acp_mcp_servers(&mut config.env, command, &custom.args);
                     return Self::gateway_pane_from_config(
                         name,
                         PaneKind::Worker,
@@ -1545,6 +1585,7 @@ impl Pane {
                     apply_configured_agent_type(&mut config, configured_agent_type);
                     merge_launcher_env(&mut config.env, launcher_env);
                     apply_runtime_model_metadata(&mut config.env, model, reasoning_effort);
+                    apply_grok_acp_mcp_servers(&mut config.env, command, &custom.args);
                     return Self::gateway_pane_from_config(
                         name,
                         pane_kind.clone(),

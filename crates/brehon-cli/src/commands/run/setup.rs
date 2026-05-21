@@ -302,6 +302,19 @@ fn launches_codex_app_server(command: &str, args: &[String]) -> bool {
     command == "codex" && args.iter().any(|arg| arg == "app-server")
 }
 
+fn command_basename(command: &str) -> &str {
+    std::path::Path::new(command)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(command)
+}
+
+fn launches_grok_agent_stdio(command: &str, args: &[String]) -> bool {
+    command_basename(command) == "grok"
+        && args.iter().any(|arg| arg == "agent")
+        && args.iter().any(|arg| arg == "stdio")
+}
+
 fn native_agent_command(configured: Option<&str>) -> String {
     if let Some(command) = configured
         .map(str::trim)
@@ -444,6 +457,24 @@ pub(crate) fn agent_to_adapter(name: &str, config: &BrehonConfig) -> brehon_mux:
                     one_shot: false,
                     uses_ink_prompt: false,
                     tool_prefix: std::borrow::Cow::Borrowed("mcp__brehon__"),
+                    transport: HarnessTransport::AppServer,
+                    preferred_control_plane: HarnessControlPlane::Acp,
+                }
+            }
+            AdapterKind::Acp
+                if launches_grok_agent_stdio(
+                    agent_config.command_str().unwrap_or_default(),
+                    &agent_config.args,
+                ) =>
+            {
+                HarnessCapabilities {
+                    supports_hooks: false,
+                    supports_subagents: false,
+                    supports_textbox_submit: true,
+                    supports_teams: false,
+                    one_shot: false,
+                    uses_ink_prompt: false,
+                    tool_prefix: std::borrow::Cow::Borrowed("brehon__"),
                     transport: HarnessTransport::AppServer,
                     preferred_control_plane: HarnessControlPlane::Acp,
                 }
@@ -2184,6 +2215,53 @@ mod tests {
             adapter.capabilities().transport,
             brehon_mux::HarnessTransport::AppServer
         );
+        assert_eq!(
+            adapter.capabilities().preferred_control_plane,
+            brehon_mux::HarnessControlPlane::Acp
+        );
+    }
+
+    #[test]
+    fn test_agent_to_adapter_uses_grok_tool_prefix_for_grok_acp() {
+        let mut config = brehon_config::parse_defaults().unwrap();
+        config.launchers.insert(
+            "grok".to_string(),
+            brehon_types::AgentConnectionConfig {
+                adapter: brehon_types::agent::AdapterKind::Acp,
+                command: Some("/usr/local/bin/grok".to_string()),
+                args: vec![
+                    "agent".to_string(),
+                    "--always-approve".to_string(),
+                    "stdio".to_string(),
+                ],
+                provider: None,
+                transport: None,
+                control_plane: None,
+                base_url: None,
+                api_key_env: None,
+                permission_mode: None,
+                max_parallel_tool_calls: None,
+                assistant_message_passthrough_fields: Vec::new(),
+                reasoning_effort_param: None,
+                extra_body: None,
+                env: std::collections::HashMap::new(),
+                headers: std::collections::HashMap::new(),
+            },
+        );
+        config.lanes.insert(
+            "grok-worker".to_string(),
+            brehon_types::LaneConfig {
+                launcher: "grok".to_string(),
+                model: None,
+                reasoning_effort: None,
+                system_prompt: None,
+            },
+        );
+
+        let adapter = agent_to_adapter("grok-worker", &config);
+
+        assert!(adapter.as_builtin().is_none());
+        assert_eq!(adapter.capabilities().tool_prefix.as_ref(), "brehon__");
         assert_eq!(
             adapter.capabilities().preferred_control_plane,
             brehon_mux::HarnessControlPlane::Acp

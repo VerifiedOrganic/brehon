@@ -14,6 +14,7 @@ const KNOWN_AGENTS: &[(&str, &str, &str)] = &[
     ("kimi", "kimi", "Kimi Code CLI"),
     ("opencode", "opencode", "OpenCode CLI"),
     ("agy", "agy", "Antigravity CLI"),
+    ("grok", "grok", "Grok Build CLI"),
 ];
 
 const AGY_PROJECT_MCP_CONFIG_PATH: &str = ".agents/mcp_config.json";
@@ -159,6 +160,10 @@ fn generate_config_for_agents(agents: &[DetectedAgent]) -> String {
                 launcher("opencode", &["acp", "--cwd", "."], &[]),
             ),
             (
+                "grok".to_string(),
+                launcher("grok", &["agent", "--always-approve", "stdio"], &[]),
+            ),
+            (
                 "agy".to_string(),
                 AgentConnectionConfig {
                     adapter: AdapterKind::Agy,
@@ -202,6 +207,7 @@ fn generate_config_for_agents(agents: &[DetectedAgent]) -> String {
             ("kimi", "kimi-code", "kimi-for-coding"),
             ("opencode", "ollama-cloud", "glm-5.1"),
             ("agy", "google", "antigravity-2.0"),
+            ("grok", "xai", "grok-build"),
         ] {
             insert_lane(
                 &mut lanes,
@@ -322,6 +328,7 @@ fn generate_config_for_agents(agents: &[DetectedAgent]) -> String {
             "kimi",
             "opencode",
             "agy",
+            "grok",
         ];
         let lane_order = [
             "claude-supervisor",
@@ -352,6 +359,9 @@ fn generate_config_for_agents(agents: &[DetectedAgent]) -> String {
             "agy-supervisor",
             "agy-worker",
             "agy-reviewer",
+            "grok-supervisor",
+            "grok-worker",
+            "grok-reviewer",
         ];
 
         let Some(root) = document.as_mapping_mut() else {
@@ -603,7 +613,7 @@ fn generate_config_for_agents(agents: &[DetectedAgent]) -> String {
     config.launchers = template_launchers();
     config.lanes = template_lanes(default_reviewer_prompt.as_deref());
 
-    // Tailor supervisor: prefer claude, then codex, then first detected.
+    // Tailor supervisor: prefer CLIs with a supervisor-capable Brehon contract.
     let supervisor_choice = [
         "claude-code",
         "codex",
@@ -615,8 +625,7 @@ fn generate_config_for_agents(agents: &[DetectedAgent]) -> String {
     ]
     .iter()
     .find(|name| found_launcher(name))
-    .and_then(|name| found.iter().find(|agent| agent.check.name == **name))
-    .or(found.first());
+    .and_then(|name| found.iter().find(|agent| agent.check.name == **name));
     if let Some(sup) = supervisor_choice {
         let launcher = launcher_key(&sup.check.name);
         let lane = supervisor_lane(&launcher);
@@ -637,10 +646,11 @@ fn generate_config_for_agents(agents: &[DetectedAgent]) -> String {
         }
     }
 
-    // Tailor workers: prefer codex, then opencode, then first detected.
+    // Tailor workers: prefer stronger ACP/headless workers, then first detected.
     let worker_choice = [
         "codex",
         "copilot",
+        "grok",
         "opencode",
         "kimi",
         "claude-code",
@@ -694,6 +704,7 @@ fn generate_config_for_agents(agents: &[DetectedAgent]) -> String {
             "claude-code",
             "codex",
             "copilot",
+            "grok",
             "gemini",
             "kimi",
             "opencode",
@@ -1210,6 +1221,34 @@ mod tests {
             config.lanes["agy-worker"].model.as_ref().unwrap().name,
             "antigravity-2.0"
         );
+    }
+
+    #[test]
+    fn generated_config_tailors_grok_worker_and_reviewer() {
+        let agents = vec![detected_agent("grok", "grok", "xai", "grok-build")];
+        let yaml = generate_config_for_agents(&agents);
+        let config = load_generated_config(&yaml);
+
+        assert_eq!(config.roles.workers[0].lane, "grok-worker");
+        assert_eq!(
+            config.review.default_reviewers,
+            vec!["grok-reviewer".to_string()]
+        );
+        assert_eq!(config.launchers["grok"].adapter, AdapterKind::Acp);
+        assert_eq!(config.launchers["grok"].command, Some("grok".to_string()));
+        assert_eq!(
+            config.launchers["grok"].args,
+            vec![
+                "agent".to_string(),
+                "--always-approve".to_string(),
+                "stdio".to_string()
+            ]
+        );
+        assert_eq!(
+            config.lanes["grok-worker"].model.as_ref().unwrap().name,
+            "grok-build"
+        );
+        assert_ne!(config.roles.supervisor.name, "grok-supervisor");
     }
 
     #[test]

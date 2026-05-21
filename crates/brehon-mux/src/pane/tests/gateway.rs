@@ -707,6 +707,89 @@ fn test_custom_acp_worker_uses_stdio_gateway_protocol() {
 }
 
 #[test]
+fn test_grok_acp_worker_receives_brehon_mcp_server() {
+    let adapter = AgentAdapter::Custom(CustomAgentConfig {
+        name: "grok-worker".to_string(),
+        command: Some("grok".to_string()),
+        args: vec![
+            "agent".to_string(),
+            "--always-approve".to_string(),
+            "stdio".to_string(),
+        ],
+        base_url: None,
+        api_key_env: None,
+        headers: Vec::new(),
+        capabilities: HarnessCapabilities {
+            supports_hooks: false,
+            supports_subagents: false,
+            supports_textbox_submit: true,
+            supports_teams: false,
+            one_shot: false,
+            uses_ink_prompt: false,
+            tool_prefix: std::borrow::Cow::Borrowed("brehon__"),
+            transport: HarnessTransport::AppServer,
+            preferred_control_plane: HarnessControlPlane::Acp,
+        },
+    });
+
+    let brehon_root = PathBuf::from("/tmp/.brehon");
+    let pane = Pane::worker_with_agent_type(
+        "worker-1",
+        PathBuf::from("/tmp"),
+        Some("session-a"),
+        Some(&brehon_root),
+        "supervisor",
+        &adapter,
+        None,
+        None,
+        24,
+        80,
+        None,
+        None,
+        None,
+        &[],
+    )
+    .expect("create grok worker pane");
+
+    let config = pane
+        .gateway_spawn_config()
+        .expect("gateway config should exist");
+    let mcp_servers = config
+        .env
+        .iter()
+        .find_map(|(key, value)| (key == "BREHON_ACP_MCP_SERVERS_JSON").then_some(value))
+        .expect("grok acp mcp servers env");
+    let parsed: serde_json::Value = serde_json::from_str(mcp_servers).unwrap();
+
+    assert_eq!(parsed[0]["name"], "brehon");
+    assert_eq!(parsed[0]["type"], "stdio");
+    assert_eq!(parsed[0]["args"], serde_json::json!(["serve"]));
+    assert!(
+        parsed[0]["command"]
+            .as_str()
+            .is_some_and(|command| !command.is_empty())
+    );
+    assert_eq!(
+        parsed[0]["env"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["name"] == "BREHON_AGENT_NAME")
+            .unwrap()["value"],
+        "worker-1"
+    );
+    assert_eq!(
+        parsed[0]["env"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["name"] == "BREHON_SESSION_NAME")
+            .unwrap()["value"],
+        "session-a"
+    );
+}
+
+#[test]
 fn test_custom_codex_app_server_worker_uses_codex_ws_gateway_protocol() {
     let cwd =
         std::env::temp_dir().join(format!("brehon-custom-codex-pane-{}", uuid::Uuid::new_v4()));
