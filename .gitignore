@@ -50,6 +50,7 @@ notes/
 
 # ─── MCP local config (paths are machine-specific) ───────────────
 .mcp.json
+.agents/mcp_config.json
 !.mcp.json.example
 
 # ─── Editor — Vim / Neovim ───────────────────────────────────────

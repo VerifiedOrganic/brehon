@@ -16,6 +16,10 @@ const KNOWN_AGENTS: &[(&str, &str, &str)] = &[
     ("agy", "agy", "Antigravity CLI"),
 ];
 
+const AGY_PROJECT_MCP_CONFIG_PATH: &str = ".agents/mcp_config.json";
+const INIT_GITIGNORE_PATTERNS: &[&str] =
+    &[".brehon/", ".agents/mcp_config.json", ".antigravitycli"];
+
 /// Agent info for config generation.
 struct DetectedAgent {
     check: ui::AgentCheck,
@@ -782,28 +786,97 @@ fn generate_config_for_agents(agents: &[DetectedAgent]) -> String {
     )
 }
 
-/// Update .gitignore to include .brehon/ if not already present.
+fn gitignore_pattern_present(lines: &[&str], pattern: &str) -> bool {
+    lines.iter().any(|line| {
+        let trimmed = line.trim();
+        trimmed == pattern || (pattern == ".brehon/" && trimmed == ".brehon")
+    })
+}
+
+/// Update .gitignore to include Brehon and machine-local agent files.
 fn update_gitignore(project_path: &Path) -> Result<bool> {
     let gitignore_path = project_path.join(".gitignore");
-
-    if gitignore_path.exists() {
-        let content = std::fs::read_to_string(&gitignore_path)?;
-        if content
-            .lines()
-            .any(|l| l.trim() == ".brehon/" || l.trim() == ".brehon")
-        {
-            return Ok(false); // Already present
-        }
-        let mut new_content = content;
-        if !new_content.ends_with('\n') {
-            new_content.push('\n');
-        }
-        new_content.push_str("\n# Brehon orchestration data\n.brehon/\n");
-        std::fs::write(&gitignore_path, new_content)?;
+    let content = if gitignore_path.exists() {
+        std::fs::read_to_string(&gitignore_path)?
     } else {
-        std::fs::write(&gitignore_path, "# Brehon orchestration data\n.brehon/\n")?;
+        String::new()
+    };
+    let lines = content.lines().collect::<Vec<_>>();
+    let missing = INIT_GITIGNORE_PATTERNS
+        .iter()
+        .filter(|pattern| !gitignore_pattern_present(&lines, pattern))
+        .copied()
+        .collect::<Vec<_>>();
+
+    if missing.is_empty() {
+        return Ok(false);
     }
 
+    let mut new_content = content;
+    if !new_content.is_empty() && !new_content.ends_with('\n') {
+        new_content.push('\n');
+    }
+    if !new_content.is_empty() {
+        new_content.push('\n');
+    }
+    new_content.push_str("# Brehon orchestration data\n");
+    for pattern in missing {
+        new_content.push_str(pattern);
+        new_content.push('\n');
+    }
+    std::fs::write(&gitignore_path, new_content)?;
+
+    Ok(true)
+}
+
+fn current_brehon_exe() -> String {
+    std::env::current_exe()
+        .map(|path| path.to_string_lossy().to_string())
+        .unwrap_or_else(|_| "brehon".to_string())
+}
+
+fn desired_brehon_mcp_server() -> serde_json::Value {
+    serde_json::json!({
+        "command": current_brehon_exe(),
+        "args": ["serve"]
+    })
+}
+
+fn ensure_agy_mcp_config(project_path: &Path) -> Result<bool> {
+    let path = project_path.join(AGY_PROJECT_MCP_CONFIG_PATH);
+    let brehon_server = desired_brehon_mcp_server();
+    let mut doc = if path.exists() {
+        std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
+            .unwrap_or_else(|| serde_json::json!({}))
+    } else {
+        serde_json::json!({})
+    };
+    if !doc.is_object() {
+        doc = serde_json::json!({});
+    }
+
+    let servers = doc
+        .as_object_mut()
+        .expect("JSON object initialized above")
+        .entry("mcpServers")
+        .or_insert_with(|| serde_json::json!({}));
+    if !servers.is_object() {
+        *servers = serde_json::json!({});
+    }
+    let servers = servers
+        .as_object_mut()
+        .expect("mcpServers object initialized above");
+    if servers.get("brehon") == Some(&brehon_server) {
+        return Ok(false);
+    }
+    servers.insert("brehon".to_string(), brehon_server);
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, serde_json::to_string_pretty(&doc)?)?;
     Ok(true)
 }
 
@@ -872,12 +945,31 @@ pub fn execute(project_path: &Path) -> Result<()> {
     std::fs::write(&config_path, &config_content)?;
     ui::print_success(&format!("Created {}", ui::dim(".brehon/config.yaml")));
 
+    if agents
+        .iter()
+        .any(|agent| agent.check.name == "agy" && agent.check.found)
+    {
+        match ensure_agy_mcp_config(project_path) {
+            Ok(true) => {
+                ui::print_success(&format!("Created {}", ui::dim(AGY_PROJECT_MCP_CONFIG_PATH)))
+            }
+            Ok(false) => ui::print_success(&format!(
+                "{} already configured",
+                ui::dim(AGY_PROJECT_MCP_CONFIG_PATH)
+            )),
+            Err(e) => ui::print_warning(&format!(
+                "Could not create {}: {}",
+                AGY_PROJECT_MCP_CONFIG_PATH, e
+            )),
+        }
+    }
+
     // Update .gitignore
     match update_gitignore(project_path) {
         Ok(true) => ui::print_success(&format!("Updated {}", ui::dim(".gitignore"))),
         Ok(false) => ui::print_success(&format!(
             "{} already in {}",
-            ui::dim(".brehon/"),
+            ui::dim("Brehon ignore patterns"),
             ui::dim(".gitignore")
         )),
         Err(e) => ui::print_warning(&format!("Could not update .gitignore: {}", e)),
@@ -1118,5 +1210,50 @@ mod tests {
             config.lanes["agy-worker"].model.as_ref().unwrap().name,
             "antigravity-2.0"
         );
+    }
+
+    #[test]
+    fn init_gitignore_adds_agy_local_patterns() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(temp.path().join(".gitignore"), "target/\n.brehon\n")
+            .expect("write gitignore");
+
+        assert!(update_gitignore(temp.path()).expect("update gitignore"));
+        let gitignore =
+            std::fs::read_to_string(temp.path().join(".gitignore")).expect("read gitignore");
+
+        assert!(gitignore.contains("target/"));
+        assert_eq!(gitignore.matches(".brehon").count(), 1, "{gitignore}");
+        assert!(gitignore.contains(".agents/mcp_config.json"));
+        assert!(gitignore.contains(".antigravitycli"));
+
+        assert!(!update_gitignore(temp.path()).expect("second update"));
+    }
+
+    #[test]
+    fn ensure_agy_mcp_config_creates_workspace_config_and_preserves_servers() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = temp.path().join(AGY_PROJECT_MCP_CONFIG_PATH);
+        std::fs::create_dir_all(config_path.parent().unwrap()).expect("create .agents");
+        std::fs::write(
+            &config_path,
+            r#"{"mcpServers":{"other":{"command":"other","args":["serve"]}}}"#,
+        )
+        .expect("write existing mcp config");
+
+        assert!(ensure_agy_mcp_config(temp.path()).expect("ensure agy mcp config"));
+        let config: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&config_path).expect("read agy mcp config"),
+        )
+        .expect("parse agy mcp config");
+
+        assert_eq!(config["mcpServers"]["other"]["command"], "other");
+        assert_eq!(
+            config["mcpServers"]["brehon"]["args"],
+            serde_json::json!(["serve"])
+        );
+        assert!(config["mcpServers"]["brehon"]["command"]
+            .as_str()
+            .is_some_and(|command| !command.is_empty()));
     }
 }

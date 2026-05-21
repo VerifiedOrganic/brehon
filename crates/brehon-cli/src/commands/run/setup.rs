@@ -688,6 +688,7 @@ pub(crate) fn default_initiative_integration_worktree(
 ///   [`ensure_mcp_config`]); the path won't resolve on any other host.
 /// * `.agents/mcp_config.json` — Antigravity CLI workspace MCP discovery
 ///   file. Also contains an absolute path to this machine's brehon binary.
+/// * `.antigravitycli` — Antigravity CLI's project-local state/cache.
 /// * `.claude/settings.local.json` — Claude Code per-developer
 ///   permissions file. The `.local.json` suffix already signals
 ///   machine-local by Claude Code convention, but it's worth making
@@ -701,6 +702,7 @@ const BREHON_LOCAL_GITIGNORE_PATTERNS: &[&str] = &[
     ".brehon/",
     ".mcp.json",
     ".agents/mcp_config.json",
+    ".antigravitycli",
     ".claude/settings.local.json",
 ];
 
@@ -3574,6 +3576,10 @@ mod tests {
             ".agents/mcp_config.json missing: {lines:?}"
         );
         assert!(
+            lines.iter().any(|l| l == ".antigravitycli"),
+            ".antigravitycli missing: {lines:?}"
+        );
+        assert!(
             lines.iter().any(|l| l == ".claude/settings.local.json"),
             ".claude/settings.local.json missing: {lines:?}"
         );
@@ -3601,6 +3607,7 @@ mod tests {
         assert!(contents.contains(".brehon/"));
         assert!(contents.contains(".mcp.json"));
         assert!(contents.contains(".agents/mcp_config.json"));
+        assert!(contents.contains(".antigravitycli"));
         assert!(contents.contains(".claude/settings.local.json"));
     }
 
@@ -3643,6 +3650,7 @@ mod tests {
         // The other patterns should have been added.
         assert!(lines.iter().any(|l| l == ".mcp.json"));
         assert!(lines.iter().any(|l| l == ".agents/mcp_config.json"));
+        assert!(lines.iter().any(|l| l == ".antigravitycli"));
         assert!(lines.iter().any(|l| l == ".claude/settings.local.json"));
     }
 
@@ -3678,6 +3686,7 @@ mod tests {
         assert!(contents.contains("\n.brehon/\n"));
         assert!(contents.contains("\n.mcp.json\n"));
         assert!(contents.contains("\n.agents/mcp_config.json\n"));
+        assert!(contents.contains("\n.antigravitycli\n"));
     }
 
     #[test]
