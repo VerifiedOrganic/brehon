@@ -10,7 +10,6 @@ use brehon_adapter_sdk::{
     AdapterError, AdapterEvent, AdapterResult, AgentAdapter, AgentProcess, PromptResult,
 };
 use brehon_types::{
-    build_reviewer_startup_prompt, build_supervisor_startup_prompt, build_worker_startup_prompt,
     AgentCapabilities, HealthStatus, PromptHandle, PromptId, PromptTurn, SessionId, SessionInfo,
     SessionSpec, TerminalId, ToolCallStreaming,
 };
@@ -102,39 +101,14 @@ impl AgySessionConfig {
             ));
         }
 
-        let mut args = vec![
+        // Set up custom local home directory to bypass the trust folder prompt
+        if let Ok(home_root) = prepare_local_agy_home(&params.cwd) {
+            env.push(("HOME".to_string(), home_root.to_string_lossy().to_string()));
+        }
+
+        let args = vec![
             "--dangerously-skip-permissions".to_string(),
         ];
-
-        let project_policy = project_policy_for_role(params.brehon_root.as_ref(), &params.role);
-        let startup_prompt = if params.role == "worker" {
-            build_worker_startup_prompt(
-                &params.name,
-                params.supervisor_name.as_deref().unwrap_or("supervisor"),
-                "mcp_brehon_agent",
-                "mcp_brehon_task",
-                project_policy.as_deref(),
-            )
-        } else if params.role == "supervisor" {
-            build_supervisor_startup_prompt(
-                &params.name,
-                "mcp_brehon_agent",
-                "mcp_brehon_task",
-                project_policy.as_deref(),
-            )
-        } else if params.role == "reviewer" {
-            build_reviewer_startup_prompt(
-                &params.name,
-                "mcp_brehon_agent",
-                "mcp_brehon_verification",
-                project_policy.as_deref(),
-            )
-        } else {
-            format!("Hello, you are {} acting as a {}.", params.name, params.role)
-        };
-
-        args.push("--prompt-interactive".to_string());
-        args.push(startup_prompt);
 
         Self {
             command: "agy".to_string(),
@@ -147,11 +121,45 @@ impl AgySessionConfig {
     }
 }
 
-fn project_policy_for_role(brehon_root: Option<&PathBuf>, role: &str) -> Option<String> {
-    let project_root = brehon_root?.parent()?;
-    let config = brehon_config::load_config(Some(project_root)).ok()?;
-    config.project_prompt_for_role_name(role)
+fn prepare_local_agy_home(cwd: &std::path::Path) -> std::result::Result<PathBuf, String> {
+    let home_root = cwd.join(".brehon/factory-runtime/agy/home");
+    let gemini_dir = home_root.join(".gemini");
+    std::fs::create_dir_all(&gemini_dir)
+        .map_err(|e| format!("Failed to create local agy runtime directory: {}", e))?;
+
+    if let Some(global_home) = std::env::var("HOME").ok().map(PathBuf::from).map(|d| d.join(".gemini")) {
+        for name in [
+            "gemini-credentials.json",
+            "google_accounts.json",
+            "oauth_creds.json",
+            "installation_id",
+            "state.json",
+            "projects.json",
+        ] {
+            let src = global_home.join(name);
+            if src.exists() {
+                let dst = gemini_dir.join(name);
+                let _ = std::fs::copy(&src, &dst);
+            }
+        }
+    }
+
+    let trusted_folders_path = gemini_dir.join("trustedFolders.json");
+    let canonical_cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    
+    // Write canonical cwd as trusted folder
+    let content = serde_json::json!({
+        canonical_cwd.to_string_lossy(): "TRUST_FOLDER"
+    });
+    
+    let file = std::fs::File::create(&trusted_folders_path)
+        .map_err(|e| format!("Failed to create trustedFolders.json: {}", e))?;
+    serde_json::to_writer_pretty(file, &content)
+        .map_err(|e| format!("Failed to write trustedFolders.json: {}", e))?;
+
+    Ok(home_root)
 }
+
 
 // ---------------------------------------------------------------------------
 // Session
@@ -563,10 +571,12 @@ mod tests {
         };
         let config = AgySessionConfig::from_params(&params);
         assert_eq!(config.command, "agy");
-        assert_eq!(config.args.len(), 3);
+        assert_eq!(config.args.len(), 1);
         assert_eq!(config.args[0], "--dangerously-skip-permissions");
-        assert_eq!(config.args[1], "--prompt-interactive");
-        assert!(config.args[2].contains("agy-worker"));
+        assert!(config
+            .env
+            .iter()
+            .any(|(k, v)| k == "HOME" && v.contains(".brehon/factory-runtime/agy/home")));
         assert!(config
             .env
             .iter()
