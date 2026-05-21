@@ -103,57 +103,38 @@ impl AgySessionConfig {
         }
 
         let mut args = vec![
-            "--prompt-interactive".to_string(),
             "--dangerously-skip-permissions".to_string(),
         ];
 
-        if let Some(ref m) = params.model {
-            args.push(format!("--model={m}"));
-        }
-
-        if let Some(ref root) = params.brehon_root {
-            let mcp_config = root.join("agy-mcp.json");
-            if mcp_config.exists() {
-                args.push("--mcp-location".to_string());
-                args.push(mcp_config.to_string_lossy().to_string());
-            }
-        }
-
-        if params.role == "worker" {
-            let project_policy = project_policy_for_role(params.brehon_root.as_ref(), &params.role);
-            let startup_prompt = build_worker_startup_prompt(
+        let project_policy = project_policy_for_role(params.brehon_root.as_ref(), &params.role);
+        let startup_prompt = if params.role == "worker" {
+            build_worker_startup_prompt(
                 &params.name,
                 params.supervisor_name.as_deref().unwrap_or("supervisor"),
                 "mcp_brehon_agent",
                 "mcp_brehon_task",
                 project_policy.as_deref(),
-            );
-            args.push("--task".to_string());
-            args.push(startup_prompt);
+            )
         } else if params.role == "supervisor" {
-            let project_policy = project_policy_for_role(params.brehon_root.as_ref(), &params.role);
-            let startup_prompt = build_supervisor_startup_prompt(
+            build_supervisor_startup_prompt(
                 &params.name,
                 "mcp_brehon_agent",
                 "mcp_brehon_task",
                 project_policy.as_deref(),
-            );
-            args.push("--task".to_string());
-            args.push(startup_prompt);
+            )
         } else if params.role == "reviewer" {
-            let project_policy = project_policy_for_role(params.brehon_root.as_ref(), &params.role);
-            let startup_prompt = build_reviewer_startup_prompt(
+            build_reviewer_startup_prompt(
                 &params.name,
                 "mcp_brehon_agent",
                 "mcp_brehon_verification",
                 project_policy.as_deref(),
-            );
-            args.push("--task".to_string());
-            args.push(startup_prompt);
-        }
+            )
+        } else {
+            format!("Hello, you are {} acting as a {}.", params.name, params.role)
+        };
 
-        args.push("--output-format".to_string());
-        args.push("json".to_string());
+        args.push("--prompt-interactive".to_string());
+        args.push(startup_prompt);
 
         Self {
             command: "agy".to_string(),
@@ -582,11 +563,10 @@ mod tests {
         };
         let config = AgySessionConfig::from_params(&params);
         assert_eq!(config.command, "agy");
-        assert!(config.args.contains(&"--prompt-interactive".to_string()));
-        assert!(config.args.contains(&"--dangerously-skip-permissions".to_string()));
-        assert!(config.args.contains(&"--task".to_string()));
-        assert!(config.args.contains(&"--output-format".to_string()));
-        assert!(config.args.contains(&"json".to_string()));
+        assert_eq!(config.args.len(), 3);
+        assert_eq!(config.args[0], "--dangerously-skip-permissions");
+        assert_eq!(config.args[1], "--prompt-interactive");
+        assert!(config.args[2].contains("agy-worker"));
         assert!(config
             .env
             .iter()
