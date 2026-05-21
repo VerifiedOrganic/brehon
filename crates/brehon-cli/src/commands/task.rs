@@ -58,6 +58,15 @@ pub enum TaskCommand {
     #[command(name = "ready")]
     Ready,
 
+    #[command(name = "repair-frontier")]
+    RepairFrontier,
+
+    #[command(name = "recover-handoff")]
+    RecoverHandoff {
+        #[arg(long)]
+        id: String,
+    },
+
     #[command(name = "archive")]
     Archive {
         #[arg(long)]
@@ -201,6 +210,31 @@ pub async fn execute(project_path: &Path, command: &TaskCommand) -> Result<()> {
                 project_path,
                 json!({
                     "action": "ready",
+                    "role": "supervisor",
+                    "agent_name": "brehon-cli"
+                }),
+            )
+            .await?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        TaskCommand::RepairFrontier => {
+            let result = call_task_tool(
+                project_path,
+                json!({
+                    "action": "repair_frontier",
+                    "role": "supervisor",
+                    "agent_name": "brehon-cli"
+                }),
+            )
+            .await?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        TaskCommand::RecoverHandoff { id } => {
+            let result = call_task_tool(
+                project_path,
+                json!({
+                    "action": "recover_handoff",
+                    "id": id,
                     "role": "supervisor",
                     "agent_name": "brehon-cli"
                 }),

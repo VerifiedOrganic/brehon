@@ -150,7 +150,43 @@ fn structured_tool_error(
     caller: &CallerAttribution,
     fields: serde_json::Value,
 ) -> String {
+    let (retryable, allowed_next_actions, next_action) = match code {
+        "mcp_input_too_large" => {
+            let action = serde_json::json!({
+                "kind": "retry_with_smaller_request",
+                "tool": tool,
+                "args": "reduce argument size below max_bytes"
+            });
+            (true, vec![action.clone()], action)
+        }
+        "mcp_tool_panic" => {
+            let action = serde_json::json!({
+                "kind": "retry_after_refresh_or_report",
+                "tool": tool,
+                "args": {}
+            });
+            (true, vec![action.clone()], action)
+        }
+        _ => {
+            let action = serde_json::json!({ "kind": "none" });
+            (false, Vec::new(), action)
+        }
+    };
     serde_json::json!({
+        "error_code": code,
+        "message": message.clone(),
+        "retryable": retryable,
+        "current_state": {
+            "tool": tool,
+            "caller": {
+                "session_id": caller.session_id,
+                "agent_name": caller.agent_name,
+                "role": caller.role,
+            },
+            "fields": fields.clone(),
+        },
+        "allowed_next_actions": allowed_next_actions,
+        "next_action": next_action,
         "error": {
             "code": code,
             "message": message,

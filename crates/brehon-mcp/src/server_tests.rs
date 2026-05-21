@@ -290,6 +290,13 @@ async fn tool_panic_catches_panics_and_returns_internal_error() {
     match result {
         Err(McpError::Internal(message)) => {
             let payload = error_payload(&message);
+            assert_eq!(payload["error_code"], "mcp_tool_panic");
+            assert_eq!(payload["retryable"], true);
+            assert_eq!(payload["current_state"]["tool"], "panic_tool");
+            assert_eq!(
+                payload["next_action"]["kind"],
+                "retry_after_refresh_or_report"
+            );
             assert_eq!(payload["error"]["code"], "mcp_tool_panic");
             assert_eq!(payload["error"]["tool"], "panic_tool");
             assert_eq!(payload["error"]["caller"]["session_id"], "sess-panic");
@@ -326,6 +333,14 @@ async fn input_size_rejects_oversized_arguments_with_caller_attribution() {
     match result {
         Err(McpError::InvalidRequest(message)) => {
             let payload = error_payload(&message);
+            assert_eq!(payload["error_code"], "mcp_input_too_large");
+            assert_eq!(payload["retryable"], true);
+            assert_eq!(payload["current_state"]["fields"]["max_bytes"], 64);
+            assert_eq!(payload["next_action"]["kind"], "retry_with_smaller_request");
+            assert!(!payload["allowed_next_actions"]
+                .as_array()
+                .unwrap()
+                .is_empty());
             assert_eq!(payload["error"]["code"], "mcp_input_too_large");
             assert_eq!(payload["error"]["tool"], "echo_tool");
             assert_eq!(payload["error"]["fields"]["max_bytes"], 64);

@@ -74,6 +74,10 @@ pub fn build_worker_protocol(
             "Use Brehon MCP tools for task/state coordination, and normal shell/CLI commands \
              for repo work — always within the current worktree (see worktree rules above)."
         ),
+        "Brehon is separate from legacy Agora. Use `brehon`, `.brehon/`, `BREHON_*`, and \
+         `mcp__brehon__*`; do not inspect, mutate, migrate, or invoke `.agora/`, `AGORA_*`, \
+         `agora`, or `mcp__agora__*` unless the operator explicitly asks for legacy migration."
+            .to_string(),
         "Do not do supervisor planning work. Do not brainstorm implementation plans, create epics, or decompose tasks. Only the supervisor does that.".to_string(),
         format!(
             "Report progress early and whenever the work phase changes: `{task_cmd} action=progress \

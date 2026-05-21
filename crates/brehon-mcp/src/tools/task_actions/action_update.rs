@@ -358,6 +358,61 @@ pub(super) async fn execute_complete(
 
     let progress_result = execute_progress(&progress_args, proof_recorder).await?;
     if progress_result.is_error == Some(true) {
+        if let Some(mut task) = read_task(id) {
+            let current_status = task
+                .get("status")
+                .and_then(|value| value.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+            if normalize_task_status(&current_status) == Some("blocked")
+                && task_has_recoverable_worker_state_blocker_text(&task)
+                && task_has_recorded_worker_handoff_commit(&task)
+            {
+                apply_worker_state_review_recovery_cleanup(&mut task);
+                task.insert("status".into(), Value::String("review_ready".to_string()));
+                task.insert(
+                    "updated_at".into(),
+                    Value::String(chrono::Utc::now().to_rfc3339()),
+                );
+                if !write_task(id, &task) {
+                    return Ok(error_result(format!(
+                        "Checkpoint succeeded for task {id}, but task action=complete could not persist recovered review_ready state after progress failed: {}",
+                        tool_result_text(&progress_result)
+                    )));
+                }
+
+                let mut result = serde_json::json!({
+                    "status": "ok",
+                    "action": "complete",
+                    "task_id": id,
+                    "task_status": "review_ready",
+                    "auto_review": true,
+                    "recovered_handoff": true,
+                    "notes": notes,
+                    "message": format!(
+                        "Task {id} checkpointed and recovered from blocked handoff to review_ready."
+                    ),
+                });
+                if let Some(value) = checkpoint_json.get("created_commit") {
+                    result["created_commit"] = value.clone();
+                }
+                if let Some(value) = checkpoint_json
+                    .get("latest_commit")
+                    .or_else(|| task.get("latest_commit"))
+                {
+                    result["latest_commit"] = value.clone();
+                }
+                copy_proof_result(&mut result, &Value::Null, &checkpoint_json);
+                result["worktree_cleanup"] =
+                    super::build_artifact_cleanup::cleanup_current_worker_build_artifacts(
+                        "after_task_complete",
+                    );
+                return Ok(text_result(
+                    serde_json::to_string_pretty(&result)
+                        .map_err(|e| McpError::Serialization(e.to_string()))?,
+                ));
+            }
+        }
         return Ok(error_result(format!(
             "Checkpoint succeeded for task {id}, but task action=complete could not move it to review_ready: {}",
             tool_result_text(&progress_result)
@@ -795,7 +850,7 @@ pub(super) async fn execute_update(
         {
             if caller_role != "supervisor" {
                 return Ok(error_result(format!(
-                    "Task {id} has a recoverable blocked worker handoff, but only the supervisor may recover it. Supervisor next action: task action=update id={id} status=review_ready."
+                    "Task {id} has a recoverable blocked worker handoff, but only the supervisor may recover it. Supervisor next action: task action=recover_handoff id={id}."
                 )));
             }
             if !task_has_recorded_worker_handoff_commit(&task) {

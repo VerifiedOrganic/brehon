@@ -160,7 +160,137 @@ fn ready_queue_task(
     if let Some(routing) = routing_summary(task, config) {
         value["routing"] = routing;
     }
+    value["liveness"] = task_liveness_context(task);
     value
+}
+
+fn task_liveness_context(task: &serde_json::Map<String, Value>) -> Value {
+    let assignee = task
+        .get("assignee")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let review_owner = task
+        .get("review_owner")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let owner = assignee.or(review_owner);
+    let Some(owner) = owner else {
+        return serde_json::json!({
+            "owner": null,
+            "state": "unassigned",
+            "next_decision": "assign_or_repair",
+        });
+    };
+
+    let Some(root) = brehon_root_dir() else {
+        return serde_json::json!({
+            "owner": owner,
+            "state": "unknown",
+            "next_decision": "refresh_runtime_context",
+            "reason": "BREHON_ROOT is not configured",
+        });
+    };
+    let session_path = root
+        .join("runtime")
+        .join("sessions")
+        .join(format!("{owner}.json"));
+    let Ok(content) = std::fs::read_to_string(&session_path) else {
+        return serde_json::json!({
+            "owner": owner,
+            "state": "missing_session",
+            "next_decision": "reassign_or_reseat",
+        });
+    };
+    let Ok(session) = serde_json::from_str::<Value>(&content) else {
+        return serde_json::json!({
+            "owner": owner,
+            "state": "bad_session_file",
+            "next_decision": "repair_runtime",
+        });
+    };
+
+    let live = crate::tools::agent::session_is_live(&session);
+    serde_json::json!({
+        "owner": owner,
+        "state": if live { "live" } else { "stale_session" },
+        "next_decision": if live { "wait_or_message" } else { "reassign_or_reseat" },
+        "session_id": session.get("session_id").cloned().unwrap_or(Value::Null),
+        "session_name": session.get("session_name").cloned().unwrap_or(Value::Null),
+        "role": session.get("role").cloned().unwrap_or(Value::Null),
+        "last_seen_at": session.get("last_seen_at").cloned().unwrap_or(Value::Null),
+        "registered_at": session.get("registered_at").cloned().unwrap_or(Value::Null),
+    })
+}
+
+fn task_has_recorded_handoff_commit(task: &serde_json::Map<String, Value>) -> bool {
+    task.get("latest_commit")
+        .and_then(|value| value.as_str())
+        .is_some_and(|value| !value.trim().is_empty())
+}
+
+fn blocked_handoff_context(
+    task: &serde_json::Map<String, Value>,
+    all_tasks: &[serde_json::Map<String, Value>],
+    config: Option<&brehon_types::BrehonConfig>,
+) -> Option<Value> {
+    let status = task.get("status").and_then(|v| v.as_str()).unwrap_or("");
+    let task_type = task
+        .get("task_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("task");
+    if status != "blocked"
+        || task_type != "task"
+        || !task_has_recoverable_worker_state_blocker_text(task)
+    {
+        return None;
+    }
+
+    let has_commit = task_has_recorded_handoff_commit(task);
+    let closed_parent = ancestor_chain_has_closed_parent(all_tasks, task);
+    let scope_issue = control_plane_scope_issue_for_task(task);
+    let safe_repair = has_commit && !closed_parent && scope_issue.is_none();
+    let mut value = ready_queue_task(task, config);
+    let task_id = queued_task_id(&value).unwrap_or("").to_string();
+    value["safe_repair"] = Value::Bool(safe_repair);
+    value["repair_action"] = if safe_repair {
+        serde_json::json!({
+            "kind": "recover_handoff",
+            "tool": "task",
+            "args": {
+                "action": "recover_handoff",
+                "id": task_id
+            }
+        })
+    } else if !has_commit {
+        serde_json::json!({
+            "kind": "wait_for_worker_checkpoint_or_reassign",
+            "tool": "task",
+            "args": {
+                "action": "ready"
+            }
+        })
+    } else {
+        serde_json::json!({
+            "kind": "inspect_task",
+            "tool": "task",
+            "args": {
+                "action": "list",
+                "status": "blocked"
+            }
+        })
+    };
+    value["repair_blocker"] = if safe_repair {
+        Value::Null
+    } else if !has_commit {
+        Value::String("latest_commit is missing".to_string())
+    } else if closed_parent {
+        Value::String("task has a closed ancestor".to_string())
+    } else {
+        Value::String(scope_issue.unwrap_or_else(|| "unsafe handoff state".to_string()))
+    };
+    Some(value)
 }
 
 fn queued_task_id(task: &Value) -> Option<&str> {
@@ -585,37 +715,15 @@ pub(super) async fn execute_ready(args: &Value) -> Result<ToolResult, McpError> 
     let project_config =
         project_root().and_then(|root| brehon_config::load_config(Some(&root)).ok());
     let integration_conflict_tasks = supervisor_integration_conflicts_from_tasks(&all_tasks);
-    let recoverable_blocked_tasks: Vec<Value> = all_tasks
+    let blocked_handoff_tasks: Vec<Value> = all_tasks
         .iter()
-        .filter(|t| {
-            let status = t.get("status").and_then(|v| v.as_str()).unwrap_or("");
-            let task_type = t
-                .get("task_type")
-                .and_then(|v| v.as_str())
-                .unwrap_or("task");
-            let has_commit = t
-                .get("latest_commit")
-                .and_then(|v| v.as_str())
-                .is_some_and(|value| !value.trim().is_empty());
-            if task_has_supervisor_integration_conflict(t) {
-                return false;
-            }
-            if status != "blocked"
-                || task_type != "task"
-                || !has_commit
-                || !task_has_recoverable_worker_state_blocker_text(t)
-            {
-                return false;
-            }
-            if ancestor_chain_has_closed_parent(&all_tasks, t) {
-                return false;
-            }
-            if control_plane_scope_issue_for_task(t).is_some() {
-                return false;
-            }
-            true
-        })
-        .map(|task| ready_queue_task(task, project_config.as_ref()))
+        .filter(|t| !task_has_supervisor_integration_conflict(t))
+        .filter_map(|task| blocked_handoff_context(task, &all_tasks, project_config.as_ref()))
+        .collect();
+    let recoverable_blocked_tasks: Vec<Value> = blocked_handoff_tasks
+        .iter()
+        .filter(|task| task.get("safe_repair").and_then(|v| v.as_bool()) == Some(true))
+        .cloned()
         .collect();
     let tasks: Vec<Value> = all_tasks
         .iter()
@@ -763,6 +871,7 @@ pub(super) async fn execute_ready(args: &Value) -> Result<ToolResult, McpError> 
 
     let count = tasks.len();
     let integration_conflict_count = integration_conflict_tasks.len();
+    let blocked_handoff_count = blocked_handoff_tasks.len();
     let recoverable_blocked_count = recoverable_blocked_tasks.len();
     let review_ready_count = review_ready_tasks.len();
     let changes_requested_count = changes_requested_tasks.len();
@@ -777,7 +886,7 @@ pub(super) async fn execute_ready(args: &Value) -> Result<ToolResult, McpError> 
     }
     if recoverable_blocked_count > 0 {
         priority_notes.push(format!(
-            "{recoverable_blocked_count} blocked task(s) have recoverable worker handoff state and should be moved to review_ready"
+            "{recoverable_blocked_count} blocked task(s) have recoverable worker handoff state and should be repaired with task action=repair_frontier"
         ));
     }
     if stalled_count > 0 {
@@ -814,15 +923,13 @@ pub(super) async fn execute_ready(args: &Value) -> Result<ToolResult, McpError> 
                 "action": "conflicts"
             }
         })
-    } else if let Some(task_id) = recoverable_blocked_tasks.first().and_then(queued_task_id) {
+    } else if recoverable_blocked_count > 0 {
         serde_json::json!({
-            "kind": "recover_blocked_review_ready",
+            "kind": "repair_frontier",
             "tool": "task",
-            "description": "Recover a blocked worker handoff that already has latest_commit recorded. Call this exact update, then call task action=ready again.",
+            "description": "Apply deterministic safe repairs from ready.recoverable_blocked_tasks. This recovers blocked worker handoffs with recorded latest_commit, then you must call task action=ready again.",
             "args": {
-                "action": "update",
-                "id": task_id,
-                "status": "review_ready"
+                "action": "repair_frontier"
             }
         })
     } else if let Some(task_id) = review_ready_tasks.first().and_then(queued_task_id) {
@@ -901,6 +1008,8 @@ pub(super) async fn execute_ready(args: &Value) -> Result<ToolResult, McpError> 
         "count": count,
         "integration_conflict_tasks": integration_conflict_tasks,
         "integration_conflict_count": integration_conflict_count,
+        "blocked_handoff_tasks": blocked_handoff_tasks,
+        "blocked_handoff_count": blocked_handoff_count,
         "recoverable_blocked_tasks": recoverable_blocked_tasks,
         "recoverable_blocked_count": recoverable_blocked_count,
         "review_ready_tasks": review_ready_tasks,

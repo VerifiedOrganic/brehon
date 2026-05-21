@@ -3,6 +3,7 @@
 //! This is the main interface for the diagnostic system.
 
 use crate::checkers::run_all_checks;
+use crate::repair::{run_repair, RepairReport};
 use crate::types::{DiagnosticFinding, DiagnosticReport};
 use std::path::Path;
 
@@ -56,6 +57,11 @@ pub fn run_doctor_json(brehon_root: &Path) -> Result<String, serde_json::Error> 
 pub fn run_doctor_compact(brehon_root: &Path) -> String {
     let report = run_doctor(brehon_root);
     report.to_compact()
+}
+
+/// Run deterministic runtime repairs and return a machine-readable report.
+pub fn run_doctor_repair(brehon_root: &Path) -> RepairReport {
+    run_repair(brehon_root)
 }
 
 #[cfg(test)]

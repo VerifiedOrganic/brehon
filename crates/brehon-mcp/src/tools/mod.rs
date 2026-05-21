@@ -62,3 +62,28 @@ fn error_result(text: impl Into<String>) -> ToolResult {
         is_error: Some(true),
     }
 }
+
+pub(crate) fn structured_error_result(
+    error_code: &str,
+    message: impl Into<String>,
+    retryable: bool,
+    current_state: Value,
+    allowed_next_actions: Vec<Value>,
+    next_action: Value,
+) -> ToolResult {
+    let payload = serde_json::json!({
+        "error_code": error_code,
+        "message": message.into(),
+        "retryable": retryable,
+        "current_state": current_state,
+        "allowed_next_actions": allowed_next_actions,
+        "next_action": next_action,
+    });
+    let text = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| {
+        format!(
+            "{{\"error_code\":\"{}\",\"message\":\"failed to serialize structured error\",\"retryable\":false,\"current_state\":null,\"allowed_next_actions\":[],\"next_action\":{{\"kind\":\"none\"}}}}",
+            error_code
+        )
+    });
+    error_result(text)
+}

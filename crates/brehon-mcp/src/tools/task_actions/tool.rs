@@ -64,7 +64,7 @@ impl Tool for TaskActionsTool {
     }
 
     fn description(&self) -> &str {
-        "Task lifecycle management. Supervisors should call action=ready and follow its next_action before guessing workflow steps; workers use checkpoint/complete/progress, supervisors use request_review/integrate/close/update recovery paths."
+        "Task lifecycle management. Supervisors should call action=ready and follow its next_action before guessing workflow steps; workers use checkpoint/complete/progress, supervisors use repair_frontier/recover_handoff/request_review/integrate/close recovery paths."
     }
 
     fn input_schema(&self) -> Value {
@@ -73,7 +73,7 @@ impl Tool for TaskActionsTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "description": "Action: list, mine, ready, checkpoint, complete, close, archive, integrate, abort-integration, progress, update, create, subtasks, children, conflicts, followups, promote_followups, waive_followups, ensure_final_hardening. Supervisors: call ready first; ready returns priority queues plus next_action. If next_action.kind=recover_blocked_review_ready, call task action=update with that id and status=review_ready exactly."
+                    "description": "Action: list, mine, ready, repair_frontier, recover_handoff, checkpoint, complete, close, archive, integrate, abort-integration, progress, update, create, subtasks, children, conflicts, followups, promote_followups, waive_followups, ensure_final_hardening. Supervisors: call ready first; ready returns priority queues plus next_action. If next_action.kind=repair_frontier or recover_handoff, call that exact task action instead of guessing status updates."
                 },
                 "id": {
                     "type": "string",
@@ -94,7 +94,7 @@ impl Tool for TaskActionsTool {
                 },
                 "status": {
                     "type": "string",
-                    "description": "Task status or filter. Do not guess status transitions. Workers finish with action=complete; supervisors start reviews with verification action=request_review. Supervisor action=update status=review_ready is allowed only for recovery cases returned by ready.recoverable_blocked_tasks or integration-conflict recovery."
+                    "description": "Task status or filter. Do not guess status transitions. Workers finish with action=complete; supervisors start reviews with verification action=request_review. Use recover_handoff or repair_frontier for blocked worker handoff recovery; supervisor action=update status=review_ready is retained only for backward-compatible integration-conflict recovery."
                 },
                 "include_closed": {
                     "type": "boolean",
@@ -235,7 +235,29 @@ impl Tool for TaskActionsTool {
                     "description": "For action=integrate: supervisor-only escape hatch. If the integration state is Aborted (or CherryPicking/Resolved with unrecoverable git state), force=true discards prior integration state and starts fresh. The prior phase is logged via tracing::warn!. force=true does NOT re-run an already-Complete integration — that requires a manual revert first."
                 }
             },
-            "required": ["action"]
+            "required": ["action"],
+            "examples": [
+                {
+                    "action": "ready"
+                },
+                {
+                    "action": "repair_frontier"
+                },
+                {
+                    "action": "recover_handoff",
+                    "id": "T-example"
+                },
+                {
+                    "action": "complete",
+                    "id": "T-example",
+                    "notes": "Implementation complete",
+                    "activity": "testing"
+                },
+                {
+                    "action": "integrate",
+                    "id": "T-example"
+                }
+            ]
         })
     }
 
@@ -252,6 +274,8 @@ impl Tool for TaskActionsTool {
             "mine" => super::action_query::execute_mine(&args).await,
             "conflicts" => super::action_query::execute_conflicts(&args).await,
             "ready" => super::action_query::execute_ready(&args).await,
+            "repair_frontier" => super::action_repair::execute_repair_frontier(&args).await,
+            "recover_handoff" => super::action_repair::execute_recover_handoff(&args).await,
             "children" | "subtasks" => super::action_query::execute_children(&args).await,
             "integrate" => {
                 super::action_integrate::execute(&args, &self.integration_proof_recorder).await

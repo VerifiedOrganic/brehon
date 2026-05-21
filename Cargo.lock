@@ -494,8 +494,10 @@ name = "brehon-doctor"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "brehon-config",
  "brehon-types",
  "chrono",
+ "filetime",
  "fjall",
  "git2",
  "libc",

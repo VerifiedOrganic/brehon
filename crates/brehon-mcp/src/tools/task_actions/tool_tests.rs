@@ -2180,6 +2180,486 @@ async fn test_supervisor_cannot_recover_blocked_worker_handoff_without_commit() 
 }
 
 #[tokio::test]
+async fn test_recover_handoff_action_repairs_blocked_worker_handoff() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let root = make_test_root();
+    let _env = ScopedEnv::set(&[
+        ("BREHON_ROOT", root.path().to_str().unwrap()),
+        ("BREHON_AGENT_ROLE", "supervisor"),
+    ]);
+    let tool = TaskActionsTool::new();
+
+    write_test_task(root.path(), "T-recover-action", "blocked", "task");
+    let mut task = read_test_task(root.path(), "T-recover-action");
+    task["latest_commit"] = Value::String("feedface".to_string());
+    task["percent"] = Value::Number(serde_json::Number::from(90_u64));
+    task["blockers"] = Value::String(
+        "Checkpoint succeeded, but task action=complete could not move it to review_ready: \
+         Invalid status transition: 'blocked' -> 'in_progress'."
+            .to_string(),
+    );
+    std::fs::write(
+        root.path()
+            .join("runtime")
+            .join("tasks")
+            .join("T-recover-action.json"),
+        serde_json::to_string_pretty(&task).unwrap(),
+    )
+    .unwrap();
+
+    let result = tool
+        .execute(serde_json::json!({
+            "action": "recover_handoff",
+            "id": "T-recover-action"
+        }))
+        .await
+        .unwrap();
+
+    assert!(result.is_error.is_none(), "{}", extract_text(&result));
+    let payload: Value = serde_json::from_str(&extract_text(&result)).unwrap();
+    assert_eq!(payload["action"], "recover_handoff");
+    assert_eq!(payload["from_status"], "blocked");
+    assert_eq!(payload["to_status"], "review_ready");
+    assert_eq!(payload["latest_commit"], "feedface");
+    assert_eq!(payload["next_action"]["kind"], "request_review");
+
+    let after = read_test_task(root.path(), "T-recover-action");
+    assert_eq!(after["status"], "review_ready");
+    assert_eq!(after["percent"], 100);
+    assert_eq!(after["activity"], "awaiting_review");
+    assert!(after.get("blockers").is_none());
+    assert_eq!(after["assignee"], Value::Null);
+    assert_eq!(after["review_owner"], Value::Null);
+}
+
+#[tokio::test]
+async fn test_repair_frontier_repairs_all_safe_blocked_handoffs() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let root = make_test_root();
+    let _env = ScopedEnv::set(&[
+        ("BREHON_ROOT", root.path().to_str().unwrap()),
+        ("BREHON_AGENT_ROLE", "supervisor"),
+    ]);
+    let tool = TaskActionsTool::new();
+
+    for task_id in ["T-repair-a", "T-repair-b"] {
+        write_test_task(root.path(), task_id, "blocked", "task");
+        let mut task = read_test_task(root.path(), task_id);
+        task["latest_commit"] = Value::String(format!("{task_id}-commit"));
+        task["blockers"] = Value::String(
+            "State deadlock: checkpoint created during pending state, need reassignment to complete"
+                .to_string(),
+        );
+        std::fs::write(
+            root.path()
+                .join("runtime")
+                .join("tasks")
+                .join(format!("{task_id}.json")),
+            serde_json::to_string_pretty(&task).unwrap(),
+        )
+        .unwrap();
+    }
+
+    let result = tool
+        .execute(serde_json::json!({ "action": "repair_frontier" }))
+        .await
+        .unwrap();
+
+    assert!(result.is_error.is_none(), "{}", extract_text(&result));
+    let payload: Value = serde_json::from_str(&extract_text(&result)).unwrap();
+    assert_eq!(payload["action"], "repair_frontier");
+    assert_eq!(payload["repaired_count"], 2, "{payload}");
+    assert_eq!(payload["skipped_count"], 0, "{payload}");
+    assert_eq!(payload["next_action"]["args"]["action"], "ready");
+    assert_eq!(
+        read_test_task(root.path(), "T-repair-a")["status"],
+        "review_ready"
+    );
+    assert_eq!(
+        read_test_task(root.path(), "T-repair-b")["status"],
+        "review_ready"
+    );
+}
+
+#[tokio::test]
+async fn test_recover_handoff_returns_structured_error_without_commit() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let root = make_test_root();
+    let _env = ScopedEnv::set(&[
+        ("BREHON_ROOT", root.path().to_str().unwrap()),
+        ("BREHON_AGENT_ROLE", "supervisor"),
+    ]);
+    let tool = TaskActionsTool::new();
+
+    write_test_task(root.path(), "T-no-commit-action", "blocked", "task");
+    let mut task = read_test_task(root.path(), "T-no-commit-action");
+    task["blockers"] = Value::String(
+        "State deadlock: checkpoint created during pending state, need reassignment to complete"
+            .to_string(),
+    );
+    std::fs::write(
+        root.path()
+            .join("runtime")
+            .join("tasks")
+            .join("T-no-commit-action.json"),
+        serde_json::to_string_pretty(&task).unwrap(),
+    )
+    .unwrap();
+
+    let result = tool
+        .execute(serde_json::json!({
+            "action": "recover_handoff",
+            "id": "T-no-commit-action"
+        }))
+        .await
+        .unwrap();
+
+    assert_eq!(result.is_error, Some(true));
+    let payload: Value = serde_json::from_str(&extract_text(&result)).unwrap();
+    assert_eq!(payload["error_code"], "handoff_missing_latest_commit");
+    assert_eq!(payload["retryable"], false);
+    assert_eq!(payload["current_state"]["status"], "blocked");
+    assert!(payload["current_state"]["latest_commit"].is_null());
+    assert_eq!(payload["next_action"]["args"]["action"], "ready");
+    assert!(payload["allowed_next_actions"].as_array().unwrap().len() >= 1);
+    assert_eq!(
+        read_test_task(root.path(), "T-no-commit-action")["status"],
+        "blocked"
+    );
+}
+
+#[tokio::test]
+async fn test_recover_handoff_rejects_non_blocked_task_with_structured_error() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let root = make_test_root();
+    let _env = ScopedEnv::set(&[
+        ("BREHON_ROOT", root.path().to_str().unwrap()),
+        ("BREHON_AGENT_ROLE", "supervisor"),
+    ]);
+    let tool = TaskActionsTool::new();
+
+    write_test_task(root.path(), "T-wrong-status", "pending", "task");
+    let mut task = read_test_task(root.path(), "T-wrong-status");
+    task["latest_commit"] = Value::String("abc123".to_string());
+    std::fs::write(
+        root.path()
+            .join("runtime")
+            .join("tasks")
+            .join("T-wrong-status.json"),
+        serde_json::to_string_pretty(&task).unwrap(),
+    )
+    .unwrap();
+
+    let result = tool
+        .execute(serde_json::json!({
+            "action": "recover_handoff",
+            "id": "T-wrong-status"
+        }))
+        .await
+        .unwrap();
+
+    assert_eq!(result.is_error, Some(true));
+    let payload: Value = serde_json::from_str(&extract_text(&result)).unwrap();
+    assert_eq!(payload["error_code"], "handoff_wrong_status");
+    assert_eq!(payload["current_state"]["status"], "pending");
+    assert_eq!(payload["next_action"]["args"]["action"], "ready");
+}
+
+#[tokio::test]
+async fn test_repair_frontier_requires_supervisor_with_structured_error() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let root = make_test_root();
+    let _env = ScopedEnv::set(&[
+        ("BREHON_ROOT", root.path().to_str().unwrap()),
+        ("BREHON_AGENT_ROLE", "worker"),
+    ]);
+    let tool = TaskActionsTool::new();
+
+    let result = tool
+        .execute(serde_json::json!({ "action": "repair_frontier" }))
+        .await
+        .unwrap();
+
+    assert_eq!(result.is_error, Some(true));
+    let payload: Value = serde_json::from_str(&extract_text(&result)).unwrap();
+    assert_eq!(payload["error_code"], "supervisor_required");
+    assert_eq!(payload["retryable"], false);
+    assert_eq!(payload["current_state"]["caller_role"], "worker");
+    assert_eq!(payload["next_action"]["args"]["action"], "ready");
+}
+
+#[tokio::test]
+async fn test_recover_handoff_reports_structured_errors_for_unsafe_states() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let root = make_test_root();
+
+    {
+        let _env = ScopedEnv::set(&[
+            ("BREHON_ROOT", root.path().to_str().unwrap()),
+            ("BREHON_AGENT_ROLE", "worker"),
+        ]);
+        let tool = TaskActionsTool::new();
+        let result = tool
+            .execute(serde_json::json!({
+                "action": "recover_handoff",
+                "id": "T-any"
+            }))
+            .await
+            .unwrap();
+        let payload: Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(payload["error_code"], "supervisor_required");
+        assert_eq!(payload["next_action"]["args"]["action"], "ready");
+    }
+
+    let _env = ScopedEnv::set(&[
+        ("BREHON_ROOT", root.path().to_str().unwrap()),
+        ("BREHON_AGENT_ROLE", "supervisor"),
+    ]);
+    let tool = TaskActionsTool::new();
+    let assert_error_code = |result: ToolResult, expected: &str| -> Value {
+        assert_eq!(result.is_error, Some(true), "{}", extract_text(&result));
+        let payload: Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        assert_eq!(payload["error_code"], expected, "{payload}");
+        assert_eq!(payload["next_action"]["args"]["action"], "ready");
+        payload
+    };
+
+    let missing_id = tool
+        .execute(serde_json::json!({ "action": "recover_handoff" }))
+        .await
+        .unwrap();
+    assert_error_code(missing_id, "missing_task_id");
+
+    let missing_task = tool
+        .execute(serde_json::json!({
+            "action": "recover_handoff",
+            "id": "T-missing"
+        }))
+        .await
+        .unwrap();
+    let payload = assert_error_code(missing_task, "task_not_found");
+    assert_eq!(payload["current_state"]["exists"], false);
+
+    write_test_task(root.path(), "T-terminal-recover", "closed", "task");
+    let terminal = tool
+        .execute(serde_json::json!({
+            "action": "recover_handoff",
+            "id": "T-terminal-recover"
+        }))
+        .await
+        .unwrap();
+    assert_error_code(terminal, "task_terminal");
+
+    write_test_task(root.path(), "T-non-task-recover", "blocked", "epic");
+    let mut non_task = read_test_task(root.path(), "T-non-task-recover");
+    non_task["latest_commit"] = Value::String("abc123".to_string());
+    non_task["blockers"] = Value::String(
+        "State deadlock: checkpoint created during pending state, need reassignment to complete"
+            .to_string(),
+    );
+    std::fs::write(
+        root.path()
+            .join("runtime")
+            .join("tasks")
+            .join("T-non-task-recover.json"),
+        serde_json::to_string_pretty(&non_task).unwrap(),
+    )
+    .unwrap();
+    let non_task_result = tool
+        .execute(serde_json::json!({
+            "action": "recover_handoff",
+            "id": "T-non-task-recover"
+        }))
+        .await
+        .unwrap();
+    assert_error_code(non_task_result, "handoff_not_worker_task");
+
+    write_test_task(root.path(), "T-not-recoverable", "blocked", "task");
+    let mut not_recoverable = read_test_task(root.path(), "T-not-recoverable");
+    not_recoverable["latest_commit"] = Value::String("def456".to_string());
+    not_recoverable["blockers"] = Value::String("Waiting on external dependency".to_string());
+    std::fs::write(
+        root.path()
+            .join("runtime")
+            .join("tasks")
+            .join("T-not-recoverable.json"),
+        serde_json::to_string_pretty(&not_recoverable).unwrap(),
+    )
+    .unwrap();
+    let not_recoverable_result = tool
+        .execute(serde_json::json!({
+            "action": "recover_handoff",
+            "id": "T-not-recoverable"
+        }))
+        .await
+        .unwrap();
+    assert_error_code(not_recoverable_result, "handoff_not_recoverable");
+
+    write_test_task(root.path(), "T-closed-parent", "closed", "epic");
+    write_test_task(root.path(), "T-child-closed-parent", "blocked", "task");
+    let mut child = read_test_task(root.path(), "T-child-closed-parent");
+    child["parent_id"] = Value::String("T-closed-parent".to_string());
+    child["latest_commit"] = Value::String("feedface".to_string());
+    child["blockers"] = Value::String(
+        "State deadlock: checkpoint created during pending state, need reassignment to complete"
+            .to_string(),
+    );
+    std::fs::write(
+        root.path()
+            .join("runtime")
+            .join("tasks")
+            .join("T-child-closed-parent.json"),
+        serde_json::to_string_pretty(&child).unwrap(),
+    )
+    .unwrap();
+    let closed_parent_result = tool
+        .execute(serde_json::json!({
+            "action": "recover_handoff",
+            "id": "T-child-closed-parent"
+        }))
+        .await
+        .unwrap();
+    assert_error_code(closed_parent_result, "handoff_closed_parent");
+
+    write_test_task(root.path(), "T-control-plane-recover", "blocked", "task");
+    let mut control_plane = read_test_task(root.path(), "T-control-plane-recover");
+    control_plane["description"] = Value::String("Repair .brehon/runtime/tasks state".to_string());
+    control_plane["latest_commit"] = Value::String("c0ffee".to_string());
+    control_plane["blockers"] = Value::String(
+        "State deadlock: checkpoint created during pending state, need reassignment to complete"
+            .to_string(),
+    );
+    std::fs::write(
+        root.path()
+            .join("runtime")
+            .join("tasks")
+            .join("T-control-plane-recover.json"),
+        serde_json::to_string_pretty(&control_plane).unwrap(),
+    )
+    .unwrap();
+    let control_plane_result = tool
+        .execute(serde_json::json!({
+            "action": "recover_handoff",
+            "id": "T-control-plane-recover"
+        }))
+        .await
+        .unwrap();
+    assert_error_code(control_plane_result, "handoff_control_plane_scope");
+}
+
+#[tokio::test]
+async fn test_live_runtime_ready_and_repair_frontier_without_manual_task_json_edits() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let root = make_test_root();
+    let workspace = tempfile::tempdir().unwrap();
+    init_git_workspace(workspace.path());
+
+    let _supervisor_env = ScopedEnv::set(&[
+        ("BREHON_ROOT", root.path().to_str().unwrap()),
+        ("BREHON_AGENT_ROLE", "supervisor"),
+        ("BREHON_AGENT_NAME", "supervisor-1"),
+    ]);
+    let tool = TaskActionsTool::new();
+    let created = create_standalone_task_for_test(&tool, "Live blocked handoff repair").await;
+    let task_id = created["task_id"].as_str().unwrap().to_string();
+
+    let blocked = tool
+        .execute(serde_json::json!({
+            "action": "update",
+            "id": task_id,
+            "status": "blocked",
+            "blockers": "State deadlock: checkpoint created during pending state, need reassignment to complete",
+            "role": "supervisor"
+        }))
+        .await
+        .unwrap();
+    assert!(blocked.is_error.is_none(), "{}", extract_text(&blocked));
+    let factory = crate::tools::factory::FactoryTool::new();
+    let owned = factory
+        .execute(serde_json::json!({
+            "action": "set_ownership",
+            "task_id": task_id,
+            "worker": "worker-1"
+        }))
+        .await
+        .unwrap();
+    assert!(owned.is_error.is_none(), "{}", extract_text(&owned));
+    drop(_supervisor_env);
+
+    let _worker_env = ScopedEnv::set(&[
+        ("BREHON_ROOT", root.path().to_str().unwrap()),
+        ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
+        ("BREHON_AGENT_ROLE", "worker"),
+        ("BREHON_AGENT_NAME", "worker-1"),
+        ("BREHON_SUPERVISOR_NAME", "supervisor-1"),
+    ]);
+    std::fs::write(workspace.path().join("feature.txt"), "finished\n").unwrap();
+    let checkpoint = tool
+        .execute(serde_json::json!({
+            "action": "checkpoint",
+            "id": task_id,
+            "message": "finished implementation",
+            "role": "worker",
+            "agent_name": "worker-1"
+        }))
+        .await
+        .unwrap();
+    assert!(
+        checkpoint.is_error.is_none(),
+        "{}",
+        extract_text(&checkpoint)
+    );
+    drop(_worker_env);
+
+    let _supervisor_env = ScopedEnv::set(&[
+        ("BREHON_ROOT", root.path().to_str().unwrap()),
+        ("BREHON_AGENT_ROLE", "supervisor"),
+        ("BREHON_AGENT_NAME", "supervisor-1"),
+    ]);
+    let ready = tool
+        .execute(serde_json::json!({ "action": "ready" }))
+        .await
+        .unwrap();
+    assert!(ready.is_error.is_none(), "{}", extract_text(&ready));
+    let ready_payload: Value = serde_json::from_str(&extract_text(&ready)).unwrap();
+    assert_eq!(
+        ready_payload["recoverable_blocked_count"], 1,
+        "{ready_payload}"
+    );
+    assert_eq!(
+        ready_payload["next_action"]["args"]["action"],
+        "repair_frontier"
+    );
+
+    let repaired = tool
+        .execute(serde_json::json!({
+            "action": "repair_frontier",
+            "role": "supervisor"
+        }))
+        .await
+        .unwrap();
+    assert!(repaired.is_error.is_none(), "{}", extract_text(&repaired));
+    let repaired_payload: Value = serde_json::from_str(&extract_text(&repaired)).unwrap();
+    assert_eq!(repaired_payload["repaired_count"], 1, "{repaired_payload}");
+
+    let after_ready = tool
+        .execute(serde_json::json!({ "action": "ready" }))
+        .await
+        .unwrap();
+    let after_payload: Value = serde_json::from_str(&extract_text(&after_ready)).unwrap();
+    assert_eq!(
+        after_payload["recoverable_blocked_count"], 0,
+        "{after_payload}"
+    );
+    assert_eq!(after_payload["review_ready_count"], 1, "{after_payload}");
+    assert_eq!(
+        after_payload["review_ready_tasks"][0]["task_id"],
+        Value::String(task_id)
+    );
+}
+
+#[tokio::test]
 async fn test_ready_reconciles_dependency_states_before_listing() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
@@ -2344,21 +2824,30 @@ async fn test_ready_surfaces_recoverable_blocked_worker_handoffs() {
         payload["recoverable_blocked_tasks"][0]["task_id"],
         "T-handoff"
     );
-    assert_eq!(
-        payload["next_action"]["kind"],
-        "recover_blocked_review_ready"
-    );
+    assert_eq!(payload["next_action"]["kind"], "repair_frontier");
     assert_eq!(payload["next_action"]["tool"], "task");
     assert!(
         payload["next_action"]["description"]
             .as_str()
             .unwrap()
-            .contains("Call this exact update"),
+            .contains("Apply deterministic safe repairs"),
         "{payload}"
     );
-    assert_eq!(payload["next_action"]["args"]["action"], "update");
-    assert_eq!(payload["next_action"]["args"]["id"], "T-handoff");
-    assert_eq!(payload["next_action"]["args"]["status"], "review_ready");
+    assert_eq!(payload["next_action"]["args"]["action"], "repair_frontier");
+    assert_eq!(payload["blocked_handoff_count"], 1, "{payload}");
+    assert_eq!(payload["blocked_handoff_tasks"][0]["safe_repair"], true);
+    assert_eq!(
+        payload["blocked_handoff_tasks"][0]["repair_action"]["args"]["action"],
+        "recover_handoff"
+    );
+    assert_eq!(
+        payload["blocked_handoff_tasks"][0]["repair_action"]["args"]["id"],
+        "T-handoff"
+    );
+    assert_eq!(
+        payload["blocked_handoff_tasks"][0]["liveness"]["state"],
+        "missing_session"
+    );
 }
 
 #[tokio::test]
@@ -4511,6 +5000,73 @@ async fn test_complete_commits_worker_workspace_and_marks_review_ready() {
         notified,
         "supervisor should be notified when complete succeeds"
     );
+}
+
+#[tokio::test]
+async fn test_complete_recovers_blocked_handoff_after_checkpoint_succeeds() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let root = make_test_root();
+    let project = tempfile::tempdir().unwrap();
+    init_git_workspace(project.path());
+    let workspace = tempfile::tempdir().unwrap();
+    let initial_commit = init_git_workspace(workspace.path());
+    std::fs::write(
+        workspace.path().join("feature.txt"),
+        "completed from blocked\n",
+    )
+    .unwrap();
+    let _env = ScopedEnv::set(&[
+        ("BREHON_ROOT", root.path().to_str().unwrap()),
+        ("BREHON_PROJECT_ROOT", project.path().to_str().unwrap()),
+        ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
+        ("BREHON_AGENT_ROLE", "worker"),
+        ("BREHON_AGENT_NAME", "worker-1"),
+        ("BREHON_SUPERVISOR_NAME", "sup-1"),
+    ]);
+    let tool = TaskActionsTool::new();
+    write_test_task(root.path(), "T-complete-blocked", "blocked", "task");
+    let mut task = read_test_task(root.path(), "T-complete-blocked");
+    task["assignee"] = Value::String("worker-1".to_string());
+    task["blockers"] = Value::String(
+        "State deadlock: checkpoint created during pending state, need reassignment to complete"
+            .to_string(),
+    );
+    std::fs::write(
+        root.path()
+            .join("runtime")
+            .join("tasks")
+            .join("T-complete-blocked.json"),
+        serde_json::to_string_pretty(&task).unwrap(),
+    )
+    .unwrap();
+
+    let result = tool
+        .execute(serde_json::json!({
+            "action": "complete",
+            "id": "T-complete-blocked",
+            "notes": "implementation complete after blocked handoff"
+        }))
+        .await
+        .unwrap();
+
+    assert!(result.is_error.is_none(), "{}", extract_text(&result));
+    let result_json: Value = serde_json::from_str(&extract_text(&result)).unwrap();
+    let commit = result_json["latest_commit"].as_str().unwrap();
+    assert_ne!(commit, initial_commit);
+    assert_eq!(result_json["created_commit"], true);
+    assert_eq!(result_json["task_status"], "review_ready");
+    assert_eq!(result_json["recovered_handoff"], true);
+    assert_eq!(run_git(workspace.path(), &["rev-parse", "HEAD"]), commit);
+    assert_eq!(run_git(workspace.path(), &["status", "--porcelain"]), "");
+
+    let task = read_test_task(root.path(), "T-complete-blocked");
+    assert_eq!(task["status"], "review_ready");
+    assert_eq!(task["latest_commit"], commit);
+    assert!(task.get("blockers").is_none(), "blockers should be cleared");
+    assert!(task["assignee"].is_null());
+    assert!(task["review_owner"].is_null());
+    assert_eq!(task["activity"], "awaiting_review");
+    assert_eq!(task["percent"], 100);
 }
 
 #[tokio::test]

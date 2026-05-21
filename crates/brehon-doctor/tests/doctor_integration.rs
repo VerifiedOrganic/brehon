@@ -1,7 +1,33 @@
 //! Integration tests for doctor diagnostic pipeline.
 
 use std::path::Path;
+use std::process::Command;
 use tempfile::TempDir;
+
+fn run_git(dir: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run git {}: {err}", args.join(" ")));
+    assert!(
+        output.status.success(),
+        "git {} failed: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+fn init_source_repo(dir: &Path) -> String {
+    run_git(dir, &["init", "-b", "main"]);
+    run_git(dir, &["config", "user.email", "test@example.com"]);
+    run_git(dir, &["config", "user.name", "Test User"]);
+    std::fs::write(dir.join("README.md"), "seed\n").unwrap();
+    run_git(dir, &["add", "README.md"]);
+    run_git(dir, &["commit", "-m", "seed"]);
+    run_git(dir, &["rev-parse", "HEAD"])
+}
 
 fn create_test_runtime(dir: &Path) {
     let runtime = dir.join("runtime");
@@ -357,4 +383,257 @@ fn test_doctor_detects_orphaned_git_metadata() {
         .collect();
 
     assert_eq!(orphan_findings.len(), 1);
+}
+
+#[test]
+fn test_doctor_repair_recovers_runtime_control_plane_state() {
+    let tmp = TempDir::new().unwrap();
+    let brehon_root = tmp.path().join(".brehon");
+    create_test_runtime(&brehon_root);
+    let tasks_dir = brehon_root.join("runtime").join("tasks");
+
+    std::fs::write(
+        tasks_dir.join("T-orphan.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "task_id": "T-orphan",
+            "title": "Orphaned worker task",
+            "status": "in_progress",
+            "task_type": "task",
+            "assignee": "dead-worker",
+            "updated_at": chrono::Utc::now().to_rfc3339(),
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        tasks_dir.join("T-review.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "task_id": "T-review",
+            "title": "Missing review state",
+            "status": "in_review",
+            "task_type": "task",
+            "latest_commit": "abc123",
+            "updated_at": chrono::Utc::now().to_rfc3339(),
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let lock_path = tasks_dir.join(".T-orphan.lock");
+    std::fs::write(&lock_path, "stale").unwrap();
+    let old = filetime::FileTime::from_unix_time(
+        (chrono::Utc::now() - chrono::Duration::minutes(2)).timestamp(),
+        0,
+    );
+    filetime::set_file_mtime(&lock_path, old).unwrap();
+
+    let mcp_dir = brehon_root.join("runtime").join("mcp-servers");
+    std::fs::create_dir_all(&mcp_dir).unwrap();
+    std::fs::write(
+        mcp_dir.join("999999.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "pid": 999999u64,
+            "server_name": "brehon",
+            "server_version": env!("CARGO_PKG_VERSION"),
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let report = brehon_doctor::run_doctor_repair(&brehon_root);
+    assert!(
+        report.repaired_count >= 4,
+        "expected lock, dead mcp metadata, orphan, and review-state repairs: {report:?}"
+    );
+    assert!(!lock_path.exists());
+    assert!(!mcp_dir.join("999999.json").exists());
+
+    let orphan: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(tasks_dir.join("T-orphan.json")).unwrap())
+            .unwrap();
+    assert_eq!(orphan["status"], "pending");
+    assert!(orphan["assignee"].is_null());
+    assert_eq!(orphan["orphaned_assignee"], "dead-worker");
+
+    let review: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(tasks_dir.join("T-review.json")).unwrap())
+            .unwrap();
+    assert_eq!(review["status"], "review_ready");
+}
+
+#[test]
+fn test_doctor_repair_preserves_live_and_fresh_runtime_state() {
+    let tmp = TempDir::new().unwrap();
+    let brehon_root = tmp.path().join(".brehon");
+    create_test_runtime(&brehon_root);
+    let tasks_dir = brehon_root.join("runtime").join("tasks");
+    let sessions_dir = brehon_root.join("runtime").join("sessions");
+
+    write_session(&brehon_root, "worker-live", 1);
+    std::fs::write(
+        tasks_dir.join("T-live.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "task_id": "T-live",
+            "title": "Live worker task",
+            "status": "in_progress",
+            "task_type": "task",
+            "assignee": "worker-live",
+            "updated_at": chrono::Utc::now().to_rfc3339(),
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        tasks_dir.join("T-review-live.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "task_id": "T-review-live",
+            "title": "Live review task",
+            "status": "in_review",
+            "task_type": "task",
+            "latest_commit": "abc123",
+            "updated_at": chrono::Utc::now().to_rfc3339(),
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let review_dir = brehon_root
+        .join("runtime")
+        .join("reviews")
+        .join("T-review-live");
+    std::fs::create_dir_all(&review_dir).unwrap();
+    std::fs::write(review_dir.join("state.json"), "{}").unwrap();
+
+    let fresh_lock = tasks_dir.join(".T-live.lock");
+    std::fs::write(&fresh_lock, "fresh").unwrap();
+
+    let mcp_dir = brehon_root.join("runtime").join("mcp-servers");
+    std::fs::create_dir_all(&mcp_dir).unwrap();
+    let live_mcp = mcp_dir.join(format!("{}.json", std::process::id()));
+    std::fs::write(
+        &live_mcp,
+        serde_json::to_string_pretty(&serde_json::json!({
+            "pid": std::process::id(),
+            "server_name": "brehon",
+            "server_version": env!("CARGO_PKG_VERSION"),
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let report = brehon_doctor::run_doctor_repair(&brehon_root);
+    assert!(
+        !report.actions.iter().any(|action| action.repaired),
+        "nothing in this fixture should be repaired: {report:?}"
+    );
+    assert!(fresh_lock.exists());
+    assert!(live_mcp.exists());
+    assert!(sessions_dir.join("worker-live.json").exists());
+    let live_task: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(tasks_dir.join("T-live.json")).unwrap())
+            .unwrap();
+    assert_eq!(live_task["status"], "in_progress");
+    assert_eq!(live_task["assignee"], "worker-live");
+    let review_task: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(tasks_dir.join("T-review-live.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(review_task["status"], "in_review");
+}
+
+#[test]
+fn test_doctor_detects_stale_mcp_binary_metadata() {
+    let tmp = TempDir::new().unwrap();
+    let brehon_root = tmp.path().join(".brehon");
+    create_test_runtime(&brehon_root);
+    let mcp_dir = brehon_root.join("runtime").join("mcp-servers");
+    std::fs::create_dir_all(&mcp_dir).unwrap();
+    let binary = tmp.path().join("brehon-bin");
+    std::fs::write(&binary, "binary").unwrap();
+
+    std::fs::write(
+        mcp_dir.join(format!("{}.json", std::process::id())),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "pid": std::process::id(),
+            "server_name": "brehon",
+            "server_version": env!("CARGO_PKG_VERSION"),
+            "binary_path": binary,
+            "binary_modified_unix_secs": 0u64,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let report = brehon_doctor::run_doctor(&brehon_root);
+    let stale_binary: Vec<_> = report
+        .findings
+        .iter()
+        .filter(|finding| finding.summary.contains("Stale installed Brehon binary"))
+        .collect();
+    assert_eq!(stale_binary.len(), 1, "{:?}", report.findings);
+}
+
+#[test]
+fn test_doctor_detects_stale_mcp_source_revision() {
+    let tmp = TempDir::new().unwrap();
+    let current_revision = init_source_repo(tmp.path());
+    assert_ne!(current_revision, "old-source-revision");
+    let brehon_root = tmp.path().join(".brehon");
+    create_test_runtime(&brehon_root);
+    let mcp_dir = brehon_root.join("runtime").join("mcp-servers");
+    std::fs::create_dir_all(&mcp_dir).unwrap();
+
+    std::fs::write(
+        mcp_dir.join(format!("{}.json", std::process::id())),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "pid": std::process::id(),
+            "server_name": "brehon",
+            "server_version": env!("CARGO_PKG_VERSION"),
+            "source_revision": "old-source-revision",
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let report = brehon_doctor::run_doctor(&brehon_root);
+    let stale_source: Vec<_> = report
+        .findings
+        .iter()
+        .filter(|finding| finding.summary.contains("Stale MCP source revision"))
+        .collect();
+    assert_eq!(stale_source.len(), 1, "{:?}", report.findings);
+
+    let repair = brehon_doctor::run_doctor_repair(&brehon_root);
+    assert!(
+        repair.actions.iter().any(|action| {
+            action.code == "stale_source_revision"
+                && !action.repaired
+                && action.message.contains("older source revision")
+        }),
+        "{repair:?}"
+    );
+}
+
+#[test]
+fn test_doctor_repair_reports_bad_routing_lanes_as_operator_action() {
+    let tmp = TempDir::new().unwrap();
+    let brehon_root = tmp.path().join(".brehon");
+    create_test_runtime(&brehon_root);
+    std::fs::write(
+        brehon_root.join("config.yaml"),
+        r#"
+routing:
+  default_worker_lane: missing-worker
+"#,
+    )
+    .unwrap();
+
+    let report = brehon_doctor::run_doctor_repair(&brehon_root);
+    assert!(
+        report.actions.iter().any(|action| {
+            action.code == "bad_routing_lane"
+                && !action.repaired
+                && action.message.contains("missing-worker")
+        }),
+        "{report:?}"
+    );
 }

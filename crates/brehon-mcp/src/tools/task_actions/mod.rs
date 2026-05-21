@@ -20,6 +20,7 @@ mod action_create;
 mod action_followup;
 mod action_integrate;
 mod action_query;
+mod action_repair;
 mod action_update;
 mod build_artifact_cleanup;
 mod dependencies;

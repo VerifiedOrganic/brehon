@@ -137,7 +137,12 @@ enum Commands {
     },
 
     #[command(name = "doctor")]
-    Doctor,
+    Doctor {
+        #[arg(long)]
+        repair: bool,
+        #[arg(long)]
+        json: bool,
+    },
 
     #[command(name = "runtime")]
     Runtime {
@@ -565,13 +570,15 @@ async fn main() -> ExitCode {
                 }
             }
         }
-        Some(Commands::Doctor) => match doctor::execute(project_path.as_deref()) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(e) => {
-                tracing::error!("Diagnostics failed: {:?}", e);
-                ExitCode::FAILURE
+        Some(Commands::Doctor { repair, json }) => {
+            match doctor::execute(project_path.as_deref(), repair, json) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    tracing::error!("Diagnostics failed: {:?}", e);
+                    ExitCode::FAILURE
+                }
             }
-        },
+        }
         Some(Commands::Runtime { command }) => {
             let result = match command {
                 RuntimeCommands::Dashboard => runtime::dashboard(project_path.as_deref()).await,

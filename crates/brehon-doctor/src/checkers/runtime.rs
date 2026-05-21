@@ -6,7 +6,8 @@ use super::Checker;
 use crate::types::{DiagnosticCategory, DiagnosticFinding, Severity};
 use brehon_types::{load_runtime_stability_counters, StabilityBounds};
 use chrono::{DateTime, Utc};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 /// Session staleness threshold in seconds (30 minutes).
 const SESSION_STALE_THRESHOLD_SECS: i64 = 1800;
@@ -532,6 +533,111 @@ impl RuntimeChecker {
 
         Ok(findings)
     }
+
+    fn check_mcp_server_metadata(&self) -> Result<Vec<DiagnosticFinding>, anyhow::Error> {
+        let mut findings = Vec::new();
+        let servers_dir = self.runtime_dir.join("mcp-servers");
+        if !servers_dir.exists() {
+            return Ok(findings);
+        }
+        let brehon_root = self.runtime_dir.parent().unwrap_or(&self.runtime_dir);
+        let project_root = brehon_root.parent().unwrap_or(brehon_root);
+        let current_revision = current_source_revision(project_root);
+
+        for entry in std::fs::read_dir(&servers_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().is_none_or(|e| e != "json") {
+                continue;
+            }
+            let Ok(content) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(metadata) = serde_json::from_str::<serde_json::Value>(&content) else {
+                continue;
+            };
+            let pid = metadata
+                .get("pid")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0);
+            if pid == 0 {
+                continue;
+            }
+            if !pid_alive(pid as u32) {
+                findings.push(
+                    DiagnosticFinding::new(
+                        DiagnosticCategory::Runtime,
+                        Severity::Error,
+                        format!("Dead MCP server metadata: pid {pid}"),
+                    )
+                    .with_subject(path.display().to_string())
+                    .with_suggestion("Run `brehon doctor --repair` to remove stale MCP metadata."),
+                );
+                continue;
+            }
+
+            if metadata
+                .get("server_version")
+                .and_then(|value| value.as_str())
+                != Some(env!("CARGO_PKG_VERSION"))
+            {
+                findings.push(
+                    DiagnosticFinding::new(
+                        DiagnosticCategory::Runtime,
+                        Severity::Warning,
+                        format!("Stale MCP server version: pid {pid}"),
+                    )
+                    .with_subject(format!("pid {pid}"))
+                    .with_suggestion("Restart the live `brehon serve` MCP process."),
+                );
+            }
+
+            if let Some(binary_path) = metadata
+                .get("binary_path")
+                .and_then(|value| value.as_str())
+                .map(PathBuf::from)
+            {
+                let recorded = metadata
+                    .get("binary_modified_unix_secs")
+                    .and_then(|value| value.as_u64());
+                if recorded.is_some() && file_modified_unix_secs(&binary_path) != recorded {
+                    findings.push(
+                        DiagnosticFinding::new(
+                            DiagnosticCategory::Runtime,
+                            Severity::Warning,
+                            format!("Stale installed Brehon binary: pid {pid}"),
+                        )
+                        .with_subject(binary_path.display().to_string())
+                        .with_suggestion("Restart the live `brehon serve` MCP process."),
+                    );
+                }
+            }
+
+            if let (Some(recorded), Some(current)) = (
+                metadata
+                    .get("source_revision")
+                    .and_then(|value| value.as_str()),
+                current_revision.as_deref(),
+            ) {
+                if recorded != current {
+                    findings.push(
+                        DiagnosticFinding::new(
+                            DiagnosticCategory::Runtime,
+                            Severity::Warning,
+                            format!("Stale MCP source revision: pid {pid}"),
+                        )
+                        .with_subject(format!("pid {pid}"))
+                        .with_description(format!(
+                            "serve started at {recorded}, current source is {current}"
+                        ))
+                        .with_suggestion("Restart the live `brehon serve` MCP process."),
+                    );
+                }
+            }
+        }
+
+        Ok(findings)
+    }
 }
 
 fn parse_timestamp(json: &serde_json::Value, fields: &[&str]) -> Option<DateTime<Utc>> {
@@ -559,8 +665,42 @@ impl Checker for RuntimeChecker {
         findings.extend(self.check_output_silent_workers()?);
         findings.extend(self.check_unacknowledged_nudges()?);
         findings.extend(self.check_stability_bounds()?);
+        findings.extend(self.check_mcp_server_metadata()?);
         Ok(findings)
     }
+}
+
+fn pid_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        let result = unsafe { libc::kill(pid as i32, 0) };
+        result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        true
+    }
+}
+
+fn current_source_revision(project_root: &Path) -> Option<String> {
+    let output = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(project_root)
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn file_modified_unix_secs(path: &Path) -> Option<u64> {
+    std::fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs())
 }
 
 #[cfg(test)]

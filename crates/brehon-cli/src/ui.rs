@@ -1041,19 +1041,23 @@ impl ShutdownProgress {
 
 /// Print the Brehon ASCII art banner with border.
 pub fn print_banner() {
-    // Each line is exactly 46 visible characters wide (accounting for
-    // multi-byte Unicode block characters which are single-width in terminals).
     let logo_lines = [
-        " █████╗  ██████╗  ██████╗ ██████╗  █████╗ ",
-        "██╔══██╗██╔════╝ ██╔═══██╗██╔══██╗██╔══██╗",
-        "███████║██║  ███╗██║   ██║██████╔╝███████║ ",
-        "██╔══██║██║   ██║██║   ██║██╔══██╗██╔══██║ ",
-        "██║  ██║╚██████╔╝╚██████╔╝██║  ██║██║  ██║",
-        "╚═╝  ╚═╝ ╚═════╝  ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝",
+        "██████╗ ██████╗ ███████╗██╗  ██╗ ██████╗ ███╗   ██╗",
+        "██╔══██╗██╔══██╗██╔════╝██║  ██║██╔═══██╗████╗  ██║",
+        "██████╔╝██████╔╝█████╗  ███████║██║   ██║██╔██╗ ██║",
+        "██╔══██╗██╔══██╗██╔══╝  ██╔══██║██║   ██║██║╚██╗██║",
+        "██████╔╝██║  ██║███████╗██║  ██║╚██████╔╝██║ ╚████║",
+        "╚═════╝ ╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═══╝",
     ];
 
-    // Use a fixed inner width that fits the logo + padding
-    let inner_width = 52;
+    let tagline = "Multi-agent orchestration for AI coding agents";
+    let inner_width = logo_lines
+        .iter()
+        .map(|line| line.chars().count())
+        .chain(std::iter::once(tagline.len()))
+        .max()
+        .unwrap_or(0)
+        + 6;
     let border = |left: &str, fill: &str, right: &str| {
         format!(
             "  {}{}{}",
@@ -1081,7 +1085,6 @@ pub fn print_banner() {
 
     println!("{}", empty);
 
-    let tagline = "Multi-agent orchestration for AI coding agents";
     let tag_len = tagline.len();
     let left_pad = (inner_width.saturating_sub(tag_len)) / 2;
     let right_pad = inner_width.saturating_sub(tag_len).saturating_sub(left_pad);
