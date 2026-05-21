@@ -106,9 +106,42 @@ impl AgySessionConfig {
             env.push(("HOME".to_string(), home_root.to_string_lossy().to_string()));
         }
 
-        let args = vec![
+        let mut args = vec![
             "--dangerously-skip-permissions".to_string(),
         ];
+
+        let project_policy = project_policy_for_role(params.brehon_root.as_ref(), &params.role);
+
+        let startup_prompt = if params.role == "worker" {
+            Some(brehon_types::build_worker_startup_prompt(
+                &params.name,
+                params.supervisor_name.as_deref().unwrap_or("supervisor"),
+                "mcp_brehon_agent",
+                "mcp_brehon_task",
+                project_policy.as_deref(),
+            ))
+        } else if params.role == "supervisor" {
+            Some(brehon_types::build_supervisor_startup_prompt(
+                &params.name,
+                "mcp_brehon_agent",
+                "mcp_brehon_task",
+                project_policy.as_deref(),
+            ))
+        } else if params.role == "reviewer" {
+            Some(brehon_types::build_reviewer_startup_prompt(
+                &params.name,
+                "mcp_brehon_agent",
+                "mcp_brehon_verification",
+                project_policy.as_deref(),
+            ))
+        } else {
+            None
+        };
+
+        if let Some(prompt) = startup_prompt {
+            args.push("--prompt-interactive".to_string());
+            args.push(prompt);
+        }
 
         Self {
             command: "agy".to_string(),
@@ -121,30 +154,48 @@ impl AgySessionConfig {
     }
 }
 
+fn project_policy_for_role(brehon_root: Option<&PathBuf>, role: &str) -> Option<String> {
+    let project_root = brehon_root?.parent()?;
+    let config = brehon_config::load_config(Some(project_root)).ok()?;
+    config.project_prompt_for_role_name(role)
+}
+
 fn prepare_local_agy_home(cwd: &std::path::Path) -> std::result::Result<PathBuf, String> {
     let home_root = cwd.join(".brehon/factory-runtime/agy/home");
-    let gemini_dir = home_root.join(".gemini");
-    std::fs::create_dir_all(&gemini_dir)
+    let agy_dir = home_root.join(".gemini/antigravity-cli");
+    std::fs::create_dir_all(&agy_dir)
         .map_err(|e| format!("Failed to create local agy runtime directory: {}", e))?;
 
-    if let Some(global_home) = std::env::var("HOME").ok().map(PathBuf::from).map(|d| d.join(".gemini")) {
-        for name in [
+    if let Some(global_home) = std::env::var("HOME").ok().map(PathBuf::from) {
+        let global_gemini = global_home.join(".gemini");
+        let global_agy = global_home.join(".gemini/antigravity-cli");
+
+        let files_to_copy = [
             "gemini-credentials.json",
             "google_accounts.json",
             "oauth_creds.json",
             "installation_id",
             "state.json",
             "projects.json",
-        ] {
-            let src = global_home.join(name);
-            if src.exists() {
-                let dst = gemini_dir.join(name);
-                let _ = std::fs::copy(&src, &dst);
+        ];
+
+        for name in &files_to_copy {
+            let src = if global_agy.join(name).exists() {
+                Some(global_agy.join(name))
+            } else if global_gemini.join(name).exists() {
+                Some(global_gemini.join(name))
+            } else {
+                None
+            };
+
+            if let Some(src_path) = src {
+                let dst = agy_dir.join(name);
+                let _ = std::fs::copy(&src_path, &dst);
             }
         }
     }
 
-    let trusted_folders_path = gemini_dir.join("trustedFolders.json");
+    let trusted_folders_path = agy_dir.join("trustedFolders.json");
     let canonical_cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
     
     // Write canonical cwd as trusted folder
@@ -571,8 +622,10 @@ mod tests {
         };
         let config = AgySessionConfig::from_params(&params);
         assert_eq!(config.command, "agy");
-        assert_eq!(config.args.len(), 1);
+        assert_eq!(config.args.len(), 3);
         assert_eq!(config.args[0], "--dangerously-skip-permissions");
+        assert_eq!(config.args[1], "--prompt-interactive");
+        assert!(config.args[2].contains("Brehon worker startup. You are worker 'agy-worker'"));
         assert!(config
             .env
             .iter()
