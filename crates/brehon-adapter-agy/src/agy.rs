@@ -101,10 +101,9 @@ impl AgySessionConfig {
             ));
         }
 
-        // Set up custom local home directory to bypass the trust folder prompt
-        if let Ok(home_root) = prepare_local_agy_home(&params.cwd) {
-            env.push(("HOME".to_string(), home_root.to_string_lossy().to_string()));
-        }
+        // Trust the dynamic sandbox/worktree path globally so that agy doesn't prompt for trust,
+        // while letting agy run with the user's authentic global HOME environment where keychains and auth are fully intact.
+        trust_folder_globally(&params.cwd);
 
         let mut args = vec![
             "--dangerously-skip-permissions".to_string(),
@@ -160,66 +159,40 @@ fn project_policy_for_role(brehon_root: Option<&PathBuf>, role: &str) -> Option<
     config.project_prompt_for_role_name(role)
 }
 
-fn prepare_local_agy_home(cwd: &std::path::Path) -> std::result::Result<PathBuf, String> {
-    let home_root = cwd.join(".brehon/factory-runtime/agy/home");
-    let gemini_dir = home_root.join(".gemini");
-    let agy_dir = home_root.join(".gemini/antigravity-cli");
-    let config_dir = home_root.join(".gemini/config");
-
-    std::fs::create_dir_all(&gemini_dir)
-        .map_err(|e| format!("Failed to create local agy GeminiDir: {}", e))?;
-    std::fs::create_dir_all(&agy_dir)
-        .map_err(|e| format!("Failed to create local agy AppDataDir: {}", e))?;
-    std::fs::create_dir_all(&config_dir)
-        .map_err(|e| format!("Failed to create local agy ConfigDir: {}", e))?;
-
+fn trust_folder_globally(cwd: &std::path::Path) {
     if let Some(global_home) = std::env::var("HOME").ok().map(PathBuf::from) {
-        let global_gemini = global_home.join(".gemini");
-        let global_agy = global_home.join(".gemini/antigravity-cli");
-        let global_config = global_home.join(".gemini/config");
+        let canonical_cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+        let cwd_str = canonical_cwd.to_string_lossy().to_string();
 
-        let files_to_copy = [
-            "gemini-credentials.json",
-            "google_accounts.json",
-            "oauth_creds.json",
-            "installation_id",
-            "state.json",
-            "projects.json",
-            "settings.json",
+        let paths_to_update = [
+            global_home.join(".gemini/trustedFolders.json"),
+            global_home.join(".gemini/config/trustedFolders.json"),
+            global_home.join(".gemini/antigravity-cli/trustedFolders.json"),
         ];
 
-        for name in &files_to_copy {
-            let src = if global_config.join(name).exists() {
-                Some(global_config.join(name))
-            } else if global_agy.join(name).exists() {
-                Some(global_agy.join(name))
-            } else if global_gemini.join(name).exists() {
-                Some(global_gemini.join(name))
+        for path in &paths_to_update {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+
+            let mut config = if path.exists() {
+                if let Ok(file) = std::fs::File::open(path) {
+                    serde_json::from_reader(file).unwrap_or_else(|_| serde_json::json!({}))
+                } else {
+                    serde_json::json!({})
+                }
             } else {
-                None
+                serde_json::json!({})
             };
 
-            if let Some(src_path) = src {
-                let _ = std::fs::copy(&src_path, gemini_dir.join(name));
-                let _ = std::fs::copy(&src_path, agy_dir.join(name));
-                let _ = std::fs::copy(&src_path, config_dir.join(name));
+            if let Some(obj) = config.as_object_mut() {
+                obj.insert(cwd_str.clone(), serde_json::Value::String("TRUST_FOLDER".to_string()));
+                if let Ok(file) = std::fs::File::create(path) {
+                    let _ = serde_json::to_writer_pretty(file, &config);
+                }
             }
         }
     }
-
-    let canonical_cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
-    let content = serde_json::json!({
-        canonical_cwd.to_string_lossy(): "TRUST_FOLDER"
-    });
-
-    for dir in &[&gemini_dir, &agy_dir, &config_dir] {
-        let trusted_folders_path = dir.join("trustedFolders.json");
-        if let Ok(file) = std::fs::File::create(&trusted_folders_path) {
-            let _ = serde_json::to_writer_pretty(file, &content);
-        }
-    }
-
-    Ok(home_root)
 }
 
 
@@ -637,10 +610,6 @@ mod tests {
         assert_eq!(config.args[0], "--dangerously-skip-permissions");
         assert_eq!(config.args[1], "--prompt-interactive");
         assert!(config.args[2].contains("Brehon worker startup. You are worker 'agy-worker'"));
-        assert!(config
-            .env
-            .iter()
-            .any(|(k, v)| k == "HOME" && v.contains(".brehon/factory-runtime/agy/home")));
         assert!(config
             .env
             .iter()
