@@ -162,9 +162,12 @@ fn project_policy_for_role(brehon_root: Option<&PathBuf>, role: &str) -> Option<
 
 fn prepare_local_agy_home(cwd: &std::path::Path) -> std::result::Result<PathBuf, String> {
     let home_root = cwd.join(".brehon/factory-runtime/agy/home");
+    let gemini_dir = home_root.join(".gemini");
     let agy_dir = home_root.join(".gemini/antigravity-cli");
     let config_dir = home_root.join(".gemini/config");
 
+    std::fs::create_dir_all(&gemini_dir)
+        .map_err(|e| format!("Failed to create local agy GeminiDir: {}", e))?;
     std::fs::create_dir_all(&agy_dir)
         .map_err(|e| format!("Failed to create local agy AppDataDir: {}", e))?;
     std::fs::create_dir_all(&config_dir)
@@ -182,6 +185,7 @@ fn prepare_local_agy_home(cwd: &std::path::Path) -> std::result::Result<PathBuf,
             "installation_id",
             "state.json",
             "projects.json",
+            "settings.json",
         ];
 
         for name in &files_to_copy {
@@ -196,6 +200,7 @@ fn prepare_local_agy_home(cwd: &std::path::Path) -> std::result::Result<PathBuf,
             };
 
             if let Some(src_path) = src {
+                let _ = std::fs::copy(&src_path, gemini_dir.join(name));
                 let _ = std::fs::copy(&src_path, agy_dir.join(name));
                 let _ = std::fs::copy(&src_path, config_dir.join(name));
             }
@@ -207,7 +212,7 @@ fn prepare_local_agy_home(cwd: &std::path::Path) -> std::result::Result<PathBuf,
         canonical_cwd.to_string_lossy(): "TRUST_FOLDER"
     });
 
-    for dir in &[&agy_dir, &config_dir] {
+    for dir in &[&gemini_dir, &agy_dir, &config_dir] {
         let trusted_folders_path = dir.join("trustedFolders.json");
         if let Ok(file) = std::fs::File::create(&trusted_folders_path) {
             let _ = serde_json::to_writer_pretty(file, &content);
