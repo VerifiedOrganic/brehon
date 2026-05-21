@@ -141,7 +141,7 @@ async fn test_brehon_service_list_tools() {
 }
 
 #[tokio::test]
-async fn test_brehon_service_worker_instructions_are_idle_protocol() {
+async fn test_brehon_service_agent_role_uses_session_start_bootstrap() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _env = ScopedEnv::set(&[
         ("BREHON_AGENT_ROLE", "worker"),
@@ -153,31 +153,21 @@ async fn test_brehon_service_worker_instructions_are_idle_protocol() {
 
     let service = BrehonService::new(server);
     let info = service.get_info();
-    let instructions = info.instructions.expect("worker instructions");
-
-    assert!(instructions.contains("Brehon worker startup"));
-    assert!(instructions.contains("agy-worker-1"));
-    assert!(instructions.contains("Do NOT proactively call `agent action=session_start`"));
-    assert!(instructions.contains("task action=mine"));
-}
-
-#[tokio::test]
-async fn test_brehon_service_non_agy_keeps_session_start_bootstrap() {
-    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let _env = ScopedEnv::set(&[
-        ("BREHON_AGENT_ROLE", "worker"),
-        ("BREHON_AGENT_TYPE", "codex"),
-        ("BREHON_AGENT_NAME", "codex-worker-1"),
-    ]);
-    let server = McpServer::new("test-server", "1.0.0");
-
-    let service = BrehonService::new(server);
-    let info = service.get_info();
     let instructions = info.instructions.expect("bootstrap instructions");
 
     assert!(instructions.contains("immediately call the `agent` tool"));
     assert!(instructions.contains("`action=session_start`"));
-    assert!(!instructions.contains("Brehon worker startup"));
+}
+
+#[tokio::test]
+async fn test_brehon_service_without_agent_role_has_no_bootstrap_instructions() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _env = ScopedEnv::set(&[("BREHON_AGENT_ROLE", ""), ("BREHON_AGENT_TYPE", "codex")]);
+    let server = McpServer::new("test-server", "1.0.0");
+
+    let service = BrehonService::new(server);
+    let info = service.get_info();
+    assert!(info.instructions.is_none());
 }
 
 #[tokio::test]

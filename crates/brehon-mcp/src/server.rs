@@ -22,9 +22,6 @@ use tokio_util::codec::{FramedRead, FramedWrite};
 use brehon_ports::EventStore;
 use brehon_ports::RunStore;
 use brehon_ports::SearchIndex;
-use brehon_types::{
-    build_reviewer_startup_prompt, build_supervisor_startup_prompt, build_worker_startup_prompt,
-};
 
 use crate::error::McpError;
 use crate::tools;
@@ -535,13 +532,6 @@ fn load_project_review_config() -> Option<brehon_types::ReviewConfig> {
         .map(|config| config.review)
 }
 
-fn project_policy_for_role(role: &str) -> Option<String> {
-    let root = configured_project_root()?;
-    brehon_config::load_config(Some(&root))
-        .ok()
-        .and_then(|config| config.project_prompt_for_role_name(role))
-}
-
 fn session_start_bootstrap_instructions() -> String {
     "You are an Brehon factory agent. \
      On startup, immediately call the `agent` tool with \
@@ -552,55 +542,12 @@ fn session_start_bootstrap_instructions() -> String {
         .to_string()
 }
 
-fn uses_passive_mcp_startup_instructions() -> bool {
-    std::env::var("BREHON_AGENT_TYPE")
-        .ok()
-        .map(|value| value.trim().to_ascii_lowercase())
-        .as_deref()
-        == Some("agy")
-}
-
 fn server_instructions_from_env() -> Option<String> {
-    let role = std::env::var("BREHON_AGENT_ROLE")
-        .ok()
-        .map(|value| value.trim().to_ascii_lowercase())
-        .filter(|value| !value.is_empty())?;
-
-    if !uses_passive_mcp_startup_instructions() {
-        return Some(session_start_bootstrap_instructions());
-    }
-
-    let name = std::env::var("BREHON_AGENT_NAME")
+    std::env::var("BREHON_AGENT_ROLE")
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "unknown".to_string());
-    let supervisor = std::env::var("BREHON_SUPERVISOR_NAME")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "supervisor".to_string());
-    let project_policy = project_policy_for_role(&role);
-
-    Some(match role.as_str() {
-        "worker" => build_worker_startup_prompt(
-            &name,
-            &supervisor,
-            "agent",
-            "task",
-            project_policy.as_deref(),
-        ),
-        "supervisor" => {
-            build_supervisor_startup_prompt(&name, "agent", "task", project_policy.as_deref())
-        }
-        "reviewer" => {
-            build_reviewer_startup_prompt(&name, "agent", "verification", project_policy.as_deref())
-        }
-        _ => format!(
-            "You are a Brehon factory agent named '{name}' with role '{role}'. \
-             Use Brehon MCP tools for coordination and stay within the current worktree."
-        ),
-    })
+        .map(|_| session_start_bootstrap_instructions())
 }
 
 // ── rmcp ServerHandler ──────────────────────────────────────────────────────

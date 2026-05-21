@@ -10,6 +10,7 @@ use brehon_adapter_sdk::{
     AdapterError, AdapterEvent, AdapterResult, AgentAdapter, AgentProcess, PromptResult,
 };
 use brehon_types::{
+    build_reviewer_startup_prompt, build_supervisor_startup_prompt, build_worker_startup_prompt,
     AgentCapabilities, HealthStatus, PromptHandle, PromptId, PromptTurn, SessionId, SessionInfo,
     SessionSpec, TerminalId, ToolCallStreaming,
 };
@@ -105,9 +106,42 @@ impl AgySessionConfig {
             &params.cwd,
             params.brehon_root.as_ref(),
         ));
-        configure_mcp_globally(&current_brehon_exe());
+        configure_mcp_in_workspace(&params.cwd, &current_brehon_exe());
 
-        let args = vec!["--dangerously-skip-permissions".to_string()];
+        let mut args = vec!["--dangerously-skip-permissions".to_string()];
+
+        if params.role == "worker" {
+            let project_policy = project_policy_for_role(params.brehon_root.as_ref(), &params.role);
+            let startup_prompt = build_worker_startup_prompt(
+                &params.name,
+                params.supervisor_name.as_deref().unwrap_or("supervisor"),
+                "agent",
+                "task",
+                project_policy.as_deref(),
+            );
+            args.push("--prompt-interactive".to_string());
+            args.push(startup_prompt);
+        } else if params.role == "supervisor" {
+            let project_policy = project_policy_for_role(params.brehon_root.as_ref(), &params.role);
+            let startup_prompt = build_supervisor_startup_prompt(
+                &params.name,
+                "agent",
+                "task",
+                project_policy.as_deref(),
+            );
+            args.push("--prompt-interactive".to_string());
+            args.push(startup_prompt);
+        } else if params.role == "reviewer" {
+            let project_policy = project_policy_for_role(params.brehon_root.as_ref(), &params.role);
+            let startup_prompt = build_reviewer_startup_prompt(
+                &params.name,
+                "agent",
+                "verification",
+                project_policy.as_deref(),
+            );
+            args.push("--prompt-interactive".to_string());
+            args.push(startup_prompt);
+        }
 
         Self {
             command: "agy".to_string(),
@@ -124,6 +158,12 @@ fn current_brehon_exe() -> String {
     std::env::current_exe()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|_| "brehon".to_string())
+}
+
+fn project_policy_for_role(brehon_root: Option<&PathBuf>, role: &str) -> Option<String> {
+    let project_root = brehon_root?.parent()?;
+    let config = brehon_config::load_config(Some(project_root)).ok()?;
+    config.project_prompt_for_role_name(role)
 }
 
 fn trusted_workspace_paths(cwd: &Path, brehon_root: Option<&PathBuf>) -> Vec<PathBuf> {
@@ -149,19 +189,18 @@ pub fn desired_agy_mcp_config(exe: &str) -> serde_json::Value {
     })
 }
 
-fn configure_mcp_globally(exe: &str) {
+fn configure_mcp_in_workspace(workspace: &Path, exe: &str) {
     if cfg!(test) {
         return;
     }
-    if let Some(global_home) = std::env::var("HOME").ok().map(PathBuf::from) {
-        configure_mcp_in_home(&global_home, exe);
-    }
+    configure_project_mcp_config(workspace, exe);
 }
 
-fn configure_mcp_in_home(global_home: &Path, exe: &str) {
-    // Antigravity CLI 1.0.0 logs and reads this path. Keep the update scoped
-    // to the Brehon server entry and preserve all other MCP servers.
-    let path = global_home.join(".gemini/config/mcp_config.json");
+fn configure_project_mcp_config(workspace: &Path, exe: &str) {
+    // Keep MCP discovery project-local. Agy supports the same .mcp.json shape
+    // used by the other Brehon-backed CLIs, and this avoids leaking one
+    // project's Brehon server into unrelated Antigravity sessions.
+    let path = workspace.join(".mcp.json");
     let mut config = read_json_or_empty_object(&path);
     let Some(obj) = config.as_object_mut() else {
         return;
@@ -681,7 +720,11 @@ mod tests {
         };
         let config = AgySessionConfig::from_params(&params);
         assert_eq!(config.command, "agy");
-        assert_eq!(config.args, vec!["--dangerously-skip-permissions"]);
+        assert_eq!(config.args[0], "--dangerously-skip-permissions");
+        assert_eq!(config.args[1], "--prompt-interactive");
+        assert!(config.args[2].contains("Brehon worker startup"));
+        assert!(config.args[2].contains("You are worker 'agy-worker'"));
+        assert!(config.args[2].contains("target=supervisor"));
         assert!(config
             .env
             .iter()
@@ -693,11 +736,11 @@ mod tests {
     }
 
     #[test]
-    fn agy_mcp_config_merges_brehon_server() {
+    fn agy_mcp_config_merges_brehon_server_in_project() {
         let test_root =
             std::env::temp_dir().join(format!("brehon-agy-mcp-test-{}", uuid::Uuid::new_v4()));
-        let home = test_root.join("home");
-        let config_path = home.join(".gemini/config/mcp_config.json");
+        let workspace = test_root.join("workspace");
+        let config_path = workspace.join(".mcp.json");
         std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
         std::fs::write(
             &config_path,
@@ -705,7 +748,7 @@ mod tests {
         )
         .unwrap();
 
-        configure_mcp_in_home(&home, "/tmp/brehon");
+        configure_project_mcp_config(&workspace, "/tmp/brehon");
 
         let config: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(config_path).unwrap()).unwrap();

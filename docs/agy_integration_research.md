@@ -85,7 +85,7 @@ graph TD
 To satisfy the requirement of having `agy` run as a long-running background process (similar to Junie), the adapter spawns a persistent subprocess using redirected OS pipes:
 
 ### 1. Spawning the Subprocess
-Brehon's `AgentProcess` should spawn `agy` with `--dangerously-skip-permissions`, then leave the interactive session idle until Brehon delivers a real task prompt. Do not pass `--prompt-interactive <startup prompt>` for worker panes; Agy treats that as a live user turn and starts acting before assignment.
+Brehon's `AgentProcess` should spawn `agy` with `--dangerously-skip-permissions` plus the same role startup prompt used by the other CLI workers. The prompt is delivered with `--prompt-interactive <startup prompt>` so Agy registers with Brehon, reports readiness to its supervisor, and then waits for assigned work.
 
 ```rust
 use std::process::Stdio;
@@ -133,7 +133,7 @@ impl AgySession {
 If you prefer to make **`agy` the primary driver** of the development process (running tasks from your active terminal), you can reverse-drive the integration:
 
 1. **Brehon MCP Server**: Brehon provides `brehon serve` which launches an MCP server over stdio exposing its underlying events, task directory, memories, and rules.
-2. **Setup the MCP Configuration**: The `agy` adapter auto-merges a `brehon` entry into the Antigravity CLI config observed in local CLI logs at `~/.gemini/config/mcp_config.json`. It preserves other configured servers and writes the current Brehon executable path:
+2. **Setup the MCP Configuration**: Brehon writes a project-local `.mcp.json` beside the workspace/worktree. The `agy` adapter preserves other configured servers and writes the current Brehon executable path:
 
 ```json
 {
@@ -146,8 +146,8 @@ If you prefer to make **`agy` the primary driver** of the development process (r
 }
 ```
 
-3. **Run Agy**: When Brehon spawns `agy`, the child process inherits the Brehon role and project-root environment. Agy then starts `brehon serve` from its MCP config.
-4. **Result**: `agy` can now call Brehon's tools, search the memories, query supervisor tasks, and request reviews without needing any ACP interface or complex PTY configurations. The MCP server exposes the role contract as passive server instructions, so worker panes start idle and wait for task prompts instead of executing the startup prompt as a live request.
+3. **Run Agy**: When Brehon spawns `agy`, the child process inherits the Brehon role and project-root environment. Agy then starts `brehon serve` from the local MCP config.
+4. **Result**: `agy` can now call Brehon's tools, search the memories, query supervisor tasks, and request reviews without needing any ACP interface or complex PTY configurations. The role startup prompt follows the same Brehon worker/supervisor/reviewer protocol as other supported CLIs.
 
 ---
 

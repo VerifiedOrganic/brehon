@@ -50,7 +50,7 @@ pub(crate) fn ensure_mcp_config(cwd: &Path) -> Result<()> {
             .entry("mcpServers")
             .or_insert_with(|| serde_json::json!({}));
         if let Some(obj) = servers.as_object_mut() {
-            if !obj.contains_key("brehon") {
+            if obj.get("brehon") != Some(&brehon_server) {
                 obj.insert("brehon".to_string(), brehon_server);
                 std::fs::write(&mcp_path, serde_json::to_string_pretty(&doc)?)?;
                 tracing::info!("Updated .mcp.json with brehon server");
