@@ -6,7 +6,7 @@ use std::sync::Arc;
 pub async fn execute() -> Result<()> {
     use brehon_mcp::McpServer;
 
-    let project_root = std::env::current_dir()?;
+    let project_root = resolve_project_root()?;
     let config = brehon_config::load_config(Some(&project_root))?;
     let store = Arc::new(brehon_store_fjall::FjallEventStore::new(
         resolve_state_path(&project_root, &config.context.db_path),
@@ -36,6 +36,31 @@ pub async fn execute() -> Result<()> {
         .map_err(|e| anyhow::anyhow!("MCP server error: {}", e))?;
 
     Ok(())
+}
+
+fn resolve_project_root() -> Result<PathBuf> {
+    if let Some(project_root) = non_empty_env_path("BREHON_PROJECT_ROOT") {
+        return Ok(project_root);
+    }
+
+    if let Some(brehon_root) = non_empty_env_path("BREHON_ROOT") {
+        if brehon_root.file_name().and_then(|name| name.to_str()) == Some(".brehon") {
+            if let Some(project_root) = brehon_root.parent() {
+                return Ok(project_root.to_path_buf());
+            }
+        }
+        return Ok(brehon_root);
+    }
+
+    Ok(std::env::current_dir()?)
+}
+
+fn non_empty_env_path(name: &str) -> Option<PathBuf> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
 }
 
 fn resolve_state_path(project_root: &Path, configured: &str) -> PathBuf {

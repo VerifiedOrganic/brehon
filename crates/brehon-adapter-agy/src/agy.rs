@@ -85,10 +85,7 @@ impl AgySessionConfig {
         brehon_adapter_sdk::push_workspace_root_env(&mut env, &params.cwd);
 
         if let Some(ref root) = params.brehon_root {
-            env.push((
-                "BREHON_ROOT".to_string(),
-                root.to_string_lossy().to_string(),
-            ));
+            brehon_adapter_sdk::push_brehon_root_env(&mut env, root);
         }
 
         if let Some(ref sup) = params.supervisor_name {
@@ -108,6 +105,7 @@ impl AgySessionConfig {
             &params.cwd,
             params.brehon_root.as_ref(),
         ));
+        configure_mcp_globally(&current_brehon_exe());
 
         let args = vec!["--dangerously-skip-permissions".to_string()];
 
@@ -120,6 +118,12 @@ impl AgySessionConfig {
             cols: 80,
         }
     }
+}
+
+fn current_brehon_exe() -> String {
+    std::env::current_exe()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| "brehon".to_string())
 }
 
 fn trusted_workspace_paths(cwd: &Path, brehon_root: Option<&PathBuf>) -> Vec<PathBuf> {
@@ -136,6 +140,44 @@ fn push_unique_canonical_path(paths: &mut Vec<PathBuf>, path: &Path) {
     if !paths.iter().any(|existing| existing == &canonical) {
         paths.push(canonical);
     }
+}
+
+pub fn desired_agy_mcp_config(exe: &str) -> serde_json::Value {
+    serde_json::json!({
+        "command": exe,
+        "args": ["serve"]
+    })
+}
+
+fn configure_mcp_globally(exe: &str) {
+    if cfg!(test) {
+        return;
+    }
+    if let Some(global_home) = std::env::var("HOME").ok().map(PathBuf::from) {
+        configure_mcp_in_home(&global_home, exe);
+    }
+}
+
+fn configure_mcp_in_home(global_home: &Path, exe: &str) {
+    // Antigravity CLI 1.0.0 logs and reads this path. Keep the update scoped
+    // to the Brehon server entry and preserve all other MCP servers.
+    let path = global_home.join(".gemini/config/mcp_config.json");
+    let mut config = read_json_or_empty_object(&path);
+    let Some(obj) = config.as_object_mut() else {
+        return;
+    };
+    let servers = obj
+        .entry("mcpServers".to_string())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    if !servers.is_object() {
+        *servers = serde_json::Value::Object(serde_json::Map::new());
+    }
+    let Some(servers) = servers.as_object_mut() else {
+        return;
+    };
+
+    servers.insert("brehon".to_string(), desired_agy_mcp_config(exe));
+    write_json_pretty(&path, &config);
 }
 
 fn trust_folders_globally(paths: &[PathBuf]) {
@@ -648,6 +690,35 @@ mod tests {
             .env
             .iter()
             .any(|(k, v)| k == "BREHON_AGENT_ROLE" && v == "worker"));
+    }
+
+    #[test]
+    fn agy_mcp_config_merges_brehon_server() {
+        let test_root =
+            std::env::temp_dir().join(format!("brehon-agy-mcp-test-{}", uuid::Uuid::new_v4()));
+        let home = test_root.join("home");
+        let config_path = home.join(".gemini/config/mcp_config.json");
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &config_path,
+            r#"{"mcpServers":{"other":{"command":"other","args":["serve"]}}}"#,
+        )
+        .unwrap();
+
+        configure_mcp_in_home(&home, "/tmp/brehon");
+
+        let config: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(config_path).unwrap()).unwrap();
+        assert_eq!(
+            config["mcpServers"]["brehon"],
+            serde_json::json!({
+                "command": "/tmp/brehon",
+                "args": ["serve"]
+            })
+        );
+        assert_eq!(config["mcpServers"]["other"]["command"], "other");
+
+        let _ = std::fs::remove_dir_all(test_root);
     }
 
     #[test]
