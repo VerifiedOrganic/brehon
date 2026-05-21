@@ -159,7 +159,7 @@ fn generate_config_for_agents(agents: &[DetectedAgent]) -> String {
                 AgentConnectionConfig {
                     adapter: AdapterKind::Agy,
                     command: Some("agy".to_string()),
-                    args: arg_list(&["-i", "--dangerously-skip-permissions"]),
+                    args: arg_list(&["--dangerously-skip-permissions"]),
                     provider: None,
                     transport: None,
                     control_plane: None,
@@ -1093,18 +1093,30 @@ mod tests {
 
     #[test]
     fn generated_config_tailors_agy() {
-        let agents = vec![
-            detected_agent("agy", "agy", "antigravity", "antigravity-2.0"),
-        ];
+        let agents = vec![detected_agent(
+            "agy",
+            "agy",
+            "antigravity",
+            "antigravity-2.0",
+        )];
         let yaml = generate_config_for_agents(&agents);
         let config = load_generated_config(&yaml);
 
         assert_eq!(config.roles.supervisor.name, "agy-supervisor");
         assert_eq!(config.roles.workers[0].lane, "agy-worker");
-        assert_eq!(config.review.default_reviewers, vec!["agy-reviewer".to_string()]);
+        assert_eq!(
+            config.review.default_reviewers,
+            vec!["agy-reviewer".to_string()]
+        );
         assert_eq!(config.launchers["agy"].adapter, AdapterKind::Agy);
         assert_eq!(config.launchers["agy"].command, Some("agy".to_string()));
-        assert_eq!(config.launchers["agy"].args, vec!["-i".to_string(), "--dangerously-skip-permissions".to_string()]);
-        assert_eq!(config.lanes["agy-worker"].model.as_ref().unwrap().name, "antigravity-2.0");
+        assert_eq!(
+            config.launchers["agy"].args,
+            vec!["--dangerously-skip-permissions".to_string()]
+        );
+        assert_eq!(
+            config.lanes["agy-worker"].model.as_ref().unwrap().name,
+            "antigravity-2.0"
+        );
     }
 }

@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -101,46 +101,15 @@ impl AgySessionConfig {
             ));
         }
 
-        // Trust the dynamic sandbox/worktree path globally so that agy doesn't prompt for trust,
-        // while letting agy run with the user's authentic global HOME environment where keychains and auth are fully intact.
-        trust_folder_globally(&params.cwd);
+        // Trust the dynamic sandbox/worktree path globally so that agy doesn't
+        // prompt for trust, while letting agy run with the user's authentic
+        // global HOME environment where keychains and auth are fully intact.
+        trust_folders_globally(&trusted_workspace_paths(
+            &params.cwd,
+            params.brehon_root.as_ref(),
+        ));
 
-        let mut args = vec![
-            "--dangerously-skip-permissions".to_string(),
-        ];
-
-        let project_policy = project_policy_for_role(params.brehon_root.as_ref(), &params.role);
-
-        let startup_prompt = if params.role == "worker" {
-            Some(brehon_types::build_worker_startup_prompt(
-                &params.name,
-                params.supervisor_name.as_deref().unwrap_or("supervisor"),
-                "mcp_brehon_agent",
-                "mcp_brehon_task",
-                project_policy.as_deref(),
-            ))
-        } else if params.role == "supervisor" {
-            Some(brehon_types::build_supervisor_startup_prompt(
-                &params.name,
-                "mcp_brehon_agent",
-                "mcp_brehon_task",
-                project_policy.as_deref(),
-            ))
-        } else if params.role == "reviewer" {
-            Some(brehon_types::build_reviewer_startup_prompt(
-                &params.name,
-                "mcp_brehon_agent",
-                "mcp_brehon_verification",
-                project_policy.as_deref(),
-            ))
-        } else {
-            None
-        };
-
-        if let Some(prompt) = startup_prompt {
-            args.push("--prompt-interactive".to_string());
-            args.push(prompt);
-        }
+        let args = vec!["--dangerously-skip-permissions".to_string()];
 
         Self {
             command: "agy".to_string(),
@@ -153,48 +122,112 @@ impl AgySessionConfig {
     }
 }
 
-fn project_policy_for_role(brehon_root: Option<&PathBuf>, role: &str) -> Option<String> {
-    let project_root = brehon_root?.parent()?;
-    let config = brehon_config::load_config(Some(project_root)).ok()?;
-    config.project_prompt_for_role_name(role)
+fn trusted_workspace_paths(cwd: &Path, brehon_root: Option<&PathBuf>) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    push_unique_canonical_path(&mut paths, cwd);
+    if let Some(project_root) = brehon_root.and_then(|root| root.parent()) {
+        push_unique_canonical_path(&mut paths, project_root);
+    }
+    paths
 }
 
-fn trust_folder_globally(cwd: &std::path::Path) {
-    if let Some(global_home) = std::env::var("HOME").ok().map(PathBuf::from) {
-        let canonical_cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
-        let cwd_str = canonical_cwd.to_string_lossy().to_string();
-
-        let paths_to_update = [
-            global_home.join(".gemini/trustedFolders.json"),
-            global_home.join(".gemini/config/trustedFolders.json"),
-            global_home.join(".gemini/antigravity-cli/trustedFolders.json"),
-        ];
-
-        for path in &paths_to_update {
-            if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-
-            let mut config = if path.exists() {
-                if let Ok(file) = std::fs::File::open(path) {
-                    serde_json::from_reader(file).unwrap_or_else(|_| serde_json::json!({}))
-                } else {
-                    serde_json::json!({})
-                }
-            } else {
-                serde_json::json!({})
-            };
-
-            if let Some(obj) = config.as_object_mut() {
-                obj.insert(cwd_str.clone(), serde_json::Value::String("TRUST_FOLDER".to_string()));
-                if let Ok(file) = std::fs::File::create(path) {
-                    let _ = serde_json::to_writer_pretty(file, &config);
-                }
-            }
-        }
+fn push_unique_canonical_path(paths: &mut Vec<PathBuf>, path: &Path) {
+    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    if !paths.iter().any(|existing| existing == &canonical) {
+        paths.push(canonical);
     }
 }
 
+fn trust_folders_globally(paths: &[PathBuf]) {
+    if paths.is_empty() {
+        return;
+    }
+    if cfg!(test) {
+        return;
+    }
+    if let Some(global_home) = std::env::var("HOME").ok().map(PathBuf::from) {
+        trust_folders_in_home(&global_home, paths);
+    }
+}
+
+fn trust_folders_in_home(global_home: &Path, paths: &[PathBuf]) {
+    let trusted_folders_paths = [
+        global_home.join(".gemini/trustedFolders.json"),
+        global_home.join(".gemini/config/trustedFolders.json"),
+        global_home.join(".gemini/antigravity-cli/trustedFolders.json"),
+    ];
+
+    for path in &trusted_folders_paths {
+        update_trusted_folders_file(path, paths);
+    }
+
+    update_antigravity_settings_trust(
+        &global_home.join(".gemini/antigravity-cli/settings.json"),
+        paths,
+    );
+}
+
+fn update_trusted_folders_file(path: &Path, paths: &[PathBuf]) {
+    let mut config = read_json_or_empty_object(path);
+    let Some(obj) = config.as_object_mut() else {
+        return;
+    };
+
+    for trusted_path in paths {
+        obj.insert(
+            trusted_path.to_string_lossy().to_string(),
+            serde_json::Value::String("TRUST_FOLDER".to_string()),
+        );
+    }
+    write_json_pretty(path, &config);
+}
+
+fn update_antigravity_settings_trust(path: &Path, paths: &[PathBuf]) {
+    let mut settings = read_json_or_empty_object(path);
+    let Some(obj) = settings.as_object_mut() else {
+        return;
+    };
+    let entry = obj
+        .entry("trustedWorkspaces".to_string())
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+    if !entry.is_array() {
+        *entry = serde_json::Value::Array(Vec::new());
+    }
+    let Some(array) = entry.as_array_mut() else {
+        return;
+    };
+
+    for trusted_path in paths {
+        let value = trusted_path.to_string_lossy();
+        if !array
+            .iter()
+            .any(|existing| existing.as_str() == Some(value.as_ref()))
+        {
+            array.push(serde_json::Value::String(value.to_string()));
+        }
+    }
+    write_json_pretty(path, &settings);
+}
+
+fn read_json_or_empty_object(path: &Path) -> serde_json::Value {
+    if path.exists() {
+        if let Ok(file) = std::fs::File::open(path) {
+            if let Ok(value) = serde_json::from_reader(file) {
+                return value;
+            }
+        }
+    }
+    serde_json::json!({})
+}
+
+fn write_json_pretty(path: &Path, value: &serde_json::Value) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(file) = std::fs::File::create(path) {
+        let _ = serde_json::to_writer_pretty(file, value);
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Session
@@ -606,10 +639,7 @@ mod tests {
         };
         let config = AgySessionConfig::from_params(&params);
         assert_eq!(config.command, "agy");
-        assert_eq!(config.args.len(), 3);
-        assert_eq!(config.args[0], "--dangerously-skip-permissions");
-        assert_eq!(config.args[1], "--prompt-interactive");
-        assert!(config.args[2].contains("Brehon worker startup. You are worker 'agy-worker'"));
+        assert_eq!(config.args, vec!["--dangerously-skip-permissions"]);
         assert!(config
             .env
             .iter()
@@ -618,6 +648,57 @@ mod tests {
             .env
             .iter()
             .any(|(k, v)| k == "BREHON_AGENT_ROLE" && v == "worker"));
+    }
+
+    #[test]
+    fn agy_trust_updates_legacy_and_cli_settings() {
+        let test_root =
+            std::env::temp_dir().join(format!("brehon-agy-trust-test-{}", uuid::Uuid::new_v4()));
+        let home = test_root.join("home");
+        let project = test_root.join("project");
+        let worktree = project.join(".brehon/worktrees/runs/test/worker-1");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let settings_path = home.join(".gemini/antigravity-cli/settings.json");
+        std::fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &settings_path,
+            r#"{"colorScheme":"dark","trustedWorkspaces":["/already/trusted"]}"#,
+        )
+        .unwrap();
+
+        let paths = trusted_workspace_paths(&worktree, Some(&project.join(".brehon")));
+        trust_folders_in_home(&home, &paths);
+        let worktree_key = paths[0].to_string_lossy();
+        let project_key = paths[1].to_string_lossy();
+
+        let trusted: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(home.join(".gemini/trustedFolders.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            trusted
+                .get(worktree_key.as_ref())
+                .and_then(serde_json::Value::as_str),
+            Some("TRUST_FOLDER")
+        );
+        assert_eq!(
+            trusted
+                .get(project_key.as_ref())
+                .and_then(serde_json::Value::as_str),
+            Some("TRUST_FOLDER")
+        );
+
+        let settings: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(settings_path).unwrap()).unwrap();
+        let workspaces = settings["trustedWorkspaces"].as_array().unwrap();
+        assert!(workspaces
+            .iter()
+            .any(|value| value.as_str() == Some(worktree_key.as_ref())));
+        assert!(workspaces
+            .iter()
+            .any(|value| value.as_str() == Some(project_key.as_ref())));
+
+        let _ = std::fs::remove_dir_all(test_root);
     }
 
     #[test]

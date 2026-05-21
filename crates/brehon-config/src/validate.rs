@@ -860,9 +860,11 @@ fn supervisor_launcher_supports_pty(
     }
 
     match launcher.adapter {
-        AdapterKind::PtyHooks | AdapterKind::Mock | AdapterKind::Junie | AdapterKind::Agy => launcher
-            .command_str()
-            .is_some_and(|command| !command.trim().is_empty()),
+        AdapterKind::PtyHooks | AdapterKind::Mock | AdapterKind::Junie | AdapterKind::Agy => {
+            launcher
+                .command_str()
+                .is_some_and(|command| !command.trim().is_empty())
+        }
         AdapterKind::NativeAgent => true,
         AdapterKind::Acp => launcher_invokes_builtin_supervisor(launcher),
         AdapterKind::OpenAiCompatible
@@ -904,7 +906,12 @@ fn launcher_invokes_builtin_supervisor(launcher: &brehon_types::AgentConnectionC
         | ("opencode", ["serve", "--pure"]) => true,
         ("junie", []) => true,
         ("copilot", args) if args.is_empty() || args.contains(&"--acp") => true,
-        ("agy", args) if args.is_empty() || args.contains(&"--prompt-interactive") || args.contains(&"-i") => true,
+        ("agy", args) => {
+            args.is_empty()
+                || args.contains(&"--prompt-interactive")
+                || args.contains(&"-i")
+                || args.contains(&"--dangerously-skip-permissions")
+        }
         _ => false,
     }
 }

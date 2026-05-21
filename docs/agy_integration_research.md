@@ -15,7 +15,7 @@ Since `agy` is closed-source and does **not** support the standard Agent Client 
 
 ### The Solutions
 * **TTY-Free Process Spawning**: Spawning subprocesses using standard OS redirected pipes (`stdout`/`stderr`/`stdin` as `Stdio::piped()`) instead of allocating interactive terminal PTY lines. This avoids `sudo` and permission boundary errors entirely.
-* **Non-Interactive Automation Flags**: Utilizing `agy`'s native `--prompt-interactive` or `--print` combined with `--dangerously-skip-permissions` to bypass prompts and permission gates.
+* **Non-Interactive Automation Flags**: Utilizing `agy`'s native `--print` for one-shot turns, or launching the interactive CLI with `--dangerously-skip-permissions` and no initial prompt so Brehon can deliver real tasks later.
 * **Stateless vs. Long-Running Processes**: Supporting both short-lived conversation resumes and long-running stream-driven interactive loops.
 * **Reverse-Drive MCP Model**: Running Brehon as an MCP server (`brehon serve`) and letting `agy` drive workspace modifications as the active terminal agent.
 
@@ -49,7 +49,7 @@ In this mode, Brehon spawns `agy` once as a long-running background process, kee
 
 ```mermaid
 graph TD
-    Orch["Brehon Orchestrator"] -->|"Spawns once & holds pipes open"| Agy["agy --prompt-interactive --dangerously-skip-permissions"]
+    Orch["Brehon Orchestrator"] -->|"Spawns once & holds pipes open"| Agy["agy --dangerously-skip-permissions"]
     Orch -->|"Writes prompt line to Stdin"| Agy
     Agy -->|"Runs continuous execution loop"| Brain["Antigravity 2.0 Engine"]
     Brain -->|"Auto-approves tools"| Tools["Executes Tools"]
@@ -85,7 +85,7 @@ graph TD
 To satisfy the requirement of having `agy` run as a long-running background process (similar to Junie), the adapter spawns a persistent subprocess using redirected OS pipes:
 
 ### 1. Spawning the Subprocess
-Brehon's `AgentProcess` will spawn `agy` using the `--prompt-interactive` (alias `-i`) flag alongside `--dangerously-skip-permissions` to suppress interactive gates:
+Brehon's `AgentProcess` should spawn `agy` with `--dangerously-skip-permissions`, then leave the interactive session idle until Brehon delivers a real task prompt. Do not pass `--prompt-interactive <startup prompt>` for worker panes; Agy treats that as a live user turn and starts acting before assignment.
 
 ```rust
 use std::process::Stdio;
@@ -93,7 +93,6 @@ use tokio::process::Command;
 
 let mut child = Command::new("/Users/recursive/.local/bin/agy")
     .args(&[
-        "--prompt-interactive",          // Keep session open interactively
         "--dangerously-skip-permissions", // Bypass permission prompts
         "--sandbox",                      // Optional: enforce sandbox limits
     ])
@@ -165,7 +164,6 @@ launchers:
     adapter: Junie # Uses the headless stdio CLI execution framework
     command: /Users/recursive/.local/bin/agy
     args:
-      - "--prompt-interactive"
       - "--dangerously-skip-permissions"
 ```
 
