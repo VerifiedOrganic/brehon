@@ -163,12 +163,17 @@ fn project_policy_for_role(brehon_root: Option<&PathBuf>, role: &str) -> Option<
 fn prepare_local_agy_home(cwd: &std::path::Path) -> std::result::Result<PathBuf, String> {
     let home_root = cwd.join(".brehon/factory-runtime/agy/home");
     let agy_dir = home_root.join(".gemini/antigravity-cli");
+    let config_dir = home_root.join(".gemini/config");
+
     std::fs::create_dir_all(&agy_dir)
-        .map_err(|e| format!("Failed to create local agy runtime directory: {}", e))?;
+        .map_err(|e| format!("Failed to create local agy AppDataDir: {}", e))?;
+    std::fs::create_dir_all(&config_dir)
+        .map_err(|e| format!("Failed to create local agy ConfigDir: {}", e))?;
 
     if let Some(global_home) = std::env::var("HOME").ok().map(PathBuf::from) {
         let global_gemini = global_home.join(".gemini");
         let global_agy = global_home.join(".gemini/antigravity-cli");
+        let global_config = global_home.join(".gemini/config");
 
         let files_to_copy = [
             "gemini-credentials.json",
@@ -180,7 +185,9 @@ fn prepare_local_agy_home(cwd: &std::path::Path) -> std::result::Result<PathBuf,
         ];
 
         for name in &files_to_copy {
-            let src = if global_agy.join(name).exists() {
+            let src = if global_config.join(name).exists() {
+                Some(global_config.join(name))
+            } else if global_agy.join(name).exists() {
                 Some(global_agy.join(name))
             } else if global_gemini.join(name).exists() {
                 Some(global_gemini.join(name))
@@ -189,24 +196,23 @@ fn prepare_local_agy_home(cwd: &std::path::Path) -> std::result::Result<PathBuf,
             };
 
             if let Some(src_path) = src {
-                let dst = agy_dir.join(name);
-                let _ = std::fs::copy(&src_path, &dst);
+                let _ = std::fs::copy(&src_path, agy_dir.join(name));
+                let _ = std::fs::copy(&src_path, config_dir.join(name));
             }
         }
     }
 
-    let trusted_folders_path = agy_dir.join("trustedFolders.json");
     let canonical_cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
-    
-    // Write canonical cwd as trusted folder
     let content = serde_json::json!({
         canonical_cwd.to_string_lossy(): "TRUST_FOLDER"
     });
-    
-    let file = std::fs::File::create(&trusted_folders_path)
-        .map_err(|e| format!("Failed to create trustedFolders.json: {}", e))?;
-    serde_json::to_writer_pretty(file, &content)
-        .map_err(|e| format!("Failed to write trustedFolders.json: {}", e))?;
+
+    for dir in &[&agy_dir, &config_dir] {
+        let trusted_folders_path = dir.join("trustedFolders.json");
+        if let Ok(file) = std::fs::File::create(&trusted_folders_path) {
+            let _ = serde_json::to_writer_pretty(file, &content);
+        }
+    }
 
     Ok(home_root)
 }
