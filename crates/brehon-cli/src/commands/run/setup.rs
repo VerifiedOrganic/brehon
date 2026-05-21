@@ -260,8 +260,11 @@ pub(crate) fn detect_builtin_cli(
     }
 
     let agent_config = config.lane_launcher(agent_name)?;
-    if agent_config.adapter != brehon_types::agent::AdapterKind::Acp {
-        return None;
+    match agent_config.adapter {
+        brehon_types::agent::AdapterKind::Junie => return Some(SupervisorCli::Junie),
+        brehon_types::agent::AdapterKind::Agy => return Some(SupervisorCli::Agy),
+        brehon_types::agent::AdapterKind::Acp => {}
+        _ => return None,
     }
     let args = agent_config
         .args
@@ -2341,6 +2344,37 @@ mod tests {
         assert_eq!(
             adapter.as_builtin(),
             Some(brehon_mux::SupervisorCli::Copilot)
+        );
+    }
+
+    #[test]
+    fn test_agent_to_adapter_maps_plain_agy_launcher_to_builtin() {
+        let mut config = brehon_config::parse_defaults().unwrap();
+        config.launchers.insert(
+            "agy-worker".to_string(),
+            brehon_types::AgentConnectionConfig {
+                adapter: brehon_types::agent::AdapterKind::Agy,
+                command: Some("agy".to_string()),
+                args: vec![],
+                provider: None,
+                transport: None,
+                control_plane: None,
+                base_url: None,
+                api_key_env: None,
+                permission_mode: None,
+                max_parallel_tool_calls: None,
+                assistant_message_passthrough_fields: Vec::new(),
+                reasoning_effort_param: None,
+                extra_body: None,
+                env: std::collections::HashMap::new(),
+                headers: std::collections::HashMap::new(),
+            },
+        );
+
+        let adapter = agent_to_adapter("agy-worker", &config);
+        assert_eq!(
+            adapter.as_builtin(),
+            Some(brehon_mux::SupervisorCli::Agy)
         );
     }
 
