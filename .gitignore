@@ -16,7 +16,6 @@ coverage/
 rustc-ice-*.txt
 
 # ─── Brehon runtime state (created by `brehon run`) ──────────────
-.brehon/
 **/.brehon/
 brehon-*.log
 
@@ -96,3 +95,6 @@ logs/
 
 # ─── Other tooling cruft ─────────────────────────────────────────
 .pantheon/
+
+# Brehon orchestration data
+.brehon/
