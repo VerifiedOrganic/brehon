@@ -21,6 +21,7 @@ use tracing::{debug, warn};
 const PROMPT_RESULT_POLL_MS: u64 = 50;
 const AGY_SESSION_COMPLETE_KEY: &str = "_session_complete";
 const AGY_PROJECT_MCP_CONFIG_PATH: &str = ".agents/mcp_config.json";
+const AGY_GLOBAL_MCP_CONFIG_PATH: &str = ".gemini/antigravity-cli/mcp_config.json";
 
 /// Error type for Agy adapter operations.
 #[derive(Debug, thiserror::Error)]
@@ -121,7 +122,7 @@ impl AgySessionConfig {
                 project_policy.as_deref(),
             );
             args.push("--prompt-interactive".to_string());
-            args.push(startup_prompt);
+            args.push(with_agy_mcp_usage_guidance(startup_prompt));
         } else if params.role == "supervisor" {
             let project_policy = project_policy_for_role(params.brehon_root.as_ref(), &params.role);
             let startup_prompt = build_supervisor_startup_prompt(
@@ -131,7 +132,7 @@ impl AgySessionConfig {
                 project_policy.as_deref(),
             );
             args.push("--prompt-interactive".to_string());
-            args.push(startup_prompt);
+            args.push(with_agy_mcp_usage_guidance(startup_prompt));
         } else if params.role == "reviewer" {
             let project_policy = project_policy_for_role(params.brehon_root.as_ref(), &params.role);
             let startup_prompt = build_reviewer_startup_prompt(
@@ -141,7 +142,7 @@ impl AgySessionConfig {
                 project_policy.as_deref(),
             );
             args.push("--prompt-interactive".to_string());
-            args.push(startup_prompt);
+            args.push(with_agy_mcp_usage_guidance(startup_prompt));
         }
 
         Self {
@@ -190,11 +191,41 @@ pub fn desired_agy_mcp_config(exe: &str) -> serde_json::Value {
     })
 }
 
+fn desired_agy_mcp_config_for_workspace(exe: &str, workspace: &Path) -> serde_json::Value {
+    let mut config = desired_agy_mcp_config(exe);
+    if let Some(obj) = config.as_object_mut() {
+        obj.insert(
+            "cwd".to_string(),
+            serde_json::Value::String(workspace.to_string_lossy().to_string()),
+        );
+    }
+    config
+}
+
+fn with_agy_mcp_usage_guidance(startup_prompt: String) -> String {
+    format!(
+        "Antigravity MCP usage for this Brehon session:\n\
+         - Brehon is an MCP server named `brehon`.\n\
+         - Its tools are direct MCP tools named `agent`, `task`, `factory`, `verification`, \
+           `search_memories`, `search_rules`, and `search_skills`.\n\
+         - Invoke those MCP tools directly with JSON arguments. For example, call MCP tool \
+           `agent` with {{\"action\":\"message\",\"target\":\"<supervisor>\",\"message\":\"ready\"}}, \
+           or call MCP tool `task` with {{\"action\":\"mine\"}}.\n\
+         - Do not run shell commands such as `brehon task ...` to simulate MCP calls.\n\
+         - Do not inspect `~/.gemini/antigravity-cli/mcp/` JSON descriptor files or `.mcp.json` \
+           while trying to discover Brehon tools; those descriptors are only Antigravity's MCP cache.\n\n\
+         {startup_prompt}"
+    )
+}
+
 fn configure_mcp_in_workspace(workspace: &Path, exe: &str) {
     if cfg!(test) {
         return;
     }
     configure_project_mcp_config(workspace, exe);
+    if let Some(global_home) = std::env::var("HOME").ok().map(PathBuf::from) {
+        configure_global_mcp_config(&global_home, workspace, exe);
+    }
 }
 
 fn configure_project_mcp_config(workspace: &Path, exe: &str) {
@@ -202,7 +233,16 @@ fn configure_project_mcp_config(workspace: &Path, exe: &str) {
     // config path, so one project's Brehon server does not leak into
     // unrelated Antigravity sessions.
     let path = workspace.join(AGY_PROJECT_MCP_CONFIG_PATH);
-    let mut config = read_json_or_empty_object(&path);
+    merge_brehon_mcp_server(&path, desired_agy_mcp_config_for_workspace(exe, workspace));
+}
+
+fn configure_global_mcp_config(global_home: &Path, workspace: &Path, exe: &str) {
+    let path = global_home.join(AGY_GLOBAL_MCP_CONFIG_PATH);
+    merge_brehon_mcp_server(&path, desired_agy_mcp_config_for_workspace(exe, workspace));
+}
+
+fn merge_brehon_mcp_server(path: &Path, brehon_server: serde_json::Value) {
+    let mut config = read_json_or_empty_object(path);
     let Some(obj) = config.as_object_mut() else {
         return;
     };
@@ -216,8 +256,8 @@ fn configure_project_mcp_config(workspace: &Path, exe: &str) {
         return;
     };
 
-    servers.insert("brehon".to_string(), desired_agy_mcp_config(exe));
-    write_json_pretty(&path, &config);
+    servers.insert("brehon".to_string(), brehon_server);
+    write_json_pretty(path, &config);
 }
 
 fn trust_folders_globally(paths: &[PathBuf]) {
@@ -724,6 +764,9 @@ mod tests {
         assert_eq!(config.args[0], "--dangerously-skip-permissions");
         assert_eq!(config.args[1], "--prompt-interactive");
         assert!(config.args[2].contains("Brehon worker startup"));
+        assert!(config.args[2].contains("Antigravity MCP usage for this Brehon session"));
+        assert!(config.args[2].contains("call MCP tool `task` with {\"action\":\"mine\"}"));
+        assert!(config.args[2].contains("Do not inspect `~/.gemini/antigravity-cli/mcp/`"));
         assert!(config.args[2].contains("You are worker 'agy-worker'"));
         assert!(config.args[2].contains("target=supervisor"));
         assert!(config
@@ -757,11 +800,46 @@ mod tests {
             config["mcpServers"]["brehon"],
             serde_json::json!({
                 "command": "/tmp/brehon",
-                "args": ["serve"]
+                "args": ["serve"],
+                "cwd": workspace.to_string_lossy()
             })
         );
         assert_eq!(config["mcpServers"]["other"]["command"], "other");
         assert!(!workspace.join(".mcp.json").exists());
+
+        let _ = std::fs::remove_dir_all(test_root);
+    }
+
+    #[test]
+    fn agy_global_mcp_config_merges_brehon_server_with_workspace_cwd() {
+        let test_root = std::env::temp_dir().join(format!(
+            "brehon-agy-global-mcp-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let home = test_root.join("home");
+        let workspace = test_root.join("workspace");
+        let config_path = home.join(AGY_GLOBAL_MCP_CONFIG_PATH);
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(
+            &config_path,
+            r#"{"mcpServers":{"other":{"command":"other","args":["serve"]}}}"#,
+        )
+        .unwrap();
+
+        configure_global_mcp_config(&home, &workspace, "/tmp/brehon");
+
+        let config: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(config_path).unwrap()).unwrap();
+        assert_eq!(
+            config["mcpServers"]["brehon"],
+            serde_json::json!({
+                "command": "/tmp/brehon",
+                "args": ["serve"],
+                "cwd": workspace.to_string_lossy()
+            })
+        );
+        assert_eq!(config["mcpServers"]["other"]["command"], "other");
 
         let _ = std::fs::remove_dir_all(test_root);
     }

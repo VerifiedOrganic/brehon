@@ -133,20 +133,21 @@ impl AgySession {
 If you prefer to make **`agy` the primary driver** of the development process (running tasks from your active terminal), you can reverse-drive the integration:
 
 1. **Brehon MCP Server**: Brehon provides `brehon serve` which launches an MCP server over stdio exposing its underlying events, task directory, memories, and rules.
-2. **Setup the MCP Configuration**: Brehon writes a project-local `.agents/mcp_config.json` beside the workspace/worktree, matching Antigravity CLI's workspace MCP location. The `agy` adapter preserves other configured servers and writes the current Brehon executable path:
+2. **Setup the MCP Configuration**: Brehon writes a project-local `.agents/mcp_config.json` beside the workspace/worktree, matching Antigravity CLI's workspace MCP location. It also refreshes the global Antigravity CLI config at `~/.gemini/antigravity-cli/mcp_config.json` for the active worker workspace, because Agy may cache MCP descriptors under `~/.gemini/antigravity-cli/mcp/` without being able to start a server unless the global config is present. The `agy` adapter preserves other configured servers and writes the current Brehon executable path:
 
 ```json
 {
   "mcpServers": {
     "brehon": {
       "command": "brehon",
-      "args": ["serve"]
+      "args": ["serve"],
+      "cwd": "/path/to/current/workspace"
     }
   }
 }
 ```
 
-3. **Run Agy**: When Brehon spawns `agy`, the child process inherits the Brehon role and project-root environment. Agy then starts `brehon serve` from the local MCP config.
+3. **Run Agy**: When Brehon spawns `agy`, the child process inherits the Brehon role and project-root environment. Agy then starts `brehon serve` from the configured MCP entry and exposes Brehon's tools as direct MCP tools such as `agent`, `task`, `factory`, and `verification`.
 4. **Result**: `agy` can now call Brehon's tools, search the memories, query supervisor tasks, and request reviews without needing any ACP interface or complex PTY configurations. The role startup prompt follows the same Brehon worker/supervisor/reviewer protocol as other supported CLIs.
 
 ---
