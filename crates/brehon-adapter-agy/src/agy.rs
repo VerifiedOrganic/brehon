@@ -20,6 +20,7 @@ use tracing::{debug, warn};
 
 const PROMPT_RESULT_POLL_MS: u64 = 50;
 const AGY_SESSION_COMPLETE_KEY: &str = "_session_complete";
+const AGY_PROJECT_MCP_CONFIG_PATH: &str = ".agents/mcp_config.json";
 
 /// Error type for Agy adapter operations.
 #[derive(Debug, thiserror::Error)]
@@ -197,10 +198,10 @@ fn configure_mcp_in_workspace(workspace: &Path, exe: &str) {
 }
 
 fn configure_project_mcp_config(workspace: &Path, exe: &str) {
-    // Keep MCP discovery project-local. Agy supports the same .mcp.json shape
-    // used by the other Brehon-backed CLIs, and this avoids leaking one
-    // project's Brehon server into unrelated Antigravity sessions.
-    let path = workspace.join(".mcp.json");
+    // Keep MCP discovery project-local using Antigravity CLI's workspace
+    // config path, so one project's Brehon server does not leak into
+    // unrelated Antigravity sessions.
+    let path = workspace.join(AGY_PROJECT_MCP_CONFIG_PATH);
     let mut config = read_json_or_empty_object(&path);
     let Some(obj) = config.as_object_mut() else {
         return;
@@ -736,11 +737,11 @@ mod tests {
     }
 
     #[test]
-    fn agy_mcp_config_merges_brehon_server_in_project() {
+    fn agy_mcp_config_merges_brehon_server_in_workspace_agents_config() {
         let test_root =
             std::env::temp_dir().join(format!("brehon-agy-mcp-test-{}", uuid::Uuid::new_v4()));
         let workspace = test_root.join("workspace");
-        let config_path = workspace.join(".mcp.json");
+        let config_path = workspace.join(AGY_PROJECT_MCP_CONFIG_PATH);
         std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
         std::fs::write(
             &config_path,
@@ -760,6 +761,7 @@ mod tests {
             })
         );
         assert_eq!(config["mcpServers"]["other"]["command"], "other");
+        assert!(!workspace.join(".mcp.json").exists());
 
         let _ = std::fs::remove_dir_all(test_root);
     }

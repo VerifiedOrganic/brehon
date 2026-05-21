@@ -9,6 +9,4 @@
 
 pub mod agy;
 
-pub use agy::{
-    AgyAdapter, AgyConfig, AgyError, AgySession, AgySessionConfig, AgySpawnParams,
-};
+pub use agy::{AgyAdapter, AgyConfig, AgyError, AgySession, AgySessionConfig, AgySpawnParams};

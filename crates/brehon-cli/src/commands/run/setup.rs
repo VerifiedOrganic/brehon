@@ -116,7 +116,7 @@ pub(crate) fn ensure_mcp_config(cwd: &Path) -> Result<()> {
         tracing::warn!(
             path = %cwd.display(),
             error = %err,
-            "Failed to update .git/info/exclude; .mcp.json and .claude/settings.local.json may show up as uncommitted"
+            "Failed to update .git/info/exclude; local MCP and agent settings files may show up as uncommitted"
         );
     }
 
@@ -137,6 +137,12 @@ fn sync_local_agent_scaffolding_to_worktree(
         worktree_path,
         Path::new(".mcp.json"),
         "MCP discovery config",
+    )?;
+    sync_project_local_file_to_worktree(
+        project_root,
+        worktree_path,
+        Path::new(".agents/mcp_config.json"),
+        "Antigravity CLI MCP discovery config",
     )?;
     sync_project_local_file_to_worktree(
         project_root,
@@ -680,6 +686,8 @@ pub(crate) fn default_initiative_integration_worktree(
 /// * `.mcp.json` — Claude Code MCP discovery file. Written with an
 ///   absolute path to the current machine's brehon binary (see
 ///   [`ensure_mcp_config`]); the path won't resolve on any other host.
+/// * `.agents/mcp_config.json` — Antigravity CLI workspace MCP discovery
+///   file. Also contains an absolute path to this machine's brehon binary.
 /// * `.claude/settings.local.json` — Claude Code per-developer
 ///   permissions file. The `.local.json` suffix already signals
 ///   machine-local by Claude Code convention, but it's worth making
@@ -689,8 +697,12 @@ pub(crate) fn default_initiative_integration_worktree(
 /// than the committed `.gitignore` so the rule follows each clone
 /// without requiring a team-wide .gitignore update. This is the same
 /// pattern most tooling uses for auto-generated dev scaffolding.
-const BREHON_LOCAL_GITIGNORE_PATTERNS: &[&str] =
-    &[".brehon/", ".mcp.json", ".claude/settings.local.json"];
+const BREHON_LOCAL_GITIGNORE_PATTERNS: &[&str] = &[
+    ".brehon/",
+    ".mcp.json",
+    ".agents/mcp_config.json",
+    ".claude/settings.local.json",
+];
 
 /// Ensure all Brehon-generated machine-local files are git-ignored
 /// via `.git/info/exclude`.
@@ -2372,10 +2384,7 @@ mod tests {
         );
 
         let adapter = agent_to_adapter("agy-worker", &config);
-        assert_eq!(
-            adapter.as_builtin(),
-            Some(brehon_mux::SupervisorCli::Agy)
-        );
+        assert_eq!(adapter.as_builtin(), Some(brehon_mux::SupervisorCli::Agy));
     }
 
     #[test]
@@ -3036,6 +3045,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         init_git_repo(temp.path());
         std::fs::create_dir_all(temp.path().join(".brehon")).unwrap();
+        std::fs::create_dir_all(temp.path().join(".agents")).unwrap();
         std::fs::create_dir_all(temp.path().join(".claude")).unwrap();
         std::fs::write(
             temp.path().join(".claude/settings.local.json"),
@@ -3047,8 +3057,14 @@ mod tests {
             r#"{"mcpServers":{"brehon":{"command":"/tmp/brehon","args":["serve"]}}}"#,
         )
         .unwrap();
+        std::fs::write(
+            temp.path().join(".agents/mcp_config.json"),
+            r#"{"mcpServers":{"other":{"command":"other"}}}"#,
+        )
+        .unwrap();
         run_git(temp.path(), &["add", ".mcp.json"]);
         run_git(temp.path(), &["commit", "-m", "add mcp config"]);
+        ensure_brehon_ignored_in_repo(temp.path()).unwrap();
 
         let mut config = brehon_config::parse_defaults().unwrap();
         config.orchestration.worktree_isolation = true;
@@ -3106,6 +3122,14 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(reviewer_path.join(".mcp.json")).unwrap(),
             r#"{"mcpServers":{"brehon":{"command":"/tmp/brehon","args":["serve"]}}}"#
+        );
+        assert_eq!(
+            std::fs::read_to_string(supervisor_path.join(".agents/mcp_config.json")).unwrap(),
+            r#"{"mcpServers":{"other":{"command":"other"}}}"#
+        );
+        assert_eq!(
+            std::fs::read_to_string(reviewer_path.join(".agents/mcp_config.json")).unwrap(),
+            r#"{"mcpServers":{"other":{"command":"other"}}}"#
         );
 
         cleanup_scoped_worktrees(temp.path(), &supervisor_cwds).await;
@@ -3546,6 +3570,10 @@ mod tests {
             ".mcp.json missing: {lines:?}"
         );
         assert!(
+            lines.iter().any(|l| l == ".agents/mcp_config.json"),
+            ".agents/mcp_config.json missing: {lines:?}"
+        );
+        assert!(
             lines.iter().any(|l| l == ".claude/settings.local.json"),
             ".claude/settings.local.json missing: {lines:?}"
         );
@@ -3572,6 +3600,7 @@ mod tests {
         // Brehon patterns get appended.
         assert!(contents.contains(".brehon/"));
         assert!(contents.contains(".mcp.json"));
+        assert!(contents.contains(".agents/mcp_config.json"));
         assert!(contents.contains(".claude/settings.local.json"));
     }
 
@@ -3599,7 +3628,7 @@ mod tests {
         init_git_repo(temp.path());
         let exclude = temp.path().join(".git/info/exclude");
         std::fs::create_dir_all(exclude.parent().unwrap()).unwrap();
-        // Pre-populate with only one of the three brehon patterns.
+        // Pre-populate with only one of the brehon patterns.
         std::fs::write(&exclude, ".brehon/\n").unwrap();
 
         ensure_brehon_ignored_in_repo(temp.path()).unwrap();
@@ -3611,8 +3640,9 @@ mod tests {
             1,
             ".brehon/ was duplicated: {lines:?}"
         );
-        // The other two should have been added.
+        // The other patterns should have been added.
         assert!(lines.iter().any(|l| l == ".mcp.json"));
+        assert!(lines.iter().any(|l| l == ".agents/mcp_config.json"));
         assert!(lines.iter().any(|l| l == ".claude/settings.local.json"));
     }
 
@@ -3647,27 +3677,40 @@ mod tests {
         assert!(contents.contains("existing-no-newline\n"));
         assert!(contents.contains("\n.brehon/\n"));
         assert!(contents.contains("\n.mcp.json\n"));
+        assert!(contents.contains("\n.agents/mcp_config.json\n"));
     }
 
     #[test]
     fn ensure_mcp_config_auto_ignores_generated_files() {
         // End-to-end contract: generating .mcp.json + .claude settings
-        // also registers them in .git/info/exclude in one call, so a
-        // fresh developer checkout never sees uncommitted noise.
+        // also registers local agent MCP config paths in .git/info/exclude
+        // in one call, so a fresh developer checkout never sees
+        // uncommitted noise.
         let temp = tempfile::tempdir().unwrap();
         init_git_repo(temp.path());
 
         ensure_mcp_config(temp.path()).unwrap();
+        std::fs::create_dir_all(temp.path().join(".agents")).unwrap();
+        std::fs::write(
+            temp.path().join(".agents/mcp_config.json"),
+            r#"{"mcpServers":{"brehon":{"command":"/tmp/brehon","args":["serve"]}}}"#,
+        )
+        .unwrap();
 
         // Files were generated as expected.
         assert!(temp.path().join(".mcp.json").exists());
         assert!(temp.path().join(".claude/settings.local.json").exists());
+        assert!(temp.path().join(".agents/mcp_config.json").exists());
 
         // And they're also git-ignored.
         let lines = exclude_lines(temp.path());
         assert!(
             lines.iter().any(|l| l == ".mcp.json"),
             "ensure_mcp_config did not auto-ignore .mcp.json: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l == ".agents/mcp_config.json"),
+            "ensure_mcp_config did not auto-ignore .agents/mcp_config.json: {lines:?}"
         );
         assert!(
             lines.iter().any(|l| l == ".claude/settings.local.json"),
@@ -3680,6 +3723,10 @@ mod tests {
         assert!(
             !status.contains(".mcp.json"),
             "git status still sees .mcp.json as untracked:\n{status}"
+        );
+        assert!(
+            !status.contains(".agents"),
+            "git status still sees .agents local config as untracked:\n{status}"
         );
         assert!(
             !status.contains(".claude/settings.local.json"),

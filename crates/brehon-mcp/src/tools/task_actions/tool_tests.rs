@@ -3180,14 +3180,22 @@ async fn test_ready_reconciles_observed_worker_state_blocker_variants() {
         .unwrap();
     let payload: Value = serde_json::from_str(&extract_text(&ready)).unwrap();
     assert_eq!(payload["count"], 0, "{payload}");
-    assert_eq!(payload["recoverable_blocked_count"], cases.len(), "{payload}");
+    assert_eq!(
+        payload["recoverable_blocked_count"],
+        cases.len(),
+        "{payload}"
+    );
 
     let repair = tool
         .execute(serde_json::json!({"action": "repair_frontier"}))
         .await
         .unwrap();
     let repair_payload: Value = serde_json::from_str(&extract_text(&repair)).unwrap();
-    assert_eq!(repair_payload["repaired_count"], cases.len(), "{repair_payload}");
+    assert_eq!(
+        repair_payload["repaired_count"],
+        cases.len(),
+        "{repair_payload}"
+    );
 
     for (task_id, _) in cases {
         let updated = read_test_task(root.path(), task_id);

@@ -133,7 +133,7 @@ impl AgySession {
 If you prefer to make **`agy` the primary driver** of the development process (running tasks from your active terminal), you can reverse-drive the integration:
 
 1. **Brehon MCP Server**: Brehon provides `brehon serve` which launches an MCP server over stdio exposing its underlying events, task directory, memories, and rules.
-2. **Setup the MCP Configuration**: Brehon writes a project-local `.mcp.json` beside the workspace/worktree. The `agy` adapter preserves other configured servers and writes the current Brehon executable path:
+2. **Setup the MCP Configuration**: Brehon writes a project-local `.agents/mcp_config.json` beside the workspace/worktree, matching Antigravity CLI's workspace MCP location. The `agy` adapter preserves other configured servers and writes the current Brehon executable path:
 
 ```json
 {
