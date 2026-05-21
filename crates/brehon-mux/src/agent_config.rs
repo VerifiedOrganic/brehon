@@ -50,7 +50,7 @@ impl AgentRegistry {
     /// List all known agent names (built-in + custom).
     pub fn names(&self) -> Vec<&str> {
         let mut names: Vec<&str> = vec![
-            "claude", "codex", "gemini", "kimi", "opencode", "junie", "copilot",
+            "claude", "codex", "gemini", "kimi", "opencode", "junie", "copilot", "agy",
         ];
         names.extend(self.custom.keys().map(|s| s.as_str()));
         names

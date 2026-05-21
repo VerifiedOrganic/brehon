@@ -24,6 +24,7 @@ use brehon_adapter_codex::codex::CodexWsSession;
 use brehon_adapter_copilot::copilot::{CopilotAdapter, CopilotConfig};
 use brehon_adapter_gemini::gemini::{GeminiAdapter, GeminiConfig};
 use brehon_adapter_junie::{JunieAdapter, JunieConfig};
+use brehon_adapter_agy::{AgyAdapter, AgyConfig};
 use brehon_adapter_kimi::{KimiAdapter, KimiConfig};
 use brehon_adapter_openai::{OpenAiCompatibleAdapter, OpenAiCompatibleConfig};
 use brehon_adapter_opencode::OpenCodeServerSession;
@@ -52,6 +53,8 @@ pub enum GatewayProtocol {
     OpenAiCompatibleChat,
     /// Junie task-based CLI over stdio.
     JunieStdio,
+    /// Agy task-based CLI over stdio.
+    AgyStdio,
 }
 
 /// Map a gateway protocol to the corresponding SupervisorCli variant.
@@ -66,6 +69,7 @@ fn protocol_to_supervisor_cli(protocol: GatewayProtocol) -> Option<SupervisorCli
         GatewayProtocol::OpenCodeServer => Some(SupervisorCli::OpenCode),
         GatewayProtocol::OpenAiCompatibleChat => None,
         GatewayProtocol::JunieStdio => Some(SupervisorCli::Junie),
+        GatewayProtocol::AgyStdio => Some(SupervisorCli::Agy),
     }
 }
 
@@ -542,6 +546,32 @@ impl AgentGateway for AcpGateway {
                     ))
                 })?;
                 let adapter = JunieAdapter::new(JunieConfig {
+                    command: command.to_string(),
+                    args: launch.args.clone(),
+                    env: launch.env.clone(),
+                });
+                adapter
+                    .spawn(spec.clone())
+                    .await
+                    .map_err(|e| PortError::Agent(format!("Failed to spawn session: {}", e)))?;
+
+                if let Some(event_tx) = self.agent_event_channels.get(&agent_id) {
+                    let event_rx = adapter.events();
+                    let event_tx = event_tx.clone();
+                    let session_id = adapter.session_id().await;
+                    tokio::spawn(forward_adapter_events(event_rx, event_tx, session_id));
+                }
+
+                Arc::new(adapter)
+            }
+            GatewayProtocol::AgyStdio => {
+                let command = launch.command.as_deref().ok_or_else(|| {
+                    PortError::Agent(format!(
+                        "Agent {} is missing a subprocess command",
+                        agent_id
+                    ))
+                })?;
+                let adapter = AgyAdapter::new(AgyConfig {
                     command: command.to_string(),
                     args: launch.args.clone(),
                     env: launch.env.clone(),

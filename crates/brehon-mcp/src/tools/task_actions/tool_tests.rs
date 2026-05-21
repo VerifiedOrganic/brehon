@@ -2079,7 +2079,7 @@ async fn test_blocked_without_integration_conflict_cannot_jump_to_review_ready()
 
     assert_eq!(result.is_error, Some(true));
     assert!(
-        extract_text(&result).contains("latest_commit is empty"),
+        extract_text(&result).contains("Invalid status transition"),
         "{}",
         extract_text(&result)
     );
@@ -3051,7 +3051,10 @@ async fn test_ready_reconciles_dependency_blocker_text_with_dead_assignee_back_t
 async fn test_ready_reconciles_worker_state_blocker_with_dead_assignee_back_to_pending() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
+    let _env = ScopedEnv::set(&[
+        ("BREHON_ROOT", root.path().to_str().unwrap()),
+        ("BREHON_AGENT_ROLE", "supervisor"),
+    ]);
     let tool = TaskActionsTool::new();
 
     let sessions_dir = root.path().join("runtime").join("sessions");
@@ -3093,14 +3096,23 @@ async fn test_ready_reconciles_worker_state_blocker_with_dead_assignee_back_to_p
         .await
         .unwrap();
     let payload: Value = serde_json::from_str(&extract_text(&ready)).unwrap();
-    assert_eq!(payload["count"], 1, "{payload}");
-    assert_eq!(payload["tasks"][0]["task_id"], "T-state-deadlock");
+    assert_eq!(payload["count"], 0, "{payload}");
+    assert_eq!(payload["recoverable_blocked_count"], 1, "{payload}");
+    assert_eq!(
+        payload["recoverable_blocked_tasks"][0]["task_id"],
+        "T-state-deadlock"
+    );
+
+    let repair = tool
+        .execute(serde_json::json!({"action": "repair_frontier"}))
+        .await
+        .unwrap();
+    let repair_payload: Value = serde_json::from_str(&extract_text(&repair)).unwrap();
+    assert_eq!(repair_payload["repaired_count"], 1, "{repair_payload}");
 
     let updated = read_test_task(root.path(), "T-state-deadlock");
-    assert_eq!(updated["status"], "pending");
+    assert_eq!(updated["status"], "review_ready");
     assert!(updated["assignee"].is_null(), "{updated:?}");
-    assert_eq!(updated["orphaned_assignee"], "dead-worker");
-    assert_eq!(updated["orphaned_status"], "in_progress");
     assert!(
         updated.get("blockers").is_none() || updated["blockers"].is_null(),
         "{updated:?}"
@@ -3111,7 +3123,10 @@ async fn test_ready_reconciles_worker_state_blocker_with_dead_assignee_back_to_p
 async fn test_ready_reconciles_observed_worker_state_blocker_variants() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
+    let _env = ScopedEnv::set(&[
+        ("BREHON_ROOT", root.path().to_str().unwrap()),
+        ("BREHON_AGENT_ROLE", "supervisor"),
+    ]);
     let tool = TaskActionsTool::new();
 
     let cases = [
@@ -3164,11 +3179,19 @@ async fn test_ready_reconciles_observed_worker_state_blocker_variants() {
         .await
         .unwrap();
     let payload: Value = serde_json::from_str(&extract_text(&ready)).unwrap();
-    assert_eq!(payload["count"], cases.len(), "{payload}");
+    assert_eq!(payload["count"], 0, "{payload}");
+    assert_eq!(payload["recoverable_blocked_count"], cases.len(), "{payload}");
+
+    let repair = tool
+        .execute(serde_json::json!({"action": "repair_frontier"}))
+        .await
+        .unwrap();
+    let repair_payload: Value = serde_json::from_str(&extract_text(&repair)).unwrap();
+    assert_eq!(repair_payload["repaired_count"], cases.len(), "{repair_payload}");
 
     for (task_id, _) in cases {
         let updated = read_test_task(root.path(), task_id);
-        assert_eq!(updated["status"], "pending", "{updated:?}");
+        assert_eq!(updated["status"], "review_ready", "{updated:?}");
         assert!(
             updated.get("blockers").is_none() || updated["blockers"].is_null(),
             "{updated:?}"

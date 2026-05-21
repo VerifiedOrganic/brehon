@@ -78,7 +78,7 @@ fn apply_test_pty_spawn_fallback(config: &mut PtyConfig) {
 fn is_test_pty_fallback_candidate(command: &str) -> bool {
     matches!(
         command,
-        "claude" | "codex" | "copilot" | "gemini" | "gh" | "junie" | "kimi" | "opencode"
+        "claude" | "codex" | "copilot" | "gemini" | "gh" | "junie" | "kimi" | "opencode" | "agy"
     )
 }
 
@@ -1225,6 +1225,34 @@ impl Pane {
                     brehon_root,
                 )
             }
+            SupervisorCli::Agy => {
+                let mut config = PtyConfig::agy(
+                    name,
+                    "worker",
+                    cwd,
+                    brehon_root,
+                    Some(supervisor_name),
+                    worker_cli_str,
+                    model,
+                    teams,
+                );
+                apply_runtime_session_name(&mut config.env, session_name);
+                apply_configured_agent_type(&mut config, configured_agent_type);
+                merge_launcher_env(&mut config.env, launcher_env);
+                apply_runtime_model_metadata(&mut config.env, model, reasoning_effort);
+                Self::pty_pane_from_config(
+                    name,
+                    PaneKind::Worker,
+                    config,
+                    rows,
+                    cols,
+                    adapter_owned,
+                    configured_agent_type,
+                    adapter.name(),
+                    materialization,
+                    brehon_root,
+                )
+            }
             SupervisorCli::Copilot => {
                 if materialization == AgentPaneMaterialization::PlanOnly {
                     let mut config = PtyConfig::copilot(
@@ -1853,6 +1881,26 @@ impl Pane {
                     brehon_root,
                 )
             }
+            SupervisorCli::Agy => {
+                let mut config =
+                    PtyConfig::agy(name, role, cwd, brehon_root, None, None, model, teams);
+                apply_runtime_session_name(&mut config.env, session_name);
+                apply_configured_agent_type(&mut config, configured_agent_type);
+                merge_launcher_env(&mut config.env, launcher_env);
+                apply_runtime_model_metadata(&mut config.env, model, reasoning_effort);
+                Self::pty_pane_from_config(
+                    name,
+                    pane_kind.clone(),
+                    config,
+                    rows,
+                    cols,
+                    adapter_owned,
+                    configured_agent_type,
+                    adapter.name(),
+                    materialization,
+                    brehon_root,
+                )
+            }
             SupervisorCli::Copilot => {
                 if materialization == AgentPaneMaterialization::PlanOnly {
                     let mut config = PtyConfig::copilot(
@@ -2282,6 +2330,40 @@ impl Pane {
             }
             SupervisorCli::Junie => {
                 let mut config = PtyConfig::junie(
+                    name,
+                    "supervisor",
+                    cwd,
+                    brehon_root,
+                    None,
+                    Some(worker_cli_str),
+                    model,
+                    teams,
+                );
+                apply_runtime_session_name(&mut config.env, session_name);
+                apply_configured_agent_type(&mut config, configured_agent_type);
+                merge_launcher_env(&mut config.env, launcher_env);
+                apply_runtime_model_metadata(&mut config.env, model, reasoning_effort);
+                Self::push_supervisor_env(
+                    &mut config.env,
+                    adapter,
+                    &worker_names_csv,
+                    &worker_pool_json,
+                );
+                Self::pty_pane_from_config(
+                    name,
+                    PaneKind::Supervisor,
+                    config,
+                    rows,
+                    cols,
+                    adapter_owned,
+                    configured_agent_type,
+                    adapter.name(),
+                    materialization,
+                    brehon_root,
+                )
+            }
+            SupervisorCli::Agy => {
+                let mut config = PtyConfig::agy(
                     name,
                     "supervisor",
                     cwd,

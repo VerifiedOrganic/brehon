@@ -219,6 +219,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "base64",
+ "brehon-adapter-agy",
  "brehon-adapter-codex",
  "brehon-adapter-copilot",
  "brehon-adapter-gemini",
@@ -239,6 +240,24 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-tungstenite",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "brehon-adapter-agy"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "brehon-adapter-sdk",
+ "brehon-config",
+ "brehon-ports",
+ "brehon-types",
+ "chrono",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
  "tracing",
  "uuid",
 ]
@@ -695,6 +714,7 @@ dependencies = [
 name = "brehon-pty"
 version = "0.1.0"
 dependencies = [
+ "brehon-adapter-agy",
  "brehon-adapter-claude",
  "brehon-adapter-copilot",
  "brehon-adapter-junie",

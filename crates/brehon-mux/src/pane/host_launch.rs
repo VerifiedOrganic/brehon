@@ -140,5 +140,6 @@ fn gateway_protocol_label(protocol: GatewayProtocol) -> &'static str {
         GatewayProtocol::OpenCodeServer => "opencode_server",
         GatewayProtocol::OpenAiCompatibleChat => "openai_compatible_chat",
         GatewayProtocol::JunieStdio => "junie_stdio",
+        GatewayProtocol::AgyStdio => "agy_stdio",
     }
 }

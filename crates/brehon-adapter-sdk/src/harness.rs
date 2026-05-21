@@ -130,6 +130,8 @@ pub enum SupervisorCli {
     Junie,
     /// GitHub Copilot CLI.
     Copilot,
+    /// Google Antigravity 2.0 CLI.
+    Agy,
 }
 
 impl SupervisorCli {
@@ -143,6 +145,7 @@ impl SupervisorCli {
             Self::OpenCode => "opencode",
             Self::Junie => "junie",
             Self::Copilot => "copilot",
+            Self::Agy => "agy",
         }
     }
 
@@ -226,6 +229,17 @@ impl SupervisorCli {
                 transport: HarnessTransport::AppServer,
                 preferred_control_plane: HarnessControlPlane::Acp,
             },
+            Self::Agy => HarnessCapabilities {
+                supports_hooks: false,
+                supports_subagents: false,
+                supports_textbox_submit: false,
+                supports_teams: false,
+                one_shot: false,
+                uses_ink_prompt: true,
+                tool_prefix: Cow::Borrowed("mcp_brehon_"),
+                transport: HarnessTransport::InteractivePty,
+                preferred_control_plane: HarnessControlPlane::PtyInjection,
+            },
         }
     }
 }
@@ -242,6 +256,7 @@ impl FromStr for SupervisorCli {
             "opencode" => Ok(Self::OpenCode),
             "junie" => Ok(Self::Junie),
             "copilot" | "gh-copilot" => Ok(Self::Copilot),
+            "agy" => Ok(Self::Agy),
             _ => Err(format!("unsupported harness: {s}")),
         }
     }

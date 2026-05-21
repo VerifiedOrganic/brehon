@@ -47,6 +47,7 @@ notes/
 .rooignore
 .clinerules
 .windsurfrules
+.antigravitycli
 
 # ─── MCP local config (paths are machine-specific) ───────────────
 .mcp.json

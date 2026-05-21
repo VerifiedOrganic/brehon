@@ -255,6 +255,7 @@ pub(crate) fn detect_builtin_cli(
         "opencode" => return Some(SupervisorCli::OpenCode),
         "junie" => return Some(SupervisorCli::Junie),
         "copilot" => return Some(SupervisorCli::Copilot),
+        "agy" => return Some(SupervisorCli::Agy),
         _ => {}
     }
 
@@ -526,6 +527,7 @@ pub(crate) fn agent_to_adapter(name: &str, config: &BrehonConfig) -> brehon_mux:
                 transport: HarnessTransport::AppServer,
                 preferred_control_plane: HarnessControlPlane::Acp,
             },
+            AdapterKind::Agy => SupervisorCli::Agy.capabilities(),
             AdapterKind::PtyHooks => SupervisorCli::Claude.capabilities(),
         };
         if let Some(transport) = agent_config

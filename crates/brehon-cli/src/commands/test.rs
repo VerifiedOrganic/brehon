@@ -106,6 +106,7 @@ pub async fn run_live_conformance(
                 brehon_types::agent::AdapterKind::Kimi => brehon_acp::GatewayProtocol::AcpStdio,
                 brehon_types::agent::AdapterKind::Junie => brehon_acp::GatewayProtocol::AcpStdio,
                 brehon_types::agent::AdapterKind::Copilot => brehon_acp::GatewayProtocol::AcpStdio,
+                brehon_types::agent::AdapterKind::Agy => brehon_acp::GatewayProtocol::AgyStdio,
                 brehon_types::agent::AdapterKind::PtyHooks => {
                     tracing::warn!(
                         "Skipping conformance test for PtyHooks adapter {} — native hooks do not speak ACP",

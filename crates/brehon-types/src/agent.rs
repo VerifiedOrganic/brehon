@@ -47,6 +47,8 @@ pub enum AdapterKind {
     Junie,
     /// GitHub Copilot CLI adapter.
     Copilot,
+    /// Google Antigravity 2.0 CLI adapter.
+    Agy,
 }
 
 /// Configuration for spawning an agent.
@@ -240,6 +242,12 @@ mod tests {
         assert_eq!(json, r#""Copilot""#);
         let parsed: AdapterKind = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, AdapterKind::Copilot);
+
+        let agy = AdapterKind::Agy;
+        let json = serde_json::to_string(&agy).unwrap();
+        assert_eq!(json, r#""Agy""#);
+        let parsed: AdapterKind = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, AdapterKind::Agy);
     }
 
     #[test]

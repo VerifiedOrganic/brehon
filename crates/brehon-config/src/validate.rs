@@ -860,7 +860,7 @@ fn supervisor_launcher_supports_pty(
     }
 
     match launcher.adapter {
-        AdapterKind::PtyHooks | AdapterKind::Mock | AdapterKind::Junie => launcher
+        AdapterKind::PtyHooks | AdapterKind::Mock | AdapterKind::Junie | AdapterKind::Agy => launcher
             .command_str()
             .is_some_and(|command| !command.trim().is_empty()),
         AdapterKind::NativeAgent => true,
@@ -884,6 +884,7 @@ fn is_builtin_supervisor_name(name: &str) -> bool {
             | "junie"
             | "copilot"
             | "gh-copilot"
+            | "agy"
     )
 }
 
@@ -903,6 +904,7 @@ fn launcher_invokes_builtin_supervisor(launcher: &brehon_types::AgentConnectionC
         | ("opencode", ["serve", "--pure"]) => true,
         ("junie", []) => true,
         ("copilot", args) if args.is_empty() || args.contains(&"--acp") => true,
+        ("agy", args) if args.is_empty() || args.contains(&"--prompt-interactive") || args.contains(&"-i") => true,
         _ => false,
     }
 }
@@ -1114,7 +1116,8 @@ fn reviewer_lane_supports_shared_reset(config: &BrehonConfig, lane: &str) -> boo
         }
         brehon_types::agent::AdapterKind::Kimi
         | brehon_types::agent::AdapterKind::Junie
-        | brehon_types::agent::AdapterKind::Copilot => false,
+        | brehon_types::agent::AdapterKind::Copilot
+        | brehon_types::agent::AdapterKind::Agy => false,
     }
 }
 

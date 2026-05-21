@@ -6,6 +6,7 @@ description = "PTY management for Brehon factory mode"
 license = "MIT"
 
 [dependencies]
+brehon-adapter-agy = { path = "../brehon-adapter-agy" }
 brehon-adapter-claude = { path = "../brehon-adapter-claude" }
 brehon-adapter-copilot = { path = "../brehon-adapter-copilot" }
 brehon-adapter-junie = { path = "../brehon-adapter-junie" }

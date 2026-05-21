@@ -15,6 +15,7 @@ brehon-adapter-kimi = { path = "../brehon-adapter-kimi" }
 brehon-adapter-codex = { path = "../brehon-adapter-codex" }
 brehon-adapter-copilot = { path = "../brehon-adapter-copilot" }
 brehon-adapter-junie = { path = "../brehon-adapter-junie" }
+brehon-adapter-agy = { path = "../brehon-adapter-agy" }
 brehon-adapter-openai = { path = "../brehon-adapter-openai" }
 tokio = { workspace = true }
 async-trait = { workspace = true }

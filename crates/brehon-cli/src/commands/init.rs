@@ -13,6 +13,7 @@ const KNOWN_AGENTS: &[(&str, &str, &str)] = &[
     ("gemini", "gemini", "Gemini CLI"),
     ("kimi", "kimi", "Kimi Code CLI"),
     ("opencode", "opencode", "OpenCode CLI"),
+    ("agy", "agy", "Antigravity CLI"),
 ];
 
 /// Agent info for config generation.
@@ -153,6 +154,26 @@ fn generate_config_for_agents(agents: &[DetectedAgent]) -> String {
                 "opencode".to_string(),
                 launcher("opencode", &["acp", "--cwd", "."], &[]),
             ),
+            (
+                "agy".to_string(),
+                AgentConnectionConfig {
+                    adapter: AdapterKind::Agy,
+                    command: Some("agy".to_string()),
+                    args: arg_list(&["-i", "--dangerously-skip-permissions"]),
+                    provider: None,
+                    transport: None,
+                    control_plane: None,
+                    base_url: None,
+                    api_key_env: None,
+                    permission_mode: None,
+                    max_parallel_tool_calls: None,
+                    assistant_message_passthrough_fields: Vec::new(),
+                    reasoning_effort_param: None,
+                    extra_body: None,
+                    env: HashMap::new(),
+                    headers: HashMap::new(),
+                },
+            ),
         ])
     }
 
@@ -162,7 +183,7 @@ fn generate_config_for_agents(agents: &[DetectedAgent]) -> String {
 
         let lane_effort = |launcher: &str, role: &str| -> Option<&'static str> {
             match launcher {
-                "gemini" => None,
+                "gemini" | "agy" => None,
                 _ => Some(if role == "worker" { "medium" } else { "high" }),
             }
         };
@@ -176,6 +197,7 @@ fn generate_config_for_agents(agents: &[DetectedAgent]) -> String {
             ("gemini", "google", "gemini-3.1-pro-preview"),
             ("kimi", "kimi-code", "kimi-for-coding"),
             ("opencode", "ollama-cloud", "glm-5.1"),
+            ("agy", "google", "antigravity-2.0"),
         ] {
             insert_lane(
                 &mut lanes,
@@ -295,6 +317,7 @@ fn generate_config_for_agents(agents: &[DetectedAgent]) -> String {
             "gemini",
             "kimi",
             "opencode",
+            "agy",
         ];
         let lane_order = [
             "claude-supervisor",
@@ -322,6 +345,9 @@ fn generate_config_for_agents(agents: &[DetectedAgent]) -> String {
             "opencode-supervisor",
             "opencode-worker",
             "opencode-reviewer",
+            "agy-supervisor",
+            "agy-worker",
+            "agy-reviewer",
         ];
 
         let Some(root) = document.as_mapping_mut() else {
@@ -581,6 +607,7 @@ fn generate_config_for_agents(agents: &[DetectedAgent]) -> String {
         "opencode",
         "kimi",
         "gemini",
+        "agy",
     ]
     .iter()
     .find(|name| found_launcher(name))
@@ -614,6 +641,7 @@ fn generate_config_for_agents(agents: &[DetectedAgent]) -> String {
         "kimi",
         "claude-code",
         "gemini",
+        "agy",
     ]
     .iter()
     .find(|name| found_launcher(name))
@@ -665,6 +693,7 @@ fn generate_config_for_agents(agents: &[DetectedAgent]) -> String {
             "gemini",
             "kimi",
             "opencode",
+            "agy",
         ];
         let mut reviewers = Vec::new();
         for candidate in reviewer_candidates {
@@ -893,6 +922,7 @@ pub fn execute(project_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use brehon_types::agent::AdapterKind;
 
     fn load_generated_config(yaml: &str) -> brehon_types::BrehonConfig {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -1059,5 +1089,22 @@ mod tests {
         let config = load_generated_config(&yaml);
         assert_eq!(config.version, 1);
         assert!(config.launchers.contains_key("claude"));
+    }
+
+    #[test]
+    fn generated_config_tailors_agy() {
+        let agents = vec![
+            detected_agent("agy", "agy", "antigravity", "antigravity-2.0"),
+        ];
+        let yaml = generate_config_for_agents(&agents);
+        let config = load_generated_config(&yaml);
+
+        assert_eq!(config.roles.supervisor.name, "agy-supervisor");
+        assert_eq!(config.roles.workers[0].lane, "agy-worker");
+        assert_eq!(config.review.default_reviewers, vec!["agy-reviewer".to_string()]);
+        assert_eq!(config.launchers["agy"].adapter, AdapterKind::Agy);
+        assert_eq!(config.launchers["agy"].command, Some("agy".to_string()));
+        assert_eq!(config.launchers["agy"].args, vec!["-i".to_string(), "--dangerously-skip-permissions".to_string()]);
+        assert_eq!(config.lanes["agy-worker"].model.as_ref().unwrap().name, "antigravity-2.0");
     }
 }

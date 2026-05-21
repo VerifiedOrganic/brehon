@@ -22,6 +22,7 @@ members = [
     "crates/brehon-adapter-sdk",
     "crates/brehon-adapter-kimi",
     "crates/brehon-adapter-junie",
+    "crates/brehon-adapter-agy",
     "crates/brehon-adapter-copilot",
     "crates/brehon-adapter-opencode",
     "crates/brehon-adapter-gemini",
