@@ -21,7 +21,6 @@ use tracing::{debug, warn};
 const PROMPT_RESULT_POLL_MS: u64 = 50;
 const AGY_SESSION_COMPLETE_KEY: &str = "_session_complete";
 const AGY_PROJECT_MCP_CONFIG_PATH: &str = ".agents/mcp_config.json";
-const AGY_GLOBAL_MCP_CONFIG_PATH: &str = ".gemini/antigravity-cli/mcp_config.json";
 
 /// Error type for Agy adapter operations.
 #[derive(Debug, thiserror::Error)]
@@ -223,9 +222,6 @@ fn configure_mcp_in_workspace(workspace: &Path, exe: &str) {
         return;
     }
     configure_project_mcp_config(workspace, exe);
-    if let Some(global_home) = std::env::var("HOME").ok().map(PathBuf::from) {
-        configure_global_mcp_config(&global_home, workspace, exe);
-    }
 }
 
 fn configure_project_mcp_config(workspace: &Path, exe: &str) {
@@ -233,11 +229,6 @@ fn configure_project_mcp_config(workspace: &Path, exe: &str) {
     // config path, so one project's Brehon server does not leak into
     // unrelated Antigravity sessions.
     let path = workspace.join(AGY_PROJECT_MCP_CONFIG_PATH);
-    merge_brehon_mcp_server(&path, desired_agy_mcp_config_for_workspace(exe, workspace));
-}
-
-fn configure_global_mcp_config(global_home: &Path, workspace: &Path, exe: &str) {
-    let path = global_home.join(AGY_GLOBAL_MCP_CONFIG_PATH);
     merge_brehon_mcp_server(&path, desired_agy_mcp_config_for_workspace(exe, workspace));
 }
 
@@ -806,40 +797,6 @@ mod tests {
         );
         assert_eq!(config["mcpServers"]["other"]["command"], "other");
         assert!(!workspace.join(".mcp.json").exists());
-
-        let _ = std::fs::remove_dir_all(test_root);
-    }
-
-    #[test]
-    fn agy_global_mcp_config_merges_brehon_server_with_workspace_cwd() {
-        let test_root = std::env::temp_dir().join(format!(
-            "brehon-agy-global-mcp-test-{}",
-            uuid::Uuid::new_v4()
-        ));
-        let home = test_root.join("home");
-        let workspace = test_root.join("workspace");
-        let config_path = home.join(AGY_GLOBAL_MCP_CONFIG_PATH);
-        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
-        std::fs::create_dir_all(&workspace).unwrap();
-        std::fs::write(
-            &config_path,
-            r#"{"mcpServers":{"other":{"command":"other","args":["serve"]}}}"#,
-        )
-        .unwrap();
-
-        configure_global_mcp_config(&home, &workspace, "/tmp/brehon");
-
-        let config: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(config_path).unwrap()).unwrap();
-        assert_eq!(
-            config["mcpServers"]["brehon"],
-            serde_json::json!({
-                "command": "/tmp/brehon",
-                "args": ["serve"],
-                "cwd": workspace.to_string_lossy()
-            })
-        );
-        assert_eq!(config["mcpServers"]["other"]["command"], "other");
 
         let _ = std::fs::remove_dir_all(test_root);
     }
