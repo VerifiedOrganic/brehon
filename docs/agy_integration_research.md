@@ -133,7 +133,7 @@ impl AgySession {
 If you prefer to make **`agy` the primary driver** of the development process (running tasks from your active terminal), you can reverse-drive the integration:
 
 1. **Brehon MCP Server**: Brehon provides `brehon serve` which launches an MCP server over stdio exposing its underlying events, task directory, memories, and rules.
-2. **Setup the MCP Configuration**: Brehon writes a project-local `.agents/mcp_config.json` beside the workspace/worktree, matching Antigravity CLI's workspace MCP location. Because this file contains machine-local paths, Brehon ignores it in git and copies it into isolated worker worktrees before launching Agy. The `agy` adapter preserves other configured project servers and writes the current Brehon executable path:
+2. **Setup the MCP Configuration**: Brehon (via the Agy adapter and `brehon run` scaffolding) writes/updates a project-local `.agents/mcp_config.json` inside the workspace (or each worker worktree), which is Antigravity CLI's dedicated workspace MCP config path. This is distinct from Claude Code's `.mcp.json`. The file is machine-local (absolute `brehon` path + `cwd`), so Brehon auto-ignores it and copies it into isolated worktrees. The `agy` adapter always preserves any pre-existing `mcpServers` entries (e.g. other tools) while adding the `brehon` server entry:
 
 ```json
 {
@@ -157,12 +157,12 @@ If you prefer to make **`agy` the primary driver** of the development process (r
 To register the long-running `agy` worker lane in Brehon, apply the following edits to your `.brehon/config.yaml`:
 
 ### 1. Register the `agy` Launcher
-Add `agy` under your list of launchers in `.brehon/config.yaml`. Because it is a long-running headless stream-driven interface, we define it using the `Junie` adapter kind style.
+Add `agy` under your list of launchers in `.brehon/config.yaml`. Use the dedicated `Agy` adapter for Antigravity 2.0 CLI workers (long-running headless stdio, PTY-free).
 
 ```yaml
 launchers:
   agy-cli:
-    adapter: Junie # Uses the headless stdio CLI execution framework
+    adapter: Agy
     command: /Users/recursive/.local/bin/agy
     args:
       - "--dangerously-skip-permissions"
