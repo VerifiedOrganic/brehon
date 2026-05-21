@@ -3686,4 +3686,30 @@ mod tests {
             "git status still sees settings.local.json as untracked:\n{status}"
         );
     }
+
+    #[test]
+    fn ensure_mcp_config_updates_stale_brehon_server_entry() {
+        let temp = tempfile::tempdir().unwrap();
+        init_git_repo(temp.path());
+        std::fs::write(
+            temp.path().join(".mcp.json"),
+            r#"{"mcpServers":{"other":{"command":"other"},"brehon":{"command":"/stale/brehon","args":["serve"]}}}"#,
+        )
+        .unwrap();
+
+        ensure_mcp_config(temp.path()).unwrap();
+
+        let config: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(temp.path().join(".mcp.json")).unwrap())
+                .unwrap();
+        let expected_exe = std::env::current_exe()
+            .map(|path| path.to_string_lossy().to_string())
+            .unwrap_or_else(|_| "brehon".to_string());
+        assert_eq!(config["mcpServers"]["brehon"]["command"], expected_exe);
+        assert_eq!(
+            config["mcpServers"]["brehon"]["args"],
+            serde_json::json!(["serve"])
+        );
+        assert_eq!(config["mcpServers"]["other"]["command"], "other");
+    }
 }
