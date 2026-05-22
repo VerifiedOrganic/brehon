@@ -22,7 +22,7 @@ const KEYBIND_ROWS: [(&str, &str, &str); 11] = [
     ("C-w", "Focus workers", "global"),
     ("C-e", "Focus reviewers", "global"),
     ("C-s", "Focus supervisor", "global"),
-    ("C-f", "Fullscreen attach", "panesmith supervisor"),
+    ("C-f", "Toggle fullscreen", "panesmith supervisor"),
     ("C-] / S-Tab", "Cycle tabs", "global"),
     ("↑ ↓ PgUp PgDn", "Scroll task list", "dashboard"),
     ("Esc", "Scroll focused pane to bottom", "pane"),

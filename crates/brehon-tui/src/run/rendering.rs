@@ -1643,7 +1643,7 @@ pub(crate) fn render_status_bar(
     if focused_panesmith_supervisor {
         spans.extend([
             Span::styled("C-f", key_style),
-            Span::styled(":Attach", label_style),
+            Span::styled(":Full", label_style),
             separator(),
         ]);
     }

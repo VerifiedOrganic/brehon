@@ -596,6 +596,7 @@ fn should_attach_focused_panesmith_supervisor(
 
 fn panesmith_attach_options_for_dashboard() -> panesmith::AttachOptions {
     let mut options = panesmith::AttachOptions::default();
+    options.detach.chord = vec![0x06]; // Ctrl-f toggles fullscreen attach off.
     options.screen = panesmith::AttachScreenPolicy::LeaveAlternateScreen;
     options
 }
@@ -3949,6 +3950,7 @@ mod tests {
             options.screen,
             panesmith::AttachScreenPolicy::LeaveAlternateScreen
         );
+        assert_eq!(options.detach.chord, vec![0x06]);
     }
 
     #[test]
