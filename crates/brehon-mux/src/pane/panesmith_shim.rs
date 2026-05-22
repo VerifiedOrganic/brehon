@@ -11,10 +11,14 @@ use crate::error::{Error, Result};
 use crate::pty::PtyConfig;
 
 use panesmith::{
-    HostInput, OwnedPaneSnapshot, OwnedScrollbackSnapshot, PaneConfig, PaneEventKind,
+    AttachOptions, HostInput, OwnedPaneSnapshot, OwnedScrollbackSnapshot, PaneAttachOutcome,
+    PaneAttachTerminal, PaneAttachTerminalControl, PaneConfig, PaneEventKind,
     PaneId as PanesmithPaneId, PaneManager, PaneManagerConfig, Size, TranscriptConfig,
     TranscriptMode,
 };
+
+#[cfg(test)]
+pub(crate) const FORCE_PANESMITH_SPAWN_FAILURE_PANE_ID: &str = "__brehon_test_panesmith_spawn_fail";
 
 /// Mirrored event data that can be applied to Brehon's pane/runtime state.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,6 +78,11 @@ impl BrehonPanesmithShim {
         config: &PtyConfig,
         title: &str,
     ) -> Result<PanesmithPaneId> {
+        #[cfg(test)]
+        if pane_id == FORCE_PANESMITH_SPAWN_FAILURE_PANE_ID {
+            return Err(Error::pty("Panesmith: forced test spawn failure"));
+        }
+
         if self.pane_ids.contains_key(pane_id) {
             return Err(Error::pty(format!(
                 "Panesmith pane already registered for '{pane_id}'"
@@ -147,6 +156,28 @@ impl BrehonPanesmithShim {
             .manager
             .kill(panesmith_id, panesmith::KillReason::HostRequested);
         Ok(true)
+    }
+
+    pub(crate) fn attach_blocking<Terminal, Control>(
+        &mut self,
+        pane_id: &str,
+        options: AttachOptions,
+        terminal: &mut Terminal,
+        control: &mut Control,
+    ) -> Result<PaneAttachOutcome>
+    where
+        Terminal: PaneAttachTerminal,
+        Control: PaneAttachTerminalControl,
+    {
+        let panesmith_id = self
+            .panesmith_id_for(pane_id)
+            .ok_or_else(|| Error::pane_not_found(pane_id))?;
+        let outcome = self
+            .manager
+            .attach_blocking(panesmith_id, options, terminal, control)
+            .map_err(map_panesmith_attach_error)?;
+        self.refresh_cached_view_by_panesmith_id(panesmith_id)?;
+        Ok(outcome)
     }
 
     #[cfg(test)]
@@ -230,12 +261,6 @@ impl BrehonPanesmithShim {
         self.scrollbacks.insert(brehon_id, scrollback);
         Ok(())
     }
-
-    // TODO(panesmith/docs/brehon-supervisor-spike.md): replace this shim-only
-    // manager ownership with a manager-owned fullscreen attach handoff once
-    // Panesmith exposes that API. The direct-handle attach spike is deliberately
-    // not wired here yet because this first dogfood path only owns embedded
-    // supervisor previews and routine input.
 }
 
 pub(crate) fn to_panesmith_config(
@@ -290,6 +315,10 @@ fn mirror_event_kind(kind: &PaneEventKind) -> BrehonPanesmithEventKind {
 
 fn map_panesmith_error(err: panesmith::PaneError) -> Error {
     Error::pty(format!("Panesmith: {err}"))
+}
+
+fn map_panesmith_attach_error(err: panesmith::PaneAttachError) -> Error {
+    Error::pty(format!("Panesmith attach: {err}"))
 }
 
 #[cfg(any(test, feature = "test-pty-fallback"))]

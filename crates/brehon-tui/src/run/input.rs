@@ -5,6 +5,7 @@ use std::io::{self, Write};
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use panesmith::TerminalViewport;
 use ratatui::layout::{Position, Rect};
 
 use brehon_mux::Mux;
@@ -451,6 +452,7 @@ pub(crate) fn handle_mouse_input(
                             delta,
                             structured_mode,
                             structured_scroll_offsets,
+                            pane_visible_rows(left_pane_area),
                         ) {
                             scrolled = true;
                             scrolled_pane = Some(SelectionPane::Left);
@@ -464,6 +466,7 @@ pub(crate) fn handle_mouse_input(
                             delta,
                             structured_mode,
                             structured_scroll_offsets,
+                            pane_visible_rows(supervisor_pane_area),
                         ) {
                             scrolled = true;
                             scrolled_pane = Some(SelectionPane::Supervisor);
@@ -483,6 +486,7 @@ pub(crate) fn handle_mouse_input(
                                         delta,
                                         structured_mode,
                                         structured_scroll_offsets,
+                                        pane_visible_rows(supervisor_pane_area),
                                     ) {
                                         scrolled = true;
                                         scrolled_pane = Some(SelectionPane::Supervisor);
@@ -497,6 +501,7 @@ pub(crate) fn handle_mouse_input(
                                         delta,
                                         structured_mode,
                                         structured_scroll_offsets,
+                                        pane_visible_rows(left_pane_area),
                                     ) {
                                         scrolled = true;
                                         scrolled_pane = Some(SelectionPane::Left);
@@ -520,6 +525,13 @@ pub(crate) fn handle_mouse_input(
                         delta,
                         structured_mode,
                         structured_scroll_offsets,
+                        focused_pane_visible_rows(
+                            &focused_id,
+                            active_left_id,
+                            supervisor_id,
+                            left_pane_area,
+                            supervisor_pane_area,
+                        ),
                     );
                 }
             }
@@ -541,12 +553,39 @@ fn scroll_pane_view(
     delta: i32,
     structured_mode: &HashSet<String>,
     structured_scroll_offsets: &mut HashMap<String, usize>,
+    visible_rows: usize,
 ) -> bool {
     let is_structured_gateway = mux
         .get(pane_id)
         .map(|pane| structured_mode.contains(pane_id) && pane.is_gateway_backed())
         .unwrap_or(false);
-    if is_structured_gateway || mux.is_panesmith_managed(pane_id) {
+    if mux.is_panesmith_managed(pane_id) {
+        let Some(snapshot) = mux.panesmith_snapshot(pane_id) else {
+            return false;
+        };
+        let scrollback = mux.panesmith_scrollback(pane_id);
+        let current = structured_scroll_offsets
+            .get(pane_id)
+            .copied()
+            .map(TerminalViewport::scrolled)
+            .unwrap_or_default();
+        let metrics = current.metrics(snapshot, scrollback, visible_rows.max(1));
+        let next = if delta < 0 {
+            current.scroll_up(delta.unsigned_abs() as usize, metrics)
+        } else {
+            current.scroll_down(delta as usize, metrics)
+        };
+        let next_metrics = next.metrics(snapshot, scrollback, visible_rows.max(1));
+        let offset = next_metrics.effective_scroll_offset;
+        if offset == 0 {
+            structured_scroll_offsets.remove(pane_id);
+        } else {
+            structured_scroll_offsets.insert(pane_id.to_string(), offset);
+        }
+        return true;
+    }
+
+    if is_structured_gateway {
         let offset = structured_scroll_offsets
             .entry(pane_id.to_string())
             .or_default();
@@ -566,6 +605,26 @@ fn scroll_pane_view(
         return true;
     }
     false
+}
+
+fn pane_visible_rows(area: Rect) -> usize {
+    usize::from(area.height.saturating_sub(2))
+}
+
+fn focused_pane_visible_rows(
+    focused_id: &str,
+    active_left_id: &Option<String>,
+    supervisor_id: &Option<String>,
+    left_pane_area: Rect,
+    supervisor_pane_area: Rect,
+) -> usize {
+    if active_left_id.as_deref() == Some(focused_id) {
+        pane_visible_rows(left_pane_area)
+    } else if supervisor_id.as_deref() == Some(focused_id) {
+        pane_visible_rows(supervisor_pane_area)
+    } else {
+        1
+    }
 }
 
 /// Extract selected text from the terminal pane buffer.

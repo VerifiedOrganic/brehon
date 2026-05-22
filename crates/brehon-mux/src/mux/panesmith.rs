@@ -49,6 +49,36 @@ impl Mux {
         Ok(())
     }
 
+    pub(crate) fn restart_panesmith_supervisor_for_existing_pane(
+        &mut self,
+        pane_id: &str,
+    ) -> Result<()> {
+        let (config, title) = {
+            let pane = self
+                .panes
+                .get(pane_id)
+                .ok_or_else(|| Error::pane_not_found(pane_id))?;
+            if pane.kind() != &PaneKind::Supervisor {
+                return Err(Error::pty(format!(
+                    "Pane '{pane_id}' is not a supervisor and cannot be Panesmith-managed"
+                )));
+            }
+            let config =
+                pane.pty_spawn_config.as_ref().cloned().ok_or_else(|| {
+                    Error::pty(format!("Pane '{pane_id}' has no PTY spawn config"))
+                })?;
+            (config, pane.title().to_string())
+        };
+
+        self.panesmith.spawn_supervisor(pane_id, &config, &title)?;
+        if let Some(pane) = self.panes.get_mut(pane_id) {
+            pane.set_panesmith_managed(true);
+            pane.set_tool_executing(true);
+            pane.set_last_output_at(Instant::now());
+        }
+        Ok(())
+    }
+
     pub(crate) fn send_panesmith_input_bytes(
         &mut self,
         pane_id: &str,
@@ -69,6 +99,34 @@ impl Mux {
 
     pub(crate) fn kill_panesmith_pane(&mut self, pane_id: &str) -> Result<bool> {
         self.panesmith.kill_and_forget(pane_id)
+    }
+
+    pub fn attach_panesmith_pane_blocking<Terminal, Control>(
+        &mut self,
+        pane_id: &str,
+        options: panesmith::AttachOptions,
+        terminal: &mut Terminal,
+        control: &mut Control,
+    ) -> Result<panesmith::PaneAttachOutcome>
+    where
+        Terminal: panesmith::PaneAttachTerminal,
+        Control: panesmith::PaneAttachTerminalControl,
+    {
+        if !self.panesmith.contains(pane_id) {
+            return Err(Error::pane_not_found(pane_id));
+        }
+
+        let pending = self.drain_panesmith_events_to_mux();
+        self.pending_panesmith_events.extend(pending);
+
+        let outcome = self
+            .panesmith
+            .attach_blocking(pane_id, options, terminal, control);
+
+        let pending = self.drain_panesmith_events_to_mux();
+        self.pending_panesmith_events.extend(pending);
+
+        outcome
     }
 
     pub(crate) fn drain_panesmith_events_to_mux(&mut self) -> Vec<MuxEvent> {

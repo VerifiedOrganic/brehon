@@ -14,7 +14,7 @@ use crate::theme::{brand, chrome};
 use super::layout::{centered_dialog_rect, expand_rect, inset_rect};
 use super::types::{InputMode, KeybindOverlayState};
 
-const KEYBIND_ROWS: [(&str, &str, &str); 10] = [
+const KEYBIND_ROWS: [(&str, &str, &str); 11] = [
     ("?", "Show keyboard help", "global"),
     ("C-d", "Open dashboard", "global"),
     ("C-o", "Open Brehon composer", "global"),
@@ -22,6 +22,7 @@ const KEYBIND_ROWS: [(&str, &str, &str); 10] = [
     ("C-w", "Focus workers", "global"),
     ("C-e", "Focus reviewers", "global"),
     ("C-s", "Focus supervisor", "global"),
+    ("C-f", "Fullscreen attach", "panesmith supervisor"),
     ("C-] / S-Tab", "Cycle tabs", "global"),
     ("↑ ↓ PgUp PgDn", "Scroll task list", "dashboard"),
     ("Esc", "Scroll focused pane to bottom", "pane"),

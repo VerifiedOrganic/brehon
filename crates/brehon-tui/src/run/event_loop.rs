@@ -4,7 +4,7 @@
 //! iterations.  `run()` contains the `while !shutdown` loop body; setup and
 //! teardown stay in `mod.rs`.
 
-use std::io;
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -568,6 +568,99 @@ fn forward_input_bytes(ctx: &mut EventLoopCtx, bytes: &[u8]) {
         bytes = bytes.len(),
         "ignored direct keyboard input for host-owned external pane"
     );
+}
+
+fn should_attach_focused_panesmith_supervisor(
+    ctx: &EventLoopCtx,
+    key: &crossterm::event::KeyEvent,
+) -> bool {
+    if ctx.task_detail.is_some() || ctx.runtime_agent_factory_host_owned {
+        return false;
+    }
+    if !key.modifiers.contains(KeyModifiers::CONTROL)
+        || key.modifiers.intersects(KeyModifiers::ALT)
+        || !matches!(key.code, KeyCode::Char('f' | 'F'))
+    {
+        return false;
+    }
+
+    let Some(pane_id) = ctx.mux.focused_id() else {
+        return false;
+    };
+    ctx.mux.is_panesmith_managed(pane_id)
+        && ctx
+            .mux
+            .get(pane_id)
+            .is_some_and(|pane| *pane.kind() == PaneKind::Supervisor)
+}
+
+#[cfg(unix)]
+fn attach_focused_panesmith_supervisor(ctx: &mut EventLoopCtx) -> io::Result<()> {
+    let Some(pane_id) = ctx.mux.focused_id().map(str::to_string) else {
+        return Ok(());
+    };
+
+    ctx.selection = None;
+    ctx.pending_down = None;
+    ctx.structured_scroll_offsets.remove(&pane_id);
+    ctx.click_regions.clear();
+    ctx.terminal.backend_mut().flush()?;
+
+    let mut terminal = panesmith::StdioAttachTerminal::new(io::stdout())?;
+    let mut control =
+        panesmith::CrosstermTerminalControl::new(io::stdout()).with_host_alternate_screen(true);
+    match ctx.mux.attach_panesmith_pane_blocking(
+        &pane_id,
+        panesmith::AttachOptions::default(),
+        &mut terminal,
+        &mut control,
+    ) {
+        Ok(outcome) => {
+            tracing::info!(
+                pane = %pane_id,
+                reason = ?outcome.reason,
+                child_exit_code = ?outcome.child_exit_code,
+                terminal_rows = outcome.terminal_size.rows,
+                terminal_cols = outcome.terminal_size.cols,
+                restored_rows = outcome.restored_size.rows,
+                restored_cols = outcome.restored_size.cols,
+                remaining_input = outcome.remaining_input.len(),
+                "Panesmith fullscreen attach ended"
+            );
+            push_dashboard_event(
+                &ctx.dashboard_data,
+                format!(
+                    "detached fullscreen supervisor {pane_id}: {:?}",
+                    outcome.reason
+                ),
+            );
+            if !outcome.remaining_input.is_empty() {
+                forward_input_bytes(ctx, &outcome.remaining_input);
+            }
+        }
+        Err(err) => {
+            tracing::warn!(pane = %pane_id, error = %err, "Panesmith fullscreen attach failed");
+            push_dashboard_event(
+                &ctx.dashboard_data,
+                format!("fullscreen attach for {pane_id} failed: {err}"),
+            );
+        }
+    }
+
+    ctx.terminal.clear()?;
+    ctx.needs_redraw = true;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn attach_focused_panesmith_supervisor(ctx: &mut EventLoopCtx) -> io::Result<()> {
+    let pane_id = ctx.mux.focused_id().unwrap_or("focused pane").to_string();
+    push_dashboard_event(
+        &ctx.dashboard_data,
+        format!("fullscreen attach for {pane_id} is only available on Unix terminals"),
+    );
+    ctx.needs_redraw = true;
+    Ok(())
 }
 
 fn open_composer(ctx: &mut EventLoopCtx) {
@@ -1671,6 +1764,15 @@ fn drain_pending_input(
                         forward_buf.clear();
                     }
                     open_composer(ctx);
+                    continue;
+                }
+
+                if should_attach_focused_panesmith_supervisor(ctx, &key) {
+                    if !forward_buf.is_empty() {
+                        forward_input_bytes(ctx, &forward_buf);
+                        forward_buf.clear();
+                    }
+                    attach_focused_panesmith_supervisor(ctx)?;
                     continue;
                 }
 
@@ -3795,6 +3897,40 @@ mod tests {
         assert!(harness.rx.recv_timeout(Duration::from_millis(50)).is_err());
         assert!(harness.ctx.pending_runtime_commands.is_empty());
         assert!(harness.ctx.recent_runtime_commands.is_empty());
+    }
+
+    #[test]
+    fn ctrl_f_attaches_only_focused_panesmith_supervisor() {
+        let project_root = tempfile::tempdir().expect("tempdir");
+        let mut mux = Mux::factory(brehon_mux::MuxConfig {
+            cwd: project_root.path().to_path_buf(),
+            workers: 0,
+            supervisor_name: "codex-supervisor".to_string(),
+            supervisor_cli: brehon_mux::AgentAdapter::BuiltIn(brehon_mux::SupervisorCli::Codex),
+            include_director: false,
+            rows: 24,
+            cols: 100,
+            ..Default::default()
+        })
+        .expect("create mux");
+        mux.focus("codex-supervisor");
+        let harness = harness_with_mux(mux);
+        let ctrl_f = crossterm::event::KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL);
+
+        assert!(should_attach_focused_panesmith_supervisor(
+            &harness.ctx,
+            &ctrl_f
+        ));
+
+        let mut ghostty_mux = Mux::new(24, 80);
+        ghostty_mux.add_pane(make_supervisor_pane("claude-supervisor"));
+        ghostty_mux.focus("claude-supervisor");
+        let ghostty_harness = harness_with_mux(ghostty_mux);
+
+        assert!(!should_attach_focused_panesmith_supervisor(
+            &ghostty_harness.ctx,
+            &ctrl_f
+        ));
     }
 
     #[test]

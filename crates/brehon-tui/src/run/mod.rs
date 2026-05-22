@@ -5439,6 +5439,98 @@ mod tests {
     }
 
     #[test]
+    fn test_render_pane_in_area_shows_panesmith_backend_indicator() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let project_root = tempfile::tempdir().expect("tempdir");
+        let mux = Mux::factory(brehon_mux::MuxConfig {
+            cwd: project_root.path().to_path_buf(),
+            workers: 0,
+            supervisor_name: "codex-supervisor".to_string(),
+            supervisor_cli: brehon_mux::AgentAdapter::BuiltIn(brehon_mux::SupervisorCli::Codex),
+            include_director: false,
+            rows: 24,
+            cols: 100,
+            ..Default::default()
+        })
+        .expect("create mux");
+        assert_eq!(
+            mux.pane_backend_ownership("codex-supervisor"),
+            Some(brehon_mux::PaneBackendOwnership::Panesmith)
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(160, 8)).unwrap();
+        terminal
+            .draw(|frame| {
+                let _ = render_pane_in_area(
+                    frame,
+                    Rect::new(0, 0, 160, 8),
+                    &mux,
+                    "codex-supervisor",
+                    true,
+                    None,
+                    false,
+                );
+            })
+            .unwrap();
+
+        let rendered = (0..8)
+            .map(|row| buffer_row_string(terminal.backend().buffer(), row))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("panesmith"), "rendered: {rendered}");
+    }
+
+    #[test]
+    fn test_render_pane_in_area_does_not_add_panesmith_indicator_for_other_backends() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let mut ghostty_mux = Mux::new(24, 80);
+        ghostty_mux.add_pane(make_supervisor_pane("claude-supervisor"));
+        let mut terminal = Terminal::new(TestBackend::new(140, 8)).unwrap();
+        terminal
+            .draw(|frame| {
+                let _ = render_pane_in_area(
+                    frame,
+                    Rect::new(0, 0, 140, 8),
+                    &ghostty_mux,
+                    "claude-supervisor",
+                    true,
+                    None,
+                    false,
+                );
+            })
+            .unwrap();
+        let rendered = (0..8)
+            .map(|row| buffer_row_string(terminal.backend().buffer(), row))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!rendered.contains("panesmith"), "rendered: {rendered}");
+
+        let mut gateway_mux = Mux::new(24, 80);
+        gateway_mux.add_pane(make_custom_worker_pane("worker-codex", "codex-worker"));
+        let mut terminal = Terminal::new(TestBackend::new(140, 8)).unwrap();
+        terminal
+            .draw(|frame| {
+                let _ = render_pane_in_area(
+                    frame,
+                    Rect::new(0, 0, 140, 8),
+                    &gateway_mux,
+                    "worker-codex",
+                    true,
+                    None,
+                    true,
+                );
+            })
+            .unwrap();
+        let rendered = (0..8)
+            .map(|row| buffer_row_string(terminal.backend().buffer(), row))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!rendered.contains("panesmith"), "rendered: {rendered}");
+    }
+
+    #[test]
     fn test_apply_entry_chrome_fade_dims_white_text_only() {
         use ratatui::{backend::TestBackend, style::Style, widgets::Paragraph, Terminal};
 

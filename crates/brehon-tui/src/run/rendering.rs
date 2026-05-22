@@ -31,8 +31,8 @@ use ratatui::Frame;
 use crate::theme::chrome::{BG, BORDER, TEXT_DIM, TEXT_MUTED};
 use crate::theme::{status_style, StatusKind};
 use brehon_mux::{
-    ActivityBuffer, ActivityEntry, ActivityKind, DeathReason, Mux, PaneKind, PaneState,
-    TaskBlockedReason, TaskContextSnapshot,
+    ActivityBuffer, ActivityEntry, ActivityKind, DeathReason, Mux, PaneBackendOwnership, PaneKind,
+    PaneState, TaskBlockedReason, TaskContextSnapshot,
 };
 use brehon_types::{task::TaskStatus, RuntimePaneState, RuntimeSource};
 
@@ -130,10 +130,7 @@ fn render_terminal_viewport(
             widget = widget.with_scrollback(scrollback);
         }
         if scroll_offset > 0 {
-            widget = widget.with_viewport(TerminalViewport {
-                scroll_offset,
-                follow_tail: false,
-            });
+            widget = widget.with_viewport(TerminalViewport::scrolled(scroll_offset));
         }
         frame.render_widget(widget, inner);
         return;
@@ -142,11 +139,23 @@ fn render_terminal_viewport(
     render_pane_viewport(frame, inner, pane, focused);
 }
 
-fn pane_right_label(pane: &brehon_mux::Pane) -> String {
-    format!("{} / {}", pane.cli_type().name(), pane_model_label(pane))
+fn pane_right_label(
+    pane: &brehon_mux::Pane,
+    backend_ownership: Option<PaneBackendOwnership>,
+) -> String {
+    let mut label = format!("{} / {}", pane.cli_type().name(), pane_model_label(pane));
+    if backend_ownership == Some(PaneBackendOwnership::Panesmith) {
+        label.push_str(" / ");
+        label.push_str(PaneBackendOwnership::Panesmith.label());
+    }
+    label
 }
 
-fn pane_footer_text(pane: &brehon_mux::Pane, activity_buffer: Option<&ActivityBuffer>) -> String {
+fn pane_footer_text(
+    pane: &brehon_mux::Pane,
+    activity_buffer: Option<&ActivityBuffer>,
+    viewport_scroll_offset: Option<usize>,
+) -> String {
     if let Some(PaneState::Dead { reason, .. }) = pane.pane_state() {
         return format!("exited with error: {}", death_reason_summary(reason));
     }
@@ -185,7 +194,7 @@ fn pane_footer_text(pane: &brehon_mux::Pane, activity_buffer: Option<&ActivityBu
 
     let mut footer = vec![state];
     footer.extend(parts);
-    if pane.display_scroll_offset() > 0 {
+    if pane.display_scroll_offset() > 0 || viewport_scroll_offset.unwrap_or_default() > 0 {
         footer.push("scrolled".to_string());
     }
     footer.join(" • ")
@@ -236,10 +245,11 @@ fn render_pane_panel(
     focused: bool,
     footer_text: &str,
     right_label_padding: usize,
+    backend_ownership: Option<PaneBackendOwnership>,
 ) -> Rect {
     let cli_name = pane.cli_type().name();
-    let scrolled = pane.display_scroll_offset() > 0;
-    let mut right_label = pane_right_label(pane);
+    let scrolled = footer_text.contains("scrolled");
+    let mut right_label = pane_right_label(pane, backend_ownership);
     if right_label_padding > 0 {
         right_label.push_str(&" ".repeat(right_label_padding));
     }
@@ -736,7 +746,7 @@ fn render_structured_pane_with_padding(
     structured_scroll_offset: Option<usize>,
     activity_click_regions: Option<&mut Vec<ClickRegion>>,
 ) {
-    let footer_text = pane_footer_text(pane, Some(activity_buffer));
+    let footer_text = pane_footer_text(pane, Some(activity_buffer), structured_scroll_offset);
     let inner = render_pane_panel(
         frame,
         area,
@@ -744,6 +754,7 @@ fn render_structured_pane_with_padding(
         focused,
         &footer_text,
         right_label_padding,
+        None,
     );
 
     // Iterate committed entries by reference (no full-buffer clone), then
@@ -1164,6 +1175,7 @@ pub(crate) fn render_pane_in_area_with_activity_regions(
     activity_click_regions: Option<&mut Vec<ClickRegion>>,
 ) -> Option<Rect> {
     if let Some(pane) = mux.get(pane_id) {
+        let backend_ownership = mux.pane_backend_ownership(pane_id);
         let is_gateway = pane.is_gateway_backed();
         let can_manual_reset = match pane.kind() {
             PaneKind::Worker => is_gateway,
@@ -1193,7 +1205,7 @@ pub(crate) fn render_pane_in_area_with_activity_regions(
                     activity_click_regions,
                 );
             } else {
-                let footer_text = pane_footer_text(pane, None);
+                let footer_text = pane_footer_text(pane, None, structured_scroll_offset);
                 let right_label_padding = if can_manual_reset {
                     "[reset]".len() + 1
                 } else {
@@ -1206,6 +1218,7 @@ pub(crate) fn render_pane_in_area_with_activity_regions(
                     focused,
                     &footer_text,
                     right_label_padding,
+                    backend_ownership,
                 );
                 render_terminal_viewport(
                     frame,
@@ -1222,7 +1235,8 @@ pub(crate) fn render_pane_in_area_with_activity_regions(
                 }
             }
         } else {
-            let footer_text = pane_footer_text(pane, pane.activity_buffer());
+            let footer_text =
+                pane_footer_text(pane, pane.activity_buffer(), structured_scroll_offset);
             let right_label_padding = if can_manual_reset {
                 "[reset]".len() + 1
             } else {
@@ -1235,6 +1249,7 @@ pub(crate) fn render_pane_in_area_with_activity_regions(
                 focused,
                 &footer_text,
                 right_label_padding,
+                backend_ownership,
             );
             render_terminal_viewport(
                 frame,
@@ -1342,6 +1357,7 @@ pub(crate) fn render_host_owned_pane_in_area(
         focused,
         &footer_text,
         right_label_padding,
+        Some(PaneBackendOwnership::HostOwned),
     );
 
     let lines = host_owned_pane_lines(runtime_status, runtime_pane, pane);
@@ -1566,6 +1582,9 @@ pub(crate) fn render_status_bar(
         .map(|p| crate::theme::agent::color(p.cli_type().name()))
         .unwrap_or(Color::White);
     let focused_kind = focused.map(|p| p.kind().clone());
+    let focused_panesmith_supervisor = focused.as_ref().is_some_and(|pane| {
+        *pane.kind() == PaneKind::Supervisor && mux.is_panesmith_managed(pane.id())
+    });
     let pane_count = mux.panes().count();
     let key_style = Style::default().fg(crate::theme::brand::PRIMARY).bg(BG);
     let label_style = Style::default().fg(TEXT_DIM).bg(BG);
@@ -1620,6 +1639,15 @@ pub(crate) fn render_status_bar(
         Span::styled("C-v", key_style),
         Span::styled(":Struct", label_style),
         separator(),
+    ]);
+    if focused_panesmith_supervisor {
+        spans.extend([
+            Span::styled("C-f", key_style),
+            Span::styled(":Attach", label_style),
+            separator(),
+        ]);
+    }
+    spans.extend([
         Span::styled("C-r", key_style),
         Span::styled(
             if matches!(focused_kind.as_ref(), Some(PaneKind::Supervisor)) {

@@ -1,5 +1,6 @@
 use crate::mux::*;
-use crate::pty::PtyConfig;
+use crate::pane::panesmith_shim::FORCE_PANESMITH_SPAWN_FAILURE_PANE_ID;
+use crate::pty::{Pty, PtyConfig};
 use crate::teams::{TeamsManager, TeamsPaths};
 use crate::{
     AgentAdapter, CustomAgentConfig, HarnessCapabilities, HarnessControlPlane, HarnessTransport,
@@ -18,6 +19,69 @@ fn test_mux_remains_send_for_cross_thread_hosts() {
     fn assert_send<T: Send>() {}
 
     assert_send::<Mux>();
+}
+
+#[test]
+fn test_pane_backend_ownership_status_api() {
+    let mut mux = Mux::new(24, 80);
+    mux.add_pane(Pane::director("native", 24, 80).expect("director pane"));
+    assert_eq!(
+        mux.pane_backend_ownership("native"),
+        Some(PaneBackendOwnership::None)
+    );
+
+    let config = PtyConfig {
+        command: "sh".to_string(),
+        args: vec!["-c".to_string(), "cat".to_string()],
+        cwd: Some(std::env::temp_dir()),
+        env: vec![],
+        rows: 24,
+        cols: 80,
+    };
+    let pty = Pty::spawn("ghostty-pane", config).expect("spawn test pty");
+    let pane = Pane::with_pty_cli(
+        "ghostty-pane",
+        PaneKind::Worker,
+        pty,
+        24,
+        80,
+        AgentAdapter::BuiltIn(SupervisorCli::Claude),
+    )
+    .expect("ghostty pane");
+    mux.add_pane(pane);
+    assert_eq!(
+        mux.pane_backend_ownership("ghostty-pane"),
+        Some(PaneBackendOwnership::GhosttyVt)
+    );
+
+    tokio::runtime::Runtime::new()
+        .expect("runtime")
+        .block_on(mux.shutdown_all());
+
+    let project_root = super::fresh_temp_dir("brehon-mux-backend-ownership");
+    let config = MuxConfig {
+        cwd: project_root,
+        workers: 0,
+        supervisor_name: "codex-supervisor".to_string(),
+        supervisor_cli: AgentAdapter::BuiltIn(SupervisorCli::Codex),
+        reviewer_names: vec!["reviewer-1".to_string()],
+        reviewer_cli: AgentAdapter::BuiltIn(SupervisorCli::Codex),
+        include_director: false,
+        rows: 24,
+        cols: 100,
+        ..Default::default()
+    };
+    let mux = Mux::factory(config).expect("create mux");
+
+    assert_eq!(
+        mux.pane_backend_ownership("codex-supervisor"),
+        Some(PaneBackendOwnership::Panesmith)
+    );
+    assert_eq!(
+        mux.pane_backend_ownership("reviewer-1"),
+        Some(PaneBackendOwnership::Gateway)
+    );
+    assert_eq!(mux.pane_backend_ownership("missing"), None);
 }
 
 #[test]
@@ -98,8 +162,144 @@ fn test_factory_uses_panesmith_for_supervisor_pty_pane() {
     assert!(supervisor.is_panesmith_managed());
     assert!(supervisor.accepts_manual_input());
     assert!(mux.is_panesmith_managed("codex-supervisor"));
+    assert_eq!(
+        mux.pane_backend_ownership("codex-supervisor"),
+        Some(PaneBackendOwnership::Panesmith)
+    );
     assert!(mux.panesmith_snapshot("codex-supervisor").is_some());
     assert!(matches!(supervisor.backend, PaneBackend::None));
+}
+
+#[test]
+fn test_panesmith_supervisor_resize_updates_snapshot() {
+    let project_root = super::fresh_temp_dir("brehon-mux-panesmith-resize");
+    let config = MuxConfig {
+        cwd: project_root,
+        workers: 0,
+        supervisor_name: "codex-supervisor".to_string(),
+        supervisor_cli: AgentAdapter::BuiltIn(SupervisorCli::Codex),
+        include_director: false,
+        rows: 24,
+        cols: 100,
+        ..Default::default()
+    };
+    let mut mux = Mux::factory(config).expect("create mux");
+
+    assert!(
+        mux.resize_panesmith_pane("codex-supervisor", 12, 44)
+            .expect("resize panesmith pane")
+    );
+    let snapshot = mux
+        .panesmith_snapshot("codex-supervisor")
+        .expect("panesmith snapshot");
+    assert_eq!(snapshot.size.rows, 12);
+    assert_eq!(snapshot.size.cols, 44);
+}
+
+#[tokio::test]
+async fn test_panesmith_supervisor_reset_restarts_panesmith() {
+    let project_root = super::fresh_temp_dir("brehon-mux-panesmith-reset");
+    let config = MuxConfig {
+        cwd: project_root,
+        workers: 0,
+        supervisor_name: "codex-supervisor".to_string(),
+        supervisor_cli: AgentAdapter::BuiltIn(SupervisorCli::Codex),
+        include_director: false,
+        rows: 24,
+        cols: 100,
+        ..Default::default()
+    };
+    let mut mux = Mux::factory(config).expect("create mux");
+    assert_eq!(
+        mux.pane_backend_ownership("codex-supervisor"),
+        Some(PaneBackendOwnership::Panesmith)
+    );
+
+    mux.reset_supervisor_session("codex-supervisor")
+        .await
+        .expect("reset supervisor");
+
+    let supervisor = mux.get("codex-supervisor").expect("supervisor pane");
+    assert!(supervisor.is_panesmith_managed());
+    assert!(matches!(supervisor.backend, PaneBackend::None));
+    assert_eq!(
+        mux.pane_backend_ownership("codex-supervisor"),
+        Some(PaneBackendOwnership::Panesmith)
+    );
+    assert!(mux.panesmith_snapshot("codex-supervisor").is_some());
+}
+
+#[test]
+fn test_panesmith_supervisor_exit_mirrors_to_brehon_state() {
+    let project_root = super::fresh_temp_dir("brehon-mux-panesmith-exit");
+    let config = MuxConfig {
+        cwd: project_root,
+        workers: 0,
+        supervisor_name: "shell-supervisor".to_string(),
+        supervisor_cli: custom_interactive_agent("shell-supervisor", "sh", &["-c", "exit 7"]),
+        include_director: false,
+        rows: 24,
+        cols: 100,
+        ..Default::default()
+    };
+    let mut mux = Mux::factory(config).expect("create mux");
+    assert_eq!(
+        mux.pane_backend_ownership("shell-supervisor"),
+        Some(PaneBackendOwnership::Panesmith)
+    );
+
+    let mut saw_exit_event = false;
+    for _ in 0..50 {
+        let (_bytes, events) = mux.poll_batch();
+        saw_exit_event |= events.iter().any(|event| {
+            matches!(
+                event,
+                MuxEvent::PaneExited {
+                    pane_id,
+                    exit_code: Some(7)
+                } if pane_id == "shell-supervisor"
+            )
+        });
+        if saw_exit_event {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    assert!(saw_exit_event, "expected mirrored PaneExited event");
+    let supervisor = mux.get("shell-supervisor").expect("supervisor pane");
+    assert!(supervisor.has_exited());
+    assert_eq!(supervisor.exit_code(), Some(7));
+}
+
+#[test]
+fn test_factory_falls_back_to_ghostty_when_panesmith_spawn_fails() {
+    let project_root = super::fresh_temp_dir("brehon-mux-panesmith-fallback");
+    let supervisor_id = FORCE_PANESMITH_SPAWN_FAILURE_PANE_ID;
+    let config = MuxConfig {
+        cwd: project_root,
+        workers: 0,
+        supervisor_name: supervisor_id.to_string(),
+        supervisor_cli: custom_interactive_agent("shell-supervisor", "sh", &["-c", "cat"]),
+        include_director: false,
+        rows: 24,
+        cols: 100,
+        ..Default::default()
+    };
+    let mut mux = Mux::factory(config).expect("create mux with ghostty fallback");
+
+    let supervisor = mux.get(supervisor_id).expect("supervisor pane");
+    assert!(!supervisor.is_panesmith_managed());
+    assert!(!mux.is_panesmith_managed(supervisor_id));
+    assert!(matches!(supervisor.backend, PaneBackend::Pty(_)));
+    assert_eq!(
+        mux.pane_backend_ownership(supervisor_id),
+        Some(PaneBackendOwnership::GhosttyVt)
+    );
+
+    tokio::runtime::Runtime::new()
+        .expect("runtime")
+        .block_on(mux.shutdown_all());
 }
 
 #[test]
@@ -158,6 +358,28 @@ fn panesmith_snapshot_text(snapshot: &::panesmith::OwnedPaneSnapshot) -> String 
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn custom_interactive_agent(name: &str, command: &str, args: &[&str]) -> AgentAdapter {
+    AgentAdapter::Custom(CustomAgentConfig {
+        name: name.to_string(),
+        command: Some(command.to_string()),
+        args: args.iter().map(|arg| arg.to_string()).collect(),
+        base_url: None,
+        api_key_env: None,
+        headers: Vec::new(),
+        capabilities: HarnessCapabilities {
+            supports_hooks: false,
+            supports_subagents: false,
+            supports_textbox_submit: true,
+            supports_teams: false,
+            one_shot: false,
+            uses_ink_prompt: false,
+            tool_prefix: std::borrow::Cow::Borrowed("mcp_brehon_"),
+            transport: HarnessTransport::InteractivePty,
+            preferred_control_plane: HarnessControlPlane::PtyInjection,
+        },
+    })
 }
 
 #[test]

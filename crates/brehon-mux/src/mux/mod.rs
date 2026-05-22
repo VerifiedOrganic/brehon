@@ -16,6 +16,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 mod activity;
+mod backend;
 mod command;
 mod config;
 mod dispatch;
@@ -31,9 +32,9 @@ mod types;
 pub use command::{MuxRuntimeCommandPort, MuxRuntimeCommandReceiver};
 pub use config::{AgentPaneMaterialization, MuxConfig};
 pub use types::{
-    AsyncGatewayPromptDeliveryError, AsyncGatewayPromptDispatch, MuxEvent, PromptDeliveryAttempt,
-    PromptQueuePosition, QuarantineOutcome, TerminalHostAgentFactoryBlockedPane,
-    TerminalHostAgentFactoryPlan,
+    AsyncGatewayPromptDeliveryError, AsyncGatewayPromptDispatch, MuxEvent, PaneBackendOwnership,
+    PromptDeliveryAttempt, PromptQueuePosition, QuarantineOutcome,
+    TerminalHostAgentFactoryBlockedPane, TerminalHostAgentFactoryPlan,
 };
 pub(crate) use types::{MAX_TURN_DURATION, QUIET_THRESHOLD};
 

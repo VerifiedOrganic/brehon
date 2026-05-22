@@ -46,9 +46,9 @@ pub use harness::{
 };
 pub use mux::{
     AgentPaneMaterialization, AsyncGatewayPromptDeliveryError, AsyncGatewayPromptDispatch, Mux,
-    MuxConfig, MuxEvent, MuxRuntimeCommandPort, MuxRuntimeCommandReceiver, PromptDeliveryAttempt,
-    PromptQueuePosition, QuarantineOutcome, TerminalHostAgentFactoryBlockedPane,
-    TerminalHostAgentFactoryPlan,
+    MuxConfig, MuxEvent, MuxRuntimeCommandPort, MuxRuntimeCommandReceiver, PaneBackendOwnership,
+    PromptDeliveryAttempt, PromptQueuePosition, QuarantineOutcome,
+    TerminalHostAgentFactoryBlockedPane, TerminalHostAgentFactoryPlan,
 };
 pub use pane::TerminalSnapshot;
 pub use pane::{

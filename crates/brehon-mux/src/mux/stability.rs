@@ -381,12 +381,29 @@ impl Mux {
         }
 
         self.clear_active_gateway_operations(pane_id);
+        let mut restarted_with_panesmith = false;
+        if is_panesmith_managed {
+            match self.restart_panesmith_supervisor_for_existing_pane(pane_id) {
+                Ok(()) => {
+                    restarted_with_panesmith = true;
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        pane = %pane_id,
+                        error = %err,
+                        "Panesmith supervisor reset restart failed; falling back to ghostty_vt PTY path"
+                    );
+                }
+            }
+        }
         if let Some(pane) = self.panes.get_mut(pane_id) {
             if is_gateway_backed {
                 pane.clear_gateway_session();
                 if let Some(activity) = pane.activity_buffer_mut() {
                     activity.clear();
                 }
+            } else if restarted_with_panesmith {
+                pane.set_panesmith_managed(true);
             } else {
                 pane.set_panesmith_managed(false);
                 pane.restart_pty_from_spawn_config()?;
@@ -395,10 +412,14 @@ impl Mux {
             pane.set_pending_inbox_nudge(false);
             let notice = if is_gateway_backed {
                 "\x1b[2mBrehon reset supervisor session after a runtime failure. Restarting with a fresh supervisor context.\x1b[0m\r\n"
+            } else if restarted_with_panesmith {
+                ""
             } else {
                 "\x1b[2mBrehon restarted supervisor process after a runtime failure. Restarting with a fresh supervisor context.\x1b[0m\r\n"
             };
-            let _ = pane.append_output(notice.as_bytes());
+            if !notice.is_empty() {
+                let _ = pane.append_output(notice.as_bytes());
+            }
         }
         self.mark_pane_ready_after_reset(pane_id, "supervisor session reset");
         clear_agent_health_marker(pane_id);

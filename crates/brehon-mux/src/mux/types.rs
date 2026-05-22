@@ -6,6 +6,33 @@ use brehon_types::PromptId;
 use std::fmt;
 use tokio::task::JoinHandle;
 
+/// Runtime owner for a pane's terminal/process surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaneBackendOwnership {
+    /// Mux-owned PTY rendered through Brehon's existing ghostty_vt surface.
+    GhosttyVt,
+    /// Mux-owned PTY and terminal surface managed by Panesmith.
+    Panesmith,
+    /// Structured agent gateway session with no local PTY surface owner.
+    Gateway,
+    /// Terminal-host-owned pane outside the mux PTY/surface path.
+    HostOwned,
+    /// Brehon-native pane with no child terminal backend.
+    None,
+}
+
+impl PaneBackendOwnership {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::GhosttyVt => "ghostty_vt",
+            Self::Panesmith => "panesmith",
+            Self::Gateway => "gateway",
+            Self::HostOwned => "host-owned",
+            Self::None => "none",
+        }
+    }
+}
+
 /// Events from the multiplexer
 #[derive(Debug, Clone)]
 pub enum MuxEvent {
