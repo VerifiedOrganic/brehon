@@ -214,6 +214,15 @@ async fn test_panesmith_supervisor_reset_restarts_panesmith() {
         mux.pane_backend_ownership("codex-supervisor"),
         Some(PaneBackendOwnership::Panesmith)
     );
+    {
+        let supervisor = mux.get_mut("codex-supervisor").expect("supervisor pane");
+        supervisor.mark_exited(Some(0));
+        assert!(supervisor.has_exited());
+        assert!(matches!(
+            supervisor.pane_state(),
+            Some(PaneState::Dead { .. })
+        ));
+    }
 
     mux.reset_supervisor_session("codex-supervisor")
         .await
@@ -221,6 +230,12 @@ async fn test_panesmith_supervisor_reset_restarts_panesmith() {
 
     let supervisor = mux.get("codex-supervisor").expect("supervisor pane");
     assert!(supervisor.is_panesmith_managed());
+    assert!(!supervisor.has_exited());
+    assert_eq!(supervisor.exit_code(), None);
+    assert!(matches!(
+        supervisor.pane_state(),
+        Some(PaneState::Ready { .. })
+    ));
     assert!(matches!(supervisor.backend, PaneBackend::None));
     assert_eq!(
         mux.pane_backend_ownership("codex-supervisor"),

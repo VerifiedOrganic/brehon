@@ -80,7 +80,11 @@ impl Mux {
             };
             let previous = pane.pane_state().map(Self::runtime_pane_state_for_state);
             let generation = pane.current_generation();
-            pane.set_pane_ready(std::time::Instant::now());
+            pane.exited = false;
+            pane.exit_code = None;
+            pane.set_pane_state(PaneState::Ready {
+                since: std::time::Instant::now(),
+            });
             Self::runtime_state_change(previous, pane.pane_state(), reason)
                 .map(|(previous, current, reason)| (generation, previous, current, reason))
         };
