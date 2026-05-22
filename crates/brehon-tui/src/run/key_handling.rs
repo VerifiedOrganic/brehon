@@ -265,6 +265,10 @@ mod tests {
             'f'
         ));
         assert!(is_ctrl_char_key(
+            &ev(KeyCode::Char('\u{6}'), KeyModifiers::CONTROL),
+            'f'
+        ));
+        assert!(is_ctrl_char_key(
             &ev(KeyCode::Char('\u{1d}'), KeyModifiers::empty()),
             ']'
         ));

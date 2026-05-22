@@ -3922,6 +3922,8 @@ mod tests {
         let ctrl_f = crossterm::event::KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL);
         let raw_ctrl_f =
             crossterm::event::KeyEvent::new(KeyCode::Char('\u{6}'), KeyModifiers::empty());
+        let raw_ctrl_f_with_modifier =
+            crossterm::event::KeyEvent::new(KeyCode::Char('\u{6}'), KeyModifiers::CONTROL);
 
         assert!(should_attach_focused_panesmith_supervisor(
             &harness.ctx,
@@ -3930,6 +3932,10 @@ mod tests {
         assert!(should_attach_focused_panesmith_supervisor(
             &harness.ctx,
             &raw_ctrl_f
+        ));
+        assert!(should_attach_focused_panesmith_supervisor(
+            &harness.ctx,
+            &raw_ctrl_f_with_modifier
         ));
 
         let mut ghostty_mux = Mux::new(24, 80);
@@ -3944,6 +3950,10 @@ mod tests {
         assert!(!should_attach_focused_panesmith_supervisor(
             &ghostty_harness.ctx,
             &raw_ctrl_f
+        ));
+        assert!(!should_attach_focused_panesmith_supervisor(
+            &ghostty_harness.ctx,
+            &raw_ctrl_f_with_modifier
         ));
     }
 

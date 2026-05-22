@@ -6959,12 +6959,15 @@ mod tests {
         );
         let ctrl_backslash = KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::CONTROL);
         let raw_ctrl_q = KeyEvent::new(KeyCode::Char('\u{11}'), KeyModifiers::empty());
+        let raw_ctrl_q_with_modifier =
+            KeyEvent::new(KeyCode::Char('\u{11}'), KeyModifiers::CONTROL);
         let raw_ctrl_backslash = KeyEvent::new(KeyCode::Char('\u{1c}'), KeyModifiers::empty());
 
         assert!(is_quit_key(&ctrl_q));
         assert!(is_quit_key(&ctrl_shift_q));
         assert!(is_quit_key(&ctrl_backslash));
         assert!(is_quit_key(&raw_ctrl_q));
+        assert!(is_quit_key(&raw_ctrl_q_with_modifier));
         assert!(is_quit_key(&raw_ctrl_backslash));
     }
 
