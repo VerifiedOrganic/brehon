@@ -51,8 +51,8 @@ use super::input::{
     parse_raw_sgr_mouse_sequence, scroll_focused_to_bottom,
 };
 use super::key_handling::{
-    cycle_sub_tab, focused_supervisor_captures_keyboard, is_quit_key, key_to_bytes,
-    resize_panes as resize_mux_panes, should_handle_key_event,
+    cycle_sub_tab, focused_supervisor_captures_keyboard, is_ctrl_char_key, is_quit_key,
+    key_to_bytes, resize_panes as resize_mux_panes, should_handle_key_event,
 };
 use super::keybind_overlay::{
     handle_keybind_overlay_key_event, handle_keybind_overlay_mouse_event, render_keybind_overlay,
@@ -577,10 +577,7 @@ fn should_attach_focused_panesmith_supervisor(
     if ctx.task_detail.is_some() || ctx.runtime_agent_factory_host_owned {
         return false;
     }
-    if !key.modifiers.contains(KeyModifiers::CONTROL)
-        || key.modifiers.intersects(KeyModifiers::ALT)
-        || !matches!(key.code, KeyCode::Char('f' | 'F'))
-    {
+    if !is_ctrl_char_key(key, 'f') {
         return false;
     }
 
@@ -1774,6 +1771,11 @@ fn drain_pending_input(
                     continue;
                 }
 
+                if is_quit_key(&key) {
+                    should_break = true;
+                    break;
+                }
+
                 if should_attach_focused_panesmith_supervisor(ctx, &key) {
                     if !forward_buf.is_empty() {
                         forward_input_bytes(ctx, &forward_buf);
@@ -1804,12 +1806,7 @@ fn drain_pending_input(
                     continue;
                 }
 
-                let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-
-                if is_quit_key(&key) {
-                    should_break = true;
-                    break;
-                } else if let Some(ref mut detail) = ctx.task_detail {
+                if let Some(ref mut detail) = ctx.task_detail {
                     match key.code {
                         KeyCode::Esc => {
                             ctx.task_detail = None;
@@ -2012,7 +2009,7 @@ fn drain_pending_input(
                         &ctx.selected_member,
                         &mut ctx.reviewer_selection,
                     );
-                } else if ctrl && key.code == KeyCode::Char(']') {
+                } else if is_ctrl_char_key(&key, ']') {
                     if !forward_buf.is_empty() {
                         forward_input_bytes(ctx, &forward_buf);
                         forward_buf.clear();
@@ -2040,7 +2037,7 @@ fn drain_pending_input(
                         &ctx.selected_member,
                         &mut ctx.reviewer_selection,
                     );
-                } else if ctrl && key.code == KeyCode::Char('d') {
+                } else if is_ctrl_char_key(&key, 'd') {
                     if !forward_buf.is_empty() {
                         forward_input_bytes(ctx, &forward_buf);
                         forward_buf.clear();
@@ -2049,7 +2046,7 @@ fn drain_pending_input(
                     ctx.task_detail = None;
                     ctx.group_tab = GroupTab::Dashboard;
                     ctx.click_regions.clear();
-                } else if ctrl && key.code == KeyCode::Char('t') {
+                } else if is_ctrl_char_key(&key, 't') {
                     if !forward_buf.is_empty() {
                         forward_input_bytes(ctx, &forward_buf);
                         forward_buf.clear();
@@ -2058,7 +2055,7 @@ fn drain_pending_input(
                     ctx.task_detail = None;
                     ctx.group_tab = GroupTab::Runtime;
                     ctx.click_regions.clear();
-                } else if ctrl && key.code == KeyCode::Char('a') {
+                } else if is_ctrl_char_key(&key, 'a') {
                     if !forward_buf.is_empty() {
                         forward_input_bytes(ctx, &forward_buf);
                         forward_buf.clear();
@@ -2067,7 +2064,7 @@ fn drain_pending_input(
                     ctx.task_detail = None;
                     ctx.group_tab = GroupTab::Advisors;
                     ctx.click_regions.clear();
-                } else if ctrl && key.code == KeyCode::Char('r') {
+                } else if is_ctrl_char_key(&key, 'r') {
                     if !forward_buf.is_empty() {
                         forward_input_bytes(ctx, &forward_buf);
                         forward_buf.clear();
@@ -2076,7 +2073,7 @@ fn drain_pending_input(
                     ctx.task_detail = None;
                     ctx.group_tab = GroupTab::Research;
                     ctx.click_regions.clear();
-                } else if ctrl && key.code == KeyCode::Char('v') {
+                } else if is_ctrl_char_key(&key, 'v') {
                     if let Some(ref focused_id) = focused_id {
                         if let Some(pane) = ctx.mux.get(focused_id) {
                             if pane.is_gateway_backed() {
@@ -2089,7 +2086,7 @@ fn drain_pending_input(
                             }
                         }
                     }
-                } else if ctrl && key.code == KeyCode::Char('w') {
+                } else if is_ctrl_char_key(&key, 'w') {
                     if !forward_buf.is_empty() {
                         forward_input_bytes(ctx, &forward_buf);
                         forward_buf.clear();
@@ -2105,7 +2102,7 @@ fn drain_pending_input(
                     if let Some(id) = ctx.worker_ids.get(ctx.selected_worker) {
                         ctx.mux.focus(id);
                     }
-                } else if ctrl && key.code == KeyCode::Char('e') {
+                } else if is_ctrl_char_key(&key, 'e') {
                     if !forward_buf.is_empty() {
                         forward_input_bytes(ctx, &forward_buf);
                         forward_buf.clear();
@@ -2124,7 +2121,7 @@ fn drain_pending_input(
                         ctx.selected_panel,
                         &ctx.selected_member,
                     );
-                } else if ctrl && key.code == KeyCode::Char('s') {
+                } else if is_ctrl_char_key(&key, 's') {
                     if !forward_buf.is_empty() {
                         forward_input_bytes(ctx, &forward_buf);
                         forward_buf.clear();
@@ -2139,7 +2136,7 @@ fn drain_pending_input(
                     if let Some(ref sup_id) = ctx.supervisor_id {
                         ctx.mux.focus(sup_id);
                     }
-                } else if ctrl && key.code == KeyCode::Char('r') {
+                } else if is_ctrl_char_key(&key, 'r') {
                     if !forward_buf.is_empty() {
                         forward_input_bytes(ctx, &forward_buf);
                         forward_buf.clear();
@@ -3923,10 +3920,16 @@ mod tests {
         mux.focus("codex-supervisor");
         let harness = harness_with_mux(mux);
         let ctrl_f = crossterm::event::KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL);
+        let raw_ctrl_f =
+            crossterm::event::KeyEvent::new(KeyCode::Char('\u{6}'), KeyModifiers::empty());
 
         assert!(should_attach_focused_panesmith_supervisor(
             &harness.ctx,
             &ctrl_f
+        ));
+        assert!(should_attach_focused_panesmith_supervisor(
+            &harness.ctx,
+            &raw_ctrl_f
         ));
 
         let mut ghostty_mux = Mux::new(24, 80);
@@ -3937,6 +3940,10 @@ mod tests {
         assert!(!should_attach_focused_panesmith_supervisor(
             &ghostty_harness.ctx,
             &ctrl_f
+        ));
+        assert!(!should_attach_focused_panesmith_supervisor(
+            &ghostty_harness.ctx,
+            &raw_ctrl_f
         ));
     }
 

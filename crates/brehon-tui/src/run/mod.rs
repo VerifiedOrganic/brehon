@@ -6958,10 +6958,14 @@ mod tests {
             KeyModifiers::CONTROL | KeyModifiers::SHIFT,
         );
         let ctrl_backslash = KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::CONTROL);
+        let raw_ctrl_q = KeyEvent::new(KeyCode::Char('\u{11}'), KeyModifiers::empty());
+        let raw_ctrl_backslash = KeyEvent::new(KeyCode::Char('\u{1c}'), KeyModifiers::empty());
 
         assert!(is_quit_key(&ctrl_q));
         assert!(is_quit_key(&ctrl_shift_q));
         assert!(is_quit_key(&ctrl_backslash));
+        assert!(is_quit_key(&raw_ctrl_q));
+        assert!(is_quit_key(&raw_ctrl_backslash));
     }
 
     #[test]

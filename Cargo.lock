@@ -2794,6 +2794,7 @@ version = "0.1.1"
 dependencies = [
  "crossterm 0.28.1",
  "libc",
+ "log",
  "panesmith-core",
 ]
 
@@ -2803,6 +2804,7 @@ version = "0.1.1"
 dependencies = [
  "crossterm 0.28.1",
  "libc",
+ "log",
  "portable-pty",
  "vt100",
 ]

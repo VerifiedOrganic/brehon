@@ -44,15 +44,43 @@ pub(crate) fn cycle_sub_tab(
     }
 }
 
-pub(crate) fn is_quit_key(key: &KeyEvent) -> bool {
-    if !key.modifiers.contains(KeyModifiers::CONTROL) {
+pub(crate) fn is_ctrl_char_key(key: &KeyEvent, expected: char) -> bool {
+    if key.modifiers.intersects(KeyModifiers::ALT) {
         return false;
     }
 
     match key.code {
-        KeyCode::Char(c) => matches!(c, 'q' | 'Q' | '\\'),
+        KeyCode::Char(c)
+            if ctrl_char_code(expected).is_some_and(|code| c as u32 == code as u32) =>
+        {
+            true
+        }
+        KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            c.eq_ignore_ascii_case(&expected)
+        }
         _ => false,
     }
+}
+
+fn ctrl_char_code(c: char) -> Option<u8> {
+    let c = c.to_ascii_lowercase();
+    if c.is_ascii_lowercase() {
+        return Some(c as u8 - b'a' + 1);
+    }
+
+    match c {
+        '[' => Some(0x1b),
+        '\\' => Some(0x1c),
+        ']' => Some(0x1d),
+        '^' => Some(0x1e),
+        '_' => Some(0x1f),
+        '?' => Some(0x7f),
+        _ => None,
+    }
+}
+
+pub(crate) fn is_quit_key(key: &KeyEvent) -> bool {
+    is_ctrl_char_key(key, 'q') || is_ctrl_char_key(key, '\\')
 }
 
 pub(crate) fn should_handle_key_event(key: &KeyEvent) -> bool {
@@ -217,6 +245,38 @@ mod tests {
             kind: KeyEventKind::Press,
             state: KeyEventState::empty(),
         }
+    }
+
+    #[test]
+    fn ctrl_char_key_accepts_enhanced_and_raw_c0_forms() {
+        assert!(is_ctrl_char_key(
+            &ev(KeyCode::Char('f'), KeyModifiers::CONTROL),
+            'f'
+        ));
+        assert!(is_ctrl_char_key(
+            &ev(
+                KeyCode::Char('F'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT
+            ),
+            'f'
+        ));
+        assert!(is_ctrl_char_key(
+            &ev(KeyCode::Char('\u{6}'), KeyModifiers::empty()),
+            'f'
+        ));
+        assert!(is_ctrl_char_key(
+            &ev(KeyCode::Char('\u{1d}'), KeyModifiers::empty()),
+            ']'
+        ));
+
+        assert!(!is_ctrl_char_key(
+            &ev(KeyCode::Char('f'), KeyModifiers::empty()),
+            'f'
+        ));
+        assert!(!is_ctrl_char_key(
+            &ev(KeyCode::Char('\u{6}'), KeyModifiers::ALT),
+            'f'
+        ));
     }
 
     #[test]
