@@ -90,7 +90,7 @@ use super::self_improvement::{
 };
 use super::session::read_session_files;
 use super::task_detail::{handle_task_detail_mouse_event, render_task_detail_dialog};
-use super::terminal_guard::reset_dashboard_terminal_session;
+use super::terminal_guard::BrehonDashboardTerminalControl;
 use super::types::{
     AdvisorRoomViewState, ClickRegion, ClickTarget, ComposerState, DashboardAgentListState,
     DashboardData, DashboardTaskListState, GroupTab, InputMode, PanePos, PendingEscapeSequence,
@@ -612,8 +612,7 @@ fn attach_focused_panesmith_supervisor(ctx: &mut EventLoopCtx) -> io::Result<()>
     ctx.terminal.backend_mut().flush()?;
 
     let mut terminal = panesmith::StdioAttachTerminal::new(io::stdout())?;
-    let mut control =
-        panesmith::CrosstermTerminalControl::new(io::stdout()).with_host_alternate_screen(true);
+    let mut control = BrehonDashboardTerminalControl::new(io::stdout());
     match ctx.mux.attach_panesmith_pane_blocking(
         &pane_id,
         panesmith_attach_options_for_dashboard(),
@@ -652,9 +651,6 @@ fn attach_focused_panesmith_supervisor(ctx: &mut EventLoopCtx) -> io::Result<()>
         }
     }
 
-    ctx.terminal.backend_mut().flush()?;
-    let mut stdout = io::stdout();
-    reset_dashboard_terminal_session(&mut stdout)?;
     ctx.terminal.clear()?;
     ctx.needs_redraw = true;
     Ok(())
