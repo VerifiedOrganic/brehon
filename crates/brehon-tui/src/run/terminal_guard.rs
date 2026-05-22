@@ -14,8 +14,7 @@ use std::io::{self, Write};
 use std::time::Duration;
 
 use crossterm::event::{
-    self, DisableBracketedPaste, DisableMouseCapture, KeyboardEnhancementFlags,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    self, DisableBracketedPaste, DisableMouseCapture, PopKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, LeaveAlternateScreen};
@@ -42,50 +41,6 @@ impl Drop for TerminalSessionGuard {
 
         restore_terminal_session();
     }
-}
-
-pub(super) struct AttachTerminalModeGuard {
-    active: bool,
-}
-
-impl AttachTerminalModeGuard {
-    pub(super) fn suspend_dashboard_modes() -> io::Result<Self> {
-        suspend_dashboard_terminal_modes_for_attach()?;
-        Ok(Self { active: true })
-    }
-
-    pub(super) fn restore(&mut self) -> io::Result<()> {
-        if !self.active {
-            return Ok(());
-        }
-        restore_dashboard_terminal_modes_after_attach()?;
-        self.active = false;
-        Ok(())
-    }
-}
-
-impl Drop for AttachTerminalModeGuard {
-    fn drop(&mut self) {
-        let _ = self.restore();
-    }
-}
-
-fn suspend_dashboard_terminal_modes_for_attach() -> io::Result<()> {
-    let mut stdout = io::stdout();
-    execute!(stdout, PopKeyboardEnhancementFlags)?;
-    stdout.flush()
-}
-
-fn restore_dashboard_terminal_modes_after_attach() -> io::Result<()> {
-    let mut stdout = io::stdout();
-    execute!(
-        stdout,
-        PushKeyboardEnhancementFlags(
-            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
-        )
-    )?;
-    stdout.flush()
 }
 
 pub(super) fn restore_terminal_session() {

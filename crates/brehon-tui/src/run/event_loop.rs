@@ -612,7 +612,6 @@ fn attach_focused_panesmith_supervisor(ctx: &mut EventLoopCtx) -> io::Result<()>
     ctx.structured_scroll_offsets.remove(&pane_id);
     ctx.click_regions.clear();
     ctx.terminal.backend_mut().flush()?;
-    let mut mode_guard = super::terminal_guard::AttachTerminalModeGuard::suspend_dashboard_modes()?;
 
     let mut terminal = panesmith::StdioAttachTerminal::new(io::stdout())?;
     let mut control =
@@ -655,7 +654,6 @@ fn attach_focused_panesmith_supervisor(ctx: &mut EventLoopCtx) -> io::Result<()>
         }
     }
 
-    mode_guard.restore()?;
     ctx.terminal.clear()?;
     ctx.needs_redraw = true;
     Ok(())
