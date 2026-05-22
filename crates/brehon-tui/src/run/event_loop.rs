@@ -90,6 +90,7 @@ use super::self_improvement::{
 };
 use super::session::read_session_files;
 use super::task_detail::{handle_task_detail_mouse_event, render_task_detail_dialog};
+use super::terminal_guard::reset_dashboard_terminal_session;
 use super::types::{
     AdvisorRoomViewState, ClickRegion, ClickTarget, ComposerState, DashboardAgentListState,
     DashboardData, DashboardTaskListState, GroupTab, InputMode, PanePos, PendingEscapeSequence,
@@ -651,6 +652,9 @@ fn attach_focused_panesmith_supervisor(ctx: &mut EventLoopCtx) -> io::Result<()>
         }
     }
 
+    ctx.terminal.backend_mut().flush()?;
+    let mut stdout = io::stdout();
+    reset_dashboard_terminal_session(&mut stdout)?;
     ctx.terminal.clear()?;
     ctx.needs_redraw = true;
     Ok(())

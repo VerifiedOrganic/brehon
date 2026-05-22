@@ -120,12 +120,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{
-    EnableBracketedPaste, EnableMouseCapture, KeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
-};
-use crossterm::execute;
-use crossterm::terminal::{enable_raw_mode, EnterAlternateScreen};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
 use ratatui::Terminal;
@@ -134,7 +128,9 @@ use brehon_mux::{Mux, PaneKind};
 use brehon_ports::RuntimeCommandRouter;
 use brehon_types::config::{OrchestrationConfig, WorkerIdleBehavior};
 
-use terminal_guard::{restore_terminal_session, TerminalSessionGuard};
+use terminal_guard::{
+    enter_dashboard_terminal_session, restore_terminal_session, TerminalSessionGuard,
+};
 
 // ── Main loop ───────────────────────────────────────────────────────────────
 
@@ -250,19 +246,9 @@ pub fn run_tui_with_panels_and_runtime_commands(
     runtime_terminal_host_absolute_resize: bool,
     project_config_loader: research::ProjectConfigLoader,
 ) -> io::Result<()> {
-    enable_raw_mode()?;
     let mut terminal_guard = TerminalSessionGuard::new();
     let mut stdout = io::stdout();
-    execute!(
-        stdout,
-        EnterAlternateScreen,
-        EnableMouseCapture,
-        EnableBracketedPaste,
-        PushKeyboardEnhancementFlags(
-            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
-        )
-    )?;
+    enter_dashboard_terminal_session(&mut stdout)?;
 
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;

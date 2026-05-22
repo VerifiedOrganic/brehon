@@ -14,10 +14,13 @@ use std::io::{self, Write};
 use std::time::Duration;
 
 use crossterm::event::{
-    self, DisableBracketedPaste, DisableMouseCapture, PopKeyboardEnhancementFlags,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
-use crossterm::terminal::{disable_raw_mode, LeaveAlternateScreen};
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
 
 pub(super) struct TerminalSessionGuard {
     active: bool,
@@ -69,4 +72,26 @@ pub(super) fn restore_terminal_session() {
     }
 
     let _ = disable_raw_mode();
+}
+
+pub(super) fn enter_dashboard_terminal_session(stdout: &mut impl Write) -> io::Result<()> {
+    enable_raw_mode()?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste,
+        PushKeyboardEnhancementFlags(dashboard_keyboard_flags())
+    )?;
+    stdout.flush()
+}
+
+pub(super) fn reset_dashboard_terminal_session(stdout: &mut impl Write) -> io::Result<()> {
+    restore_terminal_session();
+    enter_dashboard_terminal_session(stdout)
+}
+
+fn dashboard_keyboard_flags() -> KeyboardEnhancementFlags {
+    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+        | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
 }
