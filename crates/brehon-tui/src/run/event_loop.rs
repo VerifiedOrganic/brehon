@@ -597,7 +597,7 @@ fn should_attach_focused_panesmith_supervisor(
 fn panesmith_attach_options_for_dashboard() -> panesmith::AttachOptions {
     let mut options = panesmith::AttachOptions::default();
     options.detach.chord = vec![0x06]; // Ctrl-f toggles fullscreen attach off.
-    options.screen = panesmith::AttachScreenPolicy::LeaveAlternateScreen;
+    options.screen = panesmith::AttachScreenPolicy::ReuseHostAlternateScreen;
     options
 }
 
@@ -616,7 +616,7 @@ fn attach_focused_panesmith_supervisor(ctx: &mut EventLoopCtx) -> io::Result<()>
 
     let mut terminal = panesmith::StdioAttachTerminal::new(io::stdout())?;
     let mut control =
-        panesmith::CrosstermTerminalControl::new(io::stdout()).with_host_alternate_screen(true);
+        panesmith::CrosstermTerminalControl::new(io::stdout()).with_host_alternate_screen(false);
     match ctx.mux.attach_panesmith_pane_blocking(
         &pane_id,
         panesmith_attach_options_for_dashboard(),
@@ -3943,12 +3943,12 @@ mod tests {
     }
 
     #[test]
-    fn panesmith_dashboard_attach_leaves_host_alternate_screen() {
+    fn panesmith_dashboard_attach_reuses_brehon_prepared_screen() {
         let options = panesmith_attach_options_for_dashboard();
 
         assert_eq!(
             options.screen,
-            panesmith::AttachScreenPolicy::LeaveAlternateScreen
+            panesmith::AttachScreenPolicy::ReuseHostAlternateScreen
         );
         assert_eq!(options.detach.chord, vec![0x06]);
     }
