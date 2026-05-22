@@ -546,7 +546,7 @@ fn scroll_pane_view(
         .get(pane_id)
         .map(|pane| structured_mode.contains(pane_id) && pane.is_gateway_backed())
         .unwrap_or(false);
-    if is_structured_gateway {
+    if is_structured_gateway || mux.is_panesmith_managed(pane_id) {
         let offset = structured_scroll_offsets
             .entry(pane_id.to_string())
             .or_default();

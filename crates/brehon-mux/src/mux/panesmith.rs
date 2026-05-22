@@ -15,6 +15,14 @@ impl Mux {
         self.panesmith.snapshot(pane_id)
     }
 
+    /// Return the latest owned Panesmith scrollback for a Brehon pane id.
+    pub fn panesmith_scrollback(
+        &self,
+        pane_id: &str,
+    ) -> Option<&panesmith::OwnedScrollbackSnapshot> {
+        self.panesmith.scrollback(pane_id)
+    }
+
     /// Whether a Brehon pane currently has a Panesmith-managed PTY/surface.
     pub fn is_panesmith_managed(&self, pane_id: &str) -> bool {
         self.panesmith.contains(pane_id)

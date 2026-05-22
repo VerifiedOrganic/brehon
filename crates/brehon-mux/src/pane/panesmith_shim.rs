@@ -11,8 +11,9 @@ use crate::error::{Error, Result};
 use crate::pty::PtyConfig;
 
 use panesmith::{
-    HostInput, OwnedPaneSnapshot, PaneConfig, PaneEventKind, PaneId as PanesmithPaneId,
-    PaneManager, PaneManagerConfig, Size, TranscriptConfig, TranscriptMode,
+    HostInput, OwnedPaneSnapshot, OwnedScrollbackSnapshot, PaneConfig, PaneEventKind,
+    PaneId as PanesmithPaneId, PaneManager, PaneManagerConfig, Size, TranscriptConfig,
+    TranscriptMode,
 };
 
 /// Mirrored event data that can be applied to Brehon's pane/runtime state.
@@ -43,18 +44,10 @@ pub(crate) struct BrehonPanesmithShim {
     pane_ids: HashMap<String, PanesmithPaneId>,
     brehon_ids: HashMap<PanesmithPaneId, String>,
     snapshots: HashMap<String, OwnedPaneSnapshot>,
+    scrollbacks: HashMap<String, OwnedScrollbackSnapshot>,
     last_seq: HashMap<PanesmithPaneId, u64>,
     next_pane_id: u64,
 }
-
-// SAFETY: Brehon constructs this shim with `PaneManagerConfig::default()` and
-// does not expose Panesmith's custom surface factory through the mux. The
-// default surface and PTY process are thread-movable in practice, but
-// Panesmith's erased `SurfaceBackend` trait object does not currently carry a
-// `Send` bound. Keeping this assertion local preserves Brehon's existing
-// cross-thread `Mux` contract while the dogfood shim owns only supervisor PTY
-// panes.
-unsafe impl Send for BrehonPanesmithShim {}
 
 impl Default for BrehonPanesmithShim {
     fn default() -> Self {
@@ -69,6 +62,7 @@ impl BrehonPanesmithShim {
             pane_ids: HashMap::new(),
             brehon_ids: HashMap::new(),
             snapshots: HashMap::new(),
+            scrollbacks: HashMap::new(),
             last_seq: HashMap::new(),
             next_pane_id: 0,
         }
@@ -96,7 +90,7 @@ impl BrehonPanesmithShim {
 
         self.pane_ids.insert(pane_id.to_string(), spawned_id);
         self.brehon_ids.insert(spawned_id, pane_id.to_string());
-        self.refresh_snapshot_by_panesmith_id(spawned_id)?;
+        self.refresh_cached_view_by_panesmith_id(spawned_id)?;
         Ok(spawned_id)
     }
 
@@ -117,6 +111,10 @@ impl BrehonPanesmithShim {
         self.snapshots.get(pane_id)
     }
 
+    pub(crate) fn scrollback(&self, pane_id: &str) -> Option<&OwnedScrollbackSnapshot> {
+        self.scrollbacks.get(pane_id)
+    }
+
     pub(crate) fn send_input_bytes(&mut self, pane_id: &str, bytes: &[u8]) -> Result<()> {
         let panesmith_id = self
             .panesmith_id_for(pane_id)
@@ -133,7 +131,7 @@ impl BrehonPanesmithShim {
         self.manager
             .resize(panesmith_id, Size::new(rows, cols))
             .map_err(map_panesmith_error)?;
-        self.refresh_snapshot_by_panesmith_id(panesmith_id)?;
+        self.refresh_cached_view_by_panesmith_id(panesmith_id)?;
         Ok(true)
     }
 
@@ -143,6 +141,7 @@ impl BrehonPanesmithShim {
         };
         self.brehon_ids.remove(&panesmith_id);
         self.snapshots.remove(pane_id);
+        self.scrollbacks.remove(pane_id);
         self.last_seq.remove(&panesmith_id);
         let _ = self
             .manager
@@ -184,11 +183,11 @@ impl BrehonPanesmithShim {
         }
 
         for panesmith_id in affected {
-            if let Err(err) = self.refresh_snapshot_by_panesmith_id(panesmith_id) {
+            if let Err(err) = self.refresh_cached_view_by_panesmith_id(panesmith_id) {
                 tracing::warn!(
                     pane_id = panesmith_id.get(),
                     error = %err,
-                    "Failed to refresh Panesmith snapshot after event drain"
+                    "Failed to refresh Panesmith cached view after event drain"
                 );
             }
             match self.manager.last_seq(panesmith_id) {
@@ -213,7 +212,7 @@ impl BrehonPanesmithShim {
         PanesmithPaneId::new(self.next_pane_id)
     }
 
-    fn refresh_snapshot_by_panesmith_id(&mut self, panesmith_id: PanesmithPaneId) -> Result<()> {
+    fn refresh_cached_view_by_panesmith_id(&mut self, panesmith_id: PanesmithPaneId) -> Result<()> {
         let Some(brehon_id) = self.brehon_ids.get(&panesmith_id).cloned() else {
             return Ok(());
         };
@@ -222,7 +221,13 @@ impl BrehonPanesmithShim {
             .snapshot(panesmith_id)
             .map_err(map_panesmith_error)?
             .to_owned_snapshot();
-        self.snapshots.insert(brehon_id, snapshot);
+        let scrollback = self
+            .manager
+            .scrollback(panesmith_id)
+            .map_err(map_panesmith_error)?
+            .to_owned_snapshot();
+        self.snapshots.insert(brehon_id.clone(), snapshot);
+        self.scrollbacks.insert(brehon_id, scrollback);
         Ok(())
     }
 

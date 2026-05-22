@@ -1863,6 +1863,131 @@ mod tests {
     }
 
     #[test]
+    fn test_mouse_scroll_panesmith_supervisor_uses_viewport_offset() {
+        let project_root = tempfile::tempdir().expect("tempdir");
+        let mut mux = Mux::factory(brehon_mux::MuxConfig {
+            cwd: project_root.path().to_path_buf(),
+            workers: 0,
+            supervisor_name: "codex-supervisor".to_string(),
+            supervisor_cli: brehon_mux::AgentAdapter::BuiltIn(brehon_mux::SupervisorCli::Codex),
+            include_director: false,
+            rows: 24,
+            cols: 100,
+            ..Default::default()
+        })
+        .expect("create mux");
+        assert!(mux.is_panesmith_managed("codex-supervisor"));
+        mux.focus("codex-supervisor");
+
+        let mut group_tab = GroupTab::Workers;
+        let mut selected_worker = 0;
+        let mut selected_panel = 0;
+        let mut selected_member = Vec::new();
+        let worker_ids = Vec::new();
+        let all_reviewer_ids = Vec::new();
+        let panels = Vec::new();
+        let supervisor_id = Some("codex-supervisor".to_string());
+        let active_left_id = None;
+        let mut expanded_epics = std::collections::HashSet::new();
+        let mut expanded_activity_rows = std::collections::HashSet::new();
+        let mut selection = None;
+        let mut pending_down = None;
+        let mut task_detail = None;
+        let mut advisor_room_view = AdvisorRoomViewState::default();
+        let mut research_room_view = ResearchRoomViewState::default();
+        let mut dashboard_agent_list = DashboardAgentListState::default();
+        let mut dashboard_task_list = DashboardTaskListState::default();
+        let structured_mode = std::collections::HashSet::new();
+        let mut structured_scroll_offsets = std::collections::HashMap::new();
+        let mut external_terminal_tab_request = None;
+        let mut manual_reset_request = None;
+        let mut runtime_approval_request = None;
+
+        let stale = handle_mouse_input(
+            crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::ScrollUp,
+                column: 45,
+                row: 5,
+                modifiers: KeyModifiers::empty(),
+            },
+            &[],
+            &mut mux,
+            &mut group_tab,
+            &mut selected_worker,
+            &mut selected_panel,
+            &mut selected_member,
+            &worker_ids,
+            &all_reviewer_ids,
+            &panels,
+            &supervisor_id,
+            &active_left_id,
+            &mut expanded_epics,
+            &mut expanded_activity_rows,
+            Rect::new(0, 0, 40, 10),
+            Rect::new(40, 0, 40, 10),
+            &mut selection,
+            &mut pending_down,
+            &mut task_detail,
+            &mut advisor_room_view,
+            &mut research_room_view,
+            &mut dashboard_agent_list,
+            &mut dashboard_task_list,
+            &structured_mode,
+            &mut structured_scroll_offsets,
+            false,
+            &mut external_terminal_tab_request,
+            &mut manual_reset_request,
+            &mut runtime_approval_request,
+        );
+
+        assert!(!stale);
+        assert_eq!(structured_scroll_offsets.get("codex-supervisor"), Some(&3));
+        assert_eq!(
+            mux.get("codex-supervisor").unwrap().display_scroll_offset(),
+            0
+        );
+
+        let _ = handle_mouse_input(
+            crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::ScrollDown,
+                column: 45,
+                row: 5,
+                modifiers: KeyModifiers::empty(),
+            },
+            &[],
+            &mut mux,
+            &mut group_tab,
+            &mut selected_worker,
+            &mut selected_panel,
+            &mut selected_member,
+            &worker_ids,
+            &all_reviewer_ids,
+            &panels,
+            &supervisor_id,
+            &active_left_id,
+            &mut expanded_epics,
+            &mut expanded_activity_rows,
+            Rect::new(0, 0, 40, 10),
+            Rect::new(40, 0, 40, 10),
+            &mut selection,
+            &mut pending_down,
+            &mut task_detail,
+            &mut advisor_room_view,
+            &mut research_room_view,
+            &mut dashboard_agent_list,
+            &mut dashboard_task_list,
+            &structured_mode,
+            &mut structured_scroll_offsets,
+            false,
+            &mut external_terminal_tab_request,
+            &mut manual_reset_request,
+            &mut runtime_approval_request,
+        );
+
+        assert!(!structured_scroll_offsets.contains_key("codex-supervisor"));
+    }
+
+    #[test]
     fn test_read_live_reviewer_panels_preserves_configured_groups_when_leases_cross_panels() {
         let temp = tempfile::tempdir().expect("tempdir");
         let review_panels_dir = temp.path().join("runtime").join("review-panels");

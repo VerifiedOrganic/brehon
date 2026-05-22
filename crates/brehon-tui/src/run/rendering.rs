@@ -12,7 +12,7 @@ use ratatui::widgets::Paragraph;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::ghostty_widget::{PaneRenderCache, PaneViewport};
-use panesmith::TerminalPaneWidget;
+use panesmith::{TerminalPaneWidget, TerminalViewport};
 
 // Thread-local map of pane-id → render cache. The TUI render path is
 // single-threaded (ratatui draws from one thread), so a thread-local
@@ -120,12 +120,22 @@ fn render_terminal_viewport(
     pane_id: &str,
     pane: &brehon_mux::Pane,
     focused: bool,
+    structured_scroll_offset: Option<usize>,
 ) {
     if let Some(snapshot) = mux.panesmith_snapshot(pane_id) {
-        frame.render_widget(
-            TerminalPaneWidget::new(snapshot).focused(focused && pane.accepts_manual_input()),
-            inner,
-        );
+        let scroll_offset = structured_scroll_offset.unwrap_or_default();
+        let mut widget = TerminalPaneWidget::new(snapshot)
+            .focused(focused && pane.accepts_manual_input() && scroll_offset == 0);
+        if let Some(scrollback) = mux.panesmith_scrollback(pane_id) {
+            widget = widget.with_scrollback(scrollback);
+        }
+        if scroll_offset > 0 {
+            widget = widget.with_viewport(TerminalViewport {
+                scroll_offset,
+                follow_tail: false,
+            });
+        }
+        frame.render_widget(widget, inner);
         return;
     }
 
@@ -1197,7 +1207,15 @@ pub(crate) fn render_pane_in_area_with_activity_regions(
                     &footer_text,
                     right_label_padding,
                 );
-                render_terminal_viewport(frame, inner, mux, pane_id, pane, focused);
+                render_terminal_viewport(
+                    frame,
+                    inner,
+                    mux,
+                    pane_id,
+                    pane,
+                    focused,
+                    structured_scroll_offset,
+                );
 
                 if let Some(sel) = selection.filter(|s| s.pane_id == pane_id) {
                     render_selection_overlay(frame, inner, sel);
@@ -1218,7 +1236,15 @@ pub(crate) fn render_pane_in_area_with_activity_regions(
                 &footer_text,
                 right_label_padding,
             );
-            render_terminal_viewport(frame, inner, mux, pane_id, pane, focused);
+            render_terminal_viewport(
+                frame,
+                inner,
+                mux,
+                pane_id,
+                pane,
+                focused,
+                structured_scroll_offset,
+            );
 
             // Highlight selected cells by inverting fg/bg in the rendered buffer.
             if let Some(sel) = selection.filter(|s| s.pane_id == pane_id) {
