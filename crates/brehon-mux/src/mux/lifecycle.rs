@@ -216,7 +216,7 @@ impl Mux {
         }
 
         let sup_teams = config.teams_configs.get(&config.supervisor_name);
-        let supervisor = Pane::supervisor_with_agent_type_materialized(
+        let mut supervisor = Pane::supervisor_with_agent_type_materialized(
             &config.supervisor_name,
             supervisor_cwd,
             config.session_name.as_deref(),
@@ -234,8 +234,44 @@ impl Mux {
             &config.worker_agent_type_map,
             config.supervisor_reasoning_effort.as_deref(),
             &config.supervisor_env,
-            config.pane_materialization,
+            if config.pane_materialization == AgentPaneMaterialization::Spawn {
+                AgentPaneMaterialization::PlanOnly
+            } else {
+                config.pane_materialization
+            },
         )?;
+        if config.pane_materialization == AgentPaneMaterialization::Spawn {
+            if let Err(err) = mux.spawn_panesmith_supervisor_for_pane(&mut supervisor) {
+                tracing::warn!(
+                    pane = %config.supervisor_name,
+                    error = %err,
+                    "Panesmith supervisor spawn failed; falling back to ghostty_vt PTY path"
+                );
+                supervisor = Pane::supervisor_with_agent_type_materialized(
+                    &config.supervisor_name,
+                    config
+                        .supervisor_cwd
+                        .clone()
+                        .unwrap_or_else(|| config.cwd.clone()),
+                    config.session_name.as_deref(),
+                    config.brehon_root.as_ref(),
+                    supervisor_rows,
+                    supervisor_cols,
+                    &config.supervisor_cli,
+                    &config.worker_cli,
+                    &worker_names,
+                    config.supervisor_model.as_deref(),
+                    config.supervisor_server_url.as_deref(),
+                    sup_teams,
+                    &config.worker_cli_map,
+                    config.supervisor_agent_type.as_deref(),
+                    &config.worker_agent_type_map,
+                    config.supervisor_reasoning_effort.as_deref(),
+                    &config.supervisor_env,
+                    AgentPaneMaterialization::Spawn,
+                )?;
+            }
+        }
         mux.add_pane(supervisor);
 
         let reviewer_names: Vec<String> = if config.reviewer_names.is_empty() {
@@ -1168,8 +1204,12 @@ impl Mux {
         let pane_cols = cols / num_panes as u16;
         let pane_rows = rows;
 
-        for pane in self.panes.values_mut() {
-            pane.resize(pane_rows, pane_cols)?;
+        let pane_ids = self.panes.keys().cloned().collect::<Vec<_>>();
+        for pane_id in pane_ids {
+            if let Some(pane) = self.panes.get_mut(&pane_id) {
+                pane.resize(pane_rows, pane_cols)?;
+            }
+            self.resize_panesmith_pane(&pane_id, pane_rows, pane_cols)?;
         }
 
         Ok(())
@@ -1190,6 +1230,21 @@ impl Mux {
         let gateway = self.gateway.clone();
         let mut gateway_sessions = Vec::new();
         let mut operation_keys_to_clear = Vec::new();
+        let panesmith_panes = self
+            .panes
+            .iter()
+            .filter_map(|(pane_id, pane)| pane.is_panesmith_managed().then(|| pane_id.clone()))
+            .collect::<Vec<_>>();
+
+        for pane_id in panesmith_panes {
+            if let Err(err) = self.kill_panesmith_pane(&pane_id) {
+                tracing::warn!(
+                    pane = %pane_id,
+                    error = %err,
+                    "Failed to stop Panesmith-managed pane during shutdown"
+                );
+            }
+        }
 
         for (pane_id, pane) in &mut self.panes {
             if let Some(session_id) = pane.gateway_session_id().map(brehon_types::SessionId::new) {

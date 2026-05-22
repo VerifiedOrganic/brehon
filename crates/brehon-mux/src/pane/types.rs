@@ -209,6 +209,11 @@ pub struct Pane {
     pub(crate) terminal: ghostty_vt::Terminal,
     /// Process backend
     pub(crate) backend: PaneBackend,
+    /// Whether the PTY/process/surface for this pane is owned by Panesmith.
+    ///
+    /// The rest of the pane remains Brehon-owned metadata: role, task/review
+    /// context, prompt queues, gateway state, and dashboard state.
+    pub(crate) panesmith_managed: bool,
     /// Whether this pane has focus
     pub(crate) focused: bool,
     /// Title for display

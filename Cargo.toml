@@ -70,6 +70,7 @@ indexmap = "2"
 unicode-width = "0.2"
 rmcp = { version = "0.16", features = ["server", "transport-io"] }
 portable-pty = "0.9"
+panesmith = { path = "../projects/github/panesmith/crates/panesmith", features = ["crossterm"] }
 
 [profile.release-fast]
 inherits = "release"

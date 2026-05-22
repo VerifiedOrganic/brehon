@@ -475,6 +475,7 @@ impl Pane {
             kind,
             terminal,
             backend,
+            panesmith_managed: false,
             focused: false,
             color: None,
             exited: false,

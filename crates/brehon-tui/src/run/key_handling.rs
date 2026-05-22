@@ -101,6 +101,7 @@ pub(crate) fn resize_panes(
         if let Some(pane) = mux.get_mut(sup_id) {
             let _ = pane.resize(sup_inner_h, sup_inner_w);
         }
+        let _ = mux.resize_panesmith_pane(sup_id, sup_inner_h, sup_inner_w);
     }
 }
 

@@ -348,6 +348,17 @@ impl Mux {
             return self.send_input_via_gateway(pane_id, data).await;
         }
 
+        if self.send_panesmith_input_bytes(pane_id, data)? {
+            if clear_pending_inbox_nudge && let Some(pane) = self.panes.get_mut(pane_id) {
+                pane.set_pending_inbox_nudge(false);
+                tracing::info!(
+                    pane = %pane_id,
+                    "Cleared Teams inbox nudge after manual Enter at empty prompt"
+                );
+            }
+            return Ok(());
+        }
+
         let pane = self
             .panes
             .get(pane_id)
@@ -397,15 +408,22 @@ impl Mux {
             pane.set_pending_inbox_nudge(false);
         }
 
-        let Some(pane) = self.panes.get(pane_id) else {
-            return;
-        };
+        let is_gateway = self
+            .panes
+            .get(pane_id)
+            .map(|pane| pane.is_gateway_backed())
+            .unwrap_or(false);
 
-        if pane.is_gateway_backed() {
+        if is_gateway {
             let Some(gateway) = self.gateway.clone() else {
                 return;
             };
-            let Some(terminal_id) = pane.gateway_terminal_id().map(|s| s.to_string()) else {
+            let Some(terminal_id) = self
+                .panes
+                .get(pane_id)
+                .and_then(|pane| pane.gateway_terminal_id())
+                .map(|s| s.to_string())
+            else {
                 tracing::debug!(pane = %pane_id, "Gateway terminal not ready for input dispatch");
                 return;
             };
@@ -416,7 +434,23 @@ impl Mux {
                     tracing::warn!(pane = %pane_id, error = %err, "Non-blocking gateway input dispatch failed");
                 }
             });
-        } else if let Some(writer) = pane.pty_writer_handle() {
+        } else if self
+            .send_panesmith_input_bytes(pane_id, &data)
+            .unwrap_or_else(|err| {
+                tracing::warn!(
+                    pane = %pane_id,
+                    error = %err,
+                    "Panesmith input dispatch failed"
+                );
+                false
+            })
+        {
+            // Input was routed through PaneManager::send_input.
+        } else if let Some(writer) = self
+            .panes
+            .get(pane_id)
+            .and_then(|pane| pane.pty_writer_handle())
+        {
             let mut w = writer.lock().expect("PTY writer mutex poisoned");
             if let Err(err) = w.write_all(&data) {
                 tracing::warn!(pane = %pane_id, error = %err, "PTY input dispatch failed");

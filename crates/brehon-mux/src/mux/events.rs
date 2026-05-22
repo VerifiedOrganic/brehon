@@ -917,6 +917,15 @@ impl Mux {
             }
         }
 
+        if self.pending_panesmith_events.is_empty() {
+            let events = self.drain_panesmith_events_to_mux();
+            self.pending_panesmith_events.extend(events);
+        }
+        if let Some(event) = self.pending_panesmith_events.pop_front() {
+            self.publish_runtime_event_for_mux_event(&event);
+            return Some(event);
+        }
+
         // Poll each pane for ONE event (not draining all)
         // This ensures we return events as they come without losing any
         let mut next_event = None;
@@ -983,6 +992,11 @@ impl Mux {
             }
             events.push(event);
         }
+
+        while let Some(event) = self.pending_panesmith_events.pop_front() {
+            events.push(event);
+        }
+        events.extend(self.drain_panesmith_events_to_mux());
 
         // Drain each pane using coalesced output (more efficient for high throughput)
         for (id, pane) in self.panes.iter_mut() {

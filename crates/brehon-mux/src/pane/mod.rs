@@ -7,6 +7,7 @@
 
 pub mod activity;
 mod host_launch;
+pub(crate) mod panesmith_shim;
 mod pty_io;
 mod snapshot;
 pub(crate) mod spawn;

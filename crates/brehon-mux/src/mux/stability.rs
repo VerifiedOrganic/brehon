@@ -182,7 +182,7 @@ impl Mux {
     /// conversation without touching shared task or review state.
     pub async fn reset_advisor_session(&mut self, pane_id: &str) -> Result<()> {
         self.ensure_pane_uses_isolated_cwd(pane_id, "advisor")?;
-        let (is_gateway_backed, gateway_session_id) = {
+        let (is_gateway_backed, gateway_session_id, is_panesmith_managed) = {
             let pane = self
                 .panes
                 .get(pane_id)
@@ -195,6 +195,7 @@ impl Mux {
             (
                 pane.is_gateway_backed(),
                 pane.gateway_session_id().map(brehon_types::SessionId::new),
+                pane.is_panesmith_managed(),
             )
         };
         let command = self.runtime_command_for_pane(
@@ -223,6 +224,10 @@ impl Mux {
             }
         }
 
+        if is_panesmith_managed {
+            self.kill_panesmith_pane(pane_id)?;
+        }
+
         self.clear_active_gateway_operations(pane_id);
         if let Some(pane) = self.panes.get_mut(pane_id) {
             if is_gateway_backed {
@@ -231,6 +236,7 @@ impl Mux {
                     activity.clear();
                 }
             } else {
+                pane.set_panesmith_managed(false);
                 pane.restart_pty_from_spawn_config()?;
             }
             pane.set_tool_executing(false);
@@ -328,7 +334,7 @@ impl Mux {
     /// recover from wedged runtime/UI states.
     pub async fn reset_supervisor_session(&mut self, pane_id: &str) -> Result<()> {
         self.ensure_pane_uses_isolated_cwd(pane_id, "supervisor")?;
-        let (is_gateway_backed, gateway_session_id) = {
+        let (is_gateway_backed, gateway_session_id, is_panesmith_managed) = {
             let pane = self
                 .panes
                 .get(pane_id)
@@ -341,6 +347,7 @@ impl Mux {
             (
                 pane.is_gateway_backed(),
                 pane.gateway_session_id().map(brehon_types::SessionId::new),
+                pane.is_panesmith_managed(),
             )
         };
         let command = self.runtime_command_for_pane(
@@ -369,6 +376,10 @@ impl Mux {
             }
         }
 
+        if is_panesmith_managed {
+            self.kill_panesmith_pane(pane_id)?;
+        }
+
         self.clear_active_gateway_operations(pane_id);
         if let Some(pane) = self.panes.get_mut(pane_id) {
             if is_gateway_backed {
@@ -377,6 +388,7 @@ impl Mux {
                     activity.clear();
                 }
             } else {
+                pane.set_panesmith_managed(false);
                 pane.restart_pty_from_spawn_config()?;
             }
             pane.set_tool_executing(false);

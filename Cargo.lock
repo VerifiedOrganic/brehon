@@ -98,6 +98,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "arrayvec"
+version = "0.7.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7c02d123df017efcdfbd739ef81735b36c5ba83ec3c59c80a9d7ecc718f92e50"
+
+[[package]]
 name = "async-trait"
 version = "0.1.89"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -448,7 +454,7 @@ dependencies = [
  "brehon-types",
  "chrono",
  "clap",
- "crossterm",
+ "crossterm 0.29.0",
  "ctrlc",
  "directories",
  "git2",
@@ -607,10 +613,11 @@ dependencies = [
  "brehon-runtime",
  "brehon-types",
  "chrono",
- "crossterm",
+ "crossterm 0.29.0",
  "dirs",
  "ghostty_vt",
  "indexmap",
+ "panesmith",
  "ratatui",
  "serde",
  "serde_json",
@@ -636,7 +643,7 @@ dependencies = [
  "brehon-types",
  "chrono",
  "clap",
- "crossterm",
+ "crossterm 0.29.0",
  "futures-util",
  "nix 0.29.0",
  "portable-pty",
@@ -872,8 +879,9 @@ dependencies = [
  "brehon-ports",
  "brehon-types",
  "chrono",
- "crossterm",
+ "crossterm 0.29.0",
  "insta",
+ "panesmith",
  "ratatui",
  "serde",
  "serde_json",
@@ -1218,6 +1226,22 @@ name = "crossbeam-utils"
 version = "0.8.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d0a5c400df2834b80a4c3327b3aad3a4c4cd4de0629063962b03235697506a28"
+
+[[package]]
+name = "crossterm"
+version = "0.28.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "829d955a0bb380ef178a640b91779e3987da38c9aea133b20614cfed8cdea9c6"
+dependencies = [
+ "bitflags 2.11.1",
+ "crossterm_winapi",
+ "mio",
+ "parking_lot",
+ "rustix 0.38.44",
+ "signal-hook",
+ "signal-hook-mio",
+ "winapi",
+]
 
 [[package]]
 name = "crossterm"
@@ -2755,6 +2779,51 @@ dependencies = [
 ]
 
 [[package]]
+name = "panesmith"
+version = "0.1.1"
+dependencies = [
+ "panesmith-attach",
+ "panesmith-core",
+ "panesmith-ratatui",
+ "panesmith-vt100",
+]
+
+[[package]]
+name = "panesmith-attach"
+version = "0.1.1"
+dependencies = [
+ "crossterm 0.28.1",
+ "libc",
+ "panesmith-core",
+]
+
+[[package]]
+name = "panesmith-core"
+version = "0.1.1"
+dependencies = [
+ "crossterm 0.28.1",
+ "libc",
+ "portable-pty",
+ "vt100",
+]
+
+[[package]]
+name = "panesmith-ratatui"
+version = "0.1.1"
+dependencies = [
+ "panesmith-core",
+ "ratatui",
+]
+
+[[package]]
+name = "panesmith-vt100"
+version = "0.1.1"
+dependencies = [
+ "panesmith-core",
+ "vt100",
+]
+
+[[package]]
 name = "parking_lot"
 version = "0.12.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3248,7 +3317,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "577c9b9f652b4c121fb25c6a391dd06406d3b092ba68827e6d2f09550edc54b3"
 dependencies = [
  "cfg-if",
- "crossterm",
+ "crossterm 0.29.0",
  "instability",
  "ratatui-core",
 ]
@@ -3900,7 +3969,7 @@ dependencies = [
 name = "splash-demo"
 version = "0.1.0"
 dependencies = [
- "crossterm",
+ "crossterm 0.29.0",
 ]
 
 [[package]]
@@ -4715,6 +4784,27 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "vt100"
+version = "0.16.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "054ff75fb8fa83e609e685106df4faeffdf3a735d3c74ebce97ec557d5d36fd9"
+dependencies = [
+ "itoa",
+ "unicode-width",
+ "vte",
+]
+
+[[package]]
+name = "vte"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a5924018406ce0063cd67f8e008104968b74b563ee1b85dde3ed1f7cb87d3dbd"
+dependencies = [
+ "arrayvec",
+ "memchr",
+]
 
 [[package]]
 name = "vtparse"

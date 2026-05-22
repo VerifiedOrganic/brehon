@@ -11,6 +11,14 @@ use brehon_types::{
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::Duration;
+
+#[test]
+fn test_mux_remains_send_for_cross_thread_hosts() {
+    fn assert_send<T: Send>() {}
+
+    assert_send::<Mux>();
+}
 
 #[test]
 fn test_factory_uses_isolated_supervisor_and_reviewer_cwds() {
@@ -68,6 +76,88 @@ fn test_factory_uses_isolated_supervisor_and_reviewer_cwds() {
             .map(|config| config.cwd.as_str()),
         Some(reviewer_cwd.to_string_lossy().as_ref())
     );
+}
+
+#[test]
+fn test_factory_uses_panesmith_for_supervisor_pty_pane() {
+    let project_root = super::fresh_temp_dir("brehon-mux-panesmith-supervisor");
+    let config = MuxConfig {
+        cwd: project_root,
+        workers: 0,
+        supervisor_name: "codex-supervisor".to_string(),
+        supervisor_cli: AgentAdapter::BuiltIn(SupervisorCli::Codex),
+        include_director: false,
+        rows: 24,
+        cols: 100,
+        ..Default::default()
+    };
+
+    let mux = Mux::factory(config).expect("create mux");
+    let supervisor = mux.get("codex-supervisor").expect("supervisor pane exists");
+
+    assert!(supervisor.is_panesmith_managed());
+    assert!(supervisor.accepts_manual_input());
+    assert!(mux.is_panesmith_managed("codex-supervisor"));
+    assert!(mux.panesmith_snapshot("codex-supervisor").is_some());
+    assert!(matches!(supervisor.backend, PaneBackend::None));
+}
+
+#[test]
+fn test_panesmith_supervisor_input_is_mirrored_to_mux_events() {
+    let project_root = super::fresh_temp_dir("brehon-mux-panesmith-input");
+    let config = MuxConfig {
+        cwd: project_root,
+        workers: 0,
+        supervisor_name: "codex-supervisor".to_string(),
+        supervisor_cli: AgentAdapter::BuiltIn(SupervisorCli::Codex),
+        include_director: false,
+        rows: 24,
+        cols: 100,
+        ..Default::default()
+    };
+    let mut mux = Mux::factory(config).expect("create mux");
+    let rt = tokio::runtime::Runtime::new().expect("create runtime");
+
+    rt.block_on(mux.send_input_to("codex-supervisor", b"hello from panesmith\r"))
+        .expect("send input through mux");
+
+    let mut saw_output_event = false;
+    let mut saw_snapshot_text = false;
+    for _ in 0..50 {
+        let (_bytes, events) = mux.poll_batch();
+        saw_output_event |= events.iter().any(|event| {
+            matches!(event, MuxEvent::PaneOutput { pane_id, .. } if pane_id == "codex-supervisor")
+        });
+        saw_snapshot_text = mux
+            .panesmith_snapshot("codex-supervisor")
+            .map(panesmith_snapshot_text)
+            .is_some_and(|text| text.contains("hello from panesmith"));
+        if saw_output_event && saw_snapshot_text {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    assert!(saw_output_event, "expected mirrored PaneOutput event");
+    assert!(
+        saw_snapshot_text,
+        "expected echoed input in Panesmith snapshot"
+    );
+}
+
+fn panesmith_snapshot_text(snapshot: &::panesmith::OwnedPaneSnapshot) -> String {
+    snapshot
+        .surface
+        .rows
+        .iter()
+        .map(|row| {
+            row.cells
+                .iter()
+                .map(|cell| cell.text.as_ref())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[test]

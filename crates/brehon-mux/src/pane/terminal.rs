@@ -113,6 +113,16 @@ impl Pane {
         self.render_generation = self.render_generation.wrapping_add(1);
     }
 
+    /// Whether this pane's PTY and terminal surface are managed by Panesmith.
+    pub fn is_panesmith_managed(&self) -> bool {
+        self.panesmith_managed
+    }
+
+    /// Mark this pane as using Panesmith for its PTY/surface path.
+    pub(crate) fn set_panesmith_managed(&mut self, managed: bool) {
+        self.panesmith_managed = managed;
+    }
+
     /// Get the kind of this pane (worker, supervisor, director, etc.).
     pub fn kind(&self) -> &PaneKind {
         &self.kind
@@ -399,7 +409,9 @@ impl Pane {
 
     /// Whether this pane can accept manual keyboard input.
     pub fn accepts_manual_input(&self) -> bool {
-        matches!(self.backend, PaneBackend::Pty(_)) || self.is_gateway_backed()
+        self.panesmith_managed
+            || matches!(self.backend, PaneBackend::Pty(_))
+            || self.is_gateway_backed()
     }
 
     /// Check if this pane has been idle (no output and no tool executing) for longer than `threshold`.

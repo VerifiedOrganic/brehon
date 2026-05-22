@@ -5,11 +5,12 @@
 use crate::harness::{AgentAdapter, SupervisorCli};
 #[cfg(test)]
 use crate::pane::PaneKind;
+use crate::pane::panesmith_shim::BrehonPanesmithShim;
 use crate::pane::{Pane, PaneId};
 use crate::teams::TeamsManager;
 use brehon_ports::{PolicyGate, RuntimeEventSink};
 use indexmap::IndexMap;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -21,6 +22,7 @@ mod dispatch;
 mod events;
 mod format;
 mod lifecycle;
+mod panesmith;
 mod policy;
 mod runtime;
 mod stability;
@@ -45,6 +47,10 @@ pub(crate) use format::{
 pub struct Mux {
     /// All panes, keyed by ID (insertion order preserved)
     panes: IndexMap<PaneId, Pane>,
+    /// Panesmith manager and id registry for supervisor PTY dogfood panes.
+    panesmith: BrehonPanesmithShim,
+    /// Mux events mirrored from Panesmith when callers use one-at-a-time poll().
+    pending_panesmith_events: VecDeque<types::MuxEvent>,
     /// Currently focused pane
     focused: Option<PaneId>,
     /// Event sender
@@ -99,6 +105,8 @@ impl Mux {
         let (event_tx, event_rx) = mpsc::channel(types::DEFAULT_EVENT_CHANNEL_CAPACITY);
         Self {
             panes: IndexMap::new(),
+            panesmith: BrehonPanesmithShim::new(),
+            pending_panesmith_events: VecDeque::new(),
             focused: None,
             event_tx,
             event_rx,

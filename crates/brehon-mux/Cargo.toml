@@ -24,6 +24,7 @@ async-trait = { workspace = true }
 
 ratatui = { workspace = true }
 crossterm = { workspace = true }
+panesmith = { workspace = true }
 
 tokio = { workspace = true }
 thiserror = { workspace = true }

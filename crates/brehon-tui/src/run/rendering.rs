@@ -12,6 +12,7 @@ use ratatui::widgets::Paragraph;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::ghostty_widget::{PaneRenderCache, PaneViewport};
+use panesmith::TerminalPaneWidget;
 
 // Thread-local map of pane-id → render cache. The TUI render path is
 // single-threaded (ratatui draws from one thread), so a thread-local
@@ -110,6 +111,25 @@ fn render_pane_viewport(frame: &mut Frame, inner: Rect, pane: &brehon_mux::Pane,
             .or_insert_with(PaneRenderCache::new);
         frame.render_stateful_widget(widget, inner, cache);
     });
+}
+
+fn render_terminal_viewport(
+    frame: &mut Frame,
+    inner: Rect,
+    mux: &Mux,
+    pane_id: &str,
+    pane: &brehon_mux::Pane,
+    focused: bool,
+) {
+    if let Some(snapshot) = mux.panesmith_snapshot(pane_id) {
+        frame.render_widget(
+            TerminalPaneWidget::new(snapshot).focused(focused && pane.accepts_manual_input()),
+            inner,
+        );
+        return;
+    }
+
+    render_pane_viewport(frame, inner, pane, focused);
 }
 
 fn pane_right_label(pane: &brehon_mux::Pane) -> String {
@@ -1177,7 +1197,7 @@ pub(crate) fn render_pane_in_area_with_activity_regions(
                     &footer_text,
                     right_label_padding,
                 );
-                render_pane_viewport(frame, inner, pane, focused);
+                render_terminal_viewport(frame, inner, mux, pane_id, pane, focused);
 
                 if let Some(sel) = selection.filter(|s| s.pane_id == pane_id) {
                     render_selection_overlay(frame, inner, sel);
@@ -1198,7 +1218,7 @@ pub(crate) fn render_pane_in_area_with_activity_regions(
                 &footer_text,
                 right_label_padding,
             );
-            render_pane_viewport(frame, inner, pane, focused);
+            render_terminal_viewport(frame, inner, mux, pane_id, pane, focused);
 
             // Highlight selected cells by inverting fg/bg in the rendered buffer.
             if let Some(sel) = selection.filter(|s| s.pane_id == pane_id) {
