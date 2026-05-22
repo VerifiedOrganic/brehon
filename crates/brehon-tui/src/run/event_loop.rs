@@ -616,7 +616,7 @@ fn attach_focused_panesmith_supervisor(ctx: &mut EventLoopCtx) -> io::Result<()>
 
     let mut terminal = panesmith::StdioAttachTerminal::new(io::stdout())?;
     let mut control =
-        panesmith::CrosstermTerminalControl::new(io::stdout()).with_host_alternate_screen(false);
+        panesmith::CrosstermTerminalControl::new(io::stdout()).with_host_alternate_screen(true);
     match ctx.mux.attach_panesmith_pane_blocking(
         &pane_id,
         panesmith_attach_options_for_dashboard(),

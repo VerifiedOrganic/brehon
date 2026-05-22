@@ -13,15 +13,12 @@
 use std::io::{self, Write};
 use std::time::Duration;
 
-use crossterm::cursor;
 use crossterm::event::{
-    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    self, DisableBracketedPaste, DisableMouseCapture, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
-use crossterm::terminal::{
-    disable_raw_mode, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen,
-};
+use crossterm::terminal::{disable_raw_mode, LeaveAlternateScreen};
 
 pub(super) struct TerminalSessionGuard {
     active: bool,
@@ -75,19 +72,7 @@ impl Drop for AttachTerminalModeGuard {
 
 fn suspend_dashboard_terminal_modes_for_attach() -> io::Result<()> {
     let mut stdout = io::stdout();
-    execute!(
-        stdout,
-        PopKeyboardEnhancementFlags,
-        DisableBracketedPaste,
-        DisableMouseCapture,
-        LeaveAlternateScreen,
-        Clear(ClearType::All),
-        Clear(ClearType::Purge),
-        cursor::MoveTo(0, 0)
-    )?;
-    stdout.write_all(
-        b"\x1b[<u\x1b[>4;0m\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1016l\x1b[?2004l",
-    )?;
+    execute!(stdout, PopKeyboardEnhancementFlags)?;
     stdout.flush()
 }
 
@@ -95,11 +80,6 @@ fn restore_dashboard_terminal_modes_after_attach() -> io::Result<()> {
     let mut stdout = io::stdout();
     execute!(
         stdout,
-        EnterAlternateScreen,
-        Clear(ClearType::All),
-        cursor::MoveTo(0, 0),
-        EnableMouseCapture,
-        EnableBracketedPaste,
         PushKeyboardEnhancementFlags(
             KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
                 | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
