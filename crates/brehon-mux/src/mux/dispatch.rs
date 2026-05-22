@@ -494,14 +494,7 @@ impl Mux {
                 )
                 .and_then(|outcome| {
                     let outcome = outcome.ok_or_else(|| Error::pane_not_found(pane_id))?;
-                    if outcome.errors.is_empty() {
-                        Ok(())
-                    } else {
-                        Err(Error::pty(format!(
-                            "Panesmith inbox nudge failed: {:?}",
-                            outcome.errors
-                        )))
-                    }
+                    super::panesmith::ensure_panesmith_mux_outcome("inbox nudge", &outcome)
                 })
             {
                 tracing::warn!(
@@ -932,10 +925,18 @@ impl Mux {
 
         if self.is_panesmith_managed(pane_id) {
             match rt.block_on(self.send_panesmith_prompt_transaction(pane_id, &prompt)) {
-                Ok(Some(outcome)) if outcome.errors.is_empty() => {}
                 Ok(Some(outcome)) => {
+                    if outcome.is_success() {
+                        return;
+                    }
+                    let error = super::panesmith::ensure_panesmith_mux_outcome(
+                        "prompt transaction",
+                        &outcome,
+                    )
+                    .err();
                     tracing::warn!(
                         pane = %pane_id,
+                        error = ?error,
                         outcome = ?outcome,
                         "Panesmith prompt transaction failed"
                     );
@@ -1195,12 +1196,7 @@ impl Mux {
             .send_panesmith_prompt_transaction(pane_id, prompt)
             .await?
         {
-            if !outcome.errors.is_empty() {
-                return Err(Error::pty(format!(
-                    "Panesmith prompt transaction failed: {:?}",
-                    outcome.errors
-                )));
-            }
+            super::panesmith::ensure_panesmith_mux_outcome("prompt transaction", &outcome)?;
             return Ok(PromptDeliveryAttempt::Delivered {
                 prompt_id,
                 generation,
@@ -2053,18 +2049,25 @@ impl Mux {
                         pane_id,
                         panesmith::InputTransaction::interrupt(),
                     ) {
-                        Ok(Some(outcome)) if outcome.errors.is_empty() => {
-                            tracing::warn!(
-                                pane = %pane_id,
-                                "Cleared stale supervisor draft via Panesmith Ctrl-C transaction; re-entering recovery on next tick"
-                            );
-                        }
                         Ok(Some(outcome)) => {
-                            tracing::warn!(
-                                pane = %pane_id,
-                                outcome = ?outcome,
-                                "Failed to send Panesmith Ctrl-C transaction during supervisor inbox recovery"
-                            );
+                            if outcome.is_success() {
+                                tracing::warn!(
+                                    pane = %pane_id,
+                                    "Cleared stale supervisor draft via Panesmith Ctrl-C transaction; re-entering recovery on next tick"
+                                );
+                            } else {
+                                let error = super::panesmith::ensure_panesmith_mux_outcome(
+                                    "supervisor recovery interrupt",
+                                    &outcome,
+                                )
+                                .err();
+                                tracing::warn!(
+                                    pane = %pane_id,
+                                    error = ?error,
+                                    outcome = ?outcome,
+                                    "Failed to send Panesmith Ctrl-C transaction during supervisor inbox recovery"
+                                );
+                            }
                         }
                         Ok(None) => {}
                         Err(err) => {
@@ -2105,21 +2108,28 @@ impl Mux {
                         .send_panesmith_prompt_transaction(pane_id, prompt)
                         .await
                     {
-                        Ok(Some(outcome)) if outcome.errors.is_empty() => {
-                            if let Some(pane) = self.panes.get_mut(pane_id) {
-                                pane.set_pending_inbox_nudge(false);
-                            }
-                            tracing::warn!(
-                                pane = %pane_id,
-                                "Forced supervisor prompt injection through Panesmith transaction after Teams inbox nudge remained blocked"
-                            );
-                        }
                         Ok(Some(outcome)) => {
-                            tracing::warn!(
-                                pane = %pane_id,
-                                outcome = ?outcome,
-                                "Failed to force supervisor prompt injection through Panesmith transaction"
-                            );
+                            if outcome.is_success() {
+                                if let Some(pane) = self.panes.get_mut(pane_id) {
+                                    pane.set_pending_inbox_nudge(false);
+                                }
+                                tracing::warn!(
+                                    pane = %pane_id,
+                                    "Forced supervisor prompt injection through Panesmith transaction after Teams inbox nudge remained blocked"
+                                );
+                            } else {
+                                let error = super::panesmith::ensure_panesmith_mux_outcome(
+                                    "supervisor recovery prompt transaction",
+                                    &outcome,
+                                )
+                                .err();
+                                tracing::warn!(
+                                    pane = %pane_id,
+                                    error = ?error,
+                                    outcome = ?outcome,
+                                    "Failed to force supervisor prompt injection through Panesmith transaction"
+                                );
+                            }
                         }
                         Ok(None) => {}
                         Err(err) => {

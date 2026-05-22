@@ -11,7 +11,7 @@ use crate::error::{Error, Result};
 use crate::pty::PtyConfig;
 
 use panesmith::{
-    AttachOptions, InputOutcome, InputTransaction, InputTransactionError, OwnedPaneSnapshot,
+    AttachOptions, InputKind, InputOutcome, InputTransaction, OwnedPaneSnapshot,
     OwnedScrollbackSnapshot, PaneAttachOutcome, PaneAttachTerminal, PaneAttachTerminalControl,
     PaneConfig, PaneEventKind, PaneId as PanesmithPaneId, PaneManager, PaneManagerConfig, Size,
     TranscriptConfig, TranscriptMode,
@@ -33,12 +33,25 @@ pub(crate) struct BrehonPanesmithEvent {
 pub(crate) enum BrehonPanesmithEventKind {
     Spawned,
     StateChanged,
-    Output { bytes_len: usize },
+    Output {
+        bytes_len: usize,
+    },
     SurfaceChanged,
-    InputSent { bytes_len: usize },
-    Resized { rows: u16, cols: u16 },
-    Exited { code: Option<i32> },
-    Error { message: String },
+    InputSent {
+        input_kind: InputKind,
+        bytes_len: usize,
+        recorded: bool,
+    },
+    Resized {
+        rows: u16,
+        cols: u16,
+    },
+    Exited {
+        code: Option<i32>,
+    },
+    Error {
+        message: String,
+    },
     Other(&'static str),
 }
 
@@ -122,11 +135,6 @@ impl BrehonPanesmithShim {
 
     pub(crate) fn scrollback(&self, pane_id: &str) -> Option<&OwnedScrollbackSnapshot> {
         self.scrollbacks.get(pane_id)
-    }
-
-    pub(crate) fn send_input_bytes(&mut self, pane_id: &str, bytes: &[u8]) -> Result<()> {
-        self.send_input_transaction(pane_id, InputTransaction::raw_bytes(bytes.to_vec()))
-            .and_then(|outcome| ensure_panesmith_input_outcome("raw input", outcome))
     }
 
     pub(crate) fn send_input_transaction(
@@ -306,7 +314,9 @@ fn mirror_event_kind(kind: &PaneEventKind) -> BrehonPanesmithEventKind {
         },
         PaneEventKind::SurfaceChanged(_) => BrehonPanesmithEventKind::SurfaceChanged,
         PaneEventKind::InputSent(input) => BrehonPanesmithEventKind::InputSent {
+            input_kind: input.input_kind,
             bytes_len: input.bytes_len,
+            recorded: input.recorded,
         },
         PaneEventKind::Resized(resized) => BrehonPanesmithEventKind::Resized {
             rows: resized.size.rows,
@@ -331,36 +341,6 @@ fn map_panesmith_error(err: panesmith::PaneError) -> Error {
 
 fn map_panesmith_attach_error(err: panesmith::PaneAttachError) -> Error {
     Error::pty(format!("Panesmith attach: {err}"))
-}
-
-fn ensure_panesmith_input_outcome(operation: &str, outcome: InputOutcome) -> Result<()> {
-    if outcome.errors.is_empty() {
-        return Ok(());
-    }
-
-    let errors = outcome
-        .errors
-        .iter()
-        .map(format_panesmith_input_error)
-        .collect::<Vec<_>>()
-        .join("; ");
-    Err(Error::pty(format!(
-        "Panesmith {operation} failed: {errors}"
-    )))
-}
-
-fn format_panesmith_input_error(error: &InputTransactionError) -> String {
-    match error {
-        InputTransactionError::Write {
-            operation,
-            bytes_attempted,
-            bytes_written,
-            message,
-        } => format!("{operation} failed after {bytes_written}/{bytes_attempted} bytes: {message}"),
-        InputTransactionError::VerificationFailed { message } => message.clone(),
-        InputTransactionError::ChildExited => "child exited".to_string(),
-        error => format!("{error:?}"),
-    }
 }
 
 #[cfg(any(test, feature = "test-pty-fallback"))]
