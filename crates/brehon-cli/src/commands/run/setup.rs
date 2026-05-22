@@ -228,12 +228,23 @@ pub(crate) fn ensure_codex_instruction_files(cwd: &Path, config: &BrehonConfig) 
             config.project_prompt_for_role_name("advisor").as_deref(),
         )
     );
+    let research_body = format!(
+        "Use your actual Brehon agent name wherever this prompt says '<your agent name>'.\n\n{}",
+        brehon_pty::build_research_startup_prompt(
+            "<your agent name>",
+            "mcp__brehon__agent",
+            "mcp__brehon__research",
+            None,
+            config.project_prompt_for_role_name("research").as_deref(),
+        )
+    );
 
     for (name, body) in [
         ("codex-worker-instructions.md", worker_body),
         ("codex-reviewer-instructions.md", reviewer_body),
         ("codex-supervisor-instructions.md", supervisor_body),
         ("codex-advisor-instructions.md", advisor_body),
+        ("codex-research-instructions.md", research_body),
     ] {
         let path = instructions_dir.join(name);
         std::fs::write(&path, body).with_context(|| {
@@ -3607,6 +3618,9 @@ mod tests {
         let advisor =
             std::fs::read_to_string(instructions_dir.join("codex-advisor-instructions.md"))
                 .unwrap();
+        let research =
+            std::fs::read_to_string(instructions_dir.join("codex-research-instructions.md"))
+                .unwrap();
 
         assert!(
             worker.contains("Do NOT proactively call `mcp__brehon__agent action=session_start`")
@@ -3619,6 +3633,9 @@ mod tests {
         assert!(advisor.contains("Brehon advisor startup"));
         assert!(advisor.contains("mcp__brehon__advisor"));
         assert!(advisor.contains("read-only"));
+        assert!(research.contains("Brehon research startup"));
+        assert!(research.contains("mcp__brehon__research action=claim_next"));
+        assert!(research.contains("read-only"));
     }
 
     // ── ensure_brehon_ignored_in_repo ────────────────────────────────────────

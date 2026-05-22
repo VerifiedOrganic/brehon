@@ -3,7 +3,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use brehon_types::{BrehonConfig, ResearchConfig, ResearchPoolConfig};
+use brehon_types::{
+    task::is_terminal_task_status, BrehonConfig, ResearchConfig, ResearchPoolConfig,
+};
 use chrono::{DateTime, Utc};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -22,6 +24,7 @@ use super::advisors::{
 };
 use super::composer::enqueue_composer_message;
 use super::rendering::truncate_to;
+use super::session::read_session_files;
 use super::types::ResearchRoomViewState;
 
 /// Loads the merged `BrehonConfig` for a project given its `.brehon` root.
@@ -97,7 +100,24 @@ struct ResearchArtifactFile {
     citations: Vec<String>,
     #[serde(default)]
     supersedes: Vec<String>,
+    #[serde(default)]
+    handoff_deliveries: Vec<ResearchHandoffDeliveryFile>,
+    #[serde(default)]
+    handoff_warnings: Vec<String>,
     created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct ResearchHandoffDeliveryFile {
+    target: String,
+    target_role: String,
+    status: String,
+    #[serde(default)]
+    method: Option<String>,
+    #[serde(default)]
+    prompt_id: Option<String>,
+    #[serde(default)]
+    warning: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -127,6 +147,65 @@ pub(crate) struct ResearchPostResult {
     pub task_id: String,
     pub job_id: String,
     pub notified_agents: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ResearchPanelSummary {
+    live_agents: usize,
+    rooms: usize,
+    queued_jobs: usize,
+    running_jobs: usize,
+    completed_jobs: usize,
+    artifacts: usize,
+}
+
+impl ResearchPanelSummary {
+    fn from_rooms(brehon_root: Option<&Path>, rooms: &[ResearchRoomFile]) -> Self {
+        Self {
+            live_agents: live_research_agent_count(brehon_root),
+            rooms: rooms.len(),
+            queued_jobs: rooms
+                .iter()
+                .flat_map(|room| room.jobs.iter())
+                .filter(|job| job.status == JOB_STATUS_QUEUED)
+                .count(),
+            running_jobs: rooms
+                .iter()
+                .flat_map(|room| room.jobs.iter())
+                .filter(|job| job.status == JOB_STATUS_RUNNING)
+                .count(),
+            completed_jobs: rooms
+                .iter()
+                .flat_map(|room| room.jobs.iter())
+                .filter(|job| job.status == JOB_STATUS_COMPLETED)
+                .count(),
+            artifacts: rooms.iter().map(|room| room.artifacts.len()).sum(),
+        }
+    }
+
+    fn header_label(&self) -> String {
+        format!(
+            "{} agents / {} rooms / {} queued / {} running / {} done / {} artifacts",
+            self.live_agents,
+            self.rooms,
+            self.queued_jobs,
+            self.running_jobs,
+            self.completed_jobs,
+            self.artifacts
+        )
+    }
+}
+
+fn live_research_agent_count(brehon_root: Option<&Path>) -> usize {
+    brehon_root
+        .map(read_session_files)
+        .map(|sessions| {
+            sessions
+                .values()
+                .filter(|(role, _, _)| role == "research")
+                .count()
+        })
+        .unwrap_or(0)
 }
 
 fn default_job_status() -> String {
@@ -230,7 +309,9 @@ pub(crate) fn render_research_view(
     loader: &ProjectConfigLoader,
     state: &mut ResearchRoomViewState,
 ) {
-    let mut rooms = read_research_rooms(brehon_root, loader);
+    let selected_task_id = state.selected_task_id.clone();
+    let mut rooms =
+        read_research_rooms_for_render(brehon_root, loader, selected_task_id.as_deref());
     if let (Some(root), Some(task_id)) = (brehon_root, state.selected_task_id.as_deref()) {
         if !rooms.iter().any(|room| room.task_id == task_id) {
             rooms.push(ResearchRoomFile {
@@ -242,8 +323,10 @@ pub(crate) fn render_research_view(
             });
         }
     }
+    let summary = ResearchPanelSummary::from_rooms(brehon_root, &rooms);
+    let header_label = summary.header_label();
     let inner = Panel::new("Research")
-        .subtitle("async evidence rooms")
+        .subtitle(&header_label)
         .render(frame, area);
 
     if inner.width == 0 || inner.height == 0 {
@@ -263,7 +346,8 @@ pub(crate) fn render_research_view(
     }
 
     let columns = if inner.width > 86 {
-        Layout::horizontal([Constraint::Length(34), Constraint::Min(24)]).split(inner)
+        let list_width = (inner.width / 3).clamp(38, 54);
+        Layout::horizontal([Constraint::Length(list_width), Constraint::Min(30)]).split(inner)
     } else {
         Layout::horizontal([Constraint::Percentage(100)]).split(inner)
     };
@@ -329,7 +413,7 @@ fn render_room_list(
     selected_idx: usize,
 ) {
     let mut lines = Vec::new();
-    for (idx, room) in rooms.iter().take(area.height as usize / 3 + 1).enumerate() {
+    for (idx, room) in rooms.iter().take(area.height as usize / 2 + 1).enumerate() {
         let active = idx == selected_idx;
         let label = room.title.as_deref().unwrap_or(&room.task_id);
         let prefix = if active { "> " } else { "  " };
@@ -345,19 +429,13 @@ fn render_room_list(
             style,
         )));
         if lines.len() < area.height as usize {
-            lines.push(Line::from(Span::styled(
-                truncate_to(&format!("  {}", room.task_id), area.width as usize),
-                Style::default().fg(TEXT_DIM),
-            )));
-        }
-        if lines.len() < area.height as usize {
-            lines.push(Line::from(status_spans(room, area.width as usize)));
+            lines.push(Line::from(status_spans(room, area.width as usize, active)));
         }
     }
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-fn status_spans(room: &ResearchRoomFile, width: usize) -> Vec<Span<'static>> {
+fn status_spans(room: &ResearchRoomFile, width: usize, active: bool) -> Vec<Span<'static>> {
     let queued = room
         .jobs
         .iter()
@@ -373,14 +451,49 @@ fn status_spans(room: &ResearchRoomFile, width: usize) -> Vec<Span<'static>> {
         .iter()
         .filter(|job| job.status == JOB_STATUS_COMPLETED)
         .count();
-    let text = truncate_to(
-        &format!(
-            "  {queued} queued / {running} running / {completed} done / {} artifacts",
-            room.artifacts.len()
+    let task_width = width.saturating_sub(25).max(8);
+    let mut spans = vec![
+        Span::styled(
+            truncate_to(&format!("  {}", room.task_id), task_width),
+            Style::default().fg(TEXT_DIM),
         ),
-        width,
-    );
-    vec![Span::styled(text, Style::default().fg(TEXT_MUTED))]
+        Span::raw(" "),
+        Span::styled(format!("q{queued}"), Style::default().fg(TEXT_MUTED)),
+        Span::raw(" "),
+        Span::styled(
+            format!("r{running}"),
+            Style::default().fg(if running > 0 {
+                crate::theme::status::WARNING
+            } else {
+                TEXT_MUTED
+            }),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            format!("d{completed}"),
+            Style::default().fg(if completed > 0 {
+                crate::theme::status::SUCCESS
+            } else {
+                TEXT_MUTED
+            }),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            format!("a{}", room.artifacts.len()),
+            Style::default().fg(if room.artifacts.is_empty() {
+                TEXT_MUTED
+            } else {
+                crate::theme::brand::PRIMARY
+            }),
+        ),
+    ];
+    if active {
+        spans.insert(
+            0,
+            Span::styled("  ", Style::default().fg(crate::theme::brand::PRIMARY)),
+        );
+    }
+    spans
 }
 
 fn render_room_detail(
@@ -470,7 +583,7 @@ fn research_events(room: &ResearchRoomFile, brehon_root: Option<&Path>) -> Vec<R
             status: Some(job.status.clone()),
             pool: Some(job.pool.clone()),
             title: Some(job.template_id.clone()),
-            content: job.prompt.clone(),
+            content: request_preview(job),
             created_at: Some(job.created_at),
         });
     }
@@ -486,7 +599,7 @@ fn research_events(room: &ResearchRoomFile, brehon_root: Option<&Path>) -> Vec<R
             author,
             role: artifact.role.clone(),
             kind: "artifact".to_string(),
-            status: Some("attached".to_string()),
+            status: Some(artifact_handoff_status(artifact)),
             pool: Some(artifact.pool.clone()),
             title: Some(format!("{} ({})", artifact.title, artifact.artifact_id)),
             content: artifact_content(room, artifact, brehon_root),
@@ -505,6 +618,10 @@ fn research_events(room: &ResearchRoomFile, brehon_root: Option<&Path>) -> Vec<R
 }
 
 fn research_event_block_lines(event: &ResearchEvent, width: usize) -> Vec<Line<'static>> {
+    if event.role == "request" {
+        return research_request_block_lines(event, width);
+    }
+
     let bubble_width = message_bubble_width(width);
     let author_color = research_author_color(event);
     let bubble_bg = if event.role == "request" {
@@ -576,6 +693,57 @@ fn research_event_block_lines(event: &ResearchEvent, width: usize) -> Vec<Line<'
     lines
 }
 
+fn research_request_block_lines(event: &ResearchEvent, width: usize) -> Vec<Line<'static>> {
+    let time = event
+        .created_at
+        .map(|time| time.format("%H:%M").to_string())
+        .unwrap_or_default();
+    let status = event.status.as_deref().unwrap_or("queued");
+    let status_color = match status {
+        JOB_STATUS_RUNNING => crate::theme::status::WARNING,
+        JOB_STATUS_COMPLETED => crate::theme::status::SUCCESS,
+        _ => TEXT_MUTED,
+    };
+    let pool = event.pool.as_deref().unwrap_or("pool");
+    let title = event.title.as_deref().unwrap_or("request");
+    let mut lines = vec![Line::from(vec![
+        Span::styled(
+            truncate_to(&format!("#{:03} ", event.seq), width),
+            Style::default().fg(TEXT_DIM),
+        ),
+        Span::styled(
+            truncate_to(status, 12),
+            Style::default()
+                .fg(status_color)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" request ", Style::default().fg(TEXT_MUTED)),
+        Span::styled(
+            truncate_to(title, width.saturating_sub(38)),
+            Style::default().fg(chrome::TEXT_BODY),
+        ),
+        Span::styled(format!(" {time}"), Style::default().fg(TEXT_MUTED)),
+    ])];
+    lines.push(Line::from(vec![
+        Span::styled("     pool ", Style::default().fg(TEXT_DIM)),
+        Span::styled(
+            truncate_to(pool, width.saturating_sub(11)),
+            Style::default().fg(TEXT_MUTED),
+        ),
+    ]));
+    for preview in event.content.lines().take(3) {
+        let preview = preview.trim();
+        if preview.is_empty() {
+            continue;
+        }
+        lines.push(Line::from(Span::styled(
+            truncate_to(&format!("     {preview}"), width),
+            Style::default().fg(chrome::TEXT_SOFT),
+        )));
+    }
+    lines
+}
+
 fn research_author_color(event: &ResearchEvent) -> Color {
     if event.role == "request" || event.author == "operator" {
         return crate::theme::brand::PRIMARY;
@@ -583,45 +751,182 @@ fn research_author_color(event: &ResearchEvent) -> Color {
     advisor_author_color(&event.author, &event.role)
 }
 
+fn artifact_handoff_status(artifact: &ResearchArtifactFile) -> String {
+    if artifact.handoff_deliveries.is_empty() {
+        return "attached".to_string();
+    }
+    if artifact
+        .handoff_deliveries
+        .iter()
+        .any(|delivery| delivery.status == "failed")
+    {
+        return "handoff warning".to_string();
+    }
+    if artifact
+        .handoff_deliveries
+        .iter()
+        .any(|delivery| delivery.status == "queued")
+    {
+        return "handoff queued".to_string();
+    }
+    "attached".to_string()
+}
+
 fn artifact_content(
-    room: &ResearchRoomFile,
+    _room: &ResearchRoomFile,
     artifact: &ResearchArtifactFile,
     brehon_root: Option<&Path>,
 ) -> String {
-    if let Some(path) = resolve_artifact_path(brehon_root, &artifact.artifact_path) {
-        if let Ok(content) = std::fs::read_to_string(path) {
-            return truncate_chars(&content, 12_000);
-        }
-    }
-    let mut content = format!("## {}\n\n{}", artifact.title, artifact.summary);
+    let mut content = format!("## {}\n{}", artifact.title, artifact.summary);
     if let Some(confidence) = artifact.confidence.as_deref() {
-        content.push_str(&format!("\n\nConfidence: {confidence}"));
+        content.push_str(&format!("\nConfidence: {confidence}"));
     }
     if !artifact.citations.is_empty() {
-        content.push_str("\n\n## Citations\n");
-        for citation in &artifact.citations {
-            content.push_str(&format!("- {citation}\n"));
-        }
+        let first = artifact
+            .citations
+            .first()
+            .map(String::as_str)
+            .unwrap_or_default();
+        content.push_str(&format!(
+            "\nCitations: {}{}",
+            artifact.citations.len(),
+            if first.is_empty() {
+                String::new()
+            } else {
+                format!(" ({first})")
+            }
+        ));
     }
     if !artifact.supersedes.is_empty() {
         content.push_str("\nSupersedes: ");
         content.push_str(&artifact.supersedes.join(", "));
     }
-    if !artifact.structured_path.is_empty() {
+    if let Some(path) = resolve_artifact_path(brehon_root, &artifact.artifact_path) {
         content.push_str(&format!(
-            "\nStructured artifact: {}",
-            artifact.structured_path
+            "\nBrief: {}",
+            display_artifact_path(brehon_root, &path)
         ));
+    } else if !artifact.artifact_path.is_empty() {
+        content.push_str(&format!("\nBrief: {}", artifact.artifact_path));
     }
-    if !room.task_id.is_empty() {
-        content.push_str(&format!("\nTask: {}", room.task_id));
+    if !artifact.structured_path.is_empty() {
+        content.push_str(&format!("\nData: {}", artifact.structured_path));
+    }
+    if !artifact.handoff_deliveries.is_empty() {
+        let deliveries = artifact
+            .handoff_deliveries
+            .iter()
+            .map(|delivery| {
+                let target = if delivery.target.trim().is_empty() {
+                    "unknown"
+                } else {
+                    delivery.target.as_str()
+                };
+                let role = if delivery.target_role.trim().is_empty() {
+                    "target"
+                } else {
+                    delivery.target_role.as_str()
+                };
+                let method = delivery
+                    .method
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                    .map(|value| format!(" via {value}"))
+                    .unwrap_or_default();
+                let prompt_id = delivery
+                    .prompt_id
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                    .map(|value| format!(" #{value}"))
+                    .unwrap_or_default();
+                format!("{role} {target}: {}{method}{prompt_id}", delivery.status)
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        content.push_str(&format!("\nHandoff: {deliveries}"));
+    }
+    if !artifact.handoff_warnings.is_empty() {
+        content.push_str("\nWarnings: ");
+        content.push_str(&artifact.handoff_warnings.join("; "));
+    } else if let Some(warning) = artifact
+        .handoff_deliveries
+        .iter()
+        .find_map(|delivery| delivery.warning.as_deref())
+    {
+        content.push_str("\nWarnings: ");
+        content.push_str(warning);
     }
     content
+}
+
+fn request_preview(job: &ResearchJobFile) -> String {
+    let first_line = job
+        .prompt
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("No prompt text.");
+    let acceptance = prompt_section_first_line(&job.prompt, "Acceptance Criteria:")
+        .or_else(|| prompt_section_first_line(&job.prompt, "Test Requirements:"));
+    let hints = prompt_section_first_line(&job.prompt, "File Hints:");
+    let mut lines = vec![truncate_to(first_line, 180)];
+    if let Some(acceptance) = acceptance {
+        lines.push(format!("Acceptance: {}", truncate_to(&acceptance, 150)));
+    }
+    if let Some(hint) = hints {
+        lines.push(format!("Hint: {}", truncate_to(&hint, 150)));
+    }
+    lines.join("\n")
+}
+
+fn prompt_section_first_line(prompt: &str, heading: &str) -> Option<String> {
+    let mut in_section = false;
+    let heading = heading.to_ascii_lowercase();
+    for line in prompt.lines() {
+        let trimmed = line.trim();
+        if trimmed.to_ascii_lowercase() == heading {
+            in_section = true;
+            continue;
+        }
+        if in_section {
+            if trimmed.is_empty() {
+                continue;
+            }
+            if trimmed.ends_with(':') && !trimmed.starts_with('-') {
+                return None;
+            }
+            return Some(trimmed.trim_start_matches("- ").to_string());
+        }
+    }
+    None
+}
+
+fn display_artifact_path(brehon_root: Option<&Path>, path: &Path) -> String {
+    brehon_root
+        .and_then(|root| path.strip_prefix(root).ok())
+        .map(|path| format!(".brehon/{}", path.display()))
+        .unwrap_or_else(|| path.display().to_string())
 }
 
 fn read_research_rooms(
     brehon_root: Option<&Path>,
     loader: &ProjectConfigLoader,
+) -> Vec<ResearchRoomFile> {
+    read_research_rooms_matching(brehon_root, loader, None)
+}
+
+fn read_research_rooms_for_render(
+    brehon_root: Option<&Path>,
+    loader: &ProjectConfigLoader,
+    selected_task_id: Option<&str>,
+) -> Vec<ResearchRoomFile> {
+    read_research_rooms_matching(brehon_root, loader, selected_task_id)
+}
+
+fn read_research_rooms_matching(
+    brehon_root: Option<&Path>,
+    loader: &ProjectConfigLoader,
+    selected_task_id: Option<&str>,
 ) -> Vec<ResearchRoomFile> {
     let Some(brehon_root) = brehon_root else {
         return Vec::new();
@@ -650,6 +955,15 @@ fn read_research_rooms(
             .map(|manifest| manifest.task_id.clone())
             .filter(|value| !value.trim().is_empty())
             .unwrap_or(task_id);
+        let task = read_task(brehon_root, &task_id);
+        if task
+            .as_ref()
+            .and_then(task_status_from_task)
+            .is_some_and(is_terminal_task_status)
+            && selected_task_id != Some(task_id.as_str())
+        {
+            continue;
+        }
         let updated_at = jobs
             .iter()
             .map(|job| job.updated_at)
@@ -657,7 +971,7 @@ fn read_research_rooms(
             .chain(artifacts.iter().map(|artifact| artifact.created_at))
             .max();
         rooms.push(ResearchRoomFile {
-            title: read_task_title(brehon_root, &task_id),
+            title: task.as_ref().and_then(task_title_from_task),
             task_id,
             jobs,
             artifacts,
@@ -929,13 +1243,22 @@ fn read_task(brehon_root: &Path, task_id: &str) -> Option<Value> {
 }
 
 fn read_task_title(brehon_root: &Path, task_id: &str) -> Option<String> {
-    read_task(brehon_root, task_id).and_then(|task| {
-        task.get("title")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string)
-    })
+    read_task(brehon_root, task_id).and_then(|task| task_title_from_task(&task))
+}
+
+fn task_title_from_task(task: &Value) -> Option<String> {
+    task.get("title")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn task_status_from_task(task: &Value) -> Option<&str> {
+    task.get("status")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
 }
 
 fn task_id_from_task(task: &Value) -> Option<&str> {
@@ -966,18 +1289,6 @@ fn sanitize_id(value: &str) -> String {
             }
         })
         .collect()
-}
-
-fn truncate_chars(value: &str, max_chars: usize) -> String {
-    if value.chars().count() <= max_chars {
-        return value.to_string();
-    }
-    let mut output = value
-        .chars()
-        .take(max_chars.saturating_sub(3))
-        .collect::<String>();
-    output.push_str("...");
-    output
 }
 
 #[cfg(test)]
@@ -1031,6 +1342,10 @@ research:
     }
 
     fn write_task(brehon_root: &Path, task_id: &str) {
+        write_task_with_status(brehon_root, task_id, "Protocol parser", "open");
+    }
+
+    fn write_task_with_status(brehon_root: &Path, task_id: &str, title: &str, status: &str) {
         std::fs::create_dir_all(brehon_root.join("runtime/tasks")).unwrap();
         std::fs::write(
             brehon_root
@@ -1038,9 +1353,58 @@ research:
                 .join(format!("{task_id}.json")),
             serde_json::json!({
                 "task_id": task_id,
-                "title": "Protocol parser",
-                "status": "open",
+                "title": title,
+                "status": status,
                 "task_type": "task"
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    fn write_queued_job(brehon_root: &Path, task_id: &str, prompt: &str) {
+        let jobs_dir = brehon_root
+            .join("runtime/research")
+            .join(task_id)
+            .join("jobs");
+        std::fs::create_dir_all(&jobs_dir).unwrap();
+        let now = Utc::now();
+        let job_id = format!("RJOB-{task_id}-spec-001");
+        let job = ResearchJobFile {
+            job_id: job_id.clone(),
+            task_id: task_id.to_string(),
+            route_id: None,
+            template_id: "spec".to_string(),
+            pool: "spec-research".to_string(),
+            lane: "codex-worker".to_string(),
+            role: "normative_requirements".to_string(),
+            status: JOB_STATUS_QUEUED.to_string(),
+            origin: "manual_request".to_string(),
+            prompt: prompt.to_string(),
+            cost_units: 1,
+            requested_by: "operator".to_string(),
+            assigned_to: None,
+            artifact_id: None,
+            depends_on: Vec::new(),
+            warnings: Vec::new(),
+            created_at: now,
+            updated_at: now,
+        };
+        write_job(&jobs_dir.join(format!("{job_id}.json")), &job).unwrap();
+    }
+
+    fn write_session(brehon_root: &Path, name: &str, role: &str) {
+        let sessions_dir = brehon_root.join("runtime/sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let now = Utc::now().to_rfc3339();
+        std::fs::write(
+            sessions_dir.join(format!("{name}.json")),
+            serde_json::json!({
+                "name": name,
+                "role": role,
+                "session_id": format!("session-{name}"),
+                "registered_at": now,
+                "last_seen_at": now
             })
             .to_string(),
         )
@@ -1069,6 +1433,67 @@ research:
         let rooms = read_research_rooms(Some(&brehon_root), &loader);
         assert_eq!(rooms[0].jobs[0].status, JOB_STATUS_QUEUED);
         assert!(rooms[0].jobs[0].prompt.contains("RFC sections"));
+    }
+
+    #[test]
+    fn research_room_count_ignores_terminal_tasks_by_default() {
+        let temp = tempfile::tempdir().unwrap();
+        write_config(temp.path());
+        let brehon_root = temp.path().join(".brehon");
+        write_task_with_status(&brehon_root, "T-active", "Active protocol", "in_progress");
+        write_task_with_status(&brehon_root, "T-closed", "Closed protocol", "closed");
+        write_queued_job(&brehon_root, "T-active", "active research prompt");
+        write_queued_job(&brehon_root, "T-closed", "closed research prompt");
+
+        let loader = test_loader();
+        assert_eq!(research_room_count(Some(&brehon_root), &loader), 1);
+        assert_eq!(
+            active_research_room_task_id(Some(&brehon_root), &loader).as_deref(),
+            Some("T-active")
+        );
+
+        let rooms = read_research_rooms_for_render(Some(&brehon_root), &loader, Some("T-closed"));
+        assert!(rooms.iter().any(|room| room.task_id == "T-closed"));
+
+        let mut terminal = Terminal::new(TestBackend::new(90, 16)).unwrap();
+        let mut state = ResearchRoomViewState {
+            selected_task_id: Some("T-closed".to_string()),
+            ..ResearchRoomViewState::default()
+        };
+        terminal
+            .draw(|frame| {
+                render_research_view(frame, frame.area(), Some(&brehon_root), &loader, &mut state)
+            })
+            .unwrap();
+
+        let rendered = buffer_text(terminal.backend().buffer());
+        assert!(rendered.contains("Closed protocol"));
+        assert!(rendered.contains("closed research prompt"));
+    }
+
+    #[test]
+    fn render_research_header_distinguishes_live_agents_from_rooms() {
+        let temp = tempfile::tempdir().unwrap();
+        write_config(temp.path());
+        let brehon_root = temp.path().join(".brehon");
+        write_task_with_status(&brehon_root, "T-active", "Active protocol", "in_progress");
+        write_queued_job(&brehon_root, "T-active", "active research prompt");
+        write_session(&brehon_root, "research-1", "research");
+        write_session(&brehon_root, "worker-1", "worker");
+
+        let loader = test_loader();
+        assert_eq!(live_research_agent_count(Some(&brehon_root)), 1);
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 12)).unwrap();
+        let mut state = ResearchRoomViewState::default();
+        terminal
+            .draw(|frame| {
+                render_research_view(frame, frame.area(), Some(&brehon_root), &loader, &mut state)
+            })
+            .unwrap();
+
+        let rendered = buffer_text(terminal.backend().buffer());
+        assert!(rendered.contains("1 agents / 1 rooms / 1 queued / 0 running / 0 done"));
     }
 
     #[test]
@@ -1138,6 +1563,22 @@ research:
                     "artifact_path": ".brehon/runtime/research/T-3/RCH-T-3-spec-001/brief.md",
                     "structured_path": ".brehon/runtime/research/T-3/RCH-T-3-spec-001/artifact.yaml",
                     "citations": ["RFC 9999 section 1"],
+                    "handoff_deliveries": [
+                        {
+                            "target": "worker-1",
+                            "target_role": "worker",
+                            "status": "queued",
+                            "method": "queued",
+                            "prompt_id": "prompt-worker-1"
+                        },
+                        {
+                            "target": "supervisor-1",
+                            "target_role": "supervisor",
+                            "status": "failed",
+                            "warning": "research handoff could not notify supervisor"
+                        }
+                    ],
+                    "handoff_warnings": ["research handoff could not notify supervisor"],
                     "created_at": now
                 }]
             }))
@@ -1145,7 +1586,7 @@ research:
         )
         .unwrap();
 
-        let mut terminal = Terminal::new(TestBackend::new(100, 22)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(140, 24)).unwrap();
         let mut state = ResearchRoomViewState::default();
         terminal
             .draw(|frame| {
@@ -1165,6 +1606,11 @@ research:
         assert!(rendered.contains("Summarize the protocol requirements"));
         assert!(rendered.contains("Protocol Requirements"));
         assert!(rendered.contains("The protocol requires strict ordering."));
+        assert!(rendered.contains("handoff warning"));
+        assert!(rendered.contains("worker worker-1: queued"));
+        assert!(rendered.contains("supervisor-1"));
+        assert!(rendered.contains("failed"));
+        assert!(rendered.contains("Warnings: research handoff could not notify supervisor"));
     }
 
     #[test]

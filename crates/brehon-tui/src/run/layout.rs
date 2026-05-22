@@ -264,7 +264,7 @@ pub(crate) fn render_group_tabs(
     let dashboard_label = if compact { "Dash" } else { "Dashboard" };
     let runtime_label = "Runtime";
     let advisors_label = tab_count_label("Advisors", advisor_count, compact);
-    let research_label = tab_count_label("Research", research_count, compact);
+    let research_label = tab_count_label_with_unit("Research", research_count, "room", compact);
     let workers_label = tab_count_label(
         if compact { "Work" } else { "Workers" },
         worker_count,
@@ -646,6 +646,19 @@ fn tab_count_label(label: &str, count: usize, hide_zero: bool) -> String {
         label.to_string()
     } else {
         format!("{label} ({count})")
+    }
+}
+
+fn tab_count_label_with_unit(label: &str, count: usize, unit: &str, hide_zero: bool) -> String {
+    if hide_zero && count == 0 {
+        label.to_string()
+    } else {
+        let suffix = if count == 1 {
+            unit.to_string()
+        } else {
+            format!("{unit}s")
+        };
+        format!("{label} ({count} {suffix})")
     }
 }
 

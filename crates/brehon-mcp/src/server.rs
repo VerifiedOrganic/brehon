@@ -202,6 +202,27 @@ fn structured_tool_error(
     .to_string()
 }
 
+fn tool_allowed_for_role(role: &str, tool_name: &str) -> bool {
+    if role != "research" {
+        return true;
+    }
+
+    matches!(
+        tool_name,
+        "health"
+            | "search_memories"
+            | "get_memories"
+            | "list_memories"
+            | "search_rules"
+            | "search_skills"
+            | "get_task_context"
+            | "list_tasks"
+            | "get_task"
+            | "agent"
+            | "research"
+    )
+}
+
 // ── Tool registry ───────────────────────────────────────────────────────────
 
 /// The tool registry that holds all registered MCP tools.
@@ -362,6 +383,7 @@ impl McpServer {
         let mut tools: Vec<ToolDefinition> = self
             .tools
             .values()
+            .filter(|tool| tool_allowed_for_role(&self.caller.role, tool.name()))
             .map(|tool| ToolDefinition {
                 name: tool.name().to_string(),
                 description: tool.description().to_string(),
@@ -400,6 +422,31 @@ impl McpServer {
             // so the drainer will not wait for us.
             return Err(McpError::Protocol(format!(
                 "Shutdown in progress — tool {tool_name} rejected during drain"
+            )));
+        }
+
+        if !tool_allowed_for_role(&caller.role, tool_name) {
+            return Err(McpError::InvalidRequest(structured_tool_error(
+                "mcp_tool_forbidden_for_role",
+                format!("Tool {tool_name} is not available to role {}", caller.role),
+                tool_name,
+                caller,
+                serde_json::json!({
+                    "role": caller.role,
+                    "allowed_tools": [
+                        "health",
+                        "search_memories",
+                        "get_memories",
+                        "list_memories",
+                        "search_rules",
+                        "search_skills",
+                        "get_task_context",
+                        "list_tasks",
+                        "get_task",
+                        "agent",
+                        "research"
+                    ]
+                }),
             )));
         }
 

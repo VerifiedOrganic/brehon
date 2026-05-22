@@ -1139,6 +1139,7 @@ pub(crate) fn render_pane_in_area_with_activity_regions(
             PaneKind::Worker => is_gateway,
             PaneKind::Reviewer => pane.review_context().is_none(),
             PaneKind::Advisor => true,
+            PaneKind::Research => true,
             PaneKind::Supervisor => true,
             PaneKind::Director | PaneKind::Shell => false,
         };
@@ -1277,6 +1278,7 @@ pub(crate) fn render_host_owned_pane_in_area(
         PaneKind::Worker => true,
         PaneKind::Reviewer => pane.review_context().is_none(),
         PaneKind::Advisor => true,
+        PaneKind::Research => true,
         PaneKind::Supervisor => true,
         PaneKind::Director | PaneKind::Shell => false,
     };
@@ -1479,6 +1481,7 @@ fn runtime_pane_kind_label(kind: &PaneKind) -> &'static str {
         PaneKind::Worker => "worker",
         PaneKind::Reviewer => "reviewer",
         PaneKind::Advisor => "advisor",
+        PaneKind::Research => "research",
         PaneKind::Director => "director",
         PaneKind::Shell => "shell",
     }

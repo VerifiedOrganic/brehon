@@ -75,6 +75,7 @@ pub(crate) fn resize_panes(
     worker_ids: &[String],
     reviewer_ids: &[String],
     advisor_ids: &[String],
+    research_ids: &[String],
     supervisor_id: &Option<String>,
     group_tab: GroupTab,
     has_panels: bool,
@@ -87,6 +88,7 @@ pub(crate) fn resize_panes(
         .iter()
         .chain(reviewer_ids.iter())
         .chain(advisor_ids.iter())
+        .chain(research_ids.iter())
     {
         if let Some(pane) = mux.get_mut(id) {
             let _ = pane.resize(left_inner_h, left_inner_w);

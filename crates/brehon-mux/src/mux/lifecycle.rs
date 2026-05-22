@@ -371,6 +371,67 @@ impl Mux {
             mux.add_pane(advisor);
         }
 
+        for research_name in &config.research_names {
+            let research_cwd = if config.worktree_isolation {
+                config.research_cwds.get(research_name).cloned().ok_or_else(|| {
+                    Error::terminal(format!(
+                        "Worktree isolation is enabled, but research agent '{research_name}' has no isolated cwd."
+                    ))
+                })?
+            } else {
+                config
+                    .research_cwds
+                    .get(research_name)
+                    .cloned()
+                    .unwrap_or_else(|| config.cwd.clone())
+            };
+            if config.worktree_isolation {
+                ensure_isolated_cwd_is_not_shared_root(
+                    &config.cwd,
+                    &research_cwd,
+                    "research",
+                    research_name,
+                )?;
+            }
+            let research = Pane::research_with_agent_type_materialized(
+                research_name,
+                research_cwd,
+                config.session_name.as_deref(),
+                config.brehon_root.as_ref(),
+                pane_rows,
+                pane_cols,
+                config
+                    .research_cli_map
+                    .get(research_name)
+                    .unwrap_or(&config.research_cli),
+                config
+                    .research_model_map
+                    .get(research_name)
+                    .map(String::as_str)
+                    .or(config.research_model.as_deref()),
+                config
+                    .research_server_url_map
+                    .get(research_name)
+                    .map(String::as_str),
+                config.teams_configs.get(research_name),
+                config
+                    .research_agent_type_map
+                    .get(research_name)
+                    .map(String::as_str),
+                config
+                    .research_reasoning_effort_map
+                    .get(research_name)
+                    .map(String::as_str),
+                config
+                    .research_env_map
+                    .get(research_name)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]),
+                config.pane_materialization,
+            )?;
+            mux.add_pane(research);
+        }
+
         // Create director pane (no PTY)
         if config.include_director {
             let director = Pane::director("director", pane_rows, pane_cols)?;
@@ -609,7 +670,11 @@ impl Mux {
         for pane in self.panes.values() {
             if !matches!(
                 pane.kind(),
-                PaneKind::Worker | PaneKind::Reviewer | PaneKind::Advisor | PaneKind::Supervisor
+                PaneKind::Worker
+                    | PaneKind::Reviewer
+                    | PaneKind::Advisor
+                    | PaneKind::Research
+                    | PaneKind::Supervisor
             ) {
                 continue;
             }
@@ -1020,6 +1085,7 @@ impl Mux {
             PaneKind::Worker => self.reset_worker_gateway_session(pane_id).await,
             PaneKind::Reviewer => self.reset_reviewer_session(pane_id).await,
             PaneKind::Advisor => self.reset_advisor_session(pane_id).await,
+            PaneKind::Research => self.reset_research_session(pane_id).await,
             PaneKind::Supervisor => self.reset_supervisor_session(pane_id).await,
             _ => Ok(()),
         };
@@ -1082,6 +1148,7 @@ impl Mux {
             PaneKind::Worker => self.reset_worker_gateway_session(pane_id).await,
             PaneKind::Reviewer => self.reset_reviewer_session(pane_id).await,
             PaneKind::Advisor => self.reset_advisor_session(pane_id).await,
+            PaneKind::Research => self.reset_research_session(pane_id).await,
             PaneKind::Supervisor => self.reset_supervisor_session(pane_id).await,
             _ => Err(Error::pty(format!("Pane '{pane_id}' cannot be recycled"))),
         }

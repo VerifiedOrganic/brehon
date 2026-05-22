@@ -118,6 +118,36 @@ pub fn build_advisor_startup_prompt(
     )
 }
 
+pub fn build_research_startup_prompt(
+    name: &str,
+    agent_cmd: &str,
+    research_cmd: &str,
+    pool_id: Option<&str>,
+    project_policy: Option<&str>,
+) -> String {
+    let pool_hint = pool_id
+        .map(str::trim)
+        .filter(|pool| !pool.is_empty())
+        .map(|pool| format!(" pool={pool}"))
+        .unwrap_or_default();
+
+    append_project_policy(
+        format!(
+            "Brehon research startup. You are research agent '{name}' (agent_type=research).\n\
+1) On startup, register once: {agent_cmd} action=session_start name={name} agent_type=research.\n\
+2) Claim one job with `{research_cmd} action=claim_next{pool_hint}`. Work on only that claimed job until you submit it.\n\
+3) Research jobs are read-only. Do not edit repository files, task status, review state, or runtime control-plane files except through `{research_cmd} action=submit`.\n\
+4) Produce structured, cited context. Prefer concise summaries, concrete file/spec references, and uncertainty notes over broad prose.\n\
+5) Submit completed work with `{research_cmd} action=submit task_id=<task_id> job_id=<job_id> summary=\"...\" content=\"...\" citations='[...]'`.\n\
+6) If a job cannot be answered from available context, submit a brief artifact explaining the gap instead of blocking a worker.\n\
+7) After every successful submit, immediately call `{research_cmd} action=claim_next{pool_hint}` again and continue one job at a time until it returns idle/no queued work.\n\
+8) Stop only when no queued job is available for your pool. Do not poll, sleep, or keep a turn open waiting for future jobs.\n\
+9) Do not send readiness acknowledgements to the supervisor or user."
+        ),
+        project_policy,
+    )
+}
+
 pub fn build_native_agent_system_prompt(
     role: &str,
     name: &str,
@@ -129,6 +159,7 @@ pub fn build_native_agent_system_prompt(
 ) -> String {
     let agent_cmd = format!("{tool_prefix}agent");
     let advisor_cmd = format!("{tool_prefix}advisor");
+    let research_cmd = format!("{tool_prefix}research");
     let task_cmd = format!("{tool_prefix}task");
     let verification_cmd = format!("{tool_prefix}verification");
     let role_contract = match role.trim().to_ascii_lowercase().as_str() {
@@ -139,6 +170,13 @@ pub fn build_native_agent_system_prompt(
             build_reviewer_startup_prompt(name, &agent_cmd, &verification_cmd, project_policy)
         }
         "advisor" => build_advisor_startup_prompt(name, &agent_cmd, &advisor_cmd, project_policy),
+        "research" => build_research_startup_prompt(
+            name,
+            &agent_cmd,
+            &research_cmd,
+            Some(agent_type),
+            project_policy,
+        ),
         "worker" | "" => build_worker_startup_prompt(
             name,
             supervisor_name,
@@ -235,5 +273,24 @@ mod tests {
         assert!(prompt.contains("action=post"));
         assert!(prompt.contains("Never poll"));
         assert!(prompt.contains("Project policy:\nPrefer concise synthesis."));
+    }
+
+    #[test]
+    fn research_prompt_claims_pool_and_stays_read_only() {
+        let prompt = build_research_startup_prompt(
+            "research-1",
+            "mcp_brehon_agent",
+            "mcp_brehon_research",
+            Some("specs"),
+            Some("Cite primary sources."),
+        );
+
+        assert!(prompt.contains("Brehon research startup"));
+        assert!(prompt
+            .contains("mcp_brehon_agent action=session_start name=research-1 agent_type=research"));
+        assert!(prompt.contains("mcp_brehon_research action=claim_next pool=specs"));
+        assert!(prompt.contains("After every successful submit"));
+        assert!(prompt.contains("read-only"));
+        assert!(prompt.contains("Project policy:\nCite primary sources."));
     }
 }

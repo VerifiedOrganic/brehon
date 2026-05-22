@@ -42,6 +42,7 @@ pub(crate) fn collect_session_refresh_entries(mux: &Mux) -> Vec<SessionRefreshEn
                 PaneKind::Supervisor => "supervisor",
                 PaneKind::Reviewer => "reviewer",
                 PaneKind::Advisor => "advisor",
+                PaneKind::Research => "research",
                 PaneKind::Director => "director",
                 PaneKind::Shell => "shell",
             };
@@ -120,6 +121,7 @@ pub(crate) fn apply_dashboard_refresh_snapshot(
             PaneKind::Supervisor => "supervisor",
             PaneKind::Reviewer => "reviewer",
             PaneKind::Advisor => "advisor",
+            PaneKind::Research => "research",
             PaneKind::Director => "director",
             PaneKind::Shell => "shell",
         };

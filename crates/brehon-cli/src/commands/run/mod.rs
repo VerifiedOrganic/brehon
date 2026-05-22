@@ -629,12 +629,14 @@ fn build_team_member_cwds(
     worker_cwds: &HashMap<String, PathBuf>,
     reviewer_cwds: &HashMap<String, PathBuf>,
     advisor_cwds: &HashMap<String, PathBuf>,
+    research_cwds: &HashMap<String, PathBuf>,
     supervisor_name: &str,
     supervisor_cwds: &HashMap<String, PathBuf>,
 ) -> HashMap<String, PathBuf> {
     let mut team_member_cwds = worker_cwds.clone();
     team_member_cwds.extend(reviewer_cwds.clone());
     team_member_cwds.extend(advisor_cwds.clone());
+    team_member_cwds.extend(research_cwds.clone());
     if let Some(supervisor_cwd) = supervisor_cwds.get(supervisor_name) {
         team_member_cwds.insert(supervisor_name.to_string(), supervisor_cwd.clone());
     }
@@ -1395,9 +1397,18 @@ pub async fn execute(
     } else {
         0
     };
+    let total_researchers: usize = if config.research.enabled {
+        config.research.pools.iter().map(|p| p.min as usize).sum()
+    } else {
+        0
+    };
     splash.set_summary(format!(
-        "{} workers, {} reviewers, {} advisors, supervisor {}",
-        total_workers, total_reviewers, total_advisors, config.roles.supervisor.name
+        "{} workers, {} reviewers, {} advisors, {} researchers, supervisor {}",
+        total_workers,
+        total_reviewers,
+        total_advisors,
+        total_researchers,
+        config.roles.supervisor.name
     ));
     // Publish the structured roster so the splash architecture diagram can
     // display per-kind breakdowns (e.g. "claude 2  codex 1") instead of just
@@ -1421,11 +1432,16 @@ pub async fn execute(
         config.roles.supervisor.name.clone(),
     );
     splash.record(format!(
-        "Planned launch: {} workers, {} reviewers, {} advisors, supervisor {}",
-        total_workers, total_reviewers, total_advisors, config.roles.supervisor.name
+        "Planned launch: {} workers, {} reviewers, {} advisors, {} researchers, supervisor {}",
+        total_workers,
+        total_reviewers,
+        total_advisors,
+        total_researchers,
+        config.roles.supervisor.name
     ));
-    let generated_names =
-        crate::names::generate_names(total_workers + total_reviewers + total_advisors);
+    let generated_names = crate::names::generate_names(
+        total_workers + total_reviewers + total_advisors + total_researchers,
+    );
     let mut name_iter = generated_names.into_iter();
 
     // Build worker names and per-worker adapter map
@@ -1599,6 +1615,51 @@ pub async fn execute(
         }
     }
 
+    let mut research_names = Vec::new();
+    let mut research_cli_map = std::collections::HashMap::new();
+    let mut research_agent_type_map = std::collections::HashMap::new();
+    let mut research_model_map = std::collections::HashMap::new();
+    let mut research_reasoning_effort_map = std::collections::HashMap::new();
+    let mut research_env_map = std::collections::HashMap::new();
+    let mut research_startup_policy_map = std::collections::HashMap::new();
+    let research_project_policy = config.project_prompt_for_role_name("research");
+    if config.research.enabled {
+        for pool in &config.research.pools {
+            let model = config.lane_model(&pool.lane, None).ok_or_else(|| {
+                anyhow::anyhow!("Research lane '{}' has no model configured", pool.lane)
+            })?;
+            let reasoning_effort = config.lane_reasoning_effort(&pool.lane, None);
+            let launcher_name = config
+                .lane_launcher_name(&pool.lane)
+                .unwrap_or(pool.lane.as_str());
+            let model_str = format_model(launcher_name, &model.provider, &model.name);
+            for i in 0..pool.min {
+                let name = name_iter
+                    .next()
+                    .unwrap_or_else(|| format!("{}-research-{}", pool.id, i + 1));
+                research_cli_map.insert(name.clone(), agent_to_adapter(&pool.lane, &config));
+                research_agent_type_map.insert(name.clone(), pool.id.clone());
+                research_model_map.insert(name.clone(), model_str.clone());
+                let mut research_env = launcher_env_pairs(&pool.lane);
+                research_env.push(("BREHON_RESEARCH_POOL_ID".to_string(), pool.id.clone()));
+                research_env.push(("BREHON_RESEARCH_POOL_LANE".to_string(), pool.lane.clone()));
+                research_env.push(("BREHON_RESEARCH_ROLE".to_string(), pool.role.clone()));
+                if let Some(policy) = combine_startup_policy(
+                    research_project_policy.as_deref(),
+                    config.lane_system_prompt(&pool.lane, pool.instruction_profile.as_deref()),
+                ) {
+                    research_env.push(("BREHON_ROLE_SYSTEM_PROMPT".to_string(), policy.clone()));
+                    research_startup_policy_map.insert(name.clone(), policy);
+                }
+                research_env_map.insert(name.clone(), research_env);
+                if let Some(effort) = reasoning_effort {
+                    research_reasoning_effort_map.insert(name.clone(), effort.to_string());
+                }
+                research_names.push(name);
+            }
+        }
+    }
+
     let reviewer_panels = build_reviewer_panels(&config, &pool_reviewer_names);
     let planned_review_panel_seats =
         build_planned_review_panel_seats(&config, &pool_reviewer_names);
@@ -1616,7 +1677,8 @@ pub async fn execute(
     let has_claude_agents = is_claude(&supervisor_adapter)
         || worker_cli_map.values().any(&is_claude)
         || reviewer_cli_map.values().any(&is_claude)
-        || advisor_cli_map.values().any(&is_claude);
+        || advisor_cli_map.values().any(&is_claude)
+        || research_cli_map.values().any(&is_claude);
 
     let mut teams_configs = std::collections::HashMap::new();
     let teams_lead_session_id = uuid::Uuid::new_v4().to_string();
@@ -1689,6 +1751,23 @@ pub async fn execute(
                 claude_idx += 1;
             }
         }
+
+        // Claude Code research agents
+        for name in &research_names {
+            if research_cli_map.get(name).map(&is_claude).unwrap_or(false) {
+                teams_configs.insert(
+                    name.clone(),
+                    teams_mgr.spawn_config_for(
+                        name,
+                        None,
+                        "general-purpose",
+                        brehon_mux::teams::TeamsManager::color_for_index(claude_idx),
+                        Some(&teams_lead_session_id),
+                    ),
+                );
+                claude_idx += 1;
+            }
+        }
     }
 
     // Get terminal size for initial pane dimensions
@@ -1711,6 +1790,13 @@ pub async fn execute(
     });
     let default_advisor_model = config.advisors.pools.first().and_then(|p| {
         let model = config.lane_model(&p.lane, p.model.as_ref())?;
+        let launcher = config
+            .lane_launcher_name(&p.lane)
+            .unwrap_or(p.lane.as_str());
+        Some(format_model(launcher, &model.provider, &model.name))
+    });
+    let default_research_model = config.research.pools.first().and_then(|p| {
+        let model = config.lane_model(&p.lane, None)?;
         let launcher = config
             .lane_launcher_name(&p.lane)
             .unwrap_or(p.lane.as_str());
@@ -1787,6 +1873,28 @@ pub async fn execute(
             return Err(err);
         }
     };
+    splash.set_stage("Preparing research worktrees");
+    let research_cwds = match prepare_scoped_worktrees_with_progress(
+        &cwd,
+        &config,
+        Some(&session_name),
+        Some("research"),
+        &research_names,
+        |message| splash.record(message),
+    )
+    .await
+    {
+        Ok(cwds) => cwds,
+        Err(err) => {
+            if config.orchestration.auto_cleanup_worktrees {
+                cleanup_scoped_worktrees(&cwd, &worker_cwds).await;
+                cleanup_scoped_worktrees(&cwd, &supervisor_cwds).await;
+                cleanup_scoped_worktrees(&cwd, &reviewer_cwds).await;
+                cleanup_scoped_worktrees(&cwd, &advisor_cwds).await;
+            }
+            return Err(err);
+        }
+    };
     let supervisor_cwd = supervisor_cwds.get(&config.roles.supervisor.name).cloned();
     let mut supervisor_env = launcher_env_pairs(&config.roles.supervisor.name);
     if let Some(policy) = config.project_prompt_for_role_name("supervisor") {
@@ -1843,6 +1951,7 @@ pub async fn execute(
         supervisor_cwd,
         reviewer_cwds: reviewer_cwds.clone(),
         advisor_cwds: advisor_cwds.clone(),
+        research_cwds: research_cwds.clone(),
         workers: worker_count,
         worker_names: worker_names.clone(),
         supervisor_name: config.roles.supervisor.name.clone(),
@@ -1898,6 +2007,22 @@ pub async fn execute(
         advisor_model_map,
         advisor_reasoning_effort_map,
         advisor_model: default_advisor_model,
+        research_names: research_names.clone(),
+        research_cli: agent_to_adapter(
+            config
+                .research
+                .pools
+                .first()
+                .map(|p| p.lane.as_str())
+                .unwrap_or("codex"),
+            &config,
+        ),
+        research_cli_map: research_cli_map.clone(),
+        research_agent_type_map: research_agent_type_map.clone(),
+        research_env_map,
+        research_model_map,
+        research_reasoning_effort_map,
+        research_model: default_research_model,
         supervisor_agent_type: Some(config.roles.supervisor.name.clone()),
         supervisor_env,
         teams_configs,
@@ -1938,6 +2063,7 @@ pub async fn execute(
                 cleanup_scoped_worktrees(&cwd, &supervisor_cwds).await;
                 cleanup_scoped_worktrees(&cwd, &reviewer_cwds).await;
                 cleanup_scoped_worktrees(&cwd, &advisor_cwds).await;
+                cleanup_scoped_worktrees(&cwd, &research_cwds).await;
             }
             return Err(anyhow::anyhow!("Failed to seed advisor rooms: {err}"));
         }
@@ -1948,6 +2074,7 @@ pub async fn execute(
         supervisor = %mux_config.supervisor_name,
         reviewers = mux_config.reviewer_names.len(),
         advisors = mux_config.advisor_names.len(),
+        researchers = mux_config.research_names.len(),
         "Creating mux"
     );
     splash.set_stage("Creating panes");
@@ -1961,6 +2088,7 @@ pub async fn execute(
                 cleanup_scoped_worktrees(&cwd, &supervisor_cwds).await;
                 cleanup_scoped_worktrees(&cwd, &reviewer_cwds).await;
                 cleanup_scoped_worktrees(&cwd, &advisor_cwds).await;
+                cleanup_scoped_worktrees(&cwd, &research_cwds).await;
             }
             return Err(anyhow::anyhow!("Mux creation failed: {}", err));
         }
@@ -1983,6 +2111,7 @@ pub async fn execute(
             cleanup_scoped_worktrees(&cwd, &supervisor_cwds).await;
             cleanup_scoped_worktrees(&cwd, &reviewer_cwds).await;
             cleanup_scoped_worktrees(&cwd, &advisor_cwds).await;
+            cleanup_scoped_worktrees(&cwd, &research_cwds).await;
         }
         let blockers = agent_factory_plan
             .blocked_panes
@@ -2128,6 +2257,7 @@ pub async fn execute(
                     cleanup_scoped_worktrees(&cwd, &supervisor_cwds).await;
                     cleanup_scoped_worktrees(&cwd, &reviewer_cwds).await;
                     cleanup_scoped_worktrees(&cwd, &advisor_cwds).await;
+                    cleanup_scoped_worktrees(&cwd, &research_cwds).await;
                 }
                 return Err(anyhow::anyhow!(
                     "Failed to launch terminal-host agent panes: {err}"
@@ -2269,12 +2399,14 @@ pub async fn execute(
             .iter()
             .chain(reviewer_names.iter())
             .chain(advisor_names.iter())
+            .chain(research_names.iter())
             .cloned()
             .collect();
         let team_member_cwds = build_team_member_cwds(
             &worker_cwds,
             &reviewer_cwds,
             &advisor_cwds,
+            &research_cwds,
             &config.roles.supervisor.name,
             &supervisor_cwds,
         );
@@ -2481,6 +2613,47 @@ pub async fn execute(
             } else {
                 mux.queue_startup_prompt(name, prompt);
                 splash.record(format!("Queued startup prompt for advisor {name}"));
+            }
+        }
+    }
+
+    // Research startup prompts
+    for name in &research_names {
+        let adapter = research_cli_map
+            .get(name)
+            .unwrap_or(&AgentAdapter::BuiltIn(SupervisorCli::Codex));
+        if needs_post_spawn_prompt(adapter) {
+            if skip_preview_gateway_startup(adapter) {
+                splash.record(format!(
+                    "Skipped gateway startup prompt for research agent {name} in terminal-host preview mode"
+                ));
+                continue;
+            }
+            let caps = adapter.capabilities();
+            let agent_cmd = format!("{}agent", caps.tool_prefix);
+            let research_cmd = format!("{}research", caps.tool_prefix);
+            let prompt = brehon_pty::build_research_startup_prompt(
+                name,
+                &agent_cmd,
+                &research_cmd,
+                research_agent_type_map.get(name).map(String::as_str),
+                research_startup_policy_map.get(name).map(String::as_str),
+            );
+            if host_owns_agent_panes {
+                let delay = terminal_host_startup_prompt_delay(terminal_host_startup_prompt_slot);
+                terminal_host_startup_prompt_slot =
+                    terminal_host_startup_prompt_slot.saturating_add(1);
+                terminal_host_startup_prompts.push(TerminalHostStartupPrompt {
+                    target: name.clone(),
+                    prompt,
+                    delay,
+                });
+                splash.record(format!(
+                    "Queued terminal-host startup prompt for research agent {name}"
+                ));
+            } else {
+                mux.queue_startup_prompt(name, prompt);
+                splash.record(format!("Queued startup prompt for research agent {name}"));
             }
         }
     }
@@ -2785,8 +2958,11 @@ pub async fn execute(
     let _ = std::fs::remove_file(&current_session_path);
 
     if config.orchestration.auto_cleanup_worktrees {
-        let total_worktrees =
-            worker_cwds.len() + supervisor_cwds.len() + reviewer_cwds.len() + advisor_cwds.len();
+        let total_worktrees = worker_cwds.len()
+            + supervisor_cwds.len()
+            + reviewer_cwds.len()
+            + advisor_cwds.len()
+            + research_cwds.len();
         if total_worktrees > 0 {
             progress.step(format!(
                 "Cleaning up {} agent worktree(s)...",
@@ -2797,6 +2973,7 @@ pub async fn execute(
         cleanup_scoped_worktrees(&cwd, &supervisor_cwds).await;
         cleanup_scoped_worktrees(&cwd, &reviewer_cwds).await;
         cleanup_scoped_worktrees(&cwd, &advisor_cwds).await;
+        cleanup_scoped_worktrees(&cwd, &research_cwds).await;
     }
 
     if let Some(default_branch) = shared_root_default_branch.as_deref() {
@@ -3702,7 +3879,7 @@ mod tests {
     }
 
     #[test]
-    fn build_team_member_cwds_includes_supervisor_reviewers_and_advisors() {
+    fn build_team_member_cwds_includes_supervisor_reviewers_advisors_and_research() {
         let mut worker_cwds = HashMap::new();
         worker_cwds.insert(
             "worker-1".to_string(),
@@ -3718,6 +3895,11 @@ mod tests {
             "advisor-1".to_string(),
             PathBuf::from("/tmp/advisors/advisor-1"),
         );
+        let mut research_cwds = HashMap::new();
+        research_cwds.insert(
+            "research-1".to_string(),
+            PathBuf::from("/tmp/research/research-1"),
+        );
         let mut supervisor_cwds = HashMap::new();
         supervisor_cwds.insert(
             "claude-code".to_string(),
@@ -3728,6 +3910,7 @@ mod tests {
             &worker_cwds,
             &reviewer_cwds,
             &advisor_cwds,
+            &research_cwds,
             "claude-code",
             &supervisor_cwds,
         );
@@ -3743,6 +3926,10 @@ mod tests {
         assert_eq!(
             member_cwds.get("advisor-1"),
             Some(&PathBuf::from("/tmp/advisors/advisor-1"))
+        );
+        assert_eq!(
+            member_cwds.get("research-1"),
+            Some(&PathBuf::from("/tmp/research/research-1"))
         );
         assert_eq!(
             member_cwds.get("claude-code"),

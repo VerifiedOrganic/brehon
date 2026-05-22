@@ -132,6 +132,8 @@ pub enum PaneKind {
     Reviewer,
     /// Advisor agent (read-only brainstorming/chat)
     Advisor,
+    /// Research agent (read-only context/artifact producer)
+    Research,
 }
 
 impl PaneKind {
@@ -144,6 +146,7 @@ impl PaneKind {
             Self::Shell => "shell",
             Self::Reviewer => "reviewer",
             Self::Advisor => "advisor",
+            Self::Research => "research",
         }
     }
 }

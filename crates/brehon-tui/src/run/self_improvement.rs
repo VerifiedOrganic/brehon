@@ -49,6 +49,23 @@ pub(crate) fn build_advisor_reset_startup_prompt(mux: &Mux, advisor: &str) -> Op
     ))
 }
 
+pub(crate) fn build_research_reset_startup_prompt(mux: &Mux, researcher: &str) -> Option<String> {
+    let pane = mux.panes().find(|pane| pane.id() == researcher)?;
+    if pane.kind() != &PaneKind::Research {
+        return None;
+    }
+    let caps = pane.cli_type().capabilities();
+    let agent_cmd = format!("{}agent", caps.tool_prefix);
+    let research_cmd = format!("{}research", caps.tool_prefix);
+    Some(brehon_types::build_research_startup_prompt(
+        researcher,
+        &agent_cmd,
+        &research_cmd,
+        pane.configured_agent_type(),
+        None,
+    ))
+}
+
 pub(crate) fn build_worker_context_reset_startup_prompt(mux: &Mux, worker: &str) -> Option<String> {
     let pane = mux.panes().find(|pane| pane.id() == worker)?;
     if pane.kind() != &PaneKind::Worker {

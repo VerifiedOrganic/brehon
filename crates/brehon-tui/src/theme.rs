@@ -188,6 +188,7 @@ pub mod role {
     pub const SUPERVISOR: Color = Color::Rgb(255, 200, 80);
     pub const REVIEWER: Color = Color::Rgb(80, 200, 120);
     pub const ADVISOR: Color = Color::Rgb(230, 160, 70);
+    pub const RESEARCH: Color = Color::Rgb(105, 210, 190);
     pub const DIRECTOR: Color = Color::Rgb(180, 130, 255);
     pub const SHELL: Color = Color::Rgb(180, 180, 180);
 
@@ -197,6 +198,7 @@ pub mod role {
             PaneKind::Supervisor => SUPERVISOR,
             PaneKind::Reviewer => REVIEWER,
             PaneKind::Advisor => ADVISOR,
+            PaneKind::Research => RESEARCH,
             PaneKind::Director => DIRECTOR,
             PaneKind::Shell => SHELL,
         }
@@ -208,6 +210,7 @@ pub mod role {
             PaneKind::Worker => "▰",
             PaneKind::Reviewer => "⬡",
             PaneKind::Advisor => "◇",
+            PaneKind::Research => "◎",
             PaneKind::Director => "◆",
             PaneKind::Shell => "▫",
         }

@@ -131,6 +131,76 @@ fn test_register_builtin_tools() {
 }
 
 #[tokio::test]
+async fn research_role_lists_only_read_only_context_and_research_tools() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _env = ScopedEnv::set(&[
+        ("BREHON_SESSION_ID", "sess-research"),
+        ("BREHON_AGENT_NAME", "research-1"),
+        ("BREHON_AGENT_ROLE", "research"),
+    ]);
+    let mut server = McpServer::new("test-server", "1.0.0");
+    server.register_builtin_tools();
+
+    let tool_names: Vec<String> = server
+        .tool_definitions()
+        .into_iter()
+        .map(|tool| tool.name)
+        .collect();
+
+    for allowed in [
+        "health",
+        "search_memories",
+        "get_memories",
+        "list_memories",
+        "search_rules",
+        "search_skills",
+        "get_task_context",
+        "list_tasks",
+        "get_task",
+        "agent",
+        "research",
+    ] {
+        assert!(
+            tool_names.iter().any(|name| name == allowed),
+            "research role should list {allowed}; got {tool_names:?}"
+        );
+    }
+
+    for blocked in [
+        "task",
+        "factory",
+        "verification",
+        "advisor",
+        "create_memory",
+        "create_rule",
+        "delete_memory",
+    ] {
+        assert!(
+            !tool_names.iter().any(|name| name == blocked),
+            "research role should not list {blocked}; got {tool_names:?}"
+        );
+    }
+
+    let result = server
+        .call_tool("task", serde_json::json!({ "action": "list" }))
+        .await;
+    match result {
+        Err(McpError::InvalidRequest(message)) => {
+            let payload = error_payload(&message);
+            assert_eq!(payload["error_code"], "mcp_tool_forbidden_for_role");
+            assert_eq!(payload["error"]["tool"], "task");
+            assert_eq!(payload["error"]["caller"]["role"], "research");
+            assert!(payload["error"]["fields"]["allowed_tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool == "research"));
+        }
+        other => panic!("expected research role tool rejection, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn test_brehon_service_list_tools() {
     let mut server = McpServer::new("test-server", "1.0.0");
     server.register_builtin_tools();

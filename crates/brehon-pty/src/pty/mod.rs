@@ -15,8 +15,8 @@ pub(crate) mod prompts;
 pub use config::{PtyConfig, TeamsSpawnConfig};
 pub use core::{Pty, PtyEvent, format_cursor_position_report};
 pub use prompts::{
-    build_advisor_startup_prompt, build_reviewer_startup_prompt, build_supervisor_startup_prompt,
-    build_worker_startup_prompt,
+    build_advisor_startup_prompt, build_research_startup_prompt, build_reviewer_startup_prompt,
+    build_supervisor_startup_prompt, build_worker_startup_prompt,
 };
 
 #[cfg(test)]

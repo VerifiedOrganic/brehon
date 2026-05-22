@@ -562,7 +562,7 @@ fn render_dashboard_agents(
     };
 
     let mut summary_suffix = format!(
-        "  |  {} workers  {} reviewers  {} advisors",
+        "  |  {} workers  {} reviewers  {} advisors  {} researchers",
         mux.worker_count().max(
             runtime_status
                 .map(|status| runtime_dashboard_kind_count(status, RuntimePaneKind::Worker))
@@ -576,6 +576,11 @@ fn render_dashboard_agents(
         mux.panes_by_kind(PaneKind::Advisor).count().max(
             runtime_status
                 .map(|status| runtime_dashboard_kind_count(status, RuntimePaneKind::Advisor))
+                .unwrap_or_default()
+        ),
+        mux.panes_by_kind(PaneKind::Research).count().max(
+            runtime_status
+                .map(|status| runtime_dashboard_kind_count(status, RuntimePaneKind::Research))
                 .unwrap_or_default()
         )
     );
@@ -650,6 +655,7 @@ fn runtime_dashboard_pane_is_agent(kind: &RuntimePaneKind) -> bool {
             | RuntimePaneKind::Worker
             | RuntimePaneKind::Reviewer
             | RuntimePaneKind::Advisor
+            | RuntimePaneKind::Research
     )
 }
 
@@ -722,10 +728,11 @@ fn runtime_dashboard_kind_rank(kind: &RuntimePaneKind) -> usize {
         RuntimePaneKind::Worker => 1,
         RuntimePaneKind::Reviewer => 2,
         RuntimePaneKind::Advisor => 3,
+        RuntimePaneKind::Research => 4,
         RuntimePaneKind::Director
         | RuntimePaneKind::Shell
         | RuntimePaneKind::Unknown
-        | RuntimePaneKind::Other { .. } => 4,
+        | RuntimePaneKind::Other { .. } => 5,
     }
 }
 
@@ -735,6 +742,7 @@ fn runtime_dashboard_role_chrome(kind: &RuntimePaneKind) -> (&'static str, Color
         RuntimePaneKind::Worker => PaneKind::Worker,
         RuntimePaneKind::Reviewer => PaneKind::Reviewer,
         RuntimePaneKind::Advisor => PaneKind::Advisor,
+        RuntimePaneKind::Research => PaneKind::Research,
         RuntimePaneKind::Director => PaneKind::Director,
         RuntimePaneKind::Shell | RuntimePaneKind::Unknown | RuntimePaneKind::Other { .. } => {
             PaneKind::Shell
@@ -1951,6 +1959,7 @@ fn runtime_pane_kind_label(kind: &RuntimePaneKind) -> String {
         RuntimePaneKind::Worker => "worker".to_string(),
         RuntimePaneKind::Reviewer => "reviewer".to_string(),
         RuntimePaneKind::Advisor => "advisor".to_string(),
+        RuntimePaneKind::Research => "research".to_string(),
         RuntimePaneKind::Director => "director".to_string(),
         RuntimePaneKind::Shell => "shell".to_string(),
         RuntimePaneKind::Unknown => "unknown".to_string(),
@@ -2057,6 +2066,7 @@ fn infer_assignee_kind(assignee: &str, dashboard: &DashboardData) -> Option<Pane
             "worker" => Some(PaneKind::Worker),
             "reviewer" => Some(PaneKind::Reviewer),
             "advisor" => Some(PaneKind::Advisor),
+            "research" => Some(PaneKind::Research),
             "supervisor" => Some(PaneKind::Supervisor),
             "director" => Some(PaneKind::Director),
             "shell" => Some(PaneKind::Shell),

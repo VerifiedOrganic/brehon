@@ -209,7 +209,7 @@ fn configured_research_prompt(
         .and_then(|pool| {
             pool.instruction_profile.clone().or_else(|| {
                 config
-                    .lane_system_prompt(agent_type, None)
+                    .lane_system_prompt(&pool.lane, None)
                     .map(str::to_string)
             })
         })
@@ -767,12 +767,13 @@ fn research_instructions(
         \n\
         Protocol:\n\
         1. Call agent action=whoami to confirm identity.\n\
-        2. Claim work with `research action=claim_next`. If your pool is known, pass `pool=<pool-id>`.\n\
+        2. Claim work with `research action=claim_next`. If your pool is known, pass `pool=<pool-id>`. Work on only that claimed job until you submit it.\n\
         3. Research jobs are read-only. Do not edit repository files, task status, review state, or runtime control-plane files except through `research action=submit`.\n\
         4. Produce structured, cited context. Prefer concise summaries, concrete file/spec references, and uncertainty notes over broad prose.\n\
         5. Submit completed work with `research action=submit task_id=<task_id> job_id=<job_id> summary=\"...\" content=\"...\" citations='[...]'`.\n\
         6. If a job cannot be answered from available context, submit a brief artifact explaining the gap instead of blocking a worker.\n\
-        7. After submitting or finding no queued job, stop and wait. Do not poll in a tight loop."
+        7. After every successful submit, immediately call `research action=claim_next` again and continue one job at a time until it returns idle/no queued work.\n\
+        8. Stop only when no queued job is available for your pool. Do not poll, sleep, or keep a turn open waiting for future jobs."
         ),
         configured_prompt,
         project_policy,
@@ -1168,6 +1169,17 @@ impl Tool for AgentTool {
 
     async fn execute(&self, args: Value) -> Result<ToolResult, McpError> {
         let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
+        if std::env::var("BREHON_AGENT_ROLE")
+            .ok()
+            .as_deref()
+            .map(str::trim)
+            == Some("research")
+            && action == "message"
+        {
+            return Ok(error_result(
+                "Research agents are read-only and cannot send agent messages.".to_string(),
+            ));
+        }
 
         match action {
             "session_start" => {
@@ -1744,6 +1756,7 @@ mod tests {
             let instructions = v["instructions"].as_str().unwrap();
             assert!(instructions.contains("research action=claim_next"));
             assert!(instructions.contains("research action=submit"));
+            assert!(instructions.contains("After every successful submit"));
             assert!(instructions.contains("read-only"));
         }
     }
@@ -2049,6 +2062,32 @@ mod tests {
             assert_eq!(v["method"], "queued");
             assert_eq!(v["target"], "supervisor");
             assert_eq!(v["message"], "Task complete");
+        }
+    }
+
+    #[tokio::test]
+    async fn research_role_cannot_send_agent_messages() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        let _env = ScopedEnv::set(&[
+            ("BREHON_ROOT", root.path().to_str().unwrap()),
+            ("BREHON_AGENT_NAME", "research-1"),
+            ("BREHON_AGENT_ROLE", "research"),
+        ]);
+
+        let result = AgentTool::new()
+            .execute(serde_json::json!({
+                "action": "message",
+                "target": "supervisor",
+                "message": "I should not be able to send this."
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(result.is_error, Some(true));
+        if let ContentBlock::Text { text } = &result.content[0] {
+            assert!(text.contains("read-only"));
+            assert!(text.contains("cannot send agent messages"));
         }
     }
 

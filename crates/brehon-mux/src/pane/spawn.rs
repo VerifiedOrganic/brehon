@@ -240,6 +240,7 @@ fn validate_codex_gateway_bootstrap(
         "supervisor" => "codex-supervisor-instructions.md",
         "reviewer" => "codex-reviewer-instructions.md",
         "advisor" => "codex-advisor-instructions.md",
+        "research" => "codex-research-instructions.md",
         _ => "codex-worker-instructions.md",
     };
     let instructions_path = brehon_root.join("instructions").join(instructions_filename);
@@ -1508,6 +1509,44 @@ impl Pane {
         Self::role_agent_with_agent_type_materialized(
             "advisor",
             PaneKind::Advisor,
+            name,
+            cwd,
+            session_name,
+            brehon_root,
+            rows,
+            cols,
+            adapter,
+            model,
+            server_url,
+            teams,
+            configured_agent_type,
+            reasoning_effort,
+            launcher_env,
+            materialization,
+        )
+    }
+
+    /// Create a research pane with explicit materialization behavior.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn research_with_agent_type_materialized(
+        name: &str,
+        cwd: PathBuf,
+        session_name: Option<&str>,
+        brehon_root: Option<&PathBuf>,
+        rows: u16,
+        cols: u16,
+        adapter: &AgentAdapter,
+        model: Option<&str>,
+        server_url: Option<&str>,
+        teams: Option<&TeamsSpawnConfig>,
+        configured_agent_type: Option<&str>,
+        reasoning_effort: Option<&str>,
+        launcher_env: &[(String, String)],
+        materialization: AgentPaneMaterialization,
+    ) -> Result<Self> {
+        Self::role_agent_with_agent_type_materialized(
+            "research",
+            PaneKind::Research,
             name,
             cwd,
             session_name,

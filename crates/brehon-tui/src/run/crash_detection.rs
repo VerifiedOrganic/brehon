@@ -138,6 +138,25 @@ pub(crate) fn perform_manual_pane_reset(
                 })
                 .map_err(|err| err.to_string())
         }
+        PaneKind::Research => {
+            let startup_prompt = if super::helpers::pane_needs_post_spawn_prompt(mux, pane_id) {
+                let Some(startup_prompt) = super::build_research_reset_startup_prompt(mux, pane_id)
+                else {
+                    return false;
+                };
+                Some(startup_prompt)
+            } else {
+                None
+            };
+            rt.block_on(mux.reset_research_session(pane_id))
+                .map(|_| {
+                    if let Some(startup_prompt) = startup_prompt {
+                        mux.queue_startup_prompt(pane_id, startup_prompt);
+                    }
+                    format!("manually reset research agent {pane_id}")
+                })
+                .map_err(|err| err.to_string())
+        }
         PaneKind::Supervisor => {
             let startup_prompt = if super::helpers::pane_needs_post_spawn_prompt(mux, pane_id) {
                 let Some(startup_prompt) =

@@ -132,6 +132,7 @@ fn push_codex_common_args(
             "supervisor" => "codex-supervisor-instructions.md",
             "reviewer" => "codex-reviewer-instructions.md",
             "advisor" => "codex-advisor-instructions.md",
+            "research" => "codex-research-instructions.md",
             _ => "codex-worker-instructions.md",
         };
         let instructions_path = root.join("instructions").join(instructions_filename);

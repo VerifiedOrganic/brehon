@@ -116,6 +116,7 @@ fn runtime_pane_kind(kind: &PaneKind) -> RuntimePaneKind {
         PaneKind::Shell => RuntimePaneKind::Shell,
         PaneKind::Reviewer => RuntimePaneKind::Reviewer,
         PaneKind::Advisor => RuntimePaneKind::Advisor,
+        PaneKind::Research => RuntimePaneKind::Research,
     }
 }
 

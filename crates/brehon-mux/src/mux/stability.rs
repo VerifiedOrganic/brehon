@@ -248,6 +248,78 @@ impl Mux {
         Ok(())
     }
 
+    /// Hard-reset a research session while keeping the visible pane slot.
+    ///
+    /// Research agents are read-only artifact producers; resetting clears the
+    /// model conversation without touching queued jobs or submitted artifacts.
+    pub async fn reset_research_session(&mut self, pane_id: &str) -> Result<()> {
+        self.ensure_pane_uses_isolated_cwd(pane_id, "research")?;
+        let (is_gateway_backed, gateway_session_id) = {
+            let pane = self
+                .panes
+                .get(pane_id)
+                .ok_or_else(|| Error::pane_not_found(pane_id))?;
+            if pane.kind() != &PaneKind::Research {
+                return Err(Error::pty(format!(
+                    "Pane '{pane_id}' is not a research agent and cannot be reset as research state"
+                )));
+            }
+            (
+                pane.is_gateway_backed(),
+                pane.gateway_session_id().map(brehon_types::SessionId::new),
+            )
+        };
+        let command = self.runtime_command_for_pane(
+            pane_id,
+            RuntimeCommandKind::ResetPane {
+                reason: "reset research session".to_string(),
+            },
+        );
+        let context = self.runtime_policy_context_for_pane(pane_id);
+        let decision = self.evaluate_runtime_policy(command, context).await;
+        if let Some(err) = Self::policy_decision_error("research reset", &decision) {
+            return Err(err);
+        }
+
+        if is_gateway_backed
+            && let Some(session_id) = gateway_session_id
+            && let Some(gateway) = self.gateway.as_ref()
+            && let Err(err) = brehon_ports::AgentGateway::kill_session(gateway, &session_id).await
+        {
+            let err_text = err.to_string();
+            let lower = err_text.to_ascii_lowercase();
+            if !(lower.contains("not found") || lower.contains("unknown session")) {
+                return Err(Error::pty(format!(
+                    "Failed to kill research gateway session for {pane_id}: {err_text}"
+                )));
+            }
+        }
+
+        self.clear_active_gateway_operations(pane_id);
+        if let Some(pane) = self.panes.get_mut(pane_id) {
+            if is_gateway_backed {
+                pane.clear_gateway_session();
+                if let Some(activity) = pane.activity_buffer_mut() {
+                    activity.clear();
+                }
+            } else {
+                pane.restart_pty_from_spawn_config()?;
+            }
+            pane.set_tool_executing(false);
+            pane.set_pending_inbox_nudge(false);
+            let notice = if is_gateway_backed {
+                "\x1b[2mBrehon reset research session. Rejoining the research queue with a fresh context.\x1b[0m\r\n"
+            } else {
+                "\x1b[2mBrehon restarted research process. Rejoining the research queue with a fresh context.\x1b[0m\r\n"
+            };
+            let _ = pane.append_output(notice.as_bytes());
+        }
+        self.mark_pane_ready_after_reset(pane_id, "research session reset");
+        clear_agent_health_marker(pane_id);
+
+        Ok(())
+    }
+
     /// Hard-reset a supervisor session while keeping the visible pane slot.
     ///
     /// Gateway-backed supervisors have their session killed and restarted on

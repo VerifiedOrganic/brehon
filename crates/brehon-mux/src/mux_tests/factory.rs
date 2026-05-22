@@ -71,6 +71,49 @@ fn test_factory_uses_isolated_supervisor_and_reviewer_cwds() {
 }
 
 #[test]
+fn test_factory_spawns_research_pane_with_pool_agent_type() {
+    let project_root = super::fresh_temp_dir("brehon-mux-research-pane");
+    let mut research_agent_type_map = HashMap::new();
+    research_agent_type_map.insert("research-specs".to_string(), "specs".to_string());
+
+    let mux = Mux::factory(MuxConfig {
+        cwd: project_root.clone(),
+        session_name: Some("research-session".to_string()),
+        pane_materialization: AgentPaneMaterialization::PlanOnly,
+        workers: 0,
+        worker_names: Vec::new(),
+        supervisor_name: "supervisor".to_string(),
+        supervisor_cli: AgentAdapter::BuiltIn(SupervisorCli::Codex),
+        worker_cli: AgentAdapter::BuiltIn(SupervisorCli::Codex),
+        research_names: vec!["research-specs".to_string()],
+        research_cli: AgentAdapter::BuiltIn(SupervisorCli::Codex),
+        research_agent_type_map,
+        include_director: false,
+        rows: 24,
+        cols: 120,
+        ..Default::default()
+    })
+    .expect("create mux");
+
+    let researcher = mux.get("research-specs").expect("research pane exists");
+    assert_eq!(researcher.kind(), &PaneKind::Research);
+    assert_eq!(researcher.configured_agent_type(), Some("specs"));
+    let env = researcher
+        .pty_spawn_config
+        .as_ref()
+        .map(|config| config.env.clone())
+        .unwrap_or_default();
+    assert!(
+        env.iter()
+            .any(|(key, value)| key == "BREHON_AGENT_ROLE" && value == "research")
+    );
+    assert!(
+        env.iter()
+            .any(|(key, value)| key == "BREHON_AGENT_TYPE" && value == "specs")
+    );
+}
+
+#[test]
 fn terminal_host_agent_factory_plan_aggregates_pane_launch_contracts() {
     let mut mux = Mux::new(24, 80);
     let mut pty_pane = Pane::new_with_backend_cli(

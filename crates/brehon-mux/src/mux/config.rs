@@ -39,6 +39,8 @@ pub struct MuxConfig {
     pub reviewer_cwds: HashMap<String, PathBuf>,
     /// Per-advisor working directories (advisor_name -> clone path).
     pub advisor_cwds: HashMap<String, PathBuf>,
+    /// Per-research-agent working directories (researcher_name -> clone path).
+    pub research_cwds: HashMap<String, PathBuf>,
     /// Number of worker agents
     pub workers: usize,
     /// Worker names (if not provided, generated)
@@ -118,6 +120,24 @@ pub struct MuxConfig {
     pub advisor_env_map: HashMap<String, Vec<(String, String)>>,
     /// Per-advisor structured server URLs.
     pub advisor_server_url_map: HashMap<String, String>,
+    /// Research pane names derived from research pools.
+    pub research_names: Vec<String>,
+    /// Research agent adapter.
+    pub research_cli: AgentAdapter,
+    /// Per-research adapter overrides.
+    pub research_cli_map: HashMap<String, AgentAdapter>,
+    /// Per-research configured pool id. Key = research pane name.
+    pub research_agent_type_map: HashMap<String, String>,
+    /// Model for research panes.
+    pub research_model: Option<String>,
+    /// Per-research model overrides.
+    pub research_model_map: HashMap<String, String>,
+    /// Per-research reasoning effort overrides.
+    pub research_reasoning_effort_map: HashMap<String, String>,
+    /// Per-research launcher environment overrides.
+    pub research_env_map: HashMap<String, Vec<(String, String)>>,
+    /// Per-research structured server URLs.
+    pub research_server_url_map: HashMap<String, String>,
     /// Configured supervisor agent type (role key / alias).
     pub supervisor_agent_type: Option<String>,
     /// Supervisor launcher environment overrides.
@@ -150,6 +170,7 @@ impl Default for MuxConfig {
             supervisor_cwd: None,
             reviewer_cwds: HashMap::new(),
             advisor_cwds: HashMap::new(),
+            research_cwds: HashMap::new(),
             workers: 2,
             worker_names: vec![],
             supervisor_name: "supervisor".to_string(),
@@ -186,6 +207,15 @@ impl Default for MuxConfig {
             advisor_reasoning_effort_map: HashMap::new(),
             advisor_env_map: HashMap::new(),
             advisor_server_url_map: HashMap::new(),
+            research_names: vec![],
+            research_cli: AgentAdapter::BuiltIn(SupervisorCli::Codex),
+            research_cli_map: HashMap::new(),
+            research_agent_type_map: HashMap::new(),
+            research_model: None,
+            research_model_map: HashMap::new(),
+            research_reasoning_effort_map: HashMap::new(),
+            research_env_map: HashMap::new(),
+            research_server_url_map: HashMap::new(),
             supervisor_agent_type: None,
             supervisor_env: Vec::new(),
             include_director: true,

@@ -2,8 +2,8 @@ use std::path::PathBuf;
 
 #[allow(unused_imports)]
 pub use brehon_types::{
-    build_advisor_startup_prompt, build_reviewer_startup_prompt, build_supervisor_startup_prompt,
-    build_worker_startup_prompt,
+    build_advisor_startup_prompt, build_research_startup_prompt, build_reviewer_startup_prompt,
+    build_supervisor_startup_prompt, build_worker_startup_prompt,
 };
 
 pub(crate) fn project_policy_for_role(brehon_root: Option<&PathBuf>, role: &str) -> Option<String> {

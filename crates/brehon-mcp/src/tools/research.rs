@@ -21,7 +21,9 @@ use serde_json::Value;
 
 use crate::error::McpError;
 use crate::server::ToolResult;
-use crate::tools::agent::{session_is_live, session_matches_current_runtime, try_deliver_message};
+use crate::tools::agent::{
+    resolve_supervisor_name, session_is_live, session_matches_current_runtime, try_deliver_message,
+};
 use crate::tools::{error_result, text_result, Tool};
 
 const JOB_STATUS_QUEUED: &str = "queued";
@@ -46,7 +48,25 @@ pub(crate) struct ResearchContextEntry {
     pub citations: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub supersedes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub handoff_deliveries: Vec<ResearchHandoffDelivery>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub handoff_warnings: Vec<String>,
     pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ResearchHandoffDelivery {
+    pub target: String,
+    pub target_role: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
+    pub queued_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -177,6 +197,13 @@ impl Tool for ResearchTool {
 
     async fn execute(&self, args: Value) -> Result<ToolResult, McpError> {
         let action = args.get("action").and_then(Value::as_str).unwrap_or("");
+        if caller_role() == "research"
+            && !matches!(action, "status" | "list" | "get" | "claim_next" | "submit")
+        {
+            return Ok(error_result(format!(
+                "Research agents may only use research actions status, list, get, claim_next, and submit; action '{action}' is not allowed."
+            )));
+        }
         let result = match action {
             "status" => research_status(),
             "list" => list_research(&args),
@@ -483,7 +510,36 @@ fn claim_next(args: &Value) -> Result<Value, String> {
     let task_filter = string_arg(args, "task_id");
     let agent = caller_name();
 
-    let mut jobs = read_all_jobs()?;
+    let all_jobs = read_all_jobs()?;
+    if let Some(job) = all_jobs
+        .iter()
+        .filter(|job| {
+            job.status == JOB_STATUS_RUNNING
+                && job.assigned_to.as_deref() == Some(agent.as_str())
+                && job_matches_claim_filters(
+                    job,
+                    pool_filter.as_deref(),
+                    role_filter.as_deref(),
+                    task_filter.as_deref(),
+                )
+        })
+        .min_by(|left, right| {
+            left.updated_at
+                .cmp(&right.updated_at)
+                .then_with(|| left.job_id.cmp(&right.job_id))
+        })
+        .cloned()
+    {
+        return Ok(serde_json::json!({
+            "status": "claimed",
+            "message": "this research agent already has a running job; resume and submit it before claiming another",
+            "job": job,
+            "submit": research_submit_hint(),
+            "next": research_next_claim_hint(),
+        }));
+    }
+
+    let mut jobs = all_jobs;
     jobs.retain(|job| job.status == JOB_STATUS_QUEUED);
     if let Some(pool) = pool_filter.as_deref() {
         jobs.retain(|job| job.pool == pool);
@@ -501,6 +557,49 @@ fn claim_next(args: &Value) -> Result<Value, String> {
             .then_with(|| left.job_id.cmp(&right.job_id))
     });
 
+    if let Some(config) = config.as_ref().filter(|config| config.research.enabled) {
+        let running_total = running_jobs(None)?;
+        let max_parallel = config.research.defaults.max_parallel_jobs as usize;
+        if running_total >= max_parallel {
+            return Ok(serde_json::json!({
+                "status": "idle",
+                "message": format!("research concurrency limit reached: {running_total}/{max_parallel} jobs are already running"),
+            }));
+        }
+
+        let had_capacity_candidates = !jobs.is_empty();
+        let mut running_by_pool: HashMap<String, usize> = HashMap::new();
+        let mut capacity_filtered = Vec::new();
+        for job in jobs {
+            let Some(pool) = config
+                .research
+                .pools
+                .iter()
+                .find(|pool| pool.id == job.pool)
+            else {
+                continue;
+            };
+            let running_for_pool = match running_by_pool.get(&job.pool) {
+                Some(count) => *count,
+                None => {
+                    let count = running_jobs(Some(&job.pool))?;
+                    running_by_pool.insert(job.pool.clone(), count);
+                    count
+                }
+            };
+            if running_for_pool < pool.max as usize {
+                capacity_filtered.push(job);
+            }
+        }
+        jobs = capacity_filtered;
+        if had_capacity_candidates && jobs.is_empty() {
+            return Ok(serde_json::json!({
+                "status": "idle",
+                "message": "no queued research jobs have available pool capacity",
+            }));
+        }
+    }
+
     let Some(mut job) = jobs.into_iter().next() else {
         return Ok(serde_json::json!({
             "status": "idle",
@@ -516,8 +615,28 @@ fn claim_next(args: &Value) -> Result<Value, String> {
     Ok(serde_json::json!({
         "status": "claimed",
         "job": job,
-        "submit": "When complete, call research action=submit task_id=<task_id> job_id=<job_id> summary=<summary> content=<markdown brief> citations=[...]",
+        "submit": research_submit_hint(),
+        "next": research_next_claim_hint(),
     }))
+}
+
+fn research_submit_hint() -> &'static str {
+    "When complete, call research action=submit task_id=<task_id> job_id=<job_id> summary=<summary> content=<markdown brief> citations=[...]"
+}
+
+fn research_next_claim_hint() -> &'static str {
+    "After submit succeeds, call research action=claim_next again and continue one job at a time until it returns idle."
+}
+
+fn job_matches_claim_filters(
+    job: &ResearchJobRecord,
+    pool: Option<&str>,
+    role: Option<&str>,
+    task_id: Option<&str>,
+) -> bool {
+    pool.is_none_or(|pool| job.pool == pool)
+        && role.is_none_or(|role| job.role == role)
+        && task_id.is_none_or(|task_id| job.task_id == task_id)
 }
 
 fn submit_artifact(args: &Value) -> Result<Value, String> {
@@ -600,7 +719,8 @@ fn submit_artifact(args: &Value) -> Result<Value, String> {
     atomic_write(&brief_path, brief.as_bytes())?;
     atomic_write(&structured_path, structured_yaml.as_bytes())?;
 
-    let entry = ResearchContextEntry {
+    let task_snapshot = read_task(&task_id).ok_or_else(|| format!("task '{task_id}' not found"))?;
+    let mut entry = ResearchContextEntry {
         artifact_id: artifact_id.clone(),
         job_id: job.job_id.clone(),
         pool: job.pool.clone(),
@@ -612,8 +732,13 @@ fn submit_artifact(args: &Value) -> Result<Value, String> {
         structured_path: project_relative_path(&structured_path),
         citations,
         supersedes,
+        handoff_deliveries: Vec::new(),
+        handoff_warnings: Vec::new(),
         created_at: Utc::now(),
     };
+    let handoff = deliver_research_handoff(&task_id, &task_snapshot, &entry);
+    entry.handoff_deliveries = handoff.deliveries;
+    entry.handoff_warnings = handoff.warnings;
 
     append_manifest_entry(&task_id, entry.clone())?;
     attach_artifact_to_task(&task_id, &entry)?;
@@ -621,15 +746,177 @@ fn submit_artifact(args: &Value) -> Result<Value, String> {
     job.status = JOB_STATUS_COMPLETED.to_string();
     job.artifact_id = Some(artifact_id.clone());
     job.warnings.extend(validation_warnings);
+    job.warnings.extend(entry.handoff_warnings.clone());
     job.updated_at = Utc::now();
     write_job(&job)?;
 
-    Ok(serde_json::json!({
+    let mut result = serde_json::json!({
         "status": "ok",
         "artifact": entry,
         "job": job,
         "next_action": "Artifact attached to task.research_context. Workers/reviewers should treat it as advisory context and verify claims."
-    }))
+    });
+    if !result["artifact"]["handoff_deliveries"]
+        .as_array()
+        .is_none_or(Vec::is_empty)
+    {
+        result["handoff_deliveries"] = result["artifact"]["handoff_deliveries"].clone();
+    }
+    if !result["artifact"]["handoff_warnings"]
+        .as_array()
+        .is_none_or(Vec::is_empty)
+    {
+        result["handoff_warnings"] = result["artifact"]["handoff_warnings"].clone();
+    }
+    Ok(result)
+}
+
+#[derive(Debug, Clone, Default)]
+struct ResearchHandoffOutcome {
+    deliveries: Vec<ResearchHandoffDelivery>,
+    warnings: Vec<String>,
+}
+
+fn deliver_research_handoff(
+    task_id: &str,
+    task: &Value,
+    entry: &ResearchContextEntry,
+) -> ResearchHandoffOutcome {
+    let mut outcome = ResearchHandoffOutcome::default();
+    let mut targets = Vec::new();
+    if let Some(assignee) = string_field(task, "assignee")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        targets.push(("worker".to_string(), assignee.to_string()));
+    }
+
+    if let Some(supervisor) = resolve_supervisor_name(None) {
+        targets.push(("supervisor".to_string(), supervisor));
+    } else {
+        let warning =
+            "research handoff could not notify supervisor: no live supervisor session resolved"
+                .to_string();
+        outcome.deliveries.push(undelivered_research_handoff(
+            "supervisor",
+            "supervisor",
+            warning.clone(),
+        ));
+        outcome.warnings.push(warning);
+    }
+
+    let existing_targets = existing_research_handoff_targets(task, &entry.artifact_id);
+    let mut seen_targets = HashSet::new();
+    let message = build_research_handoff_message(task_id, task, entry);
+    let from = caller_name();
+
+    for (target_role, target) in targets {
+        if !seen_targets.insert(target.clone()) {
+            continue;
+        }
+        if existing_targets.contains(&target) {
+            outcome.deliveries.push(ResearchHandoffDelivery {
+                target,
+                target_role,
+                status: "skipped_duplicate".to_string(),
+                method: None,
+                prompt_id: None,
+                warning: None,
+                queued_at: Utc::now(),
+            });
+            continue;
+        }
+
+        let delivery = try_deliver_message(&target, &from, &message);
+        let warning = (!delivery.queued).then(|| {
+            format!(
+                "research handoff could not notify {target_role} '{target}': {}",
+                delivery.method
+            )
+        });
+        if let Some(warning) = warning.as_ref() {
+            outcome.warnings.push(warning.clone());
+        }
+        outcome.deliveries.push(ResearchHandoffDelivery {
+            target,
+            target_role,
+            status: if delivery.queued { "queued" } else { "failed" }.to_string(),
+            method: Some(delivery.method),
+            prompt_id: (!delivery.prompt_id.is_empty()).then_some(delivery.prompt_id),
+            warning,
+            queued_at: Utc::now(),
+        });
+    }
+
+    outcome
+}
+
+fn existing_research_handoff_targets(task: &Value, artifact_id: &str) -> HashSet<String> {
+    task.get("research_context")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|entry| string_field(entry, "artifact_id") == Some(artifact_id))
+        .filter_map(|entry| entry.get("handoff_deliveries").and_then(Value::as_array))
+        .flatten()
+        .filter_map(|delivery| string_field(delivery, "target"))
+        .filter(|target| !target.trim().is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn undelivered_research_handoff(
+    target: &str,
+    target_role: &str,
+    warning: String,
+) -> ResearchHandoffDelivery {
+    ResearchHandoffDelivery {
+        target: target.to_string(),
+        target_role: target_role.to_string(),
+        status: "failed".to_string(),
+        method: None,
+        prompt_id: None,
+        warning: Some(warning),
+        queued_at: Utc::now(),
+    }
+}
+
+fn build_research_handoff_message(
+    task_id: &str,
+    task: &Value,
+    entry: &ResearchContextEntry,
+) -> String {
+    let task_title = string_field(task, "title").unwrap_or("Untitled task");
+    let mut lines = vec![
+        format!("Research artifact attached for task {task_id}: {task_title}"),
+        format!("Artifact: {} / {}", entry.artifact_id, entry.title),
+        format!("Summary: {}", compact_line(&entry.summary, 700)),
+    ];
+    if let Some(confidence) = entry.confidence.as_deref() {
+        lines.push(format!("Confidence: {}", compact_line(confidence, 120)));
+    }
+    if !entry.citations.is_empty() {
+        let first = entry.citations.first().map(String::as_str).unwrap_or("");
+        let citation_summary = if first.is_empty() {
+            format!("{} citation(s)", entry.citations.len())
+        } else {
+            format!(
+                "{} citation(s); first: {}",
+                entry.citations.len(),
+                compact_line(first, 180)
+            )
+        };
+        lines.push(format!("Citations: {citation_summary}"));
+    }
+    lines.push(format!("Brief: {}", entry.artifact_path));
+    if !entry.structured_path.is_empty() {
+        lines.push(format!("Data: {}", entry.structured_path));
+    }
+    lines.push(
+        "Next: refresh task context before continuing; treat research as advisory and verify claims."
+            .to_string(),
+    );
+    lines.join("\n")
 }
 
 fn attach_action(args: &Value) -> Result<Value, String> {
@@ -949,6 +1236,13 @@ fn active_jobs_for_task(task_id: &str) -> Result<usize, String> {
     Ok(read_jobs_for_task(task_id)?
         .into_iter()
         .filter(|job| matches!(job.status.as_str(), JOB_STATUS_QUEUED | JOB_STATUS_RUNNING))
+        .count())
+}
+
+fn running_jobs(pool: Option<&str>) -> Result<usize, String> {
+    Ok(read_all_jobs()?
+        .into_iter()
+        .filter(|job| job.status == JOB_STATUS_RUNNING && pool.is_none_or(|pool| job.pool == pool))
         .count())
 }
 
@@ -1681,7 +1975,9 @@ fn compact_line(value: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
     use crate::server::ContentBlock;
+    use crate::tools::agent::prompt_queue_root;
     use crate::tools::{Tool, TEST_ENV_LOCK};
+    use brehon_mux::{PromptQueueEntry, SessionScopedQueue};
 
     struct EnvGuard {
         previous: BTreeMap<String, Option<String>>,
@@ -1720,21 +2016,29 @@ mod tests {
     }
 
     fn write_task_fixture(brehon_root: &Path, task_id: &str) {
+        write_task_fixture_with_assignee(brehon_root, task_id, None);
+    }
+
+    fn write_task_fixture_with_assignee(brehon_root: &Path, task_id: &str, assignee: Option<&str>) {
         let tasks = brehon_root.join("runtime").join("tasks");
         std::fs::create_dir_all(&tasks).expect("tasks dir");
+        let mut task = serde_json::json!({
+            "task_id": task_id,
+            "title": "Implement PFCP association state",
+            "description": "Use TS 29.244 and RFC context.",
+            "status": "pending",
+            "priority": "high",
+            "task_type": "task",
+            "file_hints": ["crates/pfcp/src/lib.rs"],
+            "plan_steps": ["map normative requirements"]
+        });
+        if let Some(assignee) = assignee {
+            task["assignee"] = Value::String(assignee.to_string());
+            task["status"] = Value::String("in_progress".to_string());
+        }
         std::fs::write(
             tasks.join(format!("{task_id}.json")),
-            serde_json::to_string_pretty(&serde_json::json!({
-                "task_id": task_id,
-                "title": "Implement PFCP association state",
-                "description": "Use TS 29.244 and RFC context.",
-                "status": "pending",
-                "priority": "high",
-                "task_type": "task",
-                "file_hints": ["crates/pfcp/src/lib.rs"],
-                "plan_steps": ["map normative requirements"]
-            }))
-            .unwrap(),
+            serde_json::to_string_pretty(&task).unwrap(),
         )
         .expect("task");
     }
@@ -1771,6 +2075,48 @@ research:
 "#,
         )
         .expect("config");
+    }
+
+    fn write_research_job_fixture(
+        task_id: &str,
+        job_id: &str,
+        pool: &str,
+        status: &str,
+    ) -> ResearchJobRecord {
+        let now = Utc::now();
+        let job = ResearchJobRecord {
+            job_id: job_id.to_string(),
+            task_id: task_id.to_string(),
+            route_id: None,
+            template_id: "normative-requirements".to_string(),
+            pool: pool.to_string(),
+            lane: "research-cheap".to_string(),
+            role: "normative_requirements".to_string(),
+            status: status.to_string(),
+            origin: "test".to_string(),
+            prompt: "Research the task.".to_string(),
+            cost_units: 1,
+            requested_by: "test".to_string(),
+            assigned_to: (status == JOB_STATUS_RUNNING).then(|| "research-running".to_string()),
+            artifact_id: None,
+            depends_on: Vec::new(),
+            warnings: Vec::new(),
+            created_at: now,
+            updated_at: now,
+        };
+        write_job(&job).expect("write research job");
+        job
+    }
+
+    fn drain_prompt_queue(brehon_root: &Path, session_name: &str) -> Vec<PromptQueueEntry> {
+        let prompt_queue = SessionScopedQueue::<PromptQueueEntry>::new(
+            session_name,
+            prompt_queue_root(brehon_root),
+        );
+        prompt_queue
+            .drain()
+            .map(|entry| entry.expect("prompt entry should decode").entry)
+            .collect()
     }
 
     #[tokio::test]
@@ -1843,6 +2189,396 @@ research:
             .as_str()
             .unwrap()
             .ends_with("brief.md"));
+    }
+
+    #[tokio::test]
+    async fn submit_delivers_compact_handoff_to_worker_and_supervisor() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let brehon_root = temp.path().join(".brehon");
+        let config_home = temp.path().join("xdg-config");
+        std::fs::create_dir_all(&brehon_root).expect("brehon root");
+        std::fs::create_dir_all(&config_home).expect("config home");
+        write_config_fixture(temp.path());
+        write_task_fixture_with_assignee(&brehon_root, "T-handoff", Some("worker-1"));
+        let config_home = config_home.to_string_lossy().to_string();
+        let _env = EnvGuard::set(&[
+            ("BREHON_ROOT", brehon_root.to_str().unwrap()),
+            ("XDG_CONFIG_HOME", &config_home),
+            ("BREHON_AGENT_NAME", "research-1"),
+            ("BREHON_AGENT_ROLE", "research"),
+            ("BREHON_SUPERVISOR_NAME", "supervisor-1"),
+            ("BREHON_SESSION_NAME", "research-handoff-test"),
+        ]);
+        write_research_job_fixture(
+            "T-handoff",
+            "RJOB-T-handoff-spec-001",
+            "specs",
+            JOB_STATUS_RUNNING,
+        );
+
+        let submit = text_json(
+            ResearchTool::new()
+                .execute(serde_json::json!({
+                    "action": "submit",
+                    "task_id": "T-handoff",
+                    "job_id": "RJOB-T-handoff-spec-001",
+                    "title": "PFCP normative map",
+                    "summary": "PFCP association state needs heartbeat and recovery timestamp handling.",
+                    "confidence": "high",
+                    "content": "## Full brief\nsecret full brief line that should not be pushed into handoff messages\n",
+                    "citations": ["3GPP TS 29.244 section 5"]
+                }))
+                .await
+                .unwrap(),
+        );
+
+        assert_eq!(submit["status"], "ok");
+        assert!(submit["handoff_warnings"].is_null());
+        let artifact_id = submit["artifact"]["artifact_id"].as_str().unwrap();
+        let deliveries = submit["handoff_deliveries"].as_array().unwrap();
+        assert_eq!(deliveries.len(), 2);
+        assert!(deliveries
+            .iter()
+            .any(|delivery| delivery["target"] == "worker-1" && delivery["status"] == "queued"));
+        assert!(
+            deliveries
+                .iter()
+                .any(|delivery| delivery["target"] == "supervisor-1"
+                    && delivery["status"] == "queued")
+        );
+
+        let prompts = drain_prompt_queue(&brehon_root, "research-handoff-test");
+        assert_eq!(prompts.len(), 2);
+        let worker_prompt = prompts
+            .iter()
+            .find(|prompt| prompt.target == "worker-1")
+            .expect("worker prompt");
+        assert_eq!(worker_prompt.from.as_deref(), Some("research-1"));
+        assert!(worker_prompt.message.contains(artifact_id));
+        assert!(worker_prompt.message.contains("PFCP normative map"));
+        assert!(worker_prompt
+            .message
+            .contains("Summary: PFCP association state"));
+        assert!(worker_prompt
+            .message
+            .contains("Brief: .brehon/runtime/research"));
+        assert!(worker_prompt
+            .message
+            .contains("Data: .brehon/runtime/research"));
+        assert!(worker_prompt.message.contains("Citations: 1 citation(s)"));
+        assert!(!worker_prompt.message.contains("secret full brief line"));
+        assert!(prompts.iter().any(|prompt| prompt.target == "supervisor-1"));
+
+        let task: Value = serde_json::from_str(
+            &std::fs::read_to_string(brehon_root.join("runtime/tasks/T-handoff.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(task["research_context"][0]["artifact_id"], artifact_id);
+        assert_eq!(
+            task["research_context"][0]["handoff_deliveries"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_records_handoff_warning_when_prompt_queue_write_fails() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let brehon_root = temp.path().join(".brehon");
+        let config_home = temp.path().join("xdg-config");
+        std::fs::create_dir_all(&brehon_root).expect("brehon root");
+        std::fs::create_dir_all(&config_home).expect("config home");
+        write_config_fixture(temp.path());
+        write_task_fixture_with_assignee(&brehon_root, "T-warning", Some("worker-1"));
+        std::fs::write(brehon_root.join("runtime/prompt-queue"), "not a directory")
+            .expect("prompt queue blocker");
+        let config_home = config_home.to_string_lossy().to_string();
+        let _env = EnvGuard::set(&[
+            ("BREHON_ROOT", brehon_root.to_str().unwrap()),
+            ("XDG_CONFIG_HOME", &config_home),
+            ("BREHON_AGENT_NAME", "research-1"),
+            ("BREHON_AGENT_ROLE", "research"),
+            ("BREHON_SUPERVISOR_NAME", "supervisor-1"),
+            ("BREHON_SESSION_NAME", "research-handoff-warning-test"),
+        ]);
+        write_research_job_fixture(
+            "T-warning",
+            "RJOB-T-warning-spec-001",
+            "specs",
+            JOB_STATUS_RUNNING,
+        );
+
+        let submit = text_json(
+            ResearchTool::new()
+                .execute(serde_json::json!({
+                    "action": "submit",
+                    "task_id": "T-warning",
+                    "job_id": "RJOB-T-warning-spec-001",
+                    "title": "PFCP warning map",
+                    "summary": "Handoff warning path.",
+                    "content": "## Findings\nPersist even if delivery fails.\n",
+                    "citations": ["local fixture"]
+                }))
+                .await
+                .unwrap(),
+        );
+
+        assert_eq!(submit["status"], "ok");
+        assert!(submit["handoff_warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| warning
+                .as_str()
+                .unwrap()
+                .contains("could not notify worker")));
+        assert!(submit["handoff_deliveries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|delivery| delivery["target"] == "worker-1" && delivery["status"] == "failed"));
+        assert!(brehon_root
+            .join("runtime/research/T-warning")
+            .join(submit["artifact"]["artifact_id"].as_str().unwrap())
+            .join("brief.md")
+            .exists());
+        let task: Value = serde_json::from_str(
+            &std::fs::read_to_string(brehon_root.join("runtime/tasks/T-warning.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(task["research_context"][0]["title"], "PFCP warning map");
+        assert!(task["research_context"][0]["handoff_warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| warning
+                .as_str()
+                .unwrap()
+                .contains("could not notify worker")));
+    }
+
+    #[test]
+    fn handoff_delivery_skips_duplicate_artifact_targets() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let brehon_root = temp.path().join(".brehon");
+        std::fs::create_dir_all(&brehon_root).expect("brehon root");
+        let _env = EnvGuard::set(&[
+            ("BREHON_ROOT", brehon_root.to_str().unwrap()),
+            ("BREHON_AGENT_NAME", "research-1"),
+            ("BREHON_SUPERVISOR_NAME", "supervisor-1"),
+            ("BREHON_SESSION_NAME", "research-handoff-dup-test"),
+        ]);
+        let artifact_id = "RCH-T-dup-spec-001";
+        let task = serde_json::json!({
+            "task_id": "T-dup",
+            "title": "Duplicate handoff",
+            "assignee": "worker-1",
+            "research_context": [{
+                "artifact_id": artifact_id,
+                "handoff_deliveries": [{
+                    "target": "worker-1",
+                    "target_role": "worker",
+                    "status": "queued",
+                    "queued_at": Utc::now()
+                }]
+            }]
+        });
+        let entry = ResearchContextEntry {
+            artifact_id: artifact_id.to_string(),
+            job_id: "RJOB-T-dup-spec-001".to_string(),
+            pool: "specs".to_string(),
+            role: "normative_requirements".to_string(),
+            title: "Duplicate map".to_string(),
+            summary: "Do not deliver the same artifact to the same target twice.".to_string(),
+            confidence: None,
+            artifact_path: ".brehon/runtime/research/T-dup/RCH-T-dup-spec-001/brief.md".to_string(),
+            structured_path: ".brehon/runtime/research/T-dup/RCH-T-dup-spec-001/artifact.yaml"
+                .to_string(),
+            citations: Vec::new(),
+            supersedes: Vec::new(),
+            handoff_deliveries: Vec::new(),
+            handoff_warnings: Vec::new(),
+            created_at: Utc::now(),
+        };
+
+        let outcome = deliver_research_handoff("T-dup", &task, &entry);
+
+        assert!(outcome.deliveries.iter().any(|delivery| {
+            delivery.target == "worker-1" && delivery.status == "skipped_duplicate"
+        }));
+        assert!(outcome
+            .deliveries
+            .iter()
+            .any(|delivery| { delivery.target == "supervisor-1" && delivery.status == "queued" }));
+        let prompts = drain_prompt_queue(&brehon_root, "research-handoff-dup-test");
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prompts[0].target, "supervisor-1");
+    }
+
+    #[tokio::test]
+    async fn research_role_cannot_queue_or_mutate_research_jobs() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let brehon_root = temp.path().join(".brehon");
+        let config_home = temp.path().join("xdg-config");
+        std::fs::create_dir_all(&brehon_root).expect("brehon root");
+        std::fs::create_dir_all(&config_home).expect("config home");
+        write_config_fixture(temp.path());
+        write_task_fixture(&brehon_root, "T-readonly");
+        let config_home = config_home.to_string_lossy().to_string();
+        let _env = EnvGuard::set(&[
+            ("BREHON_ROOT", brehon_root.to_str().unwrap()),
+            ("XDG_CONFIG_HOME", &config_home),
+            ("BREHON_AGENT_NAME", "research-1"),
+            ("BREHON_AGENT_ROLE", "research"),
+        ]);
+
+        let result = ResearchTool::new()
+            .execute(serde_json::json!({
+                "action": "request",
+                "task_id": "T-readonly",
+                "role": "normative_requirements",
+                "prompt": "Queueing jobs is not part of the research role."
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(result.is_error, Some(true));
+        if let ContentBlock::Text { text } = &result.content[0] {
+            assert!(text.contains("Research agents may only use research actions"));
+            assert!(text.contains("request"));
+        }
+    }
+
+    #[tokio::test]
+    async fn claim_next_respects_pool_max() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let brehon_root = temp.path().join(".brehon");
+        let config_home = temp.path().join("xdg-config");
+        std::fs::create_dir_all(&brehon_root).expect("brehon root");
+        std::fs::create_dir_all(&config_home).expect("config home");
+        write_config_fixture(temp.path());
+        let config_home = config_home.to_string_lossy().to_string();
+        let _env = EnvGuard::set(&[
+            ("BREHON_ROOT", brehon_root.to_str().unwrap()),
+            ("XDG_CONFIG_HOME", &config_home),
+            ("BREHON_AGENT_NAME", "research-1"),
+            ("BREHON_AGENT_ROLE", "research"),
+        ]);
+        write_research_job_fixture("T-pool", "running-1", "specs", JOB_STATUS_RUNNING);
+        write_research_job_fixture("T-pool", "running-2", "specs", JOB_STATUS_RUNNING);
+        write_research_job_fixture("T-pool", "queued-1", "specs", JOB_STATUS_QUEUED);
+
+        let claim = text_json(
+            ResearchTool::new()
+                .execute(serde_json::json!({
+                    "action": "claim_next",
+                    "pool": "specs"
+                }))
+                .await
+                .unwrap(),
+        );
+
+        assert_eq!(claim["status"], "idle");
+        assert!(claim["message"]
+            .as_str()
+            .unwrap()
+            .contains("available pool capacity"));
+        let queued = read_job("T-pool", "queued-1").unwrap().unwrap();
+        assert_eq!(queued.status, JOB_STATUS_QUEUED);
+        assert!(queued.assigned_to.is_none());
+    }
+
+    #[tokio::test]
+    async fn claim_next_returns_existing_running_job_for_same_agent() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let brehon_root = temp.path().join(".brehon");
+        let config_home = temp.path().join("xdg-config");
+        std::fs::create_dir_all(&brehon_root).expect("brehon root");
+        std::fs::create_dir_all(&config_home).expect("config home");
+        write_config_fixture(temp.path());
+        let config_home = config_home.to_string_lossy().to_string();
+        let _env = EnvGuard::set(&[
+            ("BREHON_ROOT", brehon_root.to_str().unwrap()),
+            ("XDG_CONFIG_HOME", &config_home),
+            ("BREHON_AGENT_NAME", "research-running"),
+            ("BREHON_AGENT_ROLE", "research"),
+        ]);
+        write_research_job_fixture("T-running", "running-1", "specs", JOB_STATUS_RUNNING);
+        write_research_job_fixture("T-running", "queued-1", "specs", JOB_STATUS_QUEUED);
+
+        let claim = text_json(
+            ResearchTool::new()
+                .execute(serde_json::json!({
+                    "action": "claim_next",
+                    "pool": "specs"
+                }))
+                .await
+                .unwrap(),
+        );
+
+        assert_eq!(claim["status"], "claimed");
+        assert_eq!(claim["job"]["job_id"], "running-1");
+        assert!(claim["message"]
+            .as_str()
+            .unwrap()
+            .contains("already has a running job"));
+        assert!(claim["next"].as_str().unwrap().contains("claim_next again"));
+        let queued = read_job("T-running", "queued-1").unwrap().unwrap();
+        assert_eq!(queued.status, JOB_STATUS_QUEUED);
+        assert!(queued.assigned_to.is_none());
+    }
+
+    #[tokio::test]
+    async fn claim_next_respects_global_max_parallel_jobs() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let brehon_root = temp.path().join(".brehon");
+        let config_home = temp.path().join("xdg-config");
+        std::fs::create_dir_all(&brehon_root).expect("brehon root");
+        std::fs::create_dir_all(&config_home).expect("config home");
+        write_config_fixture(temp.path());
+        let config_path = temp.path().join(".brehon").join("config.yaml");
+        let config = std::fs::read_to_string(&config_path).unwrap().replace(
+            "research:\n  enabled: true",
+            "research:\n  enabled: true\n  defaults:\n    max_parallel_jobs: 1",
+        );
+        std::fs::write(&config_path, config).unwrap();
+        let config_home = config_home.to_string_lossy().to_string();
+        let _env = EnvGuard::set(&[
+            ("BREHON_ROOT", brehon_root.to_str().unwrap()),
+            ("XDG_CONFIG_HOME", &config_home),
+            ("BREHON_AGENT_NAME", "research-1"),
+            ("BREHON_AGENT_ROLE", "research"),
+        ]);
+        write_research_job_fixture("T-global", "running-1", "specs", JOB_STATUS_RUNNING);
+        write_research_job_fixture("T-global", "queued-1", "specs", JOB_STATUS_QUEUED);
+
+        let claim = text_json(
+            ResearchTool::new()
+                .execute(serde_json::json!({
+                    "action": "claim_next",
+                    "pool": "specs"
+                }))
+                .await
+                .unwrap(),
+        );
+
+        assert_eq!(claim["status"], "idle");
+        assert!(claim["message"]
+            .as_str()
+            .unwrap()
+            .contains("concurrency limit reached"));
+        let queued = read_job("T-global", "queued-1").unwrap().unwrap();
+        assert_eq!(queued.status, JOB_STATUS_QUEUED);
+        assert!(queued.assigned_to.is_none());
     }
 
     #[test]

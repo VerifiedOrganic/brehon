@@ -84,8 +84,9 @@ use super::reviewer_selection::{
     ReviewerSelectionState,
 };
 use super::self_improvement::{
-    build_advisor_reset_startup_prompt, build_reviewer_reset_startup_prompt,
-    build_supervisor_reset_startup_prompt, build_worker_context_reset_startup_prompt,
+    build_advisor_reset_startup_prompt, build_research_reset_startup_prompt,
+    build_reviewer_reset_startup_prompt, build_supervisor_reset_startup_prompt,
+    build_worker_context_reset_startup_prompt,
 };
 use super::session::read_session_files;
 use super::task_detail::{handle_task_detail_mouse_event, render_task_detail_dialog};
@@ -182,6 +183,7 @@ pub(crate) struct EventLoopCtx {
     pub worker_ids: Vec<String>,
     pub all_reviewer_ids: Vec<String>,
     pub advisor_ids: Vec<String>,
+    pub research_ids: Vec<String>,
     pub supervisor_id: Option<String>,
 
     // Reviewer panels
@@ -369,6 +371,17 @@ fn manual_reset_plan(ctx: &EventLoopCtx, pane_id: &str) -> Option<(Option<String
                 None
             };
             Some((startup_prompt, format!("manually reset advisor {pane_id}")))
+        }
+        PaneKind::Research => {
+            let startup_prompt = if pane_needs_post_spawn_prompt(&ctx.mux, pane_id) {
+                build_research_reset_startup_prompt(&ctx.mux, pane_id)
+            } else {
+                None
+            };
+            Some((
+                startup_prompt,
+                format!("manually reset research agent {pane_id}"),
+            ))
         }
         PaneKind::Supervisor => {
             let startup_prompt = if pane_needs_post_spawn_prompt(&ctx.mux, pane_id) {
@@ -1367,6 +1380,7 @@ fn resize_panes(ctx: &mut EventLoopCtx, terminal_size: &Rect) {
         &ctx.worker_ids,
         &ctx.all_reviewer_ids,
         &ctx.advisor_ids,
+        &ctx.research_ids,
         &ctx.supervisor_id,
         ctx.group_tab,
         ctx.has_panels,
@@ -1384,6 +1398,7 @@ fn resize_panes(ctx: &mut EventLoopCtx, terminal_size: &Rect) {
         .iter()
         .chain(ctx.all_reviewer_ids.iter())
         .chain(ctx.advisor_ids.iter())
+        .chain(ctx.research_ids.iter())
     {
         if ctx.mux.get(pane_id).is_none() {
             continue;
@@ -3533,6 +3548,11 @@ mod tests {
             .filter(|pane| pane.kind() == &PaneKind::Advisor)
             .map(|pane| pane.id().to_string())
             .collect::<Vec<_>>();
+        let research_ids = mux
+            .panes()
+            .filter(|pane| pane.kind() == &PaneKind::Research)
+            .map(|pane| pane.id().to_string())
+            .collect::<Vec<_>>();
         let supervisor_id = mux
             .panes()
             .find(|pane| pane.kind() == &PaneKind::Supervisor)
@@ -3609,6 +3629,7 @@ mod tests {
                 worker_ids,
                 all_reviewer_ids,
                 advisor_ids,
+                research_ids,
                 supervisor_id,
                 fallback_panels: Vec::new(),
                 has_panels: false,

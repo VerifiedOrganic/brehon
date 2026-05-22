@@ -348,6 +348,7 @@ pub enum RuntimePaneKind {
     Worker,
     Reviewer,
     Advisor,
+    Research,
     Director,
     Shell,
     Unknown,

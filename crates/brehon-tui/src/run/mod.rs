@@ -353,6 +353,11 @@ pub fn run_tui_with_panels_and_runtime_commands(
         .filter(|p| *p.kind() == PaneKind::Advisor)
         .map(|p| p.id().to_string())
         .collect();
+    let research_ids: Vec<String> = mux
+        .panes()
+        .filter(|p| *p.kind() == PaneKind::Research)
+        .map(|p| p.id().to_string())
+        .collect();
     let supervisor_id: Option<String> = mux
         .panes()
         .find(|p| *p.kind() == PaneKind::Supervisor)
@@ -462,6 +467,7 @@ pub fn run_tui_with_panels_and_runtime_commands(
         worker_ids,
         all_reviewer_ids,
         advisor_ids,
+        research_ids,
         supervisor_id,
         fallback_panels,
         has_panels,
