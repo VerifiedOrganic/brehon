@@ -27,4 +27,5 @@ async-trait = { workspace = true }
 brehon-config = { path = "../brehon-config" }
 brehon-mux = { path = "../brehon-mux", features = ["test-pty-fallback"] }
 insta = "1"
+portable-pty = { workspace = true }
 tempfile = "3"

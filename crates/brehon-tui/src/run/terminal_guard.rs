@@ -9,6 +9,11 @@
 //! an orderly shutdown has fully completed and the terminal has already been
 //! restored. If the guard is dropped without being disarmed, it automatically
 //! invokes [`restore_terminal_session`].
+//!
+//! Brehon owns the dashboard terminal profile. Embedded fullscreen attach may
+//! temporarily hand stdout and input modes to Panesmith, but the TUI must pass
+//! [`BrehonDashboardTerminalControl`] so detach restores this exact dashboard
+//! profile instead of Panesmith's generic crossterm host profile.
 
 use std::io::{self, Write};
 use std::time::Duration;

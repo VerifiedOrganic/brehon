@@ -882,6 +882,7 @@ dependencies = [
  "crossterm 0.29.0",
  "insta",
  "panesmith",
+ "portable-pty",
  "ratatui",
  "serde",
  "serde_json",
