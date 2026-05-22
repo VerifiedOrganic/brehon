@@ -360,6 +360,54 @@ fn test_panesmith_supervisor_input_is_mirrored_to_mux_events() {
     );
 }
 
+#[test]
+fn test_panesmith_supervisor_prompt_delivery_uses_transaction() {
+    let project_root = super::fresh_temp_dir("brehon-mux-panesmith-prompt");
+    let config = MuxConfig {
+        cwd: project_root,
+        workers: 0,
+        supervisor_name: "codex-supervisor".to_string(),
+        supervisor_cli: AgentAdapter::BuiltIn(SupervisorCli::Codex),
+        include_director: false,
+        rows: 24,
+        cols: 100,
+        ..Default::default()
+    };
+    let mut mux = Mux::factory(config).expect("create mux");
+    let rt = tokio::runtime::Runtime::new().expect("create runtime");
+
+    let attempt = rt
+        .block_on(mux.attempt_prompt_delivery(
+            "codex-supervisor",
+            "hello from panesmith transaction",
+            None,
+        ))
+        .expect("deliver prompt through Panesmith transaction");
+
+    assert!(
+        matches!(attempt, PromptDeliveryAttempt::Delivered { .. }),
+        "expected delivered prompt, got {attempt:?}"
+    );
+
+    let mut saw_snapshot_text = false;
+    for _ in 0..50 {
+        let (_bytes, _events) = mux.poll_batch();
+        saw_snapshot_text = mux
+            .panesmith_snapshot("codex-supervisor")
+            .map(panesmith_snapshot_text)
+            .is_some_and(|text| text.contains("hello from panesmith transaction"));
+        if saw_snapshot_text {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    assert!(
+        saw_snapshot_text,
+        "expected transaction-delivered prompt in Panesmith snapshot"
+    );
+}
+
 fn panesmith_snapshot_text(snapshot: &::panesmith::OwnedPaneSnapshot) -> String {
     snapshot
         .surface

@@ -445,7 +445,7 @@ impl Mux {
                 false
             })
         {
-            // Input was routed through PaneManager::send_input.
+            // Input was routed through Panesmith's explicit raw-byte escape hatch.
         } else if let Some(writer) = self
             .panes
             .get(pane_id)
@@ -484,6 +484,36 @@ impl Mux {
         let decision = self.evaluate_runtime_policy_immediate(command, context);
         if let Some(err) = Self::policy_decision_error("inbox nudge", &decision) {
             tracing::warn!(pane = %pane_id, error = %err, "Dropped inbox nudge by policy");
+            return;
+        }
+        if self.is_panesmith_managed(pane_id) {
+            if let Err(err) = self
+                .send_panesmith_input_transaction(
+                    pane_id,
+                    super::panesmith::panesmith_enter_transaction(),
+                )
+                .and_then(|outcome| {
+                    let outcome = outcome.ok_or_else(|| Error::pane_not_found(pane_id))?;
+                    if outcome.errors.is_empty() {
+                        Ok(())
+                    } else {
+                        Err(Error::pty(format!(
+                            "Panesmith inbox nudge failed: {:?}",
+                            outcome.errors
+                        )))
+                    }
+                })
+            {
+                tracing::warn!(
+                    pane = %pane_id,
+                    error = %err,
+                    "Panesmith inbox nudge failed; flush_pending_inbox_nudges will re-detect on the next cycle"
+                );
+                return;
+            }
+            if let Some(pane) = self.panes.get_mut(pane_id) {
+                pane.set_pending_inbox_nudge(false);
+            }
             return;
         }
         let Some(writer) = pane.pty_writer_handle() else {
@@ -900,7 +930,26 @@ impl Mux {
             HarnessControlPlane::PtyInjection | HarnessControlPlane::OneShot => {}
         }
 
-        if let Some(injector) = injector {
+        if self.is_panesmith_managed(pane_id) {
+            match rt.block_on(self.send_panesmith_prompt_transaction(pane_id, &prompt)) {
+                Ok(Some(outcome)) if outcome.errors.is_empty() => {}
+                Ok(Some(outcome)) => {
+                    tracing::warn!(
+                        pane = %pane_id,
+                        outcome = ?outcome,
+                        "Panesmith prompt transaction failed"
+                    );
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    tracing::warn!(
+                        pane = %pane_id,
+                        error = %err,
+                        "Panesmith prompt transaction failed"
+                    );
+                }
+            }
+        } else if let Some(injector) = injector {
             if !pty_prompt_ready {
                 let inject_after = Instant::now() + PTY_INK_PROMPT_QUIET_THRESHOLD;
                 match self.queue_delayed_prompt(pane_id, prompt, from, inject_after, None) {
@@ -1142,6 +1191,22 @@ impl Mux {
         prompt_id: PromptId,
         generation: Generation,
     ) -> Result<PromptDeliveryAttempt> {
+        if let Some(outcome) = self
+            .send_panesmith_prompt_transaction(pane_id, prompt)
+            .await?
+        {
+            if !outcome.errors.is_empty() {
+                return Err(Error::pty(format!(
+                    "Panesmith prompt transaction failed: {:?}",
+                    outcome.errors
+                )));
+            }
+            return Ok(PromptDeliveryAttempt::Delivered {
+                prompt_id,
+                generation,
+            });
+        }
+
         if self.panes.get(pane_id).is_some_and(|pane| {
             !pane.is_ready_for_ink_prompt_injection(Instant::now(), PTY_INK_PROMPT_QUIET_THRESHOLD)
         }) {
@@ -1983,6 +2048,36 @@ impl Mux {
                 );
             }
             ClaudePromptState::Draft => {
+                if self.is_panesmith_managed(pane_id) {
+                    match self.send_panesmith_input_transaction(
+                        pane_id,
+                        panesmith::InputTransaction::interrupt(),
+                    ) {
+                        Ok(Some(outcome)) if outcome.errors.is_empty() => {
+                            tracing::warn!(
+                                pane = %pane_id,
+                                "Cleared stale supervisor draft via Panesmith Ctrl-C transaction; re-entering recovery on next tick"
+                            );
+                        }
+                        Ok(Some(outcome)) => {
+                            tracing::warn!(
+                                pane = %pane_id,
+                                outcome = ?outcome,
+                                "Failed to send Panesmith Ctrl-C transaction during supervisor inbox recovery"
+                            );
+                        }
+                        Ok(None) => {}
+                        Err(err) => {
+                            tracing::warn!(
+                                pane = %pane_id,
+                                error = %err,
+                                "Failed to send Panesmith Ctrl-C transaction during supervisor inbox recovery"
+                            );
+                        }
+                    }
+                    return;
+                }
+
                 let pane = match self.panes.get(pane_id) {
                     Some(pane) => pane,
                     None => return,
@@ -2005,6 +2100,39 @@ impl Mux {
                 );
             }
             ClaudePromptState::Empty | ClaudePromptState::None => {
+                if self.is_panesmith_managed(pane_id) {
+                    match self
+                        .send_panesmith_prompt_transaction(pane_id, prompt)
+                        .await
+                    {
+                        Ok(Some(outcome)) if outcome.errors.is_empty() => {
+                            if let Some(pane) = self.panes.get_mut(pane_id) {
+                                pane.set_pending_inbox_nudge(false);
+                            }
+                            tracing::warn!(
+                                pane = %pane_id,
+                                "Forced supervisor prompt injection through Panesmith transaction after Teams inbox nudge remained blocked"
+                            );
+                        }
+                        Ok(Some(outcome)) => {
+                            tracing::warn!(
+                                pane = %pane_id,
+                                outcome = ?outcome,
+                                "Failed to force supervisor prompt injection through Panesmith transaction"
+                            );
+                        }
+                        Ok(None) => {}
+                        Err(err) => {
+                            tracing::warn!(
+                                pane = %pane_id,
+                                error = %err,
+                                "Failed to force supervisor prompt injection through Panesmith transaction"
+                            );
+                        }
+                    }
+                    return;
+                }
+
                 let pane = match self.panes.get(pane_id) {
                     Some(pane) => pane,
                     None => return,

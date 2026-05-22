@@ -21,6 +21,9 @@ pub use prompts::{
 
 #[cfg(test)]
 mod tests {
+    use crate::pty::agents::claude::{
+        claude_builtin_skill_names_for_role, prepare_local_claude_skills,
+    };
     use crate::pty::agents::copilot::{
         desired_copilot_mcp_config, prepare_local_copilot_runtime_with_global_config,
     };
@@ -259,6 +262,124 @@ mod tests {
         assert!(!config.env.iter().any(|(k, _)| k == "BREHON_ROOT"));
     }
 
+    #[test]
+    fn test_prepare_local_claude_skills_writes_role_scoped_native_skills() {
+        let temp_dir = fresh_temp_dir("brehon-claude-skills");
+        let runtime_skills = temp_dir
+            .join(".brehon/factory-runtime/claude/claude-supervisor/skills-project/.claude/skills");
+        std::fs::create_dir_all(runtime_skills.join("brehon-supervisor")).unwrap();
+        std::fs::write(
+            runtime_skills.join("brehon-supervisor/SKILL.md"),
+            "stale supervisor skill",
+        )
+        .unwrap();
+        std::fs::create_dir_all(runtime_skills.join("brehon-supervisor-checklist")).unwrap();
+        std::fs::write(
+            runtime_skills.join("brehon-supervisor-checklist/SKILL.md"),
+            "stale checklist skill",
+        )
+        .unwrap();
+        std::fs::create_dir_all(runtime_skills.join("brehon-worker")).unwrap();
+        std::fs::write(
+            runtime_skills.join("brehon-worker/SKILL.md"),
+            "stale worker skill",
+        )
+        .unwrap();
+        std::fs::create_dir_all(runtime_skills.join("custom-local")).unwrap();
+        std::fs::write(runtime_skills.join("custom-local/SKILL.md"), "local skill").unwrap();
+
+        let project_dir =
+            prepare_local_claude_skills(&temp_dir, "claude-supervisor", "supervisor").unwrap();
+
+        assert_eq!(
+            project_dir,
+            temp_dir.join(".brehon/factory-runtime/claude/claude-supervisor/skills-project")
+        );
+        let discovery = runtime_skills.join("brehon-discovery/SKILL.md");
+        let discovery_content = std::fs::read_to_string(discovery).unwrap();
+        assert!(discovery_content.contains("name: brehon-discovery"));
+        assert!(discovery_content.contains("description: "));
+        assert!(
+            !discovery_content.contains("\nroles:"),
+            "Claude native skill files should not include Brehon MCP-only metadata"
+        );
+        assert!(runtime_skills.join("brehon-breakdown/SKILL.md").exists());
+        assert!(runtime_skills.join("brehon-dispatch/SKILL.md").exists());
+        assert!(
+            !runtime_skills.join("brehon-supervisor/SKILL.md").exists(),
+            "Native user-facing skills should expose only planning workflows"
+        );
+        assert!(
+            !runtime_skills
+                .join("brehon-supervisor-checklist/SKILL.md")
+                .exists(),
+            "Native user-facing skills should expose only planning workflows"
+        );
+        assert!(
+            !runtime_skills.join("brehon-worker/SKILL.md").exists(),
+            "Native user-facing skills should expose only planning workflows"
+        );
+        assert!(
+            runtime_skills.join("custom-local/SKILL.md").exists(),
+            "Non-Brehon skill directories should not be pruned"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_pty_config_claude_adds_native_skill_project_dir() {
+        let temp_dir = fresh_temp_dir("brehon-claude-skill-args");
+        let config = PtyConfig::claude(
+            "claude-supervisor",
+            "supervisor",
+            None,
+            None,
+            temp_dir.clone(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let add_dir_idx = config
+            .args
+            .iter()
+            .position(|arg| arg == "--add-dir")
+            .expect("Claude supervisor should receive a native Brehon skill project dir");
+        let skill_project_dir = temp_dir
+            .join(".brehon/factory-runtime/claude/claude-supervisor/skills-project")
+            .to_string_lossy()
+            .to_string();
+        assert_eq!(config.args.get(add_dir_idx + 1), Some(&skill_project_dir));
+        assert!(
+            temp_dir
+                .join(".brehon/factory-runtime/claude/claude-supervisor/skills-project/.claude/skills/brehon-discovery/SKILL.md")
+                .exists()
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_claude_builtin_skill_names_are_brehon_namespaced() {
+        for role in ["supervisor", "worker", "reviewer"] {
+            for skill_name in claude_builtin_skill_names_for_role(role) {
+                assert!(
+                    skill_name.starts_with("brehon-"),
+                    "Claude role skill '{skill_name}' for {role} must use the brehon-* namespace"
+                );
+            }
+        }
+        assert_eq!(
+            claude_builtin_skill_names_for_role("supervisor"),
+            &["brehon-discovery", "brehon-breakdown", "brehon-dispatch"],
+            "Claude native /skills exposure must stay limited to user planning workflows"
+        );
+    }
+
     #[tokio::test]
     async fn test_pty_config_claude_with_brehon_root() {
         let brehon_root = PathBuf::from("/home/user/project/.brehon");
@@ -445,6 +566,15 @@ mod tests {
         assert!(codex_config.contains("BREHON_AGENT_ROLE = \"supervisor\""));
         assert!(codex_config.contains("BREHON_AGENT_TYPE = \"codex\""));
         assert!(!codex_config.contains("[mcp_servers.pantheon]"));
+        assert!(codex_config.contains("[[skills.config]]"));
+        assert!(codex_config.contains("brehon-discovery/SKILL.md"));
+        assert!(codex_config.contains("brehon-breakdown/SKILL.md"));
+        assert!(codex_config.contains("brehon-dispatch/SKILL.md"));
+        let codex_skills = codex_home.join("skills");
+        assert!(codex_skills.join("brehon-discovery/SKILL.md").exists());
+        assert!(codex_skills.join("brehon-breakdown/SKILL.md").exists());
+        assert!(codex_skills.join("brehon-dispatch/SKILL.md").exists());
+        assert!(!codex_skills.join("brehon-worker/SKILL.md").exists());
         let _ = std::fs::remove_dir_all(workdir);
     }
 
@@ -1094,6 +1224,43 @@ mod tests {
     }
 
     #[test]
+    fn test_prepare_local_opencode_runtime_writes_supervisor_planning_skills() {
+        let temp_dir = fresh_temp_dir("brehon-opencode-skills");
+        let config = PtyConfig::opencode(
+            "opencode-supervisor",
+            "supervisor",
+            temp_dir.clone(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let xdg_root = config
+            .env
+            .iter()
+            .find_map(|(key, value)| {
+                (key == "XDG_CONFIG_HOME").then(|| std::path::PathBuf::from(value))
+            })
+            .expect("OpenCode launch should set an isolated XDG_CONFIG_HOME");
+        assert_eq!(
+            xdg_root,
+            temp_dir.join(".brehon/factory-runtime/opencode/xdg"),
+            "unexpected XDG root"
+        );
+        let skills = xdg_root.join("opencode/skills");
+        assert!(skills.join("brehon-discovery/SKILL.md").exists());
+        assert!(skills.join("brehon-breakdown/SKILL.md").exists());
+        assert!(skills.join("brehon-dispatch/SKILL.md").exists());
+        assert!(!skills.join("brehon-supervisor/SKILL.md").exists());
+        assert!(!skills.join("brehon-supervisor-checklist/SKILL.md").exists());
+        assert!(!skills.join("brehon-worker/SKILL.md").exists());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
     fn test_prepare_local_opencode_runtime_preserves_provider_config_and_plugins() {
         let temp_dir = fresh_temp_dir("brehon-opencode-runtime");
         let global_root = fresh_temp_dir("brehon-opencode-global");
@@ -1428,6 +1595,18 @@ mod tests {
             "supervisor skill",
         )
         .unwrap();
+        std::fs::create_dir_all(source_root.join("brehon-breakdown")).unwrap();
+        std::fs::write(
+            source_root.join("brehon-breakdown/SKILL.md"),
+            "breakdown skill",
+        )
+        .unwrap();
+        std::fs::create_dir_all(source_root.join("brehon-dispatch")).unwrap();
+        std::fs::write(
+            source_root.join("brehon-dispatch/SKILL.md"),
+            "dispatch skill",
+        )
+        .unwrap();
         std::fs::create_dir_all(source_root.join("brehon-supervisor-checklist")).unwrap();
         std::fs::write(
             source_root.join("brehon-supervisor-checklist/SKILL.md"),
@@ -1441,10 +1620,13 @@ mod tests {
             prepare_local_gemini_home(&temp_dir, "/tmp/brehon", "supervisor", None).unwrap();
         let runtime_skills = home_root.join(".gemini/extensions/maestro/skills");
         assert!(runtime_skills.join("brehon-discovery/SKILL.md").exists());
+        assert!(runtime_skills.join("brehon-breakdown/SKILL.md").exists());
+        assert!(runtime_skills.join("brehon-dispatch/SKILL.md").exists());
         assert!(
-            runtime_skills
+            !runtime_skills
                 .join("brehon-supervisor-checklist/SKILL.md")
-                .exists()
+                .exists(),
+            "Native user-facing skills should expose only planning workflows"
         );
         assert!(!runtime_skills.join("brehon-worker/SKILL.md").exists());
 
@@ -1452,12 +1634,14 @@ mod tests {
             prepare_local_gemini_home(&temp_dir, "/tmp/brehon", "worker", None).unwrap();
         let runtime_skills = home_root.join(".gemini/extensions/maestro/skills");
         assert!(!runtime_skills.join("brehon-discovery/SKILL.md").exists());
+        assert!(!runtime_skills.join("brehon-breakdown/SKILL.md").exists());
+        assert!(!runtime_skills.join("brehon-dispatch/SKILL.md").exists());
         assert!(
             !runtime_skills
                 .join("brehon-supervisor-checklist/SKILL.md")
                 .exists()
         );
-        assert!(runtime_skills.join("brehon-worker/SKILL.md").exists());
+        assert!(!runtime_skills.join("brehon-worker/SKILL.md").exists());
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
@@ -1472,10 +1656,10 @@ mod tests {
                 );
             }
         }
-        assert!(
-            gemini_builtin_skill_names_for_role("supervisor")
-                .contains(&"brehon-supervisor-checklist"),
-            "Gemini supervisors must receive the built-in Brehon checklist skill"
+        assert_eq!(
+            gemini_builtin_skill_names_for_role("supervisor"),
+            &["brehon-discovery", "brehon-breakdown", "brehon-dispatch"],
+            "Gemini native skills exposure must stay limited to user planning workflows"
         );
     }
 

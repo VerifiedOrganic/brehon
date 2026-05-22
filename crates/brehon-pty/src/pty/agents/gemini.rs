@@ -8,6 +8,7 @@ use crate::pty::prompts::{
     project_policy_for_role,
 };
 
+use super::brehon_skills::builtin_skill_names_for_role;
 use super::{
     current_brehon_exe, prepend_current_exe_dir_to_path, push_brehon_root_env,
     push_workspace_root_env,
@@ -69,18 +70,7 @@ pub(crate) fn gemini_skill_root(base: &Path) -> PathBuf {
 }
 
 pub(crate) fn gemini_builtin_skill_names_for_role(role: &str) -> &'static [&'static str] {
-    match role {
-        "supervisor" => &[
-            "brehon-supervisor",
-            "brehon-supervisor-checklist",
-            "brehon-discovery",
-            "brehon-breakdown",
-            "brehon-dispatch",
-        ],
-        "worker" => &["brehon-worker"],
-        "reviewer" => &[],
-        _ => &[],
-    }
+    builtin_skill_names_for_role(role)
 }
 
 pub(crate) fn sync_local_gemini_skills(

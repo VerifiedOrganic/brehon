@@ -5,6 +5,7 @@ use crate::pty::config::{PtyConfig, TeamsSpawnConfig};
 use crate::pty::filesystem::linked_worktree_gitdir;
 use crate::pty::prompts::{build_supervisor_startup_prompt, project_policy_for_role};
 
+use super::brehon_skills::{builtin_skill_names_for_role, write_builtin_skills};
 use super::opencode::shell_single_quote;
 use super::{
     current_brehon_exe, prepend_current_exe_dir_to_path, push_brehon_root_env,
@@ -38,6 +39,7 @@ pub(crate) fn prepare_local_codex_home(
     cwd: &Path,
     exe: &str,
     mcp_env: &[(String, String)],
+    role: &str,
 ) -> std::result::Result<PathBuf, &'static str> {
     let home_root = cwd.join(".brehon/factory-runtime/codex/home");
     std::fs::create_dir_all(&home_root)
@@ -52,6 +54,10 @@ pub(crate) fn prepare_local_codex_home(
             }
         }
     }
+
+    let skill_names = builtin_skill_names_for_role(role);
+    write_builtin_skills(&home_root.join("skills"), role)
+        .map_err(|_| "Failed to write local Codex skills.")?;
 
     let mut config = String::new();
     for trusted_path in codex_trusted_paths(cwd) {
@@ -73,6 +79,13 @@ pub(crate) fn prepare_local_codex_home(
         for (key, value) in mcp_env {
             config.push_str(&format!("{key} = \"{}\"\n", toml_basic_string(value)));
         }
+    }
+    for skill_name in skill_names {
+        let skill_path = home_root.join("skills").join(skill_name).join("SKILL.md");
+        config.push_str(&format!(
+            "\n[[skills.config]]\npath = \"{}\"\n",
+            toml_basic_string(&skill_path.to_string_lossy())
+        ));
     }
     std::fs::write(home_root.join("config.toml"), config)
         .map_err(|_| "Failed to write local Codex config.")?;
@@ -100,8 +113,8 @@ fn push_codex_common_args(
     if role != "supervisor" {
         args.push("--no-alt-screen".to_string());
     }
-    // Disable personality/superpowers so Codex doesn't try to use
-    // its built-in skills instead of Brehon MCP tools.
+    // Disable personality while leaving explicit Brehon skills available from
+    // the isolated CODEX_HOME written by `prepare_local_codex_home`.
     args.push("--disable".to_string());
     args.push("personality".to_string());
 
@@ -241,7 +254,7 @@ impl PtyConfig {
             .filter(|(key, _)| key.starts_with("BREHON_"))
             .cloned()
             .collect::<Vec<_>>();
-        let codex_home = prepare_local_codex_home(&cwd, &brehon_exe, &mcp_env)
+        let codex_home = prepare_local_codex_home(&cwd, &brehon_exe, &mcp_env, role)
             .unwrap_or_else(|_| cwd.join(".brehon/factory-runtime/codex/home"));
         env.push((
             "CODEX_HOME".to_string(),

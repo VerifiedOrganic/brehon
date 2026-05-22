@@ -9,6 +9,7 @@ use crate::pty::prompts::{
     project_policy_for_role,
 };
 
+use super::brehon_skills::write_builtin_skills;
 use super::{
     current_brehon_exe, prepend_current_exe_dir_to_path, push_brehon_root_env,
     push_workspace_root_env,
@@ -415,6 +416,7 @@ pub(crate) fn build_opencode_env(
     )
     .unwrap_or_else(|_| {
         let mut config = serde_json::json!({});
+        let xdg_root = cwd.join(".brehon/factory-runtime/opencode/xdg");
         let _ = ensure_opencode_spawn_config(
             &mut config,
             &brehon_exe,
@@ -423,11 +425,13 @@ pub(crate) fn build_opencode_env(
             model,
             reasoning_effort,
         );
+        let _ = write_builtin_skills(&xdg_root.join("opencode/skills"), role);
         (
-            cwd.join(".brehon/factory-runtime/opencode/xdg"),
+            xdg_root,
             serde_json::to_string(&config).unwrap_or_else(|_| "{}".to_string()),
         )
     });
+    let _ = write_builtin_skills(&xdg_root.join("opencode/skills"), role);
 
     let mut env = vec![
         ("BREHON_AGENT_NAME".to_string(), name.to_string()),

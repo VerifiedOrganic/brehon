@@ -1,4 +1,5 @@
 pub(crate) mod agy;
+pub(crate) mod brehon_skills;
 pub(crate) mod claude;
 pub(crate) mod codex;
 pub(crate) mod copilot;

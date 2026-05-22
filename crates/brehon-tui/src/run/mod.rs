@@ -497,7 +497,14 @@ mod tests {
     use ratatui::text::Line;
     use std::path::Path;
     use std::process::Command;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::sync::Mutex;
+    use std::thread;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    // This test owns a real Panesmith PTY child and drives process-global mux
+    // polling state, so keep it serial inside this test binary.
+    #[cfg(unix)]
+    static SERIAL_PANESMITH_STYLE_TEST: Mutex<()> = Mutex::new(());
 
     fn test_unix_timestamp_ms() -> u64 {
         SystemTime::now()
@@ -748,6 +755,32 @@ mod tests {
         .expect("create custom worker pane")
     }
 
+    fn custom_interactive_agent(
+        name: &str,
+        command: &str,
+        args: &[&str],
+    ) -> brehon_mux::AgentAdapter {
+        brehon_mux::AgentAdapter::Custom(brehon_mux::CustomAgentConfig {
+            name: name.to_string(),
+            command: Some(command.to_string()),
+            args: args.iter().map(|arg| arg.to_string()).collect(),
+            base_url: None,
+            api_key_env: None,
+            headers: Vec::new(),
+            capabilities: brehon_mux::HarnessCapabilities {
+                supports_hooks: false,
+                supports_subagents: false,
+                supports_textbox_submit: true,
+                supports_teams: false,
+                one_shot: false,
+                uses_ink_prompt: false,
+                tool_prefix: std::borrow::Cow::Borrowed("mcp_brehon_"),
+                transport: brehon_mux::HarnessTransport::InteractivePty,
+                preferred_control_plane: brehon_mux::HarnessControlPlane::PtyInjection,
+            },
+        })
+    }
+
     fn make_worker_pane(name: &str) -> brehon_mux::Pane {
         let dir = tempfile::tempdir().expect("tempdir");
         brehon_mux::Pane::worker(
@@ -833,6 +866,65 @@ mod tests {
             .join("")
             .trim_end()
             .to_string()
+    }
+
+    fn buffer_text_cell(buffer: &ratatui::buffer::Buffer, needle: &str) -> Option<(u16, u16)> {
+        for y in 0..buffer.area.height {
+            let row = (0..buffer.area.width)
+                .filter_map(|x| buffer.cell((x, y)).map(|cell| cell.symbol()))
+                .collect::<Vec<_>>()
+                .join("");
+            if let Some(x) = row.find(needle) {
+                return Some((x as u16, y));
+            }
+        }
+        None
+    }
+
+    fn panesmith_row_text(row: &panesmith::SurfaceRow<'_>) -> String {
+        row.cells
+            .iter()
+            .map(|cell| cell.text.as_ref())
+            .collect::<String>()
+    }
+
+    fn panesmith_style_for_text_in_row(
+        row: &panesmith::SurfaceRow<'_>,
+        needle: &str,
+    ) -> Option<panesmith::CellStyle> {
+        let row_text = panesmith_row_text(row);
+        let target_start = row_text.find(needle)?;
+        let mut byte_offset = 0;
+        for cell in &row.cells {
+            let text = cell.text.as_ref();
+            let next_offset = byte_offset + text.len();
+            if next_offset > target_start && !text.trim().is_empty() {
+                return Some(cell.style);
+            }
+            byte_offset = next_offset;
+        }
+        None
+    }
+
+    fn panesmith_snapshot_style_for_text(
+        snapshot: &panesmith::OwnedPaneSnapshot,
+        needle: &str,
+    ) -> Option<panesmith::CellStyle> {
+        snapshot
+            .surface
+            .rows
+            .iter()
+            .find_map(|row| panesmith_style_for_text_in_row(row, needle))
+    }
+
+    fn panesmith_scrollback_style_for_text(
+        scrollback: &panesmith::OwnedScrollbackSnapshot,
+        needle: &str,
+    ) -> Option<panesmith::CellStyle> {
+        scrollback
+            .lines
+            .iter()
+            .find_map(|line| panesmith_style_for_text_in_row(&line.row, needle))
     }
 
     fn color_label(color: Color) -> String {
@@ -1971,6 +2063,243 @@ mod tests {
         );
 
         assert!(!structured_scroll_offsets.contains_key("codex-supervisor"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_panesmith_styled_scrollback_survives_brehon_scroll_render_path() {
+        use ratatui::{backend::TestBackend, style::Modifier, Terminal};
+
+        const SUPERVISOR_ID: &str = "styled-supervisor";
+
+        let _serial = SERIAL_PANESMITH_STYLE_TEST
+            .lock()
+            .expect("serial Panesmith style test lock poisoned");
+        let project_root = tempfile::tempdir().expect("tempdir");
+        let script = concat!(
+            "printf '\\033[31mHIST_RED\\033[0m\\r\\n'; ",
+            "printf '\\033[1;32mHIST_GREEN_BOLD\\033[0m\\r\\n'; ",
+            "i=1; while [ $i -le 12 ]; do printf 'plain tail %02d\\r\\n' \"$i\"; i=$((i + 1)); done; ",
+            "printf '\\033[1;32mLIVE_GREEN_BOLD\\033[0m\\r\\n'; ",
+            "sleep 30"
+        );
+        let mut mux = Mux::factory(brehon_mux::MuxConfig {
+            cwd: project_root.path().to_path_buf(),
+            workers: 0,
+            supervisor_name: SUPERVISOR_ID.to_string(),
+            supervisor_cli: custom_interactive_agent("styled-test-agent", "sh", &["-c", script]),
+            worker_cli: brehon_mux::AgentAdapter::BuiltIn(brehon_mux::SupervisorCli::Codex),
+            include_director: false,
+            rows: 6,
+            cols: 100,
+            ..Default::default()
+        })
+        .expect("create mux");
+        assert!(mux.is_panesmith_managed(SUPERVISOR_ID));
+        mux.focus(SUPERVISOR_ID);
+
+        wait_for_panesmith_text(&mut mux, SUPERVISOR_ID, "LIVE_GREEN_BOLD");
+        wait_for_panesmith_scrollback_text(&mut mux, SUPERVISOR_ID, "HIST_RED");
+
+        let live_style = panesmith_snapshot_style_for_text(
+            mux.panesmith_snapshot(SUPERVISOR_ID)
+                .expect("live snapshot"),
+            "LIVE_GREEN_BOLD",
+        )
+        .expect("live styled row");
+        assert_eq!(live_style.fg, Some(panesmith::ColorSpec::Indexed(2)));
+        assert!(live_style.attrs.bold);
+
+        let scrollback = mux.panesmith_scrollback(SUPERVISOR_ID).expect("scrollback");
+        let red_history_style =
+            panesmith_scrollback_style_for_text(scrollback, "HIST_RED").expect("red history row");
+        assert_eq!(red_history_style.fg, Some(panesmith::ColorSpec::Indexed(1)));
+        let green_history_style =
+            panesmith_scrollback_style_for_text(scrollback, "HIST_GREEN_BOLD")
+                .expect("green history row");
+        assert_eq!(
+            green_history_style.fg,
+            Some(panesmith::ColorSpec::Indexed(2))
+        );
+        assert!(green_history_style.attrs.bold);
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 10)).unwrap();
+        terminal
+            .draw(|frame| {
+                let expanded = std::collections::HashSet::new();
+                let _ = render_pane_in_area_with_activity_regions(
+                    frame,
+                    Rect::new(0, 0, 100, 10),
+                    &mux,
+                    SUPERVISOR_ID,
+                    true,
+                    None,
+                    false,
+                    &expanded,
+                    None,
+                    None,
+                );
+            })
+            .unwrap();
+        let live_cell_pos =
+            buffer_text_cell(terminal.backend().buffer(), "LIVE_GREEN_BOLD").expect("live cell");
+        let live_cell = terminal
+            .backend()
+            .buffer()
+            .cell(live_cell_pos)
+            .expect("live cell");
+        assert_eq!(live_cell.fg, Color::Indexed(2));
+        assert!(live_cell.modifier.contains(Modifier::BOLD));
+
+        let mut structured_scroll_offsets = std::collections::HashMap::new();
+        for _ in 0..8 {
+            scroll_supervisor_with_brehon_mouse_path(
+                &mut mux,
+                SUPERVISOR_ID,
+                &mut structured_scroll_offsets,
+                MouseEventKind::ScrollUp,
+            );
+        }
+        let scroll_offset = structured_scroll_offsets
+            .get(SUPERVISOR_ID)
+            .copied()
+            .expect("Brehon mouse scroll should move Panesmith viewport away from tail");
+        assert!(scroll_offset > 0);
+
+        let mut scrolled_terminal = Terminal::new(TestBackend::new(100, 10)).unwrap();
+        scrolled_terminal
+            .draw(|frame| {
+                let expanded = std::collections::HashSet::new();
+                let _ = render_pane_in_area_with_activity_regions(
+                    frame,
+                    Rect::new(0, 0, 100, 10),
+                    &mux,
+                    SUPERVISOR_ID,
+                    true,
+                    None,
+                    false,
+                    &expanded,
+                    Some(scroll_offset),
+                    None,
+                );
+            })
+            .unwrap();
+        let buffer = scrolled_terminal.backend().buffer();
+        let red_cell_pos = buffer_text_cell(buffer, "HIST_RED").expect("red scrollback cell");
+        let red_cell = buffer.cell(red_cell_pos).expect("red scrollback cell");
+        assert_eq!(red_cell.fg, Color::Indexed(1));
+
+        let green_cell_pos =
+            buffer_text_cell(buffer, "HIST_GREEN_BOLD").expect("green scrollback cell");
+        let green_cell = buffer.cell(green_cell_pos).expect("green scrollback cell");
+        assert_eq!(green_cell.fg, Color::Indexed(2));
+        assert!(green_cell.modifier.contains(Modifier::BOLD));
+
+        tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(mux.shutdown_all());
+    }
+
+    #[cfg(unix)]
+    fn wait_for_panesmith_text(mux: &mut Mux, pane_id: &str, needle: &str) {
+        wait_for_panesmith_condition(mux, |mux| {
+            mux.panesmith_snapshot(pane_id).is_some_and(|snapshot| {
+                panesmith_snapshot_style_for_text(snapshot, needle).is_some()
+            })
+        });
+    }
+
+    #[cfg(unix)]
+    fn wait_for_panesmith_scrollback_text(mux: &mut Mux, pane_id: &str, needle: &str) {
+        wait_for_panesmith_condition(mux, |mux| {
+            mux.panesmith_scrollback(pane_id).is_some_and(|scrollback| {
+                panesmith_scrollback_style_for_text(scrollback, needle).is_some()
+            })
+        });
+    }
+
+    #[cfg(unix)]
+    fn wait_for_panesmith_condition(mux: &mut Mux, mut predicate: impl FnMut(&Mux) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            mux.poll_batch();
+            if predicate(mux) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for Panesmith pane content"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[cfg(unix)]
+    fn scroll_supervisor_with_brehon_mouse_path(
+        mux: &mut Mux,
+        supervisor_id: &str,
+        structured_scroll_offsets: &mut std::collections::HashMap<String, usize>,
+        kind: MouseEventKind,
+    ) {
+        let mut group_tab = GroupTab::Workers;
+        let mut selected_worker = 0;
+        let mut selected_panel = 0;
+        let mut selected_member = Vec::new();
+        let worker_ids = Vec::new();
+        let all_reviewer_ids = Vec::new();
+        let panels = Vec::new();
+        let supervisor_id = Some(supervisor_id.to_string());
+        let active_left_id = None;
+        let mut expanded_epics = std::collections::HashSet::new();
+        let mut expanded_activity_rows = std::collections::HashSet::new();
+        let mut selection = None;
+        let mut pending_down = None;
+        let mut task_detail = None;
+        let mut advisor_room_view = AdvisorRoomViewState::default();
+        let mut research_room_view = ResearchRoomViewState::default();
+        let mut dashboard_agent_list = DashboardAgentListState::default();
+        let mut dashboard_task_list = DashboardTaskListState::default();
+        let structured_mode = std::collections::HashSet::new();
+        let mut external_terminal_tab_request = None;
+        let mut manual_reset_request = None;
+        let mut runtime_approval_request = None;
+
+        let _ = handle_mouse_input(
+            crossterm::event::MouseEvent {
+                kind,
+                column: 5,
+                row: 5,
+                modifiers: KeyModifiers::empty(),
+            },
+            &[],
+            mux,
+            &mut group_tab,
+            &mut selected_worker,
+            &mut selected_panel,
+            &mut selected_member,
+            &worker_ids,
+            &all_reviewer_ids,
+            &panels,
+            &supervisor_id,
+            &active_left_id,
+            &mut expanded_epics,
+            &mut expanded_activity_rows,
+            Rect::new(0, 0, 0, 0),
+            Rect::new(0, 0, 100, 10),
+            &mut selection,
+            &mut pending_down,
+            &mut task_detail,
+            &mut advisor_room_view,
+            &mut research_room_view,
+            &mut dashboard_agent_list,
+            &mut dashboard_task_list,
+            &structured_mode,
+            structured_scroll_offsets,
+            false,
+            &mut external_terminal_tab_request,
+            &mut manual_reset_request,
+            &mut runtime_approval_request,
+        );
     }
 
     #[test]

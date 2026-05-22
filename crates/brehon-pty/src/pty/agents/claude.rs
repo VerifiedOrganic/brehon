@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use crate::pty::config::{PtyConfig, TeamsSpawnConfig};
 use crate::pty::filesystem::write_json_config;
 
+use super::brehon_skills::{builtin_skill_names_for_role, write_builtin_skills};
 use super::{
     current_brehon_exe, current_brehon_session_name, prepend_current_exe_dir_to_path,
     push_brehon_root_env, push_workspace_root_env,
@@ -17,6 +18,28 @@ fn claude_factory_runtime_dir(cwd: &Path, name: &str) -> PathBuf {
 
 fn claude_mcp_config_path(cwd: &Path, name: &str) -> PathBuf {
     claude_factory_runtime_dir(cwd, name).join("mcp.json")
+}
+
+fn claude_skill_project_dir(cwd: &Path, name: &str) -> PathBuf {
+    claude_factory_runtime_dir(cwd, name).join("skills-project")
+}
+
+fn claude_skill_root(cwd: &Path, name: &str) -> PathBuf {
+    claude_skill_project_dir(cwd, name).join(".claude/skills")
+}
+
+pub(crate) fn claude_builtin_skill_names_for_role(role: &str) -> &'static [&'static str] {
+    builtin_skill_names_for_role(role)
+}
+
+pub(crate) fn prepare_local_claude_skills(
+    cwd: &Path,
+    name: &str,
+    role: &str,
+) -> std::result::Result<PathBuf, &'static str> {
+    let project_dir = claude_skill_project_dir(cwd, name);
+    write_builtin_skills(&claude_skill_root(cwd, name), role)?;
+    Ok(project_dir)
 }
 
 /// Build the BREHON_* env block that the per-agent MCP server config must
@@ -209,6 +232,23 @@ impl PtyConfig {
             );
         }
 
+        let skill_project_dir = if claude_builtin_skill_names_for_role(role).is_empty() {
+            None
+        } else {
+            match prepare_local_claude_skills(&cwd, name, role) {
+                Ok(path) => Some(path),
+                Err(e) => {
+                    tracing::error!(
+                        agent = %name,
+                        role = %role,
+                        error = %e,
+                        "Failed to install native Claude Brehon skills; MCP search_skills remains available, but /skills will not show Brehon workflows."
+                    );
+                    None
+                }
+            }
+        };
+
         let mut env = vec![
             ("BREHON_AGENT_NAME".to_string(), name.to_string()),
             ("BREHON_AGENT_ROLE".to_string(), role.to_string()),
@@ -290,6 +330,13 @@ impl PtyConfig {
         args.push("--mcp-config".to_string());
         args.push(mcp_config_path.to_string_lossy().to_string());
         args.push("--strict-mcp-config".to_string());
+        if let Some(skill_project_dir) = skill_project_dir {
+            // Claude Code loads `.claude/skills` from `--add-dir` roots, so the
+            // generated ignored runtime tree shows up in `/skills` without
+            // writing provider config into the agent worktree.
+            args.push("--add-dir".to_string());
+            args.push(skill_project_dir.to_string_lossy().to_string());
+        }
         // When using Agent Teams, session identity comes from --agent-id, not --session-id.
         // Including both causes conflicts in Claude Code's session tracking.
         if teams.is_none() {

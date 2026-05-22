@@ -11,10 +11,10 @@ use crate::error::{Error, Result};
 use crate::pty::PtyConfig;
 
 use panesmith::{
-    AttachOptions, HostInput, OwnedPaneSnapshot, OwnedScrollbackSnapshot, PaneAttachOutcome,
-    PaneAttachTerminal, PaneAttachTerminalControl, PaneConfig, PaneEventKind,
-    PaneId as PanesmithPaneId, PaneManager, PaneManagerConfig, Size, TranscriptConfig,
-    TranscriptMode,
+    AttachOptions, InputOutcome, InputTransaction, InputTransactionError, OwnedPaneSnapshot,
+    OwnedScrollbackSnapshot, PaneAttachOutcome, PaneAttachTerminal, PaneAttachTerminalControl,
+    PaneConfig, PaneEventKind, PaneId as PanesmithPaneId, PaneManager, PaneManagerConfig, Size,
+    TranscriptConfig, TranscriptMode,
 };
 
 #[cfg(test)]
@@ -125,12 +125,24 @@ impl BrehonPanesmithShim {
     }
 
     pub(crate) fn send_input_bytes(&mut self, pane_id: &str, bytes: &[u8]) -> Result<()> {
+        self.send_input_transaction(pane_id, InputTransaction::raw_bytes(bytes.to_vec()))
+            .and_then(|outcome| ensure_panesmith_input_outcome("raw input", outcome))
+    }
+
+    pub(crate) fn send_input_transaction(
+        &mut self,
+        pane_id: &str,
+        transaction: InputTransaction,
+    ) -> Result<InputOutcome> {
         let panesmith_id = self
             .panesmith_id_for(pane_id)
             .ok_or_else(|| Error::pane_not_found(pane_id))?;
-        self.manager
-            .send_input(panesmith_id, HostInput::Raw(bytes.to_vec()))
-            .map_err(map_panesmith_error)
+        let outcome = self
+            .manager
+            .send_input_transaction(panesmith_id, transaction)
+            .map_err(map_panesmith_error)?;
+        self.refresh_cached_view_by_panesmith_id(panesmith_id)?;
+        Ok(outcome)
     }
 
     pub(crate) fn resize(&mut self, pane_id: &str, rows: u16, cols: u16) -> Result<bool> {
@@ -319,6 +331,36 @@ fn map_panesmith_error(err: panesmith::PaneError) -> Error {
 
 fn map_panesmith_attach_error(err: panesmith::PaneAttachError) -> Error {
     Error::pty(format!("Panesmith attach: {err}"))
+}
+
+fn ensure_panesmith_input_outcome(operation: &str, outcome: InputOutcome) -> Result<()> {
+    if outcome.errors.is_empty() {
+        return Ok(());
+    }
+
+    let errors = outcome
+        .errors
+        .iter()
+        .map(format_panesmith_input_error)
+        .collect::<Vec<_>>()
+        .join("; ");
+    Err(Error::pty(format!(
+        "Panesmith {operation} failed: {errors}"
+    )))
+}
+
+fn format_panesmith_input_error(error: &InputTransactionError) -> String {
+    match error {
+        InputTransactionError::Write {
+            operation,
+            bytes_attempted,
+            bytes_written,
+            message,
+        } => format!("{operation} failed after {bytes_written}/{bytes_attempted} bytes: {message}"),
+        InputTransactionError::VerificationFailed { message } => message.clone(),
+        InputTransactionError::ChildExited => "child exited".to_string(),
+        error => format!("{error:?}"),
+    }
 }
 
 #[cfg(any(test, feature = "test-pty-fallback"))]
