@@ -594,6 +594,12 @@ fn should_attach_focused_panesmith_supervisor(
             .is_some_and(|pane| *pane.kind() == PaneKind::Supervisor)
 }
 
+fn panesmith_attach_options_for_dashboard() -> panesmith::AttachOptions {
+    let mut options = panesmith::AttachOptions::default();
+    options.screen = panesmith::AttachScreenPolicy::LeaveAlternateScreen;
+    options
+}
+
 #[cfg(unix)]
 fn attach_focused_panesmith_supervisor(ctx: &mut EventLoopCtx) -> io::Result<()> {
     let Some(pane_id) = ctx.mux.focused_id().map(str::to_string) else {
@@ -605,13 +611,14 @@ fn attach_focused_panesmith_supervisor(ctx: &mut EventLoopCtx) -> io::Result<()>
     ctx.structured_scroll_offsets.remove(&pane_id);
     ctx.click_regions.clear();
     ctx.terminal.backend_mut().flush()?;
+    let mut mode_guard = super::terminal_guard::AttachTerminalModeGuard::suspend_dashboard_modes()?;
 
     let mut terminal = panesmith::StdioAttachTerminal::new(io::stdout())?;
     let mut control =
         panesmith::CrosstermTerminalControl::new(io::stdout()).with_host_alternate_screen(true);
     match ctx.mux.attach_panesmith_pane_blocking(
         &pane_id,
-        panesmith::AttachOptions::default(),
+        panesmith_attach_options_for_dashboard(),
         &mut terminal,
         &mut control,
     ) {
@@ -647,6 +654,7 @@ fn attach_focused_panesmith_supervisor(ctx: &mut EventLoopCtx) -> io::Result<()>
         }
     }
 
+    mode_guard.restore()?;
     ctx.terminal.clear()?;
     ctx.needs_redraw = true;
     Ok(())
@@ -3931,6 +3939,16 @@ mod tests {
             &ghostty_harness.ctx,
             &ctrl_f
         ));
+    }
+
+    #[test]
+    fn panesmith_dashboard_attach_leaves_host_alternate_screen() {
+        let options = panesmith_attach_options_for_dashboard();
+
+        assert_eq!(
+            options.screen,
+            panesmith::AttachScreenPolicy::LeaveAlternateScreen
+        );
     }
 
     #[test]
