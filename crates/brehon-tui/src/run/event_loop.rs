@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
 use ratatui::Terminal;
 
@@ -330,15 +330,6 @@ fn manual_reset_plan(ctx: &EventLoopCtx, pane_id: &str) -> Option<(Option<String
 
     match pane.kind() {
         PaneKind::Worker => {
-            if !pane.is_gateway_backed() && !ctx.runtime_agent_factory_host_owned {
-                let err = format!("manual reset is not supported for non-gateway worker {pane_id}");
-                push_dashboard_event(
-                    &ctx.dashboard_data,
-                    format!("manual reset for {pane_id} failed: {err}"),
-                );
-                tracing::warn!(pane = %pane_id, error = %err, "manual reset failed");
-                return None;
-            }
             let startup_prompt = if pane_needs_post_spawn_prompt(&ctx.mux, pane_id) {
                 build_worker_context_reset_startup_prompt(&ctx.mux, pane_id)
             } else {
@@ -513,6 +504,13 @@ fn live_worker_ids(ctx: &EventLoopCtx) -> Vec<String> {
         .collect()
 }
 
+fn flush_forward_input_buffer(ctx: &mut EventLoopCtx, forward_buf: &mut Vec<u8>) {
+    if !forward_buf.is_empty() {
+        forward_input_bytes(ctx, forward_buf);
+        forward_buf.clear();
+    }
+}
+
 fn forward_input_bytes(ctx: &mut EventLoopCtx, bytes: &[u8]) {
     ctx.selection = None;
     if bytes.is_empty() {
@@ -571,7 +569,7 @@ fn forward_input_bytes(ctx: &mut EventLoopCtx, bytes: &[u8]) {
     );
 }
 
-fn should_attach_focused_panesmith_supervisor(
+fn should_attach_focused_panesmith_pane(
     ctx: &EventLoopCtx,
     key: &crossterm::event::KeyEvent,
 ) -> bool {
@@ -586,10 +584,6 @@ fn should_attach_focused_panesmith_supervisor(
         return false;
     };
     ctx.mux.is_panesmith_managed(pane_id)
-        && ctx
-            .mux
-            .get(pane_id)
-            .is_some_and(|pane| *pane.kind() == PaneKind::Supervisor)
 }
 
 fn panesmith_attach_options_for_dashboard() -> panesmith::AttachOptions {
@@ -600,7 +594,7 @@ fn panesmith_attach_options_for_dashboard() -> panesmith::AttachOptions {
 }
 
 #[cfg(unix)]
-fn attach_focused_panesmith_supervisor(ctx: &mut EventLoopCtx) -> io::Result<()> {
+fn attach_focused_panesmith_pane(ctx: &mut EventLoopCtx) -> io::Result<()> {
     let Some(pane_id) = ctx.mux.focused_id().map(str::to_string) else {
         return Ok(());
     };
@@ -633,10 +627,7 @@ fn attach_focused_panesmith_supervisor(ctx: &mut EventLoopCtx) -> io::Result<()>
             );
             push_dashboard_event(
                 &ctx.dashboard_data,
-                format!(
-                    "detached fullscreen supervisor {pane_id}: {:?}",
-                    outcome.reason
-                ),
+                format!("detached fullscreen pane {pane_id}: {:?}", outcome.reason),
             );
             if !outcome.remaining_input.is_empty() {
                 forward_input_bytes(ctx, &outcome.remaining_input);
@@ -657,7 +648,7 @@ fn attach_focused_panesmith_supervisor(ctx: &mut EventLoopCtx) -> io::Result<()>
 }
 
 #[cfg(not(unix))]
-fn attach_focused_panesmith_supervisor(ctx: &mut EventLoopCtx) -> io::Result<()> {
+fn attach_focused_panesmith_pane(ctx: &mut EventLoopCtx) -> io::Result<()> {
     let pane_id = ctx.mux.focused_id().unwrap_or("focused pane").to_string();
     push_dashboard_event(
         &ctx.dashboard_data,
@@ -909,6 +900,182 @@ This is a notification only: do not change task ownership, do not join the advis
             ctx.input_mode = InputMode::Composer(state);
         }
     }
+}
+
+fn handle_global_control_key(
+    ctx: &mut EventLoopCtx,
+    key: &KeyEvent,
+    forward_buf: &mut Vec<u8>,
+) -> bool {
+    if key.code == KeyCode::BackTab {
+        flush_forward_input_buffer(ctx, forward_buf);
+        ctx.selection = None;
+        ctx.task_detail = None;
+        ctx.click_regions.clear();
+        if ctx.runtime_agent_factory_host_owned {
+            switch_external_terminal_tab_relative(ctx, false);
+            return true;
+        }
+        cycle_sub_tab(
+            &mut ctx.mux,
+            ctx.group_tab,
+            &ctx.worker_ids,
+            &ctx.panels,
+            &mut ctx.selected_worker,
+            &mut ctx.selected_panel,
+            &mut ctx.selected_member,
+            -1,
+        );
+        capture_reviewer_selection_state(
+            &ctx.panels,
+            ctx.selected_panel,
+            &ctx.selected_member,
+            &mut ctx.reviewer_selection,
+        );
+        return true;
+    }
+
+    if is_ctrl_char_key(key, ']') {
+        flush_forward_input_buffer(ctx, forward_buf);
+        ctx.selection = None;
+        ctx.task_detail = None;
+        ctx.click_regions.clear();
+        if ctx.runtime_agent_factory_host_owned {
+            switch_external_terminal_tab_relative(ctx, true);
+            return true;
+        }
+        cycle_sub_tab(
+            &mut ctx.mux,
+            ctx.group_tab,
+            &ctx.worker_ids,
+            &ctx.panels,
+            &mut ctx.selected_worker,
+            &mut ctx.selected_panel,
+            &mut ctx.selected_member,
+            1,
+        );
+        capture_reviewer_selection_state(
+            &ctx.panels,
+            ctx.selected_panel,
+            &ctx.selected_member,
+            &mut ctx.reviewer_selection,
+        );
+        return true;
+    }
+
+    if is_ctrl_char_key(key, 'd') {
+        flush_forward_input_buffer(ctx, forward_buf);
+        ctx.selection = None;
+        ctx.task_detail = None;
+        ctx.group_tab = GroupTab::Dashboard;
+        ctx.click_regions.clear();
+        return true;
+    }
+
+    if is_ctrl_char_key(key, 't') {
+        flush_forward_input_buffer(ctx, forward_buf);
+        ctx.selection = None;
+        ctx.task_detail = None;
+        ctx.group_tab = GroupTab::Runtime;
+        ctx.click_regions.clear();
+        return true;
+    }
+
+    if is_ctrl_char_key(key, 'a') {
+        flush_forward_input_buffer(ctx, forward_buf);
+        ctx.selection = None;
+        ctx.task_detail = None;
+        ctx.group_tab = GroupTab::Advisors;
+        ctx.click_regions.clear();
+        return true;
+    }
+
+    if is_ctrl_char_key(key, 'y') {
+        flush_forward_input_buffer(ctx, forward_buf);
+        ctx.selection = None;
+        ctx.task_detail = None;
+        ctx.group_tab = GroupTab::Research;
+        ctx.click_regions.clear();
+        return true;
+    }
+
+    if is_ctrl_char_key(key, 'v') {
+        if let Some(focused_id) = ctx.mux.focused_id().map(str::to_string) {
+            if let Some(pane) = ctx.mux.get(&focused_id) {
+                if pane.is_gateway_backed() {
+                    if ctx.structured_mode.contains(&focused_id) {
+                        ctx.structured_mode.remove(&focused_id);
+                    } else {
+                        ctx.structured_mode.insert(focused_id);
+                    }
+                    ctx.click_regions.clear();
+                }
+            }
+        }
+        return true;
+    }
+
+    if is_ctrl_char_key(key, 'w') {
+        flush_forward_input_buffer(ctx, forward_buf);
+        ctx.selection = None;
+        ctx.task_detail = None;
+        ctx.click_regions.clear();
+        if ctx.runtime_agent_factory_host_owned {
+            switch_external_terminal_tab(ctx, "Workers");
+            return true;
+        }
+        ctx.group_tab = GroupTab::Workers;
+        if let Some(id) = ctx.worker_ids.get(ctx.selected_worker) {
+            ctx.mux.focus(id);
+        }
+        return true;
+    }
+
+    if is_ctrl_char_key(key, 'e') {
+        flush_forward_input_buffer(ctx, forward_buf);
+        ctx.selection = None;
+        ctx.task_detail = None;
+        ctx.click_regions.clear();
+        if ctx.runtime_agent_factory_host_owned {
+            switch_external_terminal_tab(ctx, "Reviewers");
+            return true;
+        }
+        ctx.group_tab = GroupTab::Reviewers;
+        focus_current_reviewer(
+            &mut ctx.mux,
+            &ctx.panels,
+            ctx.selected_panel,
+            &ctx.selected_member,
+        );
+        return true;
+    }
+
+    if is_ctrl_char_key(key, 's') {
+        flush_forward_input_buffer(ctx, forward_buf);
+        ctx.selection = None;
+        ctx.task_detail = None;
+        ctx.click_regions.clear();
+        if ctx.runtime_agent_factory_host_owned {
+            switch_external_terminal_tab(ctx, "Supervisor");
+            return true;
+        }
+        if let Some(ref sup_id) = ctx.supervisor_id {
+            ctx.mux.focus(sup_id);
+        }
+        return true;
+    }
+
+    if is_ctrl_char_key(key, 'r') {
+        flush_forward_input_buffer(ctx, forward_buf);
+        if let Some(focused_id) = ctx.mux.focused_id().map(str::to_string) {
+            if perform_manual_reset_request(ctx, &focused_id) {
+                ctx.needs_redraw = true;
+            }
+        }
+        return true;
+    }
+
+    false
 }
 
 fn process_pending_runtime_commands(ctx: &mut EventLoopCtx) {
@@ -1614,7 +1781,7 @@ struct InputDrainOutcome {
 fn drain_pending_input(
     ctx: &mut EventLoopCtx,
     initial_wait: Duration,
-    focused_id: &Option<String>,
+    _focused_id: &Option<String>,
     active_left_id: &Option<String>,
 ) -> io::Result<InputDrainOutcome> {
     let mut outcome = InputDrainOutcome {
@@ -1776,12 +1943,16 @@ fn drain_pending_input(
                     break;
                 }
 
-                if should_attach_focused_panesmith_supervisor(ctx, &key) {
+                if should_attach_focused_panesmith_pane(ctx, &key) {
                     if !forward_buf.is_empty() {
                         forward_input_bytes(ctx, &forward_buf);
                         forward_buf.clear();
                     }
-                    attach_focused_panesmith_supervisor(ctx)?;
+                    attach_focused_panesmith_pane(ctx)?;
+                    continue;
+                }
+
+                if handle_global_control_key(ctx, &key, &mut forward_buf) {
                     continue;
                 }
 
@@ -1980,171 +2151,6 @@ fn drain_pending_input(
                             }
                         }
                         _ => {}
-                    }
-                } else if key.code == KeyCode::BackTab {
-                    if !forward_buf.is_empty() {
-                        forward_input_bytes(ctx, &forward_buf);
-                        forward_buf.clear();
-                    }
-                    ctx.selection = None;
-                    ctx.task_detail = None;
-                    ctx.click_regions.clear();
-                    if ctx.runtime_agent_factory_host_owned {
-                        switch_external_terminal_tab_relative(ctx, false);
-                        continue;
-                    }
-                    cycle_sub_tab(
-                        &mut ctx.mux,
-                        ctx.group_tab,
-                        &ctx.worker_ids,
-                        &ctx.panels,
-                        &mut ctx.selected_worker,
-                        &mut ctx.selected_panel,
-                        &mut ctx.selected_member,
-                        -1,
-                    );
-                    capture_reviewer_selection_state(
-                        &ctx.panels,
-                        ctx.selected_panel,
-                        &ctx.selected_member,
-                        &mut ctx.reviewer_selection,
-                    );
-                } else if is_ctrl_char_key(&key, ']') {
-                    if !forward_buf.is_empty() {
-                        forward_input_bytes(ctx, &forward_buf);
-                        forward_buf.clear();
-                    }
-                    ctx.selection = None;
-                    ctx.task_detail = None;
-                    ctx.click_regions.clear();
-                    if ctx.runtime_agent_factory_host_owned {
-                        switch_external_terminal_tab_relative(ctx, true);
-                        continue;
-                    }
-                    cycle_sub_tab(
-                        &mut ctx.mux,
-                        ctx.group_tab,
-                        &ctx.worker_ids,
-                        &ctx.panels,
-                        &mut ctx.selected_worker,
-                        &mut ctx.selected_panel,
-                        &mut ctx.selected_member,
-                        1,
-                    );
-                    capture_reviewer_selection_state(
-                        &ctx.panels,
-                        ctx.selected_panel,
-                        &ctx.selected_member,
-                        &mut ctx.reviewer_selection,
-                    );
-                } else if is_ctrl_char_key(&key, 'd') {
-                    if !forward_buf.is_empty() {
-                        forward_input_bytes(ctx, &forward_buf);
-                        forward_buf.clear();
-                    }
-                    ctx.selection = None;
-                    ctx.task_detail = None;
-                    ctx.group_tab = GroupTab::Dashboard;
-                    ctx.click_regions.clear();
-                } else if is_ctrl_char_key(&key, 't') {
-                    if !forward_buf.is_empty() {
-                        forward_input_bytes(ctx, &forward_buf);
-                        forward_buf.clear();
-                    }
-                    ctx.selection = None;
-                    ctx.task_detail = None;
-                    ctx.group_tab = GroupTab::Runtime;
-                    ctx.click_regions.clear();
-                } else if is_ctrl_char_key(&key, 'a') {
-                    if !forward_buf.is_empty() {
-                        forward_input_bytes(ctx, &forward_buf);
-                        forward_buf.clear();
-                    }
-                    ctx.selection = None;
-                    ctx.task_detail = None;
-                    ctx.group_tab = GroupTab::Advisors;
-                    ctx.click_regions.clear();
-                } else if is_ctrl_char_key(&key, 'r') {
-                    if !forward_buf.is_empty() {
-                        forward_input_bytes(ctx, &forward_buf);
-                        forward_buf.clear();
-                    }
-                    ctx.selection = None;
-                    ctx.task_detail = None;
-                    ctx.group_tab = GroupTab::Research;
-                    ctx.click_regions.clear();
-                } else if is_ctrl_char_key(&key, 'v') {
-                    if let Some(ref focused_id) = focused_id {
-                        if let Some(pane) = ctx.mux.get(focused_id) {
-                            if pane.is_gateway_backed() {
-                                if ctx.structured_mode.contains(focused_id) {
-                                    ctx.structured_mode.remove(focused_id);
-                                } else {
-                                    ctx.structured_mode.insert(focused_id.clone());
-                                }
-                                ctx.click_regions.clear();
-                            }
-                        }
-                    }
-                } else if is_ctrl_char_key(&key, 'w') {
-                    if !forward_buf.is_empty() {
-                        forward_input_bytes(ctx, &forward_buf);
-                        forward_buf.clear();
-                    }
-                    ctx.selection = None;
-                    ctx.task_detail = None;
-                    ctx.click_regions.clear();
-                    if ctx.runtime_agent_factory_host_owned {
-                        switch_external_terminal_tab(ctx, "Workers");
-                        continue;
-                    }
-                    ctx.group_tab = GroupTab::Workers;
-                    if let Some(id) = ctx.worker_ids.get(ctx.selected_worker) {
-                        ctx.mux.focus(id);
-                    }
-                } else if is_ctrl_char_key(&key, 'e') {
-                    if !forward_buf.is_empty() {
-                        forward_input_bytes(ctx, &forward_buf);
-                        forward_buf.clear();
-                    }
-                    ctx.selection = None;
-                    ctx.task_detail = None;
-                    ctx.click_regions.clear();
-                    if ctx.runtime_agent_factory_host_owned {
-                        switch_external_terminal_tab(ctx, "Reviewers");
-                        continue;
-                    }
-                    ctx.group_tab = GroupTab::Reviewers;
-                    focus_current_reviewer(
-                        &mut ctx.mux,
-                        &ctx.panels,
-                        ctx.selected_panel,
-                        &ctx.selected_member,
-                    );
-                } else if is_ctrl_char_key(&key, 's') {
-                    if !forward_buf.is_empty() {
-                        forward_input_bytes(ctx, &forward_buf);
-                        forward_buf.clear();
-                    }
-                    ctx.selection = None;
-                    ctx.task_detail = None;
-                    ctx.click_regions.clear();
-                    if ctx.runtime_agent_factory_host_owned {
-                        switch_external_terminal_tab(ctx, "Supervisor");
-                        continue;
-                    }
-                    if let Some(ref sup_id) = ctx.supervisor_id {
-                        ctx.mux.focus(sup_id);
-                    }
-                } else if is_ctrl_char_key(&key, 'r') {
-                    if !forward_buf.is_empty() {
-                        forward_input_bytes(ctx, &forward_buf);
-                        forward_buf.clear();
-                    }
-                    if let Some(focused_id) = ctx.mux.focused_id().map(str::to_string) {
-                        if perform_manual_reset_request(ctx, &focused_id) {
-                            ctx.needs_redraw = true;
-                        }
                     }
                 } else if key.code == KeyCode::Esc {
                     if !forward_buf.is_empty() {
@@ -3292,6 +3298,7 @@ pub(super) fn run(ctx: &mut EventLoopCtx) -> io::Result<()> {
                         f,
                         areas.left_content,
                         dashboard_snapshot.brehon_root.as_deref(),
+                        Some(&ctx.mux),
                         &ctx.recent_runtime_commands,
                     );
                     regions.extend(runtime_regions);
@@ -3904,7 +3911,7 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_f_attaches_only_focused_panesmith_supervisor() {
+    fn ctrl_f_attaches_focused_panesmith_pane() {
         let project_root = tempfile::tempdir().expect("tempdir");
         let mut mux = Mux::factory(brehon_mux::MuxConfig {
             cwd: project_root.path().to_path_buf(),
@@ -3918,40 +3925,54 @@ mod tests {
         })
         .expect("create mux");
         mux.focus("codex-supervisor");
-        let harness = harness_with_mux(mux);
+        let mut harness = harness_with_mux(mux);
         let ctrl_f = crossterm::event::KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL);
         let raw_ctrl_f =
             crossterm::event::KeyEvent::new(KeyCode::Char('\u{6}'), KeyModifiers::empty());
         let raw_ctrl_f_with_modifier =
             crossterm::event::KeyEvent::new(KeyCode::Char('\u{6}'), KeyModifiers::CONTROL);
 
-        assert!(should_attach_focused_panesmith_supervisor(
-            &harness.ctx,
-            &ctrl_f
-        ));
-        assert!(should_attach_focused_panesmith_supervisor(
+        assert!(should_attach_focused_panesmith_pane(&harness.ctx, &ctrl_f));
+        assert!(should_attach_focused_panesmith_pane(
             &harness.ctx,
             &raw_ctrl_f
         ));
-        assert!(should_attach_focused_panesmith_supervisor(
+        assert!(should_attach_focused_panesmith_pane(
             &harness.ctx,
             &raw_ctrl_f_with_modifier
         ));
+        tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(harness.ctx.mux.shutdown_all());
+
+        let mut shell_mux = Mux::new(24, 80);
+        let shell_id = shell_mux
+            .add_shell("shell", std::env::temp_dir(), Some("cat"))
+            .expect("add shell");
+        shell_mux.focus(&shell_id);
+        let mut shell_harness = harness_with_mux(shell_mux);
+        assert!(should_attach_focused_panesmith_pane(
+            &shell_harness.ctx,
+            &ctrl_f
+        ));
+        tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(shell_harness.ctx.mux.shutdown_all());
 
         let mut ghostty_mux = Mux::new(24, 80);
         ghostty_mux.add_pane(make_supervisor_pane("claude-supervisor"));
         ghostty_mux.focus("claude-supervisor");
         let ghostty_harness = harness_with_mux(ghostty_mux);
 
-        assert!(!should_attach_focused_panesmith_supervisor(
+        assert!(!should_attach_focused_panesmith_pane(
             &ghostty_harness.ctx,
             &ctrl_f
         ));
-        assert!(!should_attach_focused_panesmith_supervisor(
+        assert!(!should_attach_focused_panesmith_pane(
             &ghostty_harness.ctx,
             &raw_ctrl_f
         ));
-        assert!(!should_attach_focused_panesmith_supervisor(
+        assert!(!should_attach_focused_panesmith_pane(
             &ghostty_harness.ctx,
             &raw_ctrl_f_with_modifier
         ));

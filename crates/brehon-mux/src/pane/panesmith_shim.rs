@@ -55,7 +55,7 @@ pub(crate) enum BrehonPanesmithEventKind {
     Other(&'static str),
 }
 
-/// Supervisor-only Panesmith owner for the first Brehon dogfood path.
+/// Panesmith owner for Brehon-managed interactive PTY panes.
 pub(crate) struct BrehonPanesmithShim {
     manager: PaneManager,
     pane_ids: HashMap<String, PanesmithPaneId>,
@@ -85,7 +85,7 @@ impl BrehonPanesmithShim {
         }
     }
 
-    pub(crate) fn spawn_supervisor(
+    pub(crate) fn spawn_pane(
         &mut self,
         pane_id: &str,
         config: &PtyConfig,
@@ -408,7 +408,7 @@ mod tests {
         let config = test_config("sh", &["-c", "true"]);
 
         let panesmith_id = shim
-            .spawn_supervisor("supervisor", &config, "Supervisor")
+            .spawn_pane("supervisor", &config, "Supervisor")
             .expect("spawn Panesmith supervisor");
 
         assert_eq!(shim.panesmith_id_for("supervisor"), Some(panesmith_id));
@@ -420,7 +420,7 @@ mod tests {
     fn drains_events_and_preserves_pane_sequence() {
         let mut shim = BrehonPanesmithShim::new();
         let config = test_config("sh", &["-c", "printf shim-output"]);
-        shim.spawn_supervisor("supervisor", &config, "Supervisor")
+        shim.spawn_pane("supervisor", &config, "Supervisor")
             .expect("spawn Panesmith supervisor");
 
         let mut mirrored = Vec::new();
@@ -460,7 +460,7 @@ mod tests {
         let config = test_config("/definitely/missing/panesmith-command", &[]);
 
         let err = shim
-            .spawn_supervisor("supervisor", &config, "Supervisor")
+            .spawn_pane("supervisor", &config, "Supervisor")
             .expect_err("missing command should fail");
 
         assert!(err.to_string().contains("Panesmith"));

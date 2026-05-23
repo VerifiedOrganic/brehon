@@ -171,6 +171,209 @@ fn test_factory_uses_panesmith_for_supervisor_pty_pane() {
 }
 
 #[test]
+fn test_factory_uses_panesmith_for_all_interactive_pty_roles() {
+    let project_root = super::fresh_temp_dir("brehon-mux-panesmith-all-pty-roles");
+    let config = MuxConfig {
+        cwd: project_root,
+        workers: 1,
+        worker_names: vec!["claude-worker".to_string()],
+        worker_cli: AgentAdapter::BuiltIn(SupervisorCli::Claude),
+        supervisor_name: "claude-supervisor".to_string(),
+        supervisor_cli: AgentAdapter::BuiltIn(SupervisorCli::Claude),
+        reviewer_names: vec!["claude-reviewer".to_string()],
+        reviewer_cli: AgentAdapter::BuiltIn(SupervisorCli::Claude),
+        advisor_names: vec!["claude-advisor".to_string()],
+        advisor_cli: AgentAdapter::BuiltIn(SupervisorCli::Claude),
+        research_names: vec!["claude-research".to_string()],
+        research_cli: AgentAdapter::BuiltIn(SupervisorCli::Claude),
+        include_director: false,
+        rows: 24,
+        cols: 140,
+        ..Default::default()
+    };
+
+    let mut mux = Mux::factory(config).expect("create mux");
+
+    for pane_id in [
+        "claude-worker",
+        "claude-supervisor",
+        "claude-reviewer",
+        "claude-advisor",
+        "claude-research",
+    ] {
+        let pane = mux.get(pane_id).expect("pane exists");
+        assert!(
+            pane.is_panesmith_managed(),
+            "{pane_id} should use Panesmith"
+        );
+        assert!(
+            !pane.is_gateway_backed(),
+            "{pane_id} should not be gateway-owned"
+        );
+        assert!(matches!(pane.backend, PaneBackend::None));
+        assert_eq!(
+            mux.pane_backend_ownership(pane_id),
+            Some(PaneBackendOwnership::Panesmith)
+        );
+        assert!(
+            mux.panesmith_snapshot(pane_id).is_some(),
+            "{pane_id} should have a Panesmith snapshot"
+        );
+    }
+
+    let shell_id = mux
+        .add_shell("local-shell", std::env::temp_dir(), Some("cat"))
+        .expect("add shell");
+    let shell = mux.get(&shell_id).expect("shell pane exists");
+    assert!(shell.is_panesmith_managed());
+    assert_eq!(
+        mux.pane_backend_ownership(&shell_id),
+        Some(PaneBackendOwnership::Panesmith)
+    );
+
+    tokio::runtime::Runtime::new()
+        .expect("runtime")
+        .block_on(mux.shutdown_all());
+}
+
+#[test]
+fn test_factory_keeps_acp_roles_gateway_owned_under_panesmith_default() {
+    let project_root = super::fresh_temp_dir("brehon-mux-panesmith-gateway-non-regression");
+    let config = MuxConfig {
+        cwd: project_root,
+        workers: 1,
+        worker_names: vec!["codex-worker".to_string()],
+        worker_cli: AgentAdapter::BuiltIn(SupervisorCli::Codex),
+        supervisor_name: "codex-supervisor".to_string(),
+        supervisor_cli: AgentAdapter::BuiltIn(SupervisorCli::Codex),
+        reviewer_names: vec!["codex-reviewer".to_string()],
+        reviewer_cli: AgentAdapter::BuiltIn(SupervisorCli::Codex),
+        advisor_names: vec!["codex-advisor".to_string()],
+        advisor_cli: AgentAdapter::BuiltIn(SupervisorCli::Codex),
+        research_names: vec!["codex-research".to_string()],
+        research_cli: AgentAdapter::BuiltIn(SupervisorCli::Codex),
+        include_director: false,
+        rows: 24,
+        cols: 140,
+        ..Default::default()
+    };
+
+    let mut mux = Mux::factory(config).expect("create mux");
+
+    assert_eq!(
+        mux.pane_backend_ownership("codex-supervisor"),
+        Some(PaneBackendOwnership::Panesmith)
+    );
+    for pane_id in [
+        "codex-worker",
+        "codex-reviewer",
+        "codex-advisor",
+        "codex-research",
+    ] {
+        let pane = mux.get(pane_id).expect("pane exists");
+        assert!(
+            pane.is_gateway_backed(),
+            "{pane_id} should stay gateway-owned"
+        );
+        assert!(!pane.is_panesmith_managed());
+        assert_eq!(
+            mux.pane_backend_ownership(pane_id),
+            Some(PaneBackendOwnership::Gateway)
+        );
+    }
+
+    tokio::runtime::Runtime::new()
+        .expect("runtime")
+        .block_on(mux.shutdown_all());
+}
+
+#[test]
+fn test_factory_uses_panesmith_for_custom_interactive_pty_supervisor() {
+    let project_root = super::fresh_temp_dir("brehon-mux-panesmith-custom-pty-supervisor");
+    let mut mux = Mux::factory(MuxConfig {
+        cwd: project_root,
+        workers: 0,
+        supervisor_name: "custom-supervisor".to_string(),
+        supervisor_cli: custom_interactive_agent("custom-supervisor-agent", "cat", &[]),
+        include_director: false,
+        rows: 24,
+        cols: 120,
+        ..Default::default()
+    })
+    .expect("create mux");
+
+    let supervisor = mux
+        .get("custom-supervisor")
+        .expect("custom supervisor exists");
+    assert!(supervisor.is_panesmith_managed());
+    assert!(matches!(supervisor.backend, PaneBackend::None));
+    assert_eq!(
+        mux.pane_backend_ownership("custom-supervisor"),
+        Some(PaneBackendOwnership::Panesmith)
+    );
+    assert!(mux.panesmith_snapshot("custom-supervisor").is_some());
+
+    tokio::runtime::Runtime::new()
+        .expect("runtime")
+        .block_on(mux.shutdown_all());
+}
+
+#[test]
+fn test_factory_uses_panesmith_for_custom_interactive_pty_roles() {
+    let project_root = super::fresh_temp_dir("brehon-mux-panesmith-custom-pty-roles");
+    let mut mux = Mux::factory(MuxConfig {
+        cwd: project_root,
+        workers: 1,
+        worker_names: vec!["custom-worker".to_string()],
+        worker_cli: custom_interactive_agent("custom-worker-agent", "sh", &["-c", "cat"]),
+        supervisor_name: "custom-supervisor".to_string(),
+        supervisor_cli: custom_interactive_agent("custom-supervisor-agent", "sh", &["-c", "cat"]),
+        reviewer_names: vec!["custom-reviewer".to_string()],
+        reviewer_cli: custom_interactive_agent("custom-reviewer-agent", "sh", &["-c", "cat"]),
+        advisor_names: vec!["custom-advisor".to_string()],
+        advisor_cli: custom_interactive_agent("custom-advisor-agent", "sh", &["-c", "cat"]),
+        research_names: vec!["custom-research".to_string()],
+        research_cli: custom_interactive_agent("custom-research-agent", "sh", &["-c", "cat"]),
+        include_director: false,
+        rows: 24,
+        cols: 120,
+        ..Default::default()
+    })
+    .expect("create mux");
+
+    for pane_id in [
+        "custom-worker",
+        "custom-supervisor",
+        "custom-reviewer",
+        "custom-advisor",
+        "custom-research",
+    ] {
+        let pane = mux.get(pane_id).expect("custom pane exists");
+        assert!(
+            pane.is_panesmith_managed(),
+            "{pane_id} should be Panesmith-managed"
+        );
+        assert!(
+            !pane.is_gateway_backed(),
+            "{pane_id} should not be gateway-backed"
+        );
+        assert!(matches!(pane.backend, PaneBackend::None));
+        assert_eq!(
+            mux.pane_backend_ownership(pane_id),
+            Some(PaneBackendOwnership::Panesmith)
+        );
+        assert!(
+            mux.panesmith_snapshot(pane_id).is_some(),
+            "{pane_id} should have a Panesmith snapshot"
+        );
+    }
+
+    tokio::runtime::Runtime::new()
+        .expect("runtime")
+        .block_on(mux.shutdown_all());
+}
+
+#[test]
 fn test_panesmith_supervisor_resize_updates_snapshot() {
     let project_root = super::fresh_temp_dir("brehon-mux-panesmith-resize");
     let config = MuxConfig {
@@ -242,6 +445,68 @@ async fn test_panesmith_supervisor_reset_restarts_panesmith() {
         Some(PaneBackendOwnership::Panesmith)
     );
     assert!(mux.panesmith_snapshot("codex-supervisor").is_some());
+}
+
+#[tokio::test]
+async fn test_panesmith_role_resets_keep_interactive_pty_panes_panesmith_owned() {
+    let project_root = super::fresh_temp_dir("brehon-mux-panesmith-role-resets");
+    let config = MuxConfig {
+        cwd: project_root,
+        workers: 1,
+        worker_names: vec!["claude-worker".to_string()],
+        worker_cli: AgentAdapter::BuiltIn(SupervisorCli::Claude),
+        supervisor_name: "claude-supervisor".to_string(),
+        supervisor_cli: AgentAdapter::BuiltIn(SupervisorCli::Claude),
+        reviewer_names: vec!["claude-reviewer".to_string()],
+        reviewer_cli: AgentAdapter::BuiltIn(SupervisorCli::Claude),
+        advisor_names: vec!["claude-advisor".to_string()],
+        advisor_cli: AgentAdapter::BuiltIn(SupervisorCli::Claude),
+        research_names: vec!["claude-research".to_string()],
+        research_cli: AgentAdapter::BuiltIn(SupervisorCli::Claude),
+        include_director: false,
+        rows: 24,
+        cols: 140,
+        ..Default::default()
+    };
+    let mut mux = Mux::factory(config).expect("create mux");
+
+    mux.reset_worker_gateway_session("claude-worker")
+        .await
+        .expect("reset worker");
+    mux.reset_reviewer_session("claude-reviewer")
+        .await
+        .expect("reset reviewer");
+    mux.reset_advisor_session("claude-advisor")
+        .await
+        .expect("reset advisor");
+    mux.reset_research_session("claude-research")
+        .await
+        .expect("reset research");
+    mux.reset_supervisor_session("claude-supervisor")
+        .await
+        .expect("reset supervisor");
+
+    for pane_id in [
+        "claude-worker",
+        "claude-reviewer",
+        "claude-advisor",
+        "claude-research",
+        "claude-supervisor",
+    ] {
+        let pane = mux.get(pane_id).expect("pane exists");
+        assert!(
+            pane.is_panesmith_managed(),
+            "{pane_id} should remain Panesmith-managed after reset"
+        );
+        assert!(matches!(pane.backend, PaneBackend::None));
+        assert_eq!(
+            mux.pane_backend_ownership(pane_id),
+            Some(PaneBackendOwnership::Panesmith)
+        );
+        assert!(mux.panesmith_snapshot(pane_id).is_some());
+    }
+
+    mux.shutdown_all().await;
 }
 
 #[test]

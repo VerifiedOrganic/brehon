@@ -9,11 +9,26 @@ use std::sync::Arc;
 /// restartable launch contracts.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum AgentPaneMaterialization {
-    /// Create mux-owned PTY child processes immediately.
+    /// Create mux-owned agent runtimes immediately.
+    ///
+    /// Gateway-capable agents use their structured protocol runtime; local
+    /// interactive terminal agents use the legacy ghostty_vt PTY path unless
+    /// the factory maps this to [`Self::Panesmith`] first.
     #[default]
     Spawn,
+    /// Use production routing, but build local interactive PTY panes as
+    /// Panesmith-owned processes/surfaces instead of ghostty_vt-owned PTYs.
+    ///
+    /// Gateway/protocol panes still stay gateway-owned.
+    Panesmith,
     /// Build pane metadata and launch contracts without starting a process.
     PlanOnly,
+}
+
+impl AgentPaneMaterialization {
+    pub(crate) fn is_plan_only(self) -> bool {
+        matches!(self, Self::PlanOnly)
+    }
 }
 
 /// Configuration for the multiplexer

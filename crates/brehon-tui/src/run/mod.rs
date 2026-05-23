@@ -4225,7 +4225,13 @@ mod tests {
 
         terminal
             .draw(|frame| {
-                render_runtime_view(frame, Rect::new(0, 0, 120, 24), Some(&brehon_root), &[]);
+                render_runtime_view(
+                    frame,
+                    Rect::new(0, 0, 120, 24),
+                    Some(&brehon_root),
+                    None,
+                    &[],
+                );
             })
             .unwrap();
 
@@ -4249,7 +4255,7 @@ mod tests {
         assert!(rendered.contains("terminal host does not advertise absolute resize"));
         assert!(rendered.contains("session=brehon-session"));
         assert!(rendered.contains("Pane"));
-        assert!(rendered.contains("Source"));
+        assert!(rendered.contains("Owner"));
         assert!(rendered.contains("Output"));
         assert!(rendered.contains("Title"));
         assert!(rendered.contains("session-1/host-preview"));
@@ -4323,6 +4329,7 @@ mod tests {
                     frame,
                     Rect::new(0, 0, 120, 30),
                     Some(&brehon_root),
+                    None,
                     &recent_runtime_commands,
                 );
             })
@@ -4520,8 +4527,13 @@ mod tests {
 
         terminal
             .draw(|frame| {
-                regions =
-                    render_runtime_view(frame, Rect::new(0, 0, 120, 20), Some(&brehon_root), &[]);
+                regions = render_runtime_view(
+                    frame,
+                    Rect::new(0, 0, 120, 20),
+                    Some(&brehon_root),
+                    None,
+                    &[],
+                );
             })
             .unwrap();
 
@@ -4605,11 +4617,58 @@ mod tests {
             }),
         };
 
-        let summary = runtime_registry_summary(&status);
+        let summary = runtime_registry_summary(&status, None);
 
         assert!(summary.contains("panes=2"));
         assert!(summary.contains("ready=2"));
         assert!(summary.contains("sources=headless:1,mux:1"));
+    }
+
+    #[test]
+    fn test_runtime_registry_summary_includes_live_backend_owner_counts() {
+        let project_root = tempfile::tempdir().expect("tempdir");
+        let mut mux = Mux::factory(brehon_mux::MuxConfig {
+            cwd: project_root.path().to_path_buf(),
+            workers: 0,
+            supervisor_name: "codex-supervisor".to_string(),
+            supervisor_cli: brehon_mux::AgentAdapter::BuiltIn(brehon_mux::SupervisorCli::Codex),
+            include_director: false,
+            rows: 24,
+            cols: 100,
+            ..Default::default()
+        })
+        .expect("create mux");
+        let status = RuntimeDaemonDashboardStatus {
+            generated_at_ms: 1,
+            running: true,
+            metrics: RuntimeDaemonDashboardMetrics::default(),
+            registry_count: 1,
+            registry: RuntimePaneRegistryDashboardSnapshot {
+                panes: vec![RuntimePaneDashboardInfo {
+                    session_id: "session-1".to_string(),
+                    pane_id: "codex-supervisor".to_string(),
+                    generation: 1,
+                    state: brehon_types::RuntimePaneState::Ready,
+                    kind: brehon_types::RuntimePaneKind::Supervisor,
+                    source: Some(brehon_types::RuntimeSource::Mux),
+                    title: None,
+                    last_output_ms: None,
+                    exit_code: None,
+                    exit_reason: None,
+                }],
+            },
+            approvals: RuntimeApprovalDashboardSnapshot::default(),
+            sidecar: None,
+            terminal_host: None,
+        };
+
+        let summary = runtime_registry_summary(&status, Some(&mux));
+
+        assert!(summary.contains("sources=mux:1"));
+        assert!(summary.contains("owners=panesmith:1"));
+        tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(mux.shutdown_all());
     }
 
     #[test]

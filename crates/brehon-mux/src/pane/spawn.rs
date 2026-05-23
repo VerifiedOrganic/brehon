@@ -113,8 +113,6 @@ fn custom_supervisor_requires_pty_error(
     adapter: &AgentAdapter,
     custom: &crate::harness::CustomAgentConfig,
 ) -> Option<String> {
-    use crate::harness::{HarnessControlPlane, HarnessTransport};
-
     let capabilities = adapter.capabilities();
     if custom.command.as_deref().is_none() {
         return Some(format!(
@@ -122,15 +120,15 @@ fn custom_supervisor_requires_pty_error(
             adapter.name()
         ));
     }
-    let has_valid_supervisor_contract = match capabilities.preferred_control_plane {
-        HarnessControlPlane::NativeHooks | HarnessControlPlane::PtyInjection => matches!(
+    let has_valid_supervisor_contract = if capabilities.preferred_control_plane
+        == crate::harness::HarnessControlPlane::AcpSidecar
+    {
+        matches!(
             capabilities.transport,
-            HarnessTransport::NativeHooks | HarnessTransport::InteractivePty
-        ),
-        HarnessControlPlane::AcpSidecar => {
-            matches!(capabilities.transport, HarnessTransport::InteractivePty)
-        }
-        _ => false,
+            crate::harness::HarnessTransport::InteractivePty
+        )
+    } else {
+        custom_agent_supports_direct_pty(adapter)
     };
     if !has_valid_supervisor_contract {
         return Some(format!(
@@ -141,6 +139,42 @@ fn custom_supervisor_requires_pty_error(
         ));
     }
     None
+}
+
+fn custom_non_supervisor_requires_pty_error(
+    adapter: &AgentAdapter,
+    custom: &crate::harness::CustomAgentConfig,
+    role: &str,
+) -> Option<String> {
+    let capabilities = adapter.capabilities();
+    if custom.command.as_deref().is_none() {
+        return Some(format!(
+            "Custom {role} agent '{}' must provide an interactive PTY launch command",
+            adapter.name()
+        ));
+    }
+    if !custom_agent_supports_direct_pty(adapter) {
+        return Some(format!(
+            "Custom {role} agent '{}' must be gateway-backed or configured as an interactive PTY; got transport={} control_plane={}",
+            adapter.name(),
+            capabilities.transport,
+            capabilities.preferred_control_plane
+        ));
+    }
+    None
+}
+
+fn custom_agent_supports_direct_pty(adapter: &AgentAdapter) -> bool {
+    let capabilities = adapter.capabilities();
+    match capabilities.preferred_control_plane {
+        crate::harness::HarnessControlPlane::NativeHooks
+        | crate::harness::HarnessControlPlane::PtyInjection => matches!(
+            capabilities.transport,
+            crate::harness::HarnessTransport::NativeHooks
+                | crate::harness::HarnessTransport::InteractivePty
+        ),
+        _ => false,
+    }
 }
 
 pub(crate) fn config_env_value(env: &[(String, String)], key: &str) -> Option<String> {
@@ -558,7 +592,7 @@ impl Pane {
                 let pty = Pty::spawn(name, spawn_config)?;
                 Self::with_pty_cli(name, kind, pty, rows, cols, cli_type)?
             }
-            AgentPaneMaterialization::PlanOnly => {
+            AgentPaneMaterialization::Panesmith | AgentPaneMaterialization::PlanOnly => {
                 let mut pane = Self::new_with_backend_cli(
                     name,
                     name,
@@ -639,6 +673,24 @@ impl Pane {
         rows: u16,
         cols: u16,
     ) -> Result<Self> {
+        Self::shell_materialized(
+            name,
+            cwd,
+            shell_command,
+            rows,
+            cols,
+            AgentPaneMaterialization::Spawn,
+        )
+    }
+
+    pub(crate) fn shell_materialized(
+        name: &str,
+        cwd: PathBuf,
+        shell_command: Option<&str>,
+        rows: u16,
+        cols: u16,
+        materialization: AgentPaneMaterialization,
+    ) -> Result<Self> {
         let shell = shell_command
             .map(|s| s.to_string())
             .unwrap_or_else(|| std::env::var("SHELL").unwrap_or_else(|_| "bash".to_string()));
@@ -651,8 +703,18 @@ impl Pane {
             rows,
             cols,
         };
-        let pty = Pty::spawn(name, config)?;
-        let mut pane = Self::with_pty(name, PaneKind::Shell, pty, rows, cols)?;
+        let mut pane = Self::pty_pane_from_config(
+            name,
+            PaneKind::Shell,
+            config,
+            rows,
+            cols,
+            AgentAdapter::BuiltIn(SupervisorCli::Claude),
+            None,
+            "shell",
+            materialization,
+            None,
+        )?;
         pane.set_tool_executing(false);
         Ok(pane)
     }
@@ -972,6 +1034,45 @@ impl Pane {
                         brehon_root,
                     );
                 }
+                crate::harness::HarnessControlPlane::NativeHooks
+                | crate::harness::HarnessControlPlane::PtyInjection => {
+                    if let Some(reason) =
+                        custom_non_supervisor_requires_pty_error(adapter, custom, "worker")
+                    {
+                        return Err(Error::pty(reason));
+                    }
+                    let command = custom
+                        .command
+                        .as_deref()
+                        .expect("custom worker PTY contract checked command presence");
+                    let mut config = PtyConfig::custom_pty(
+                        name,
+                        "worker",
+                        command,
+                        &custom.args,
+                        configured_agent_type.or(Some(adapter.name())),
+                        cwd,
+                        brehon_root,
+                        Some(supervisor_name),
+                        worker_cli_str,
+                    );
+                    apply_runtime_session_name(&mut config.env, session_name);
+                    apply_configured_agent_type(&mut config, configured_agent_type);
+                    merge_launcher_env(&mut config.env, launcher_env);
+                    apply_runtime_model_metadata(&mut config.env, model, reasoning_effort);
+                    return Self::pty_pane_from_config(
+                        name,
+                        PaneKind::Worker,
+                        config,
+                        rows,
+                        cols,
+                        adapter_owned,
+                        configured_agent_type,
+                        adapter.name(),
+                        materialization,
+                        brehon_root,
+                    );
+                }
                 _ => {
                     return Err(Error::pty(format!(
                         "Custom agent '{}' is not yet supported for worker spawn unless it is gateway-backed",
@@ -1021,7 +1122,7 @@ impl Pane {
             // Build PtyConfig for command/args/env, then create a gateway pane.
             SupervisorCli::Codex => {
                 let _ = server_url;
-                if materialization == AgentPaneMaterialization::PlanOnly {
+                if materialization.is_plan_only() {
                     let mut config = PtyConfig::codex(
                         name,
                         "worker",
@@ -1075,7 +1176,7 @@ impl Pane {
                 )
             }
             SupervisorCli::Gemini => {
-                if materialization == AgentPaneMaterialization::PlanOnly {
+                if materialization.is_plan_only() {
                     let mut config = PtyConfig::gemini(
                         name,
                         "worker",
@@ -1129,7 +1230,7 @@ impl Pane {
                 )
             }
             SupervisorCli::Kimi => {
-                if materialization == AgentPaneMaterialization::PlanOnly {
+                if materialization.is_plan_only() {
                     let mut config = PtyConfig::kimi(
                         name,
                         "worker",
@@ -1183,7 +1284,7 @@ impl Pane {
             }
             SupervisorCli::OpenCode => {
                 let _ = server_url;
-                if materialization == AgentPaneMaterialization::PlanOnly {
+                if materialization.is_plan_only() {
                     let mut config = PtyConfig::opencode(
                         name,
                         "worker",
@@ -1296,7 +1397,7 @@ impl Pane {
                 )
             }
             SupervisorCli::Copilot => {
-                if materialization == AgentPaneMaterialization::PlanOnly {
+                if materialization.is_plan_only() {
                     let mut config = PtyConfig::copilot(
                         name,
                         "worker",
@@ -1676,6 +1777,45 @@ impl Pane {
                         brehon_root,
                     );
                 }
+                crate::harness::HarnessControlPlane::NativeHooks
+                | crate::harness::HarnessControlPlane::PtyInjection => {
+                    if let Some(reason) =
+                        custom_non_supervisor_requires_pty_error(adapter, custom, role)
+                    {
+                        return Err(Error::pty(reason));
+                    }
+                    let command = custom
+                        .command
+                        .as_deref()
+                        .expect("custom role PTY contract checked command presence");
+                    let mut config = PtyConfig::custom_pty(
+                        name,
+                        role,
+                        command,
+                        &custom.args,
+                        configured_agent_type.or(Some(adapter.name())),
+                        cwd,
+                        brehon_root,
+                        None,
+                        None,
+                    );
+                    apply_runtime_session_name(&mut config.env, session_name);
+                    apply_configured_agent_type(&mut config, configured_agent_type);
+                    merge_launcher_env(&mut config.env, launcher_env);
+                    apply_runtime_model_metadata(&mut config.env, model, reasoning_effort);
+                    return Self::pty_pane_from_config(
+                        name,
+                        pane_kind.clone(),
+                        config,
+                        rows,
+                        cols,
+                        adapter_owned,
+                        configured_agent_type,
+                        adapter.name(),
+                        materialization,
+                        brehon_root,
+                    );
+                }
                 _ => {
                     return Err(Error::pty(format!(
                         "Custom agent '{}' is not yet supported for {role} spawn unless it is gateway-backed",
@@ -1724,7 +1864,7 @@ impl Pane {
             // ACP-capable role agents: gateway panes (piped stdio, no PTY)
             SupervisorCli::Codex => {
                 let _ = server_url;
-                if materialization == AgentPaneMaterialization::PlanOnly {
+                if materialization.is_plan_only() {
                     let mut config = PtyConfig::codex(
                         name,
                         role,
@@ -1778,7 +1918,7 @@ impl Pane {
                 )
             }
             SupervisorCli::Gemini => {
-                if materialization == AgentPaneMaterialization::PlanOnly {
+                if materialization.is_plan_only() {
                     let mut config = PtyConfig::gemini(
                         name,
                         role,
@@ -1832,7 +1972,7 @@ impl Pane {
                 )
             }
             SupervisorCli::Kimi => {
-                if materialization == AgentPaneMaterialization::PlanOnly {
+                if materialization.is_plan_only() {
                     let mut config = PtyConfig::kimi(
                         name,
                         role,
@@ -1886,7 +2026,7 @@ impl Pane {
             }
             SupervisorCli::OpenCode => {
                 let _ = server_url;
-                if materialization == AgentPaneMaterialization::PlanOnly {
+                if materialization.is_plan_only() {
                     let mut config = PtyConfig::opencode(
                         name,
                         role,
@@ -1983,7 +2123,7 @@ impl Pane {
                 )
             }
             SupervisorCli::Copilot => {
-                if materialization == AgentPaneMaterialization::PlanOnly {
+                if materialization.is_plan_only() {
                     let mut config = PtyConfig::copilot(
                         name,
                         role,

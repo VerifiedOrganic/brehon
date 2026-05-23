@@ -1,4 +1,4 @@
-//! Mux-level integration for the supervisor-only Panesmith dogfood path.
+//! Mux-level integration for Panesmith-owned interactive PTY panes.
 
 use std::time::Duration;
 use std::time::Instant;
@@ -9,7 +9,7 @@ use crate::pane::spawn::{
     PRE_SUBMIT_INTER_INTERRUPT_DELAY, PRE_SUBMIT_SETTLE_DELAY, uses_delayed_submit_injection,
     uses_ink_echo_injection, uses_pre_submit_interrupt_reset,
 };
-use crate::pane::{Pane, PaneKind};
+use crate::pane::{ClaudePromptState, Pane};
 
 use super::Mux;
 use super::types::MuxEvent;
@@ -53,13 +53,36 @@ impl Mux {
         self.panesmith.contains(pane_id)
     }
 
-    pub(crate) fn spawn_panesmith_supervisor_for_pane(&mut self, pane: &mut Pane) -> Result<()> {
-        if pane.kind() != &PaneKind::Supervisor {
-            return Err(Error::pty(format!(
-                "Pane '{}' is not a supervisor and cannot be Panesmith-managed",
-                pane.id()
-            )));
+    pub(crate) fn panesmith_claude_prompt_state(&self, pane_id: &str) -> Option<ClaudePromptState> {
+        let snapshot = self.panesmith_snapshot(pane_id)?;
+        for row in snapshot.surface.rows.iter().rev() {
+            let text = row
+                .cells
+                .iter()
+                .map(|cell| cell.text.as_ref())
+                .collect::<String>();
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            if let Some(rest) = trimmed.strip_prefix('\u{276F}') {
+                return Some(if rest.trim().is_empty() {
+                    ClaudePromptState::Empty
+                } else {
+                    ClaudePromptState::Draft
+                });
+            }
+
+            if trimmed.contains("\u{2500}\u{2500}\u{2500}\u{2500}") && trimmed.contains('@') {
+                return Some(ClaudePromptState::Visible);
+            }
         }
+
+        Some(ClaudePromptState::None)
+    }
+
+    pub(crate) fn spawn_panesmith_for_pane(&mut self, pane: &mut Pane) -> Result<()> {
         let config = pane
             .pty_spawn_config
             .as_ref()
@@ -67,27 +90,19 @@ impl Mux {
         let pane_id = pane.id().to_string();
         let title = pane.title().to_string();
 
-        self.panesmith.spawn_supervisor(&pane_id, config, &title)?;
+        self.panesmith.spawn_pane(&pane_id, config, &title)?;
         pane.set_panesmith_managed(true);
         pane.set_tool_executing(true);
         pane.set_last_output_at(Instant::now());
         Ok(())
     }
 
-    pub(crate) fn restart_panesmith_supervisor_for_existing_pane(
-        &mut self,
-        pane_id: &str,
-    ) -> Result<()> {
+    pub(crate) fn restart_panesmith_for_existing_pane(&mut self, pane_id: &str) -> Result<()> {
         let (config, title) = {
             let pane = self
                 .panes
                 .get(pane_id)
                 .ok_or_else(|| Error::pane_not_found(pane_id))?;
-            if pane.kind() != &PaneKind::Supervisor {
-                return Err(Error::pty(format!(
-                    "Pane '{pane_id}' is not a supervisor and cannot be Panesmith-managed"
-                )));
-            }
             let config =
                 pane.pty_spawn_config.as_ref().cloned().ok_or_else(|| {
                     Error::pty(format!("Pane '{pane_id}' has no PTY spawn config"))
@@ -95,7 +110,7 @@ impl Mux {
             (config, pane.title().to_string())
         };
 
-        self.panesmith.spawn_supervisor(pane_id, &config, &title)?;
+        self.panesmith.spawn_pane(pane_id, &config, &title)?;
         if let Some(pane) = self.panes.get_mut(pane_id) {
             pane.set_panesmith_managed(true);
             pane.set_tool_executing(true);

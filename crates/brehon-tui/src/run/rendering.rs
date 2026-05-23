@@ -1582,13 +1582,14 @@ pub(crate) fn render_status_bar(
         .map(|p| crate::theme::agent::color(p.cli_type().name()))
         .unwrap_or(Color::White);
     let focused_kind = focused.map(|p| p.kind().clone());
-    let focused_panesmith_supervisor = focused.as_ref().is_some_and(|pane| {
-        *pane.kind() == PaneKind::Supervisor && mux.is_panesmith_managed(pane.id())
-    });
+    let focused_panesmith_pane = focused
+        .as_ref()
+        .is_some_and(|pane| mux.is_panesmith_managed(pane.id()));
     let pane_count = mux.panes().count();
     let key_style = Style::default().fg(crate::theme::brand::PRIMARY).bg(BG);
     let label_style = Style::default().fg(TEXT_DIM).bg(BG);
     let separator_style = Style::default().fg(TEXT_MUTED).bg(BG);
+    let compact_key_labels = area.width < 240;
     let separator = || {
         Span::styled(
             format!("  {}  ", crate::theme::glyph::BULLET),
@@ -1625,22 +1626,60 @@ pub(crate) fn render_status_bar(
         Span::styled(":Runtime", label_style),
         separator(),
         Span::styled("C-a", key_style),
-        Span::styled(":Advisors", label_style),
+        Span::styled(
+            if compact_key_labels {
+                ":Adv"
+            } else {
+                ":Advisors"
+            },
+            label_style,
+        ),
+        separator(),
+        Span::styled("C-y", key_style),
+        Span::styled(
+            if compact_key_labels {
+                ":Res"
+            } else {
+                ":Research"
+            },
+            label_style,
+        ),
         separator(),
         Span::styled("C-w", key_style),
-        Span::styled(":Workers", label_style),
+        Span::styled(
+            if compact_key_labels {
+                ":Work"
+            } else {
+                ":Workers"
+            },
+            label_style,
+        ),
         separator(),
         Span::styled("C-e", key_style),
-        Span::styled(":Reviewers", label_style),
+        Span::styled(
+            if compact_key_labels {
+                ":Rev"
+            } else {
+                ":Reviewers"
+            },
+            label_style,
+        ),
         separator(),
         Span::styled("C-s", key_style),
-        Span::styled(":Supervisor", label_style),
+        Span::styled(
+            if compact_key_labels {
+                ":Sup"
+            } else {
+                ":Supervisor"
+            },
+            label_style,
+        ),
         separator(),
         Span::styled("C-v", key_style),
         Span::styled(":Struct", label_style),
         separator(),
     ]);
-    if focused_panesmith_supervisor {
+    if focused_panesmith_pane {
         spans.extend([
             Span::styled("C-f", key_style),
             Span::styled(":Full", label_style),

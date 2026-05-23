@@ -49,6 +49,21 @@ fn capture_info_logs(run: impl FnOnce()) -> String {
         .expect("captured logs should be utf-8")
 }
 
+fn panesmith_snapshot_text(snapshot: &::panesmith::OwnedPaneSnapshot) -> String {
+    snapshot
+        .surface
+        .rows
+        .iter()
+        .map(|row| {
+            row.cells
+                .iter()
+                .map(|cell| cell.text.as_ref())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[test]
 fn test_flush_pending_inbox_nudges_waits_for_empty_claude_prompt() {
     let mut mux = Mux::new(24, 80);
@@ -412,6 +427,74 @@ fn test_force_supervisor_inbox_recovery_sends_enter_not_prompt_text_when_empty()
         "empty prompt recovery must only send Enter, never type recovery text"
     );
 
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn test_panesmith_teams_inbox_nudge_uses_snapshot_prompt_state() {
+    let project_root = super::fresh_temp_dir("brehon-mux-panesmith-teams-nudge");
+    let mut mux = Mux::factory(MuxConfig {
+        cwd: project_root,
+        workers: 0,
+        supervisor_name: "codex-supervisor".to_string(),
+        supervisor_cli: AgentAdapter::BuiltIn(SupervisorCli::Codex),
+        reviewer_names: vec!["claude-reviewer".to_string()],
+        reviewer_cli: AgentAdapter::BuiltIn(SupervisorCli::Claude),
+        include_director: false,
+        rows: 24,
+        cols: 120,
+        ..Default::default()
+    })
+    .expect("create mux");
+    let home = std::env::temp_dir().join(format!("brehon-mux-home-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&home).expect("create fake home");
+    mux.set_teams(TeamsManager::new_for_test("test-session", home.clone()));
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+
+    assert!(mux.is_panesmith_managed("claude-reviewer"));
+    rt.block_on(mux.send_input_to("claude-reviewer", b"\xe2\x9d\xaf \r\n"))
+        .expect("seed empty prompt marker through Panesmith");
+
+    let mut saw_empty_prompt = false;
+    for _ in 0..50 {
+        let (_bytes, _events) = mux.poll_batch();
+        saw_empty_prompt = mux
+            .panesmith_snapshot("claude-reviewer")
+            .map(panesmith_snapshot_text)
+            .is_some_and(|text| text.contains('\u{276F}'));
+        if saw_empty_prompt {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        saw_empty_prompt,
+        "expected prompt marker in Panesmith snapshot"
+    );
+
+    {
+        let pane = mux
+            .get_mut("claude-reviewer")
+            .expect("reviewer pane exists");
+        pane.set_inbox_nudge_not_before(None);
+        pane.set_last_output_at(std::time::Instant::now() - std::time::Duration::from_secs(10));
+        pane.set_pending_inbox_nudge(true);
+        pane.set_pending_inbox_nudge_since(Some(
+            std::time::Instant::now() - std::time::Duration::from_secs(20),
+        ));
+        pane.set_focused(false);
+    }
+
+    mux.flush_pending_inbox_nudges(rt.handle());
+
+    assert!(
+        !mux.get("claude-reviewer")
+            .expect("reviewer pane exists")
+            .pending_inbox_nudge(),
+        "Panesmith Teams inbox nudge should use snapshot prompt state and clear the pending flag"
+    );
+
+    rt.block_on(mux.shutdown_all());
     let _ = std::fs::remove_dir_all(&home);
 }
 

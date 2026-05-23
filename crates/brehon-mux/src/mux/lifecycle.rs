@@ -17,6 +17,38 @@ use super::types::{
 use super::{AgentPaneMaterialization, Mux, MuxConfig};
 
 impl Mux {
+    fn panesmith_materialization_for_factory(
+        materialization: AgentPaneMaterialization,
+    ) -> AgentPaneMaterialization {
+        if materialization == AgentPaneMaterialization::Spawn {
+            AgentPaneMaterialization::Panesmith
+        } else {
+            materialization
+        }
+    }
+
+    fn start_panesmith_or_legacy_pty(&mut self, pane: &mut Pane) -> Result<()> {
+        if pane.is_gateway_backed()
+            || pane.pty_spawn_config.is_none()
+            || pane.is_panesmith_managed()
+        {
+            return Ok(());
+        }
+
+        match self.spawn_panesmith_for_pane(pane) {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                tracing::warn!(
+                    pane = %pane.id(),
+                    error = %err,
+                    "Panesmith pane spawn failed; falling back to ghostty_vt PTY path"
+                );
+                pane.set_panesmith_managed(false);
+                pane.start_pty_from_spawn_config()
+            }
+        }
+    }
+
     pub(super) fn ensure_pane_uses_isolated_cwd(&self, pane_id: &str, role: &str) -> Result<()> {
         if !self.worktree_isolation {
             return Ok(());
@@ -122,6 +154,8 @@ impl Mux {
         let supervisor_rows = config.rows.saturating_sub(3).max(10);
         let pane_rows = worker_rows;
         let pane_cols = left_cols;
+        let pane_materialization =
+            Self::panesmith_materialization_for_factory(config.pane_materialization);
 
         // Create worker panes
         let worker_names: Vec<String> = if config.worker_names.is_empty() {
@@ -169,7 +203,7 @@ impl Mux {
                 .get(name)
                 .map(|s| s.as_str());
 
-            let pane = Pane::worker_with_agent_type_materialized(
+            let mut pane = Pane::worker_with_agent_type_materialized(
                 name,
                 worker_cwd,
                 config.session_name.as_deref(),
@@ -188,8 +222,11 @@ impl Mux {
                     .get(name)
                     .map(Vec::as_slice)
                     .unwrap_or(&[]),
-                config.pane_materialization,
+                pane_materialization,
             )?;
+            if pane_materialization == AgentPaneMaterialization::Panesmith {
+                mux.start_panesmith_or_legacy_pty(&mut pane)?;
+            }
             mux.add_pane(pane);
         }
 
@@ -234,43 +271,10 @@ impl Mux {
             &config.worker_agent_type_map,
             config.supervisor_reasoning_effort.as_deref(),
             &config.supervisor_env,
-            if config.pane_materialization == AgentPaneMaterialization::Spawn {
-                AgentPaneMaterialization::PlanOnly
-            } else {
-                config.pane_materialization
-            },
+            pane_materialization,
         )?;
-        if config.pane_materialization == AgentPaneMaterialization::Spawn {
-            if let Err(err) = mux.spawn_panesmith_supervisor_for_pane(&mut supervisor) {
-                tracing::warn!(
-                    pane = %config.supervisor_name,
-                    error = %err,
-                    "Panesmith supervisor spawn failed; falling back to ghostty_vt PTY path"
-                );
-                supervisor = Pane::supervisor_with_agent_type_materialized(
-                    &config.supervisor_name,
-                    config
-                        .supervisor_cwd
-                        .clone()
-                        .unwrap_or_else(|| config.cwd.clone()),
-                    config.session_name.as_deref(),
-                    config.brehon_root.as_ref(),
-                    supervisor_rows,
-                    supervisor_cols,
-                    &config.supervisor_cli,
-                    &config.worker_cli,
-                    &worker_names,
-                    config.supervisor_model.as_deref(),
-                    config.supervisor_server_url.as_deref(),
-                    sup_teams,
-                    &config.worker_cli_map,
-                    config.supervisor_agent_type.as_deref(),
-                    &config.worker_agent_type_map,
-                    config.supervisor_reasoning_effort.as_deref(),
-                    &config.supervisor_env,
-                    AgentPaneMaterialization::Spawn,
-                )?;
-            }
+        if pane_materialization == AgentPaneMaterialization::Panesmith {
+            mux.start_panesmith_or_legacy_pty(&mut supervisor)?;
         }
         mux.add_pane(supervisor);
 
@@ -336,8 +340,11 @@ impl Mux {
                     .get(reviewer_name)
                     .map(Vec::as_slice)
                     .unwrap_or(&[]),
-                config.pane_materialization,
+                pane_materialization,
             )?;
+            if pane_materialization == AgentPaneMaterialization::Panesmith {
+                mux.start_panesmith_or_legacy_pty(&mut reviewer)?;
+            }
             apply_reviewer_panel_metadata(
                 &mut reviewer,
                 config.reviewer_panel_map.get(reviewer_name),
@@ -368,7 +375,7 @@ impl Mux {
                     advisor_name,
                 )?;
             }
-            let advisor = Pane::advisor_with_agent_type_materialized(
+            let mut advisor = Pane::advisor_with_agent_type_materialized(
                 advisor_name,
                 advisor_cwd,
                 config.session_name.as_deref(),
@@ -402,8 +409,11 @@ impl Mux {
                     .get(advisor_name)
                     .map(Vec::as_slice)
                     .unwrap_or(&[]),
-                config.pane_materialization,
+                pane_materialization,
             )?;
+            if pane_materialization == AgentPaneMaterialization::Panesmith {
+                mux.start_panesmith_or_legacy_pty(&mut advisor)?;
+            }
             mux.add_pane(advisor);
         }
 
@@ -429,7 +439,7 @@ impl Mux {
                     research_name,
                 )?;
             }
-            let research = Pane::research_with_agent_type_materialized(
+            let mut research = Pane::research_with_agent_type_materialized(
                 research_name,
                 research_cwd,
                 config.session_name.as_deref(),
@@ -463,8 +473,11 @@ impl Mux {
                     .get(research_name)
                     .map(Vec::as_slice)
                     .unwrap_or(&[]),
-                config.pane_materialization,
+                pane_materialization,
             )?;
+            if pane_materialization == AgentPaneMaterialization::Panesmith {
+                mux.start_panesmith_or_legacy_pty(&mut research)?;
+            }
             mux.add_pane(research);
         }
 
@@ -542,6 +555,18 @@ impl Mux {
 
     /// Remove a pane
     pub fn remove_pane(&mut self, id: &str) -> Option<Pane> {
+        if self
+            .panes
+            .get(id)
+            .is_some_and(|pane| pane.is_panesmith_managed())
+            && let Err(err) = self.kill_panesmith_pane(id)
+        {
+            tracing::warn!(
+                pane = %id,
+                error = %err,
+                "Failed to stop Panesmith-managed pane during removal"
+            );
+        }
         let pane = self.panes.shift_remove(id);
         self.recycle_markers.remove(id);
 
@@ -867,7 +892,15 @@ impl Mux {
         if let Some(err) = Self::policy_decision_error("shell spawn", &decision) {
             return Err(err);
         }
-        let pane = Pane::shell(name, cwd, shell_command, self.rows, self.cols)?;
+        let mut pane = Pane::shell_materialized(
+            name,
+            cwd,
+            shell_command,
+            self.rows,
+            self.cols,
+            AgentPaneMaterialization::Panesmith,
+        )?;
+        self.start_panesmith_or_legacy_pty(&mut pane)?;
         let id = pane.id().to_string();
         self.add_pane(pane);
         Ok(id)

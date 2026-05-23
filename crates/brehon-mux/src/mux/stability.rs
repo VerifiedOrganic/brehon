@@ -73,6 +73,36 @@ pub(crate) fn agent_is_marked_unavailable(agent_name: &str) -> bool {
 // ── impl Mux stability methods ──────────────────────────────────────────────
 
 impl Mux {
+    fn restart_local_terminal_after_reset(&mut self, pane_id: &str, role: &str) -> Result<bool> {
+        let is_panesmith_managed = self
+            .panes
+            .get(pane_id)
+            .is_some_and(|pane| pane.is_panesmith_managed());
+
+        if is_panesmith_managed {
+            self.kill_panesmith_pane(pane_id)?;
+            match self.restart_panesmith_for_existing_pane(pane_id) {
+                Ok(()) => return Ok(true),
+                Err(err) => {
+                    tracing::warn!(
+                        pane = %pane_id,
+                        role,
+                        error = %err,
+                        "Panesmith reset restart failed; falling back to ghostty_vt PTY path"
+                    );
+                }
+            }
+        }
+
+        let pane = self
+            .panes
+            .get_mut(pane_id)
+            .ok_or_else(|| Error::pane_not_found(pane_id))?;
+        pane.set_panesmith_managed(false);
+        pane.restart_pty_from_spawn_config()?;
+        Ok(false)
+    }
+
     fn mark_pane_ready_after_reset(&mut self, pane_id: &str, reason: &str) {
         let state_change = {
             let Some(pane) = self.panes.get_mut(pane_id) else {
@@ -150,23 +180,30 @@ impl Mux {
         }
 
         self.clear_active_gateway_operations(pane_id);
+        let restarted_with_panesmith = if is_gateway_backed {
+            false
+        } else {
+            self.restart_local_terminal_after_reset(pane_id, "reviewer")?
+        };
         if let Some(pane) = self.panes.get_mut(pane_id) {
             if is_gateway_backed {
                 pane.clear_gateway_session();
                 if let Some(activity) = pane.activity_buffer_mut() {
                     activity.clear();
                 }
-            } else {
-                pane.restart_pty_from_spawn_config()?;
             }
             pane.clear_review_context();
             pane.set_tool_executing(false);
             let notice = if is_gateway_backed {
                 "\x1b[2mBrehon reset reviewer session after completed submission. Starting a fresh review context.\x1b[0m\r\n"
+            } else if restarted_with_panesmith {
+                ""
             } else {
                 "\x1b[2mBrehon restarted reviewer process after completed submission. Starting a fresh review context.\x1b[0m\r\n"
             };
-            let _ = pane.append_output(notice.as_bytes());
+            if !notice.is_empty() {
+                let _ = pane.append_output(notice.as_bytes());
+            }
         }
         self.mark_pane_ready_after_reset(pane_id, "reviewer session reset");
         clear_agent_health_marker(pane_id);
@@ -186,7 +223,7 @@ impl Mux {
     /// conversation without touching shared task or review state.
     pub async fn reset_advisor_session(&mut self, pane_id: &str) -> Result<()> {
         self.ensure_pane_uses_isolated_cwd(pane_id, "advisor")?;
-        let (is_gateway_backed, gateway_session_id, is_panesmith_managed) = {
+        let (is_gateway_backed, gateway_session_id) = {
             let pane = self
                 .panes
                 .get(pane_id)
@@ -199,7 +236,6 @@ impl Mux {
             (
                 pane.is_gateway_backed(),
                 pane.gateway_session_id().map(brehon_types::SessionId::new),
-                pane.is_panesmith_managed(),
             )
         };
         let command = self.runtime_command_for_pane(
@@ -228,29 +264,31 @@ impl Mux {
             }
         }
 
-        if is_panesmith_managed {
-            self.kill_panesmith_pane(pane_id)?;
-        }
-
         self.clear_active_gateway_operations(pane_id);
+        let restarted_with_panesmith = if is_gateway_backed {
+            false
+        } else {
+            self.restart_local_terminal_after_reset(pane_id, "advisor")?
+        };
         if let Some(pane) = self.panes.get_mut(pane_id) {
             if is_gateway_backed {
                 pane.clear_gateway_session();
                 if let Some(activity) = pane.activity_buffer_mut() {
                     activity.clear();
                 }
-            } else {
-                pane.set_panesmith_managed(false);
-                pane.restart_pty_from_spawn_config()?;
             }
             pane.set_tool_executing(false);
             pane.set_pending_inbox_nudge(false);
             let notice = if is_gateway_backed {
                 "\x1b[2mBrehon reset advisor session. Rejoining advisor rooms with a fresh context.\x1b[0m\r\n"
+            } else if restarted_with_panesmith {
+                ""
             } else {
                 "\x1b[2mBrehon restarted advisor process. Rejoining advisor rooms with a fresh context.\x1b[0m\r\n"
             };
-            let _ = pane.append_output(notice.as_bytes());
+            if !notice.is_empty() {
+                let _ = pane.append_output(notice.as_bytes());
+            }
         }
         self.mark_pane_ready_after_reset(pane_id, "advisor session reset");
         clear_agent_health_marker(pane_id);
@@ -306,23 +344,30 @@ impl Mux {
         }
 
         self.clear_active_gateway_operations(pane_id);
+        let restarted_with_panesmith = if is_gateway_backed {
+            false
+        } else {
+            self.restart_local_terminal_after_reset(pane_id, "research")?
+        };
         if let Some(pane) = self.panes.get_mut(pane_id) {
             if is_gateway_backed {
                 pane.clear_gateway_session();
                 if let Some(activity) = pane.activity_buffer_mut() {
                     activity.clear();
                 }
-            } else {
-                pane.restart_pty_from_spawn_config()?;
             }
             pane.set_tool_executing(false);
             pane.set_pending_inbox_nudge(false);
             let notice = if is_gateway_backed {
                 "\x1b[2mBrehon reset research session. Rejoining the research queue with a fresh context.\x1b[0m\r\n"
+            } else if restarted_with_panesmith {
+                ""
             } else {
                 "\x1b[2mBrehon restarted research process. Rejoining the research queue with a fresh context.\x1b[0m\r\n"
             };
-            let _ = pane.append_output(notice.as_bytes());
+            if !notice.is_empty() {
+                let _ = pane.append_output(notice.as_bytes());
+            }
         }
         self.mark_pane_ready_after_reset(pane_id, "research session reset");
         clear_agent_health_marker(pane_id);
@@ -338,7 +383,7 @@ impl Mux {
     /// recover from wedged runtime/UI states.
     pub async fn reset_supervisor_session(&mut self, pane_id: &str) -> Result<()> {
         self.ensure_pane_uses_isolated_cwd(pane_id, "supervisor")?;
-        let (is_gateway_backed, gateway_session_id, is_panesmith_managed) = {
+        let (is_gateway_backed, gateway_session_id) = {
             let pane = self
                 .panes
                 .get(pane_id)
@@ -351,7 +396,6 @@ impl Mux {
             (
                 pane.is_gateway_backed(),
                 pane.gateway_session_id().map(brehon_types::SessionId::new),
-                pane.is_panesmith_managed(),
             )
         };
         let command = self.runtime_command_for_pane(
@@ -380,37 +424,18 @@ impl Mux {
             }
         }
 
-        if is_panesmith_managed {
-            self.kill_panesmith_pane(pane_id)?;
-        }
-
         self.clear_active_gateway_operations(pane_id);
-        let mut restarted_with_panesmith = false;
-        if is_panesmith_managed {
-            match self.restart_panesmith_supervisor_for_existing_pane(pane_id) {
-                Ok(()) => {
-                    restarted_with_panesmith = true;
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        pane = %pane_id,
-                        error = %err,
-                        "Panesmith supervisor reset restart failed; falling back to ghostty_vt PTY path"
-                    );
-                }
-            }
-        }
+        let restarted_with_panesmith = if is_gateway_backed {
+            false
+        } else {
+            self.restart_local_terminal_after_reset(pane_id, "supervisor")?
+        };
         if let Some(pane) = self.panes.get_mut(pane_id) {
             if is_gateway_backed {
                 pane.clear_gateway_session();
                 if let Some(activity) = pane.activity_buffer_mut() {
                     activity.clear();
                 }
-            } else if restarted_with_panesmith {
-                pane.set_panesmith_managed(true);
-            } else {
-                pane.set_panesmith_managed(false);
-                pane.restart_pty_from_spawn_config()?;
             }
             pane.set_tool_executing(false);
             pane.set_pending_inbox_nudge(false);
@@ -483,23 +508,30 @@ impl Mux {
         }
 
         self.clear_active_gateway_operations(pane_id);
+        let restarted_with_panesmith = if is_gateway_backed {
+            false
+        } else {
+            self.restart_local_terminal_after_reset(pane_id, "worker")?
+        };
         if let Some(pane) = self.panes.get_mut(pane_id) {
             if is_gateway_backed {
                 pane.clear_gateway_session();
                 if let Some(activity) = pane.activity_buffer_mut() {
                     activity.clear();
                 }
-            } else {
-                pane.restart_pty_from_spawn_config()?;
             }
             pane.set_tool_executing(false);
             pane.set_pending_inbox_nudge(false);
             let notice = if is_gateway_backed {
                 "\x1b[2mBrehon reset worker session after a model context error. Restarting the worker on the same task/worktree.\x1b[0m\r\n"
+            } else if restarted_with_panesmith {
+                ""
             } else {
                 "\x1b[2mBrehon restarted worker process after a model context error. Restarting the worker on the same task/worktree.\x1b[0m\r\n"
             };
-            let _ = pane.append_output(notice.as_bytes());
+            if !notice.is_empty() {
+                let _ = pane.append_output(notice.as_bytes());
+            }
         }
         self.mark_pane_ready_after_reset(pane_id, "worker session reset");
         clear_agent_health_marker(pane_id);

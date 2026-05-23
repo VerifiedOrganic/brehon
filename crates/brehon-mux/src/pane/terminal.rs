@@ -49,11 +49,21 @@ impl Pane {
     }
 
     pub(crate) fn restart_pty_from_spawn_config(&mut self) -> Result<()> {
+        self.spawn_pty_from_spawn_config(true)
+    }
+
+    pub(crate) fn start_pty_from_spawn_config(&mut self) -> Result<()> {
+        self.spawn_pty_from_spawn_config(false)
+    }
+
+    fn spawn_pty_from_spawn_config(&mut self, refresh_session_id: bool) -> Result<()> {
         let mut config = self
             .pty_spawn_config
             .clone()
             .ok_or_else(|| Error::pty("Pane has no stored PTY spawn config"))?;
-        refresh_brehon_session_id(&mut config);
+        if refresh_session_id {
+            refresh_brehon_session_id(&mut config);
+        }
 
         let new_session_id = config
             .env

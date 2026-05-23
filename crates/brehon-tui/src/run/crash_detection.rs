@@ -68,30 +68,24 @@ pub(crate) fn perform_manual_pane_reset(
 
     let reset_result = match pane.kind() {
         PaneKind::Worker => {
-            if !pane.is_gateway_backed() {
-                Err(format!(
-                    "manual reset is not supported for non-gateway worker {pane_id}"
-                ))
-            } else {
-                let startup_prompt = if super::helpers::pane_needs_post_spawn_prompt(mux, pane_id) {
-                    let Some(startup_prompt) =
-                        super::build_worker_context_reset_startup_prompt(mux, pane_id)
-                    else {
-                        return false;
-                    };
-                    Some(startup_prompt)
-                } else {
-                    None
+            let startup_prompt = if super::helpers::pane_needs_post_spawn_prompt(mux, pane_id) {
+                let Some(startup_prompt) =
+                    super::build_worker_context_reset_startup_prompt(mux, pane_id)
+                else {
+                    return false;
                 };
-                rt.block_on(mux.reset_worker_gateway_session(pane_id))
-                    .map(|_| {
-                        if let Some(startup_prompt) = startup_prompt {
-                            mux.queue_startup_prompt(pane_id, startup_prompt);
-                        }
-                        format!("manually reset worker {pane_id}")
-                    })
-                    .map_err(|err| err.to_string())
-            }
+                Some(startup_prompt)
+            } else {
+                None
+            };
+            rt.block_on(mux.reset_worker_gateway_session(pane_id))
+                .map(|_| {
+                    if let Some(startup_prompt) = startup_prompt {
+                        mux.queue_startup_prompt(pane_id, startup_prompt);
+                    }
+                    format!("manually reset worker {pane_id}")
+                })
+                .map_err(|err| err.to_string())
         }
         PaneKind::Reviewer => {
             if pane.review_context().is_some() {

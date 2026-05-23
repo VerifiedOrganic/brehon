@@ -322,6 +322,7 @@ pub(crate) fn render_dashboard(
             frame,
             sections[1],
             runtime_status_ref,
+            Some(mux),
             recent_runtime_commands,
         ));
         regions.extend(render_dashboard_tasks(
@@ -392,6 +393,7 @@ pub(crate) fn render_runtime_view(
     frame: &mut Frame,
     area: Rect,
     brehon_root: Option<&Path>,
+    mux: Option<&Mux>,
     recent_runtime_commands: &[RuntimeCommandActivity],
 ) -> Vec<ClickRegion> {
     let Some(status) = brehon_root.and_then(read_runtime_daemon_dashboard_status) else {
@@ -409,10 +411,10 @@ pub(crate) fn render_runtime_view(
     };
 
     if area.height < 12 {
-        return render_dashboard_runtime(frame, area, &status, recent_runtime_commands);
+        return render_dashboard_runtime(frame, area, &status, mux, recent_runtime_commands);
     }
 
-    render_expanded_runtime_view(frame, area, &status, recent_runtime_commands)
+    render_expanded_runtime_view(frame, area, &status, mux, recent_runtime_commands)
 }
 
 fn render_dashboard_agents(
@@ -797,6 +799,7 @@ fn render_dashboard_runtime(
     frame: &mut Frame,
     area: Rect,
     status: &RuntimeDaemonDashboardStatus,
+    mux: Option<&Mux>,
     recent_runtime_commands: &[RuntimeCommandActivity],
 ) -> Vec<ClickRegion> {
     let mut regions = Vec::new();
@@ -853,7 +856,7 @@ fn render_dashboard_runtime(
             format!(
                 "  {}  {}",
                 runtime_terminal_host_summary_for_status(status),
-                runtime_registry_summary(status)
+                runtime_registry_summary(status, mux)
             ),
             Style::default().fg(TEXT_DIM),
         )));
@@ -866,7 +869,7 @@ fn render_dashboard_runtime(
             .take(max_registry_rows)
         {
             lines.push(Line::from(Span::styled(
-                pad_cell(&runtime_pane_summary(pane), inner.width as usize),
+                pad_cell(&runtime_pane_summary(pane, mux), inner.width as usize),
                 Style::default().fg(Color::White),
             )));
         }
@@ -965,6 +968,7 @@ fn render_expanded_runtime_view(
     frame: &mut Frame,
     area: Rect,
     status: &RuntimeDaemonDashboardStatus,
+    mux: Option<&Mux>,
     recent_runtime_commands: &[RuntimeCommandActivity],
 ) -> Vec<ClickRegion> {
     let mut regions = Vec::new();
@@ -1131,7 +1135,7 @@ fn render_expanded_runtime_view(
 
     runtime_push_heading(&mut lines, "Pane Registry");
     lines.push(runtime_line(
-        &runtime_registry_summary(status),
+        &runtime_registry_summary(status, mux),
         inner.width,
         Color::White,
     ));
@@ -1152,7 +1156,7 @@ fn render_expanded_runtime_view(
             .into_iter()
             .take(max_registry_rows.saturating_sub(1))
         {
-            lines.push(runtime_registry_table_row(pane, inner.width));
+            lines.push(runtime_registry_table_row(pane, inner.width, mux));
         }
     }
 
@@ -1555,7 +1559,10 @@ fn runtime_terminal_host_pane_count(
         .count()
 }
 
-pub(super) fn runtime_registry_summary(status: &RuntimeDaemonDashboardStatus) -> String {
+pub(super) fn runtime_registry_summary(
+    status: &RuntimeDaemonDashboardStatus,
+    mux: Option<&Mux>,
+) -> String {
     let ready = status
         .registry
         .panes
@@ -1588,6 +1595,11 @@ pub(super) fn runtime_registry_summary(status: &RuntimeDaemonDashboardStatus) ->
         summary.push_str(" sources=");
         summary.push_str(&source_summary);
     }
+    let owner_summary = runtime_registry_owner_summary(status, mux);
+    if !owner_summary.is_empty() {
+        summary.push_str(" owners=");
+        summary.push_str(&owner_summary);
+    }
     summary
 }
 
@@ -1604,6 +1616,26 @@ fn runtime_registry_source_summary(status: &RuntimeDaemonDashboardStatus) -> Str
     counts
         .into_iter()
         .map(|(source, count)| format!("{source}:{count}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn runtime_registry_owner_summary(
+    status: &RuntimeDaemonDashboardStatus,
+    mux: Option<&Mux>,
+) -> String {
+    let Some(mux) = mux else {
+        return String::new();
+    };
+    let mut counts = BTreeMap::<String, usize>::new();
+    for pane in &status.registry.panes {
+        if let Some(owner) = mux.pane_backend_ownership(&pane.pane_id) {
+            *counts.entry(owner.label().to_string()).or_default() += 1;
+        }
+    }
+    counts
+        .into_iter()
+        .map(|(owner, count)| format!("{owner}:{count}"))
         .collect::<Vec<_>>()
         .join(",")
 }
@@ -1654,11 +1686,15 @@ fn runtime_source_matches_terminal_host(
 fn runtime_registry_table_header(width: u16) -> Line<'static> {
     let columns = RuntimeRegistryColumns::new(width as usize);
     runtime_registry_table_line(
-        &columns, "Pane", "Gen", "Kind", "State", "Source", "Output", "Title", TEXT_DIM,
+        &columns, "Pane", "Gen", "Kind", "State", "Owner", "Output", "Title", TEXT_DIM,
     )
 }
 
-fn runtime_registry_table_row(pane: &RuntimePaneDashboardInfo, width: u16) -> Line<'static> {
+fn runtime_registry_table_row(
+    pane: &RuntimePaneDashboardInfo,
+    width: u16,
+    mux: Option<&Mux>,
+) -> Line<'static> {
     let columns = RuntimeRegistryColumns::new(width as usize);
     let pane_label = format!(
         "{}/{}",
@@ -1668,11 +1704,7 @@ fn runtime_registry_table_row(pane: &RuntimePaneDashboardInfo, width: u16) -> Li
     let generation = pane.generation.to_string();
     let kind = runtime_pane_kind_label(&pane.kind);
     let state = runtime_pane_state_label(&pane.state).to_string();
-    let source = pane
-        .source
-        .as_ref()
-        .map(runtime_source_label)
-        .unwrap_or_else(|| "unknown".to_string());
+    let source = runtime_pane_owner_or_source_label(pane, mux);
     let output = runtime_output_age_label(pane.last_output_ms);
     let title = pane.title.as_deref().unwrap_or("-");
     runtime_registry_table_line(
@@ -1753,7 +1785,7 @@ fn runtime_registry_table_line(
     ))
 }
 
-fn runtime_pane_summary(pane: &RuntimePaneDashboardInfo) -> String {
+fn runtime_pane_summary(pane: &RuntimePaneDashboardInfo, mux: Option<&Mux>) -> String {
     let mut summary = format!(
         "  {}/{} gen={} {} {}",
         short_runtime_id(&pane.session_id),
@@ -1764,6 +1796,9 @@ fn runtime_pane_summary(pane: &RuntimePaneDashboardInfo) -> String {
     );
     if let Some(source) = pane.source.as_ref() {
         summary.push_str(&format!(" source={}", runtime_source_label(source)));
+    }
+    if let Some(owner) = runtime_pane_owner_label(pane, mux) {
+        summary.push_str(&format!(" owner={owner}"));
     }
     if let Some(title) = pane.title.as_deref() {
         summary.push_str(&format!(" title={title:?}"));
@@ -1781,6 +1816,23 @@ fn runtime_pane_summary(pane: &RuntimePaneDashboardInfo) -> String {
         summary.push_str(&format!(" reason={reason:?}"));
     }
     summary
+}
+
+fn runtime_pane_owner_label(pane: &RuntimePaneDashboardInfo, mux: Option<&Mux>) -> Option<String> {
+    mux.and_then(|mux| mux.pane_backend_ownership(&pane.pane_id))
+        .map(|owner| owner.label().to_string())
+}
+
+fn runtime_pane_owner_or_source_label(
+    pane: &RuntimePaneDashboardInfo,
+    mux: Option<&Mux>,
+) -> String {
+    runtime_pane_owner_label(pane, mux).unwrap_or_else(|| {
+        pane.source
+            .as_ref()
+            .map(runtime_source_label)
+            .unwrap_or_else(|| "unknown".to_string())
+    })
 }
 
 fn runtime_output_age_label(last_output_ms: Option<u64>) -> String {

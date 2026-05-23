@@ -108,6 +108,50 @@ impl Mux {
         pane.inbox_nudge_not_before()
     }
 
+    fn claude_prompt_state_for_pane(&self, pane_id: &str) -> ClaudePromptState {
+        if self.is_panesmith_managed(pane_id)
+            && let Some(prompt_state) = self.panesmith_claude_prompt_state(pane_id)
+        {
+            return prompt_state;
+        }
+        self.panes
+            .get(pane_id)
+            .map(|pane| pane.claude_prompt_state())
+            .unwrap_or(ClaudePromptState::None)
+    }
+
+    fn pane_ready_for_inbox_nudge(
+        &self,
+        pane_id: &str,
+        pane: &crate::pane::Pane,
+        now: Instant,
+    ) -> bool {
+        if !pane.is_panesmith_managed() {
+            return pane.is_ready_for_inbox_nudge(now, TEAMS_NUDGE_QUIET_THRESHOLD);
+        }
+
+        if pane.is_focused() {
+            return false;
+        }
+
+        if now.saturating_duration_since(pane.last_output_at()) <= TEAMS_NUDGE_QUIET_THRESHOLD {
+            return false;
+        }
+
+        if pane
+            .inbox_nudge_not_before()
+            .is_some_and(|not_before| now < not_before)
+        {
+            return false;
+        }
+
+        if pane.cli_type().capabilities().supports_teams {
+            self.claude_prompt_state_for_pane(pane_id) == ClaudePromptState::Empty
+        } else {
+            true
+        }
+    }
+
     fn next_delayed_prompt_inject_after(&self, pane_id: &str, now: Instant) -> Instant {
         if self
             .panes
@@ -148,7 +192,7 @@ impl Mux {
     }
 
     /// Inject a prompt into a specific pane
-    pub async fn inject(&self, pane_id: &str, prompt: &str) -> Result<()> {
+    pub async fn inject(&mut self, pane_id: &str, prompt: &str) -> Result<()> {
         if !self.panes.contains_key(pane_id) {
             return Err(Error::pane_not_found(pane_id));
         }
@@ -167,11 +211,19 @@ impl Mux {
         if let Some(err) = Self::policy_decision_error("direct prompt injection", &decision) {
             return Err(err);
         }
+        if let Some(outcome) = self
+            .send_panesmith_prompt_transaction(pane_id, prompt)
+            .await?
+        {
+            super::panesmith::ensure_panesmith_mux_outcome("direct prompt injection", &outcome)?;
+            return Ok(());
+        }
+
         self.inject_unchecked(pane_id, prompt).await
     }
 
     /// Inject a prompt into the focused pane
-    pub async fn inject_focused(&self, prompt: &str) -> Result<()> {
+    pub async fn inject_focused(&mut self, prompt: &str) -> Result<()> {
         let pane_id = self
             .focused_id()
             .ok_or_else(|| Error::pty("No focused pane"))?
@@ -180,7 +232,7 @@ impl Mux {
     }
 
     /// Inject a prompt into all workers
-    pub async fn inject_all_workers(&self, prompt: &str) -> Result<()> {
+    pub async fn inject_all_workers(&mut self, prompt: &str) -> Result<()> {
         let pane_ids: Vec<String> = self.workers().map(|pane| pane.id().to_string()).collect();
         let prompt_id = Self::new_prompt_id();
         let command = self.runtime_command_for_session(RuntimeCommandKind::BroadcastPrompt {
@@ -194,24 +246,35 @@ impl Mux {
             return Err(err);
         }
         for pane_id in pane_ids {
-            self.inject_unchecked(&pane_id, prompt).await?;
+            if let Some(outcome) = self
+                .send_panesmith_prompt_transaction(&pane_id, prompt)
+                .await?
+            {
+                super::panesmith::ensure_panesmith_mux_outcome(
+                    "worker prompt broadcast",
+                    &outcome,
+                )?;
+            } else {
+                self.inject_unchecked(&pane_id, prompt).await?;
+            }
         }
         Ok(())
     }
 
     /// Inject a prompt into the supervisor
-    pub async fn inject_supervisor(&self, prompt: &str) -> Result<()> {
-        let pane = self
+    pub async fn inject_supervisor(&mut self, prompt: &str) -> Result<()> {
+        let pane_id = self
             .supervisor()
+            .map(|pane| pane.id().to_string())
             .ok_or_else(|| Error::pane_not_found("supervisor"))?;
-        self.inject(pane.id(), prompt).await
+        self.inject(&pane_id, prompt).await
     }
 
     /// Nudge a pane to check its Teams inbox (no visible text).
     ///
     /// Sends a plain Enter to trigger a new turn. The agent reads its
     /// inbox at turn start, so no message text is needed in the PTY.
-    pub async fn nudge_inbox(&self, pane_id: &str) -> Result<()> {
+    pub async fn nudge_inbox(&mut self, pane_id: &str) -> Result<()> {
         if !self.panes.contains_key(pane_id) {
             return Err(Error::pane_not_found(pane_id));
         }
@@ -225,6 +288,14 @@ impl Mux {
         let decision = self.evaluate_runtime_policy(command, context).await;
         if let Some(err) = Self::policy_decision_error("inbox nudge", &decision) {
             return Err(err);
+        }
+
+        if let Some(outcome) = self.send_panesmith_input_transaction(
+            pane_id,
+            super::panesmith::panesmith_enter_transaction(),
+        )? {
+            super::panesmith::ensure_panesmith_mux_outcome("inbox nudge", &outcome)?;
+            return Ok(());
         }
 
         let pane = self
@@ -244,7 +315,7 @@ impl Mux {
     }
 
     /// Interrupt the focused pane
-    pub async fn interrupt_focused(&self) -> Result<()> {
+    pub async fn interrupt_focused(&mut self) -> Result<()> {
         let pane_id = self
             .focused_id()
             .ok_or_else(|| Error::pty("No focused pane"))?
@@ -253,7 +324,7 @@ impl Mux {
     }
 
     /// Interrupt a specific pane by ID
-    pub async fn interrupt(&self, pane_id: &str) -> Result<()> {
+    pub async fn interrupt(&mut self, pane_id: &str) -> Result<()> {
         if !self.panes.contains_key(pane_id) {
             return Err(Error::pane_not_found(pane_id));
         }
@@ -267,6 +338,13 @@ impl Mux {
         let decision = self.evaluate_runtime_policy(command, context).await;
         if let Some(err) = Self::policy_decision_error("interrupt", &decision) {
             return Err(err);
+        }
+
+        if let Some(outcome) = self
+            .send_panesmith_input_transaction(pane_id, panesmith::InputTransaction::interrupt())?
+        {
+            super::panesmith::ensure_panesmith_mux_outcome("interrupt", &outcome)?;
+            return Ok(());
         }
 
         let pane = self
@@ -1963,17 +2041,17 @@ impl Mux {
         let ready: Vec<String> = self
             .panes
             .iter()
-            .filter(|(_pane_id, pane)| {
+            .filter(|(pane_id, pane)| {
                 self.pane_uses_teams(pane)
                     && pane.pending_inbox_nudge()
-                    && pane.is_ready_for_inbox_nudge(now, TEAMS_NUDGE_QUIET_THRESHOLD)
+                    && self.pane_ready_for_inbox_nudge(pane_id, pane, now)
             })
             .map(|(pane_id, _)| pane_id.clone())
             .collect();
         let forced_supervisor_recovery: Vec<String> = self
             .panes
             .iter()
-            .filter(|(_pane_id, pane)| {
+            .filter(|(pane_id, pane)| {
                 self.pane_uses_teams(pane)
                     && pane.pending_inbox_nudge()
                     && pane.kind() == &crate::pane::PaneKind::Supervisor
@@ -1982,7 +2060,7 @@ impl Mux {
                     })
                     && now.saturating_duration_since(pane.last_output_at())
                         >= SUPERVISOR_INBOX_ESCALATION_QUIET_THRESHOLD
-                    && !pane.is_ready_for_inbox_nudge(now, TEAMS_NUDGE_QUIET_THRESHOLD)
+                    && !self.pane_ready_for_inbox_nudge(pane_id, pane, now)
             })
             .map(|(pane_id, _)| pane_id.clone())
             .collect();
@@ -2029,11 +2107,7 @@ impl Mux {
             pane.set_inbox_nudge_not_before(Some(cooldown_until));
         }
 
-        let prompt_state = self
-            .panes
-            .get(pane_id)
-            .map(|pane| pane.claude_prompt_state())
-            .unwrap_or(ClaudePromptState::None);
+        let prompt_state = self.claude_prompt_state_for_pane(pane_id);
 
         match prompt_state {
             ClaudePromptState::Visible => {

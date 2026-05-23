@@ -12,18 +12,25 @@ use std::time::{Duration, Instant};
 
 use brehon_mux::{
     AgentAdapter, CustomAgentConfig, HarnessCapabilities, HarnessControlPlane, HarnessTransport,
-    Mux, MuxConfig, SupervisorCli,
+    Mux, MuxConfig,
 };
 use portable_pty::{native_pty_system, Child, CommandBuilder, PtySize};
 
 const HELPER_TEST_NAME: &str = "__brehon_tui_fullscreen_helper";
 const HELPER_ENV: &str = "BREHON_TUI_FULLSCREEN_HELPER";
 const TMP_ENV: &str = "BREHON_TUI_FULLSCREEN_TMP";
-const CHILD_INPUT_LOG: &str = "child-input.bin";
+const SUPERVISOR_INPUT_LOG: &str = "supervisor-input.bin";
+const WORKER_INPUT_LOG: &str = "worker-input.bin";
 const SUPERVISOR_ID: &str = "test-supervisor";
+const WORKER_ID: &str = "test-worker";
 const READY_TEXT: &[u8] = b"SUPERVISOR_CHILD_READY";
+const WORKER_READY_TEXT: &[u8] = b"WORKER_CHILD_READY";
+const WORKER_INPUT_MARKER: &[u8] = b"worker fullscreen smoke\n";
 const CTRL_F: &[u8] = b"\x06";
 const CTRL_Q: &[u8] = b"\x11";
+const CTRL_R: &[u8] = b"\x12";
+const CTRL_S: &[u8] = b"\x13";
+const CTRL_W: &[u8] = b"\x17";
 const SGR_WHEEL_UP: &[u8] = b"\x1b[<64;10;10M";
 const ENTER_ALT_SCREEN: &[u8] = b"\x1b[?1049h";
 const LEAVE_ALT_SCREEN: &[u8] = b"\x1b[?1049l";
@@ -45,7 +52,8 @@ fn panesmith_fullscreen_attach_detach_repeats_and_ctrl_q_exits() -> Result<(), B
         .lock()
         .expect("serial PTY test lock poisoned");
     let temp = tempfile::tempdir()?;
-    let child_input_log = temp.path().join(CHILD_INPUT_LOG);
+    let supervisor_input_log = temp.path().join(SUPERVISOR_INPUT_LOG);
+    let worker_input_log = temp.path().join(WORKER_INPUT_LOG);
     let output = Arc::new(Mutex::new(Vec::new()));
 
     let pty_system = native_pty_system();
@@ -82,6 +90,46 @@ fn panesmith_fullscreen_attach_detach_repeats_and_ctrl_q_exits() -> Result<(), B
     });
 
     wait_for_contains(&output, READY_TEXT, Duration::from_secs(10))?;
+    wait_for_contains(&output, SUPERVISOR_ID.as_bytes(), Duration::from_secs(10))?;
+
+    write_input(&mut writer, CTRL_W)?;
+    wait_for_contains(&output, WORKER_READY_TEXT, Duration::from_secs(10))?;
+    wait_for_contains(&output, WORKER_ID.as_bytes(), Duration::from_secs(10))?;
+
+    let worker_enter_offset = output_len(&output);
+    write_input(&mut writer, CTRL_F)?;
+    wait_for_any_after(
+        &output,
+        worker_enter_offset,
+        MOUSE_ENABLE_SEQUENCES,
+        Duration::from_secs(5),
+        "mouse capture enable for worker attach",
+    )?;
+    write_input(&mut writer, WORKER_INPUT_MARKER)?;
+    write_input(&mut writer, SGR_WHEEL_UP)?;
+    thread::sleep(Duration::from_millis(150));
+
+    let worker_detach_offset = output_len(&output);
+    write_input(&mut writer, CTRL_F)?;
+    wait_for_contains_after(
+        &output,
+        worker_detach_offset,
+        ENTER_ALT_SCREEN,
+        Duration::from_secs(5),
+        "dashboard restore after worker detach",
+    )?;
+
+    let worker_reset_offset = output_len(&output);
+    write_input(&mut writer, CTRL_R)?;
+    wait_for_contains_after(
+        &output,
+        worker_reset_offset,
+        WORKER_READY_TEXT,
+        Duration::from_secs(5),
+        "worker Panesmith reset respawn",
+    )?;
+
+    write_input(&mut writer, CTRL_S)?;
     wait_for_contains(&output, SUPERVISOR_ID.as_bytes(), Duration::from_secs(10))?;
 
     for cycle in 1..=2 {
@@ -131,7 +179,7 @@ fn panesmith_fullscreen_attach_detach_repeats_and_ctrl_q_exits() -> Result<(), B
         output_tail(&output)
     );
 
-    let child_input = std::fs::read(&child_input_log).unwrap_or_default();
+    let child_input = std::fs::read(&supervisor_input_log).unwrap_or_default();
     assert!(
         !child_input
             .windows(CTRL_F.len())
@@ -154,6 +202,36 @@ fn panesmith_fullscreen_attach_detach_repeats_and_ctrl_q_exits() -> Result<(), B
         child_input
     );
 
+    let worker_input = std::fs::read(&worker_input_log).unwrap_or_default();
+    assert!(
+        worker_input
+            .windows(WORKER_INPUT_MARKER.len())
+            .any(|window| window == WORKER_INPUT_MARKER),
+        "fullscreen input did not reach the worker PTY session: {:?}",
+        worker_input
+    );
+    assert!(
+        !worker_input
+            .windows(CTRL_F.len())
+            .any(|window| window == CTRL_F),
+        "Ctrl-f detach chord was forwarded into the worker PTY: {:?}",
+        worker_input
+    );
+    assert!(
+        !worker_input
+            .windows(SGR_WHEEL_UP.len())
+            .any(|window| window == SGR_WHEEL_UP),
+        "fullscreen mouse wheel event was forwarded into the worker PTY: {:?}",
+        worker_input
+    );
+    assert!(
+        !worker_input
+            .windows(CTRL_Q.len())
+            .any(|window| window == CTRL_Q),
+        "Ctrl-q was forwarded into the worker PTY after fullscreen detach: {:?}",
+        worker_input
+    );
+
     Ok(())
 }
 
@@ -168,23 +246,32 @@ fn __brehon_tui_fullscreen_helper() -> Result<(), Box<dyn Error>> {
     let tmp = env::var_os(TMP_ENV)
         .map(PathBuf::from)
         .expect("helper temp directory env must be set");
-    let child_input_log = tmp.join(CHILD_INPUT_LOG);
-    let child_script = format!(
+    let supervisor_input_log = tmp.join(SUPERVISOR_INPUT_LOG);
+    let worker_input_log = tmp.join(WORKER_INPUT_LOG);
+    let supervisor_script = format!(
         "stty raw -echo || true; printf 'SUPERVISOR_CHILD_READY\\r\\n'; exec cat > {}",
-        shell_single_quote(&child_input_log.to_string_lossy())
+        shell_single_quote(&supervisor_input_log.to_string_lossy())
+    );
+    let worker_script = format!(
+        "stty raw -echo || true; printf 'WORKER_CHILD_READY\\r\\n'; exec cat >> {}",
+        shell_single_quote(&worker_input_log.to_string_lossy())
     );
     let mut mux = Mux::factory(MuxConfig {
         cwd: tmp.clone(),
         session_name: Some("fullscreen-pty-regression".to_string()),
-        workers: 0,
-        worker_names: Vec::new(),
+        workers: 1,
+        worker_names: vec![WORKER_ID.to_string()],
         supervisor_name: SUPERVISOR_ID.to_string(),
         supervisor_cli: custom_interactive_agent(
             "fullscreen-test-agent",
             "sh",
-            &["-c", child_script.as_str()],
+            &["-c", supervisor_script.as_str()],
         ),
-        worker_cli: AgentAdapter::BuiltIn(SupervisorCli::Codex),
+        worker_cli: custom_interactive_agent(
+            "fullscreen-worker-test-agent",
+            "sh",
+            &["-c", worker_script.as_str()],
+        ),
         include_director: false,
         rows: 32,
         cols: 120,
@@ -194,6 +281,10 @@ fn __brehon_tui_fullscreen_helper() -> Result<(), Box<dyn Error>> {
     assert!(
         mux.is_panesmith_managed(SUPERVISOR_ID),
         "helper mux supervisor must be Panesmith-managed"
+    );
+    assert!(
+        mux.is_panesmith_managed(WORKER_ID),
+        "helper mux worker must be Panesmith-managed"
     );
     assert!(mux.focus(SUPERVISOR_ID));
 
