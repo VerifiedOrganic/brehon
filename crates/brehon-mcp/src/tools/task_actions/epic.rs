@@ -1353,7 +1353,25 @@ mod tests {
         }
         std::fs::write(
             &hook,
-            "#!/bin/sh\nif [ \"${BREHON_ALLOW_PROTECTED_BRANCH_COMMIT:-}\" != \"1\" ]; then\n  echo protected bypass missing >&2\n  exit 1\nfi\n",
+            r#"#!/bin/sh
+if [ "${BREHON_ALLOW_PROTECTED_BRANCH_COMMIT:-}" != "1" ]; then
+  echo protected bypass missing >&2
+  exit 1
+fi
+if [ -z "${BREHON_PROTECTED_BRANCH_BYPASS_TOKEN:-}" ]; then
+  echo protected bypass token missing >&2
+  exit 1
+fi
+brehon_git_common_dir="$(git rev-parse --git-common-dir 2>/dev/null || true)"
+case "$brehon_git_common_dir" in
+  /*) ;;
+  *) brehon_git_common_dir="$(git rev-parse --show-toplevel)/$brehon_git_common_dir" ;;
+esac
+if [ ! -f "$brehon_git_common_dir/brehon/protected-branch-bypass/$BREHON_PROTECTED_BRANCH_BYPASS_TOKEN" ]; then
+  echo protected bypass lease missing >&2
+  exit 1
+fi
+"#,
         )
         .unwrap();
         let mut permissions = std::fs::metadata(&hook).unwrap().permissions();

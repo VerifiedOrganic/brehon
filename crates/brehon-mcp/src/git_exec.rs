@@ -35,11 +35,13 @@
 //! in unit tests without requiring a real git repo. [`run_git`] is a
 //! thin adapter over that core.
 
+use std::fs;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Wall-clock ceiling for any MCP-issued git command. 60 s is generous
 /// for local-repo operations (status, rev-parse, merge-base, cherry-pick
@@ -48,6 +50,9 @@ use std::time::{Duration, Instant};
 /// take longer (e.g. full-repo initial cherry-pick sequence) can supply
 /// a larger timeout via [`run_git_with_timeout`].
 pub(crate) const DEFAULT_GIT_TIMEOUT: Duration = Duration::from_secs(60);
+const PROTECTED_BRANCH_BYPASS_DIR: &str = "protected-branch-bypass";
+
+static PROTECTED_BRANCH_BYPASS_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Run `git <args>` in `cwd`, returning the captured [`Output`] on exit
 /// or a ready-to-display `String` error on spawn failure, I/O failure,
@@ -63,14 +68,88 @@ pub(crate) fn run_git_allow_protected_branch_commit(
     cwd: &Path,
     args: &[&str],
 ) -> Result<Output, String> {
+    let lease = create_protected_branch_bypass_lease(cwd)?;
+    let token = lease.token.as_str();
     run_command_hardened_with_env(
         "git",
         cwd,
         args,
         None,
         DEFAULT_GIT_TIMEOUT,
-        &[("BREHON_ALLOW_PROTECTED_BRANCH_COMMIT", "1")],
+        &[
+            ("BREHON_ALLOW_PROTECTED_BRANCH_COMMIT", "1"),
+            ("BREHON_PROTECTED_BRANCH_BYPASS_TOKEN", token),
+        ],
     )
+}
+
+struct ProtectedBranchBypassLease {
+    path: PathBuf,
+    token: String,
+}
+
+impl Drop for ProtectedBranchBypassLease {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn create_protected_branch_bypass_lease(cwd: &Path) -> Result<ProtectedBranchBypassLease, String> {
+    let git_common_dir = git_common_dir(cwd)?;
+    let bypass_dir = git_common_dir
+        .join("brehon")
+        .join(PROTECTED_BRANCH_BYPASS_DIR);
+    fs::create_dir_all(&bypass_dir).map_err(|err| {
+        format!(
+            "Failed to create protected-branch bypass dir {}: {err}",
+            bypass_dir.display()
+        )
+    })?;
+
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let counter = PROTECTED_BRANCH_BYPASS_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let token = format!("{}-{now_ms}-{counter}", std::process::id());
+    let path = bypass_dir.join(&token);
+    let content = format!("pid={}\ncreated_ms={now_ms}\n", std::process::id());
+    fs::write(&path, content).map_err(|err| {
+        format!(
+            "Failed to create protected-branch bypass lease {}: {err}",
+            path.display()
+        )
+    })?;
+
+    Ok(ProtectedBranchBypassLease { path, token })
+}
+
+fn git_common_dir(cwd: &Path) -> Result<PathBuf, String> {
+    let output = run_command_hardened(
+        "git",
+        cwd,
+        &["rev-parse", "--git-common-dir"],
+        None,
+        DEFAULT_GIT_TIMEOUT,
+    )?;
+    if !output.status.success() {
+        return Err(format!(
+            "git rev-parse --git-common-dir failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if raw.is_empty() {
+        return Err("git rev-parse --git-common-dir returned an empty path".to_string());
+    }
+
+    let path = PathBuf::from(raw);
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Ok(cwd.join(path))
+    }
 }
 
 /// Same as [`run_git`] but with a caller-specified timeout. Use when

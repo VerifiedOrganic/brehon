@@ -11,6 +11,7 @@ use std::os::unix::fs::PermissionsExt;
 const BREHON_PROTECTED_BRANCH_GUARD_BEGIN: &str = "# BEGIN BREHON PROTECTED BRANCH GUARD";
 const BREHON_PROTECTED_BRANCH_GUARD_END: &str = "# END BREHON PROTECTED BRANCH GUARD";
 const BREHON_PROTECTED_BRANCH_GUARD_MARKER: &str = "protected-branch-guard-active";
+const BREHON_PROTECTED_BRANCH_BYPASS_DIR: &str = "protected-branch-bypass";
 const BREHON_PROTECTED_BRANCH_HOOKS: &[&str] = &[
     "pre-commit",
     "pre-merge-commit",
@@ -1522,14 +1523,16 @@ fn strip_existing_protected_branch_guard(content: &str) -> String {
 fn protected_branch_guard_body(hook_name: &str, default_branch: &str) -> String {
     let fallback = shell_double_quote_fragment(&protected_branch_fallback(default_branch));
     let active_guard = protected_branch_guard_active_shell();
+    let bypass_guard = protected_branch_bypass_shell();
     if hook_name == "reference-transaction" {
         return format!(
             r#"{BREHON_PROTECTED_BRANCH_GUARD_BEGIN}
 {active_guard}
+{bypass_guard}
 brehon_ref_txn_input="$(mktemp "${{TMPDIR:-/tmp}}/brehon-ref-transaction.XXXXXX")" || exit 1
 cat > "$brehon_ref_txn_input"
 trap 'rm -f "$brehon_ref_txn_input"' EXIT HUP INT TERM
-if [ "${{BREHON_ALLOW_PROTECTED_BRANCH_COMMIT:-}}" != "1" ] && [ "$brehon_protected_branch_guard_active" = "1" ] && [ "${{1:-}}" = "prepared" ]; then
+if [ "$brehon_protected_branch_bypass_valid" != "1" ] && [ "$brehon_protected_branch_guard_active" = "1" ] && [ "${{1:-}}" = "prepared" ]; then
     brehon_protected_branches="${{BREHON_PROTECTED_BRANCHES:-}}"
     if [ -z "$brehon_protected_branches" ]; then
         brehon_protected_branches="$(git config --get brehon.protectedBranches 2>/dev/null || true)"
@@ -1544,7 +1547,7 @@ if [ "${{BREHON_ALLOW_PROTECTED_BRANCH_COMMIT:-}}" != "1" ] && [ "$brehon_protec
                 for brehon_protected_branch in $brehon_protected_branches; do
                     if [ "$brehon_ref_branch" = "$brehon_protected_branch" ]; then
                         echo "Brehon protected branch guard: refusing to update protected branch '$brehon_ref_branch'." >&2
-                        echo "Use Brehon's task integration/close flow. Only deliberate repair commands should set BREHON_ALLOW_PROTECTED_BRANCH_COMMIT=1." >&2
+                        echo "Use Brehon's task integration/close flow; generic BREHON_ALLOW_PROTECTED_BRANCH_COMMIT is not enough without a Brehon lease token." >&2
                         exit 1
                     fi
                 done
@@ -1553,6 +1556,7 @@ if [ "${{BREHON_ALLOW_PROTECTED_BRANCH_COMMIT:-}}" != "1" ] && [ "$brehon_protec
     done < "$brehon_ref_txn_input"
 fi
 unset brehon_old_ref brehon_new_ref brehon_ref_name brehon_ref_branch brehon_protected_branches brehon_protected_branch
+unset brehon_protected_branch_bypass_valid brehon_bypass_token brehon_bypass_path brehon_bypass_pid
 unset brehon_protected_branch_guard_active brehon_git_common_dir brehon_git_root brehon_guard_marker brehon_guard_pid brehon_guard_line
 exec < "$brehon_ref_txn_input"
 {BREHON_PROTECTED_BRANCH_GUARD_END}"#
@@ -1562,7 +1566,8 @@ exec < "$brehon_ref_txn_input"
     format!(
         r#"{BREHON_PROTECTED_BRANCH_GUARD_BEGIN}
 {active_guard}
-if [ "${{BREHON_ALLOW_PROTECTED_BRANCH_COMMIT:-}}" != "1" ] && [ "$brehon_protected_branch_guard_active" = "1" ]; then
+{bypass_guard}
+if [ "$brehon_protected_branch_bypass_valid" != "1" ] && [ "$brehon_protected_branch_guard_active" = "1" ]; then
     brehon_current_branch="$(git symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
     if [ -n "$brehon_current_branch" ]; then
         brehon_protected_branches="${{BREHON_PROTECTED_BRANCHES:-}}"
@@ -1575,13 +1580,14 @@ if [ "${{BREHON_ALLOW_PROTECTED_BRANCH_COMMIT:-}}" != "1" ] && [ "$brehon_protec
         for brehon_protected_branch in $brehon_protected_branches; do
             if [ "$brehon_current_branch" = "$brehon_protected_branch" ]; then
                 echo "Brehon protected branch guard: refusing to create a commit on '$brehon_current_branch'." >&2
-                echo "Use Brehon's task integration/close flow. Only deliberate repair commands should set BREHON_ALLOW_PROTECTED_BRANCH_COMMIT=1." >&2
+                echo "Use Brehon's task integration/close flow; generic BREHON_ALLOW_PROTECTED_BRANCH_COMMIT is not enough without a Brehon lease token." >&2
                 exit 1
             fi
         done
     fi
 fi
 unset brehon_current_branch brehon_protected_branches brehon_protected_branch
+unset brehon_protected_branch_bypass_valid brehon_bypass_token brehon_bypass_path brehon_bypass_pid
 unset brehon_protected_branch_guard_active brehon_git_common_dir brehon_git_root brehon_guard_marker brehon_guard_pid brehon_guard_line
 {BREHON_PROTECTED_BRANCH_GUARD_END}"#
     )
@@ -1589,38 +1595,70 @@ unset brehon_protected_branch_guard_active brehon_git_common_dir brehon_git_root
 
 fn protected_branch_guard_active_shell() -> &'static str {
     r#"brehon_protected_branch_guard_active=0
-if [ "${BREHON_ALLOW_PROTECTED_BRANCH_COMMIT:-}" != "1" ]; then
-    brehon_git_common_dir="$(git rev-parse --git-common-dir 2>/dev/null || true)"
-    if [ -n "$brehon_git_common_dir" ]; then
-        case "$brehon_git_common_dir" in
-            /*) ;;
-            *)
-                brehon_git_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-                brehon_git_common_dir="$brehon_git_root/$brehon_git_common_dir"
-                ;;
-        esac
-        brehon_guard_marker="$brehon_git_common_dir/brehon/protected-branch-guard-active"
-        if [ -f "$brehon_guard_marker" ]; then
-            brehon_guard_pid=""
-            while IFS= read -r brehon_guard_line; do
-                case "$brehon_guard_line" in
-                    pid=*)
-                        brehon_guard_pid="${brehon_guard_line#pid=}"
-                        break
-                        ;;
-                esac
-            done < "$brehon_guard_marker" || true
-            case "$brehon_guard_pid" in
-                ""|*[!0-9]*) ;;
-                *)
-                    if kill -0 "$brehon_guard_pid" 2>/dev/null; then
-                        brehon_protected_branch_guard_active=1
-                    fi
+brehon_git_common_dir="$(git rev-parse --git-common-dir 2>/dev/null || true)"
+if [ -n "$brehon_git_common_dir" ]; then
+    case "$brehon_git_common_dir" in
+        /*) ;;
+        *)
+            brehon_git_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+            brehon_git_common_dir="$brehon_git_root/$brehon_git_common_dir"
+            ;;
+    esac
+    brehon_guard_marker="$brehon_git_common_dir/brehon/protected-branch-guard-active"
+    if [ -f "$brehon_guard_marker" ]; then
+        brehon_guard_pid=""
+        while IFS= read -r brehon_guard_line; do
+            case "$brehon_guard_line" in
+                pid=*)
+                    brehon_guard_pid="${brehon_guard_line#pid=}"
+                    break
                     ;;
             esac
-        fi
+        done < "$brehon_guard_marker" || true
+        case "$brehon_guard_pid" in
+            ""|*[!0-9]*) ;;
+            *)
+                if kill -0 "$brehon_guard_pid" 2>/dev/null; then
+                    brehon_protected_branch_guard_active=1
+                fi
+                ;;
+        esac
     fi
 fi"#
+}
+
+fn protected_branch_bypass_shell() -> String {
+    format!(
+        r#"brehon_protected_branch_bypass_valid=0
+if [ "${{BREHON_ALLOW_PROTECTED_BRANCH_COMMIT:-}}" = "1" ] && [ -n "${{BREHON_PROTECTED_BRANCH_BYPASS_TOKEN:-}}" ] && [ -n "$brehon_git_common_dir" ]; then
+    brehon_bypass_token="$BREHON_PROTECTED_BRANCH_BYPASS_TOKEN"
+    case "$brehon_bypass_token" in
+        *[!A-Za-z0-9_.-]*|"") ;;
+        *)
+            brehon_bypass_path="$brehon_git_common_dir/brehon/{BREHON_PROTECTED_BRANCH_BYPASS_DIR}/$brehon_bypass_token"
+            if [ -f "$brehon_bypass_path" ]; then
+                brehon_bypass_pid=""
+                while IFS= read -r brehon_guard_line; do
+                    case "$brehon_guard_line" in
+                        pid=*)
+                            brehon_bypass_pid="${{brehon_guard_line#pid=}}"
+                            break
+                            ;;
+                    esac
+                done < "$brehon_bypass_path" || true
+                case "$brehon_bypass_pid" in
+                    ""|*[!0-9]*) ;;
+                    *)
+                        if kill -0 "$brehon_bypass_pid" 2>/dev/null; then
+                            brehon_protected_branch_bypass_valid=1
+                        fi
+                        ;;
+                esac
+            fi
+            ;;
+    esac
+fi"#
+    )
 }
 
 fn shell_double_quote_fragment(value: &str) -> String {
@@ -3402,6 +3440,7 @@ mod tests {
             .args(["commit", "-m", "allowed on inactive main"])
             .current_dir(temp.path())
             .env_remove("BREHON_ALLOW_PROTECTED_BRANCH_COMMIT")
+            .env_remove("BREHON_PROTECTED_BRANCH_BYPASS_TOKEN")
             .env_remove("BREHON_PROTECTED_BRANCHES")
             .output()
             .unwrap();
@@ -3426,6 +3465,7 @@ mod tests {
             .args(["commit", "-m", "blocked on main"])
             .current_dir(temp.path())
             .env_remove("BREHON_ALLOW_PROTECTED_BRANCH_COMMIT")
+            .env_remove("BREHON_PROTECTED_BRANCH_BYPASS_TOKEN")
             .env_remove("BREHON_PROTECTED_BRANCHES")
             .output()
             .unwrap();
@@ -3446,6 +3486,7 @@ mod tests {
             .args(["update-ref", "refs/heads/main", "HEAD"])
             .current_dir(temp.path())
             .env_remove("BREHON_ALLOW_PROTECTED_BRANCH_COMMIT")
+            .env_remove("BREHON_PROTECTED_BRANCH_BYPASS_TOKEN")
             .env_remove("BREHON_PROTECTED_BRANCHES")
             .output()
             .unwrap();
@@ -3463,16 +3504,46 @@ mod tests {
         run_git(temp.path(), &["checkout", "main"]);
         std::fs::write(temp.path().join("repair.txt"), "repair\n").unwrap();
         run_git(temp.path(), &["add", "repair.txt"]);
-        let repair = std::process::Command::new("git")
+        let env_only_repair = std::process::Command::new("git")
             .args(["commit", "-m", "deliberate repair"])
             .current_dir(temp.path())
             .env("BREHON_ALLOW_PROTECTED_BRANCH_COMMIT", "1")
+            .env_remove("BREHON_PROTECTED_BRANCH_BYPASS_TOKEN")
             .output()
             .unwrap();
         assert!(
-            repair.status.success(),
-            "explicit repair bypass should succeed: {}",
-            String::from_utf8_lossy(&repair.stderr)
+            !env_only_repair.status.success(),
+            "generic repair env unexpectedly bypassed hook: {}",
+            String::from_utf8_lossy(&env_only_repair.stdout)
+        );
+        let env_only_stderr = String::from_utf8_lossy(&env_only_repair.stderr);
+        assert!(
+            env_only_stderr.contains("Brehon lease token"),
+            "stderr: {env_only_stderr}"
+        );
+
+        let bypass_token = format!("test-{}", std::process::id());
+        let bypass_dir = git_common_dir(temp.path())
+            .unwrap()
+            .join("brehon")
+            .join(BREHON_PROTECTED_BRANCH_BYPASS_DIR);
+        std::fs::create_dir_all(&bypass_dir).unwrap();
+        std::fs::write(
+            bypass_dir.join(&bypass_token),
+            format!("pid={}\n", std::process::id()),
+        )
+        .unwrap();
+        let leased_repair = std::process::Command::new("git")
+            .args(["commit", "-m", "deliberate repair"])
+            .current_dir(temp.path())
+            .env("BREHON_ALLOW_PROTECTED_BRANCH_COMMIT", "1")
+            .env("BREHON_PROTECTED_BRANCH_BYPASS_TOKEN", &bypass_token)
+            .output()
+            .unwrap();
+        assert!(
+            leased_repair.status.success(),
+            "leased repair bypass should succeed: {}",
+            String::from_utf8_lossy(&leased_repair.stderr)
         );
     }
 
@@ -3490,6 +3561,7 @@ mod tests {
             .args(["commit", "-m", "allowed after shutdown"])
             .current_dir(temp.path())
             .env_remove("BREHON_ALLOW_PROTECTED_BRANCH_COMMIT")
+            .env_remove("BREHON_PROTECTED_BRANCH_BYPASS_TOKEN")
             .env_remove("BREHON_PROTECTED_BRANCHES")
             .output()
             .unwrap();
@@ -3520,6 +3592,7 @@ mod tests {
             .args(["commit", "-m", "feature"])
             .current_dir(temp.path())
             .env_remove("BREHON_ALLOW_PROTECTED_BRANCH_COMMIT")
+            .env_remove("BREHON_PROTECTED_BRANCH_BYPASS_TOKEN")
             .env_remove("BREHON_PROTECTED_BRANCHES")
             .output()
             .unwrap();
