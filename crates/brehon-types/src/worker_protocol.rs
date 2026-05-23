@@ -78,10 +78,6 @@ pub fn build_worker_protocol(
          `TaskGet`, or `TaskOutput` for Brehon work. They are not Brehon lifecycle tools and can \
          bypass checkpoint, review, and integration state."
             .to_string(),
-        "Brehon is separate from legacy Agora. Use `brehon`, `.brehon/`, `BREHON_*`, and \
-         `mcp__brehon__*`; do not inspect, mutate, migrate, or invoke `.agora/`, `AGORA_*`, \
-         `agora`, or `mcp__agora__*` unless the operator explicitly asks for legacy migration."
-            .to_string(),
         "Do not do supervisor planning work. Do not brainstorm implementation plans, create epics, or decompose tasks. Only the supervisor does that.".to_string(),
         format!(
             "Report progress early and whenever the work phase changes: `{task_cmd} action=progress \

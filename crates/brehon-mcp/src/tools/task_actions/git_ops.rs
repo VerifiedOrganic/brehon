@@ -198,74 +198,6 @@ pub(super) fn non_brehon_status_entries(status: &str) -> Vec<&str> {
         .collect()
 }
 
-fn explicit_project_root() -> Option<PathBuf> {
-    std::env::var("BREHON_PROJECT_ROOT")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-}
-
-fn shared_root_escape_status_entries(status: &str) -> Vec<&str> {
-    status
-        .lines()
-        .filter(|line| {
-            let path = line.get(3..).unwrap_or("").trim();
-            !path.is_empty()
-                && !path.starts_with(".brehon/")
-                && path != ".mcp.json"
-                && path != ".claude/settings.local.json"
-        })
-        .collect()
-}
-
-fn ensure_shared_root_clean_for_checkpoint(cwd: &Path) -> Result<(), String> {
-    let Some(project) = explicit_project_root() else {
-        return Ok(());
-    };
-    let (Ok(canonical_project), Ok(canonical_cwd)) = (project.canonicalize(), cwd.canonicalize())
-    else {
-        return Ok(());
-    };
-    if canonical_project == canonical_cwd {
-        return Ok(());
-    }
-    if !canonical_project.join(".git").exists() {
-        return Ok(());
-    }
-
-    let status = git_status_porcelain_in(&canonical_project).map_err(|err| {
-        format!(
-            "Failed to inspect shared project checkout '{}' before checkpointing worker worktree '{}': {err}",
-            canonical_project.display(),
-            cwd.display()
-        )
-    })?;
-    let entries = shared_root_escape_status_entries(&status);
-    if entries.is_empty() {
-        return Ok(());
-    }
-
-    let preview = entries
-        .iter()
-        .take(8)
-        .copied()
-        .collect::<Vec<_>>()
-        .join(", ");
-    let extra = entries.len().saturating_sub(8);
-    let suffix = if extra == 0 {
-        String::new()
-    } else {
-        format!(", ... plus {extra} more")
-    };
-    Err(format!(
-        "Refusing to checkpoint worker worktree '{}' because the shared project checkout '{}' has local changes: {preview}{suffix}. \
-         This usually means the agent edited files outside its assigned worktree. Move those edits into the worker worktree or clean the shared checkout before completing; otherwise Brehon would record the worker's existing HEAD and create an empty or incomplete review.",
-        cwd.display(),
-        canonical_project.display()
-    ))
-}
-
 pub(super) fn current_workspace_root() -> Result<PathBuf, String> {
     std::env::var("BREHON_WORKSPACE_ROOT")
         .ok()
@@ -289,7 +221,6 @@ pub(super) fn commit_workspace_checkpoint(
     }
 
     ensure_checkpoint_cwd_is_isolated(cwd)?;
-    ensure_shared_root_clean_for_checkpoint(cwd)?;
 
     let status_before = git_status_porcelain_in(cwd)?;
     let had_changes = !status_before.trim().is_empty();

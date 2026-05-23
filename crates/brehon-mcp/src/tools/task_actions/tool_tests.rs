@@ -5251,7 +5251,7 @@ async fn test_complete_recovers_legacy_completed_handoff_after_checkpoint_succee
 }
 
 #[tokio::test]
-async fn test_complete_rejects_clean_worker_when_shared_root_is_dirty() {
+async fn test_complete_ignores_dirty_shared_root_when_worker_worktree_has_changes() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
     let project = tempfile::tempdir().unwrap();
@@ -5261,6 +5261,7 @@ async fn test_complete_rejects_clean_worker_when_shared_root_is_dirty() {
 
     let workspace = tempfile::tempdir().unwrap();
     let initial_commit = init_git_workspace(workspace.path());
+    std::fs::write(workspace.path().join("feature.txt"), "worker tree\n").unwrap();
     let _env = ScopedEnv::set(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_PROJECT_ROOT", project.path().to_str().unwrap()),
@@ -5281,30 +5282,22 @@ async fn test_complete_rejects_clean_worker_when_shared_root_is_dirty() {
         .await
         .unwrap();
 
-    let text = extract_text(&result);
-    assert!(
-        result.is_error.unwrap_or(false),
-        "expected shared-root dirty rejection, got: {text}"
-    );
-    assert!(
-        text.contains("shared project checkout") && text.contains("leaked.txt"),
-        "rejection should identify the shared-root escape; got: {text}"
-    );
-    assert!(
-        text.contains("outside its assigned worktree"),
-        "rejection should explain the likely worktree escape; got: {text}"
-    );
+    assert!(result.is_error.is_none(), "{}", extract_text(&result));
+    let result_json: Value = serde_json::from_str(&extract_text(&result)).unwrap();
+    let commit = result_json["latest_commit"].as_str().unwrap();
+    assert_ne!(commit, initial_commit);
+    assert_eq!(result_json["created_commit"], true);
+    assert_eq!(result_json["task_status"], "review_ready");
+    assert_eq!(run_git(workspace.path(), &["rev-parse", "HEAD"]), commit);
+    assert_eq!(run_git(workspace.path(), &["status", "--porcelain"]), "");
     assert_eq!(
-        run_git(workspace.path(), &["rev-parse", "HEAD"]),
-        initial_commit
+        run_git(project.path(), &["status", "--porcelain"]),
+        "?? leaked.txt"
     );
 
     let task = read_test_task(root.path(), "T-shared-dirty");
-    assert_eq!(task["status"], "in_progress");
-    assert!(
-        task.get("latest_commit").is_none(),
-        "failed completion must not record an existing worker HEAD; task: {task}"
-    );
+    assert_eq!(task["status"], "review_ready");
+    assert_eq!(task["latest_commit"], commit);
 }
 
 #[tokio::test]
