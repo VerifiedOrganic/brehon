@@ -232,20 +232,16 @@ pub(crate) const QUIET_THRESHOLD: std::time::Duration = std::time::Duration::fro
 /// Absolute upper bound on a single in-flight turn before forced Busy → Ready.
 pub(crate) const MAX_TURN_DURATION: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 /// Maximum time a supervisor Teams inbox message may remain queued before we
-/// force a direct prompt injection to trigger a turn.
+/// force control-only recovery to trigger a turn.
 pub(super) const SUPERVISOR_INBOX_ESCALATION_DELAY: std::time::Duration =
     std::time::Duration::from_secs(15);
 /// Minimum output-quiet time before we forcibly interrupt a stuck supervisor inbox nudge.
 pub(super) const SUPERVISOR_INBOX_ESCALATION_QUIET_THRESHOLD: std::time::Duration =
     std::time::Duration::from_secs(5);
-/// Direct PTY fallback used when Claude Teams inbox delivery is stuck behind a
-/// non-empty supervisor prompt.
-pub(super) const SUPERVISOR_INBOX_ESCALATION_PROMPT: &str =
-    "Check your unread inbox messages now and act on any review_ready tasks immediately.";
 /// Cooldown applied to the supervisor pane after each forced inbox-recovery
 /// attempt. This prevents the recovery loop from re-firing every tick when a
 /// stale draft cannot be submitted in a single pass (e.g. Ctrl-C must clear
-/// the draft on tick N before a clean inject runs on tick N+1). Long enough
+/// the draft on tick N before an Enter nudge runs on tick N+1). Long enough
 /// for Claude Code to redraw its prompt after Ctrl-C; short enough that real
 /// inbox events aren't perceptibly delayed.
 pub(super) const SUPERVISOR_INBOX_RECOVERY_COOLDOWN: std::time::Duration =

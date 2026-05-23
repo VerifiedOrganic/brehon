@@ -1,10 +1,15 @@
 use crate::mux::*;
-use crate::{ActivityEntry, ActivityKind, DeathReason, Generation, Pane, PaneState};
+use crate::teams::{TeamsManager, TeamsPaths};
+use crate::{
+    ActivityEntry, ActivityKind, AgentAdapter, DeathReason, Generation, Pane, PaneState,
+    SupervisorCli,
+};
 use brehon_ports::{RuntimeCommandPort, RuntimeEventStream};
 use brehon_types::{
     PromptDeliveryMode, RuntimeCommand, RuntimeCommandKind, RuntimeCommandStatus,
     RuntimeCommandTarget, RuntimePaneKind, RuntimePaneState, RuntimePolicyContext,
 };
+use std::path::PathBuf;
 use std::sync::Arc;
 
 fn runtime_command(
@@ -401,6 +406,79 @@ fn test_mux_runtime_command_attempt_prompt_reports_deferred_when_queue_full() {
 
     assert_eq!(result.status, RuntimeCommandStatus::Deferred);
     assert!(result.message.unwrap_or_default().contains("deferred"));
+}
+
+#[test]
+fn test_mux_runtime_command_attempt_prompt_bypasses_pending_teams_nudge_cooldown() {
+    let mut mux = Mux::new(24, 80);
+    let home = std::env::temp_dir().join(format!("brehon-mux-home-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&home).expect("create fake home");
+    let teams = TeamsManager::new_for_test("session", home.clone());
+    teams
+        .init_team_config(
+            "claude-reviewer",
+            &[],
+            PathBuf::from("/tmp").as_path(),
+            &std::collections::HashMap::new(),
+            "lead",
+        )
+        .expect("init team config");
+    mux.set_teams(teams);
+
+    let pane = Pane::reviewer(
+        "claude-reviewer",
+        PathBuf::from("/tmp"),
+        None,
+        24,
+        80,
+        &AgentAdapter::BuiltIn(SupervisorCli::Claude),
+        None,
+        None,
+        None,
+    )
+    .expect("create reviewer pane");
+    mux.add_pane(pane);
+    {
+        let pane = mux.get_mut("claude-reviewer").expect("pane exists");
+        pane.set_pending_inbox_nudge(true);
+        pane.set_inbox_nudge_not_before(Some(
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+        ));
+    }
+
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let result = mux.execute_runtime_command(
+        rt.handle(),
+        runtime_command(
+            "cmd-prompt-attempt",
+            Some("claude-reviewer"),
+            Some(0),
+            RuntimeCommandKind::SendPrompt {
+                prompt_id: "prompt-1".to_string(),
+                text: "review approved".to_string(),
+                from: Some("review-coordinator".to_string()),
+                delivery: PromptDeliveryMode::Attempt,
+            },
+        ),
+    );
+
+    assert_eq!(result.status, RuntimeCommandStatus::Applied);
+    assert_eq!(mux.pending_delayed_prompt_count(), 0);
+    let inbox_path = TeamsPaths::for_session_with_home("session", home.clone())
+        .inbox_for("claude-reviewer")
+        .expect("inbox path");
+    let payload = std::fs::read_to_string(&inbox_path).expect("read reviewer inbox");
+    let messages: serde_json::Value = serde_json::from_str(&payload).expect("parse inbox");
+    assert!(
+        messages
+            .as_array()
+            .expect("inbox entries array")
+            .iter()
+            .any(|message| message["text"] == "review approved"),
+        "daemon runtime command delivery must write the durable prompt to Teams inbox"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
 }
 
 #[tokio::test]

@@ -283,7 +283,7 @@ fn test_flush_pending_inbox_nudges_escalates_stuck_supervisor_draft() {
 
     // Stage 1: stale Draft state. Recovery should send Ctrl-C to clear the
     // draft, leave `pending_inbox_nudge` set (we have not yet submitted the
-    // escalation prompt), and arm a cooldown so the very next tick cannot
+    // inbox nudge), and arm a cooldown so the very next tick cannot
     // re-fire while Claude is still redrawing.
     {
         let pane = mux.get_mut("claude-code").expect("pane exists");
@@ -313,8 +313,8 @@ fn test_flush_pending_inbox_nudges_escalates_stuck_supervisor_draft() {
 
     // Stage 2: simulate Claude redrawing an empty prompt after Ctrl-C, then
     // bypass the cooldown to drive the next tick. Recovery should now
-    // observe Empty state, kick off an echo-verified inject, and clear the
-    // pending flag because the prompt is on its way to the agent.
+    // observe Empty state, send a plain Enter inbox nudge, and clear the
+    // pending flag without typing synthetic prompt text into the input box.
     {
         let pane = mux.get_mut("claude-code").expect("pane exists");
         // Push the existing draft row out of view by writing a screenful of
@@ -336,7 +336,16 @@ fn test_flush_pending_inbox_nudges_escalates_stuck_supervisor_draft() {
         !mux.get("claude-code")
             .expect("pane exists")
             .pending_inbox_nudge(),
-        "after Empty state observed, recovery should inject and clear the flag"
+        "after Empty state observed, recovery should nudge and clear the flag"
+    );
+    let viewport = mux
+        .get("claude-code")
+        .expect("pane exists")
+        .dump_viewport()
+        .expect("dump viewport");
+    assert!(
+        !viewport.contains("Check your unread inbox"),
+        "recovery must not type synthetic inbox prompts into Claude input"
     );
 
     let _ = std::fs::remove_dir_all(&home);
@@ -347,18 +356,18 @@ fn test_force_supervisor_inbox_recovery_arms_cooldown_on_every_pass() {
     // Regression guard for the "messages stack up unsent in Claude's input
     // box" bug: even when the recovery cannot deliver the prompt this tick,
     // it MUST set `inbox_nudge_not_before` so the loop cannot retype the
-    // escalation message into a non-empty Ink buffer five times in a row.
+    // recovery control sequence into a non-empty Ink buffer five times in a row.
     let (mut mux, home, rt) = setup_claude_supervisor("cooldown");
 
     {
         let pane = mux.get_mut("claude-code").expect("pane exists");
         pane.set_inbox_nudge_not_before(None);
-        pane.append_output(b"\xe2\x9d\xaf already-typed escalation\r\n")
+        pane.append_output(b"\xe2\x9d\xaf already-typed draft\r\n")
             .expect("append draft");
         pane.set_pending_inbox_nudge(true);
     }
 
-    rt.block_on(mux.force_supervisor_inbox_recovery("claude-code", "Check your unread inbox"));
+    rt.block_on(mux.force_supervisor_inbox_recovery("claude-code"));
 
     let pane = mux.get("claude-code").expect("pane exists");
     assert!(
@@ -368,6 +377,39 @@ fn test_force_supervisor_inbox_recovery_arms_cooldown_on_every_pass() {
     assert!(
         pane.pending_inbox_nudge(),
         "Draft branch must NOT clear the flag — message has not been submitted yet"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn test_force_supervisor_inbox_recovery_sends_enter_not_prompt_text_when_empty() {
+    let (mut mux, home, rt) = setup_claude_supervisor("empty-nudge");
+
+    {
+        let pane = mux.get_mut("claude-code").expect("pane exists");
+        pane.set_inbox_nudge_not_before(None);
+        pane.append_output(b"\xe2\x9d\xaf \r\n")
+            .expect("append empty prompt");
+        pane.set_last_output_at(std::time::Instant::now() - std::time::Duration::from_secs(10));
+        pane.set_pending_inbox_nudge(true);
+        pane.set_pending_inbox_nudge_since(Some(
+            std::time::Instant::now() - std::time::Duration::from_secs(20),
+        ));
+        pane.set_focused(false);
+    }
+
+    rt.block_on(mux.force_supervisor_inbox_recovery("claude-code"));
+
+    let pane = mux.get("claude-code").expect("pane exists");
+    assert!(
+        !pane.pending_inbox_nudge(),
+        "empty prompt recovery should consume the pending inbox nudge"
+    );
+    let viewport = pane.dump_viewport().expect("dump viewport");
+    assert!(
+        !viewport.contains("Check your unread inbox"),
+        "empty prompt recovery must only send Enter, never type recovery text"
     );
 
     let _ = std::fs::remove_dir_all(&home);
@@ -1145,6 +1187,107 @@ fn test_deliver_prompt_delays_claude_teams_inbox_until_settle_deadline() {
             .iter()
             .any(|message| message["text"] == "review request")
     );
+    assert!(
+        mux.get("claude-reviewer")
+            .expect("reviewer pane exists")
+            .pending_inbox_nudge()
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn test_pending_teams_nudge_cooldown_does_not_block_inbox_writes() {
+    let mut mux = Mux::new(24, 80);
+    let home = std::env::temp_dir().join(format!("brehon-mux-home-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&home).expect("create fake home");
+    let teams = TeamsManager::new_for_test("test-session", home.clone());
+    teams
+        .init_team_config(
+            "claude-reviewer",
+            &[],
+            PathBuf::from("/tmp").as_path(),
+            &std::collections::HashMap::new(),
+            "lead",
+        )
+        .expect("init team config");
+    mux.set_teams(teams);
+
+    let pane = Pane::reviewer(
+        "claude-reviewer",
+        PathBuf::from("/tmp"),
+        None,
+        24,
+        80,
+        &AgentAdapter::BuiltIn(SupervisorCli::Claude),
+        None,
+        None,
+        None,
+    )
+    .expect("create reviewer pane");
+    mux.add_pane(pane);
+
+    {
+        let pane = mux
+            .get_mut("claude-reviewer")
+            .expect("reviewer pane exists");
+        pane.set_pending_inbox_nudge(true);
+        pane.set_inbox_nudge_not_before(Some(
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+        ));
+    }
+
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let attempt = rt
+        .block_on(mux.attempt_prompt_delivery(
+            "claude-reviewer",
+            "review approved",
+            Some("review-coordinator"),
+        ))
+        .expect("attempt prompt delivery");
+    assert!(
+        matches!(attempt, PromptDeliveryAttempt::Delivered { .. }),
+        "pending nudge cooldown must not defer safe Teams inbox writes, got {attempt:?}"
+    );
+    assert_eq!(mux.pending_delayed_prompt_count(), 0);
+
+    mux.dispatch_deliver_prompt(
+        rt.handle(),
+        "claude-reviewer",
+        "dispatch follow-up".to_string(),
+        Some("review-coordinator".to_string()),
+    );
+
+    let inbox_path = TeamsPaths::for_session_with_home("test-session", home.clone())
+        .inbox_for("claude-reviewer")
+        .unwrap();
+    let mut messages = serde_json::Value::Null;
+    for _ in 0..20 {
+        let payload = std::fs::read_to_string(&inbox_path).expect("read reviewer inbox");
+        messages = serde_json::from_str(&payload).expect("parse inbox");
+        if messages
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| message["text"] == "dispatch follow-up")
+        {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    let messages = messages.as_array().expect("inbox entries array");
+    assert!(
+        messages
+            .iter()
+            .any(|message| message["text"] == "review approved")
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|message| message["text"] == "dispatch follow-up")
+    );
+    assert_eq!(mux.pending_delayed_prompt_count(), 0);
     assert!(
         mux.get("claude-reviewer")
             .expect("reviewer pane exists")

@@ -408,6 +408,71 @@ fn test_panesmith_supervisor_prompt_delivery_uses_transaction() {
     );
 }
 
+#[test]
+fn test_panesmith_supervisor_inbox_recovery_sends_enter_not_prompt_text() {
+    let project_root = super::fresh_temp_dir("brehon-mux-panesmith-inbox-recovery");
+    let config = MuxConfig {
+        cwd: project_root,
+        workers: 0,
+        supervisor_name: "shell-supervisor".to_string(),
+        supervisor_cli: custom_interactive_agent("shell-supervisor", "sh", &["-c", "cat"]),
+        include_director: false,
+        rows: 24,
+        cols: 100,
+        ..Default::default()
+    };
+    let mut mux = Mux::factory(config).expect("create mux");
+    let rt = tokio::runtime::Runtime::new().expect("create runtime");
+
+    assert!(mux.is_panesmith_managed("shell-supervisor"));
+    {
+        let supervisor = mux
+            .get_mut("shell-supervisor")
+            .expect("supervisor pane exists");
+        supervisor
+            .append_output(b"\xe2\x9d\xaf \r\n")
+            .expect("append empty prompt marker");
+        supervisor.set_pending_inbox_nudge(true);
+        supervisor.set_pending_inbox_nudge_since(Some(
+            std::time::Instant::now() - Duration::from_secs(20),
+        ));
+        supervisor.set_last_output_at(std::time::Instant::now() - Duration::from_secs(10));
+        supervisor.set_focused(false);
+    }
+
+    rt.block_on(mux.force_supervisor_inbox_recovery("shell-supervisor"));
+
+    let supervisor = mux.get("shell-supervisor").expect("supervisor pane exists");
+    assert!(
+        !supervisor.pending_inbox_nudge(),
+        "Panesmith Enter recovery should consume the pending inbox nudge"
+    );
+    let viewport = supervisor.dump_viewport().expect("dump viewport");
+    assert!(
+        !viewport.contains("Check your unread inbox"),
+        "Panesmith recovery must not type synthetic inbox prompts into the mux pane"
+    );
+
+    let mut snapshot_text = String::new();
+    for _ in 0..50 {
+        let (_bytes, _events) = mux.poll_batch();
+        snapshot_text = mux
+            .panesmith_snapshot("shell-supervisor")
+            .map(panesmith_snapshot_text)
+            .unwrap_or_default();
+        if !snapshot_text.is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        !snapshot_text.contains("Check your unread inbox"),
+        "Panesmith recovery must send Enter only, not a prompt transaction"
+    );
+
+    rt.block_on(mux.shutdown_all());
+}
+
 fn panesmith_snapshot_text(snapshot: &::panesmith::OwnedPaneSnapshot) -> String {
     snapshot
         .surface

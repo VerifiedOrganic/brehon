@@ -23,8 +23,8 @@ use super::types::{
     AsyncGatewayPromptDeliveryError, AsyncGatewayPromptDispatch, GATEWAY_PROMPT_RETRY_DELAY,
     MuxEvent, PTY_INK_PROMPT_QUIET_THRESHOLD, PTY_STARTUP_PROMPT_DELAY_SECS, PromptDeliveryAttempt,
     STARTUP_PROMPT_STAGGER_MILLIS, SUPERVISOR_INBOX_ESCALATION_DELAY,
-    SUPERVISOR_INBOX_ESCALATION_PROMPT, SUPERVISOR_INBOX_ESCALATION_QUIET_THRESHOLD,
-    SUPERVISOR_INBOX_RECOVERY_COOLDOWN, TEAMS_NUDGE_QUIET_THRESHOLD,
+    SUPERVISOR_INBOX_ESCALATION_QUIET_THRESHOLD, SUPERVISOR_INBOX_RECOVERY_COOLDOWN,
+    TEAMS_NUDGE_QUIET_THRESHOLD,
 };
 
 pub(super) fn gateway_env_value<'a>(env: &'a [(String, String)], key: &str) -> Option<&'a str> {
@@ -100,6 +100,14 @@ impl Mux {
         }
     }
 
+    fn teams_inbox_write_not_before(&self, pane_id: &str) -> Option<Instant> {
+        let pane = self.panes.get(pane_id)?;
+        if !self.pane_uses_teams(pane) || pane.pending_inbox_nudge() {
+            return None;
+        }
+        pane.inbox_nudge_not_before()
+    }
+
     fn next_delayed_prompt_inject_after(&self, pane_id: &str, now: Instant) -> Instant {
         if self
             .panes
@@ -110,14 +118,7 @@ impl Mux {
             return now + GATEWAY_PROMPT_RETRY_DELAY;
         }
 
-        if self
-            .panes
-            .get(pane_id)
-            .is_some_and(|pane| self.pane_uses_teams(pane))
-            && let Some(not_before) = self
-                .panes
-                .get(pane_id)
-                .and_then(|pane| pane.inbox_nudge_not_before())
+        if let Some(not_before) = self.teams_inbox_write_not_before(pane_id)
             && now < not_before
         {
             return not_before;
@@ -668,10 +669,14 @@ impl Mux {
             return;
         };
         let control_plane = pane.cli_type().control_plane();
-        let inbox_nudge_not_before = pane.inbox_nudge_not_before();
         let injector = pane.injector_handle();
         let pane_is_gateway_backed = pane.is_gateway_backed();
         let pane_uses_teams = self.pane_uses_teams(pane);
+        let teams_inbox_write_not_before = if pane_uses_teams && !pane.pending_inbox_nudge() {
+            pane.inbox_nudge_not_before()
+        } else {
+            None
+        };
         let pty_prompt_ready =
             pane.is_ready_for_ink_prompt_injection(Instant::now(), PTY_INK_PROMPT_QUIET_THRESHOLD);
         let gateway_policy_owned_by_async_dispatch = matches!(
@@ -837,7 +842,7 @@ impl Mux {
                         let sender = from
                             .clone()
                             .unwrap_or_else(|| teams::DIRECTOR_AGENT_NAME.to_string());
-                        if let Some(inject_after) = inbox_nudge_not_before
+                        if let Some(inject_after) = teams_inbox_write_not_before
                             .filter(|inject_after| Instant::now() < *inject_after)
                         {
                             match self.queue_delayed_prompt(
@@ -1147,10 +1152,7 @@ impl Mux {
         generation: Generation,
         teams: &crate::teams::TeamsManager,
     ) -> Result<PromptDeliveryAttempt> {
-        if let Some(inject_after) = self
-            .panes
-            .get(pane_id)
-            .and_then(|pane| pane.inbox_nudge_not_before())
+        if let Some(inject_after) = self.teams_inbox_write_not_before(pane_id)
             && Instant::now() < inject_after
         {
             return Ok(PromptDeliveryAttempt::Queued {
@@ -1968,7 +1970,7 @@ impl Mux {
             })
             .map(|(pane_id, _)| pane_id.clone())
             .collect();
-        let forced_supervisor_inject: Vec<String> = self
+        let forced_supervisor_recovery: Vec<String> = self
             .panes
             .iter()
             .filter(|(_pane_id, pane)| {
@@ -1990,10 +1992,8 @@ impl Mux {
             tracing::info!(pane = %pane_id, "Dispatched Teams inbox nudge (non-blocking)");
         }
 
-        for pane_id in forced_supervisor_inject {
-            rt.block_on(
-                self.force_supervisor_inbox_recovery(&pane_id, SUPERVISOR_INBOX_ESCALATION_PROMPT),
-            );
+        for pane_id in forced_supervisor_recovery {
+            rt.block_on(self.force_supervisor_inbox_recovery(&pane_id));
         }
     }
 
@@ -2006,24 +2006,23 @@ impl Mux {
     /// fails for Claude Code, whose multi-line Ink input box treats `\r` as a
     /// literal newline rather than submit when the buffer is non-empty, and
     /// where Ctrl-U only kills the current row instead of the whole buffer.
-    /// The result was multiple identical escalation messages stacking up
-    /// unsent in the supervisor's input box on every retry tick.
+    /// The result was multiple identical recovery messages stacking up
+    /// unsent in the supervisor's input box on every retry tick. Recovery is
+    /// now control-only: clear a draft with Ctrl-C, then send plain Enter once
+    /// an empty prompt is observed so Claude picks up its Teams inbox.
     ///
     /// This implementation inspects the Claude prompt state and dispatches:
     ///
     /// * `Visible` — agent is mid-turn; defer.
     /// * `Draft` — non-empty input; send Ctrl-C (Claude Code's "discard
     ///   draft" affordance) and let the next tick observe `Empty`.
-    /// * `Empty` / `None` — inject text with **viewport-echo verification**:
-    ///   the typed text is written to the PTY, and Enter is sent only after
-    ///   the text appears on screen (with a 3 s fallback timer as a safety
-    ///   net). This closes the open-loop bug that allowed the recovery to
-    ///   declare success without verifying submission.
+    /// * `Empty` / `None` — send only Enter to nudge Claude's inbox. Never
+    ///   type synthetic recovery text into the agent prompt.
     ///
     /// In all branches, [`Pane::set_inbox_nudge_not_before`] is armed with a
     /// short cooldown so the recovery cannot re-fire on every tick while
     /// Claude is still redrawing after our previous keystrokes.
-    pub(super) async fn force_supervisor_inbox_recovery(&mut self, pane_id: &str, prompt: &str) {
+    pub(super) async fn force_supervisor_inbox_recovery(&mut self, pane_id: &str) {
         let now = Instant::now();
         let cooldown_until = now + SUPERVISOR_INBOX_RECOVERY_COOLDOWN;
         if let Some(pane) = self.panes.get_mut(pane_id) {
@@ -2104,10 +2103,10 @@ impl Mux {
             }
             ClaudePromptState::Empty | ClaudePromptState::None => {
                 if self.is_panesmith_managed(pane_id) {
-                    match self
-                        .send_panesmith_prompt_transaction(pane_id, prompt)
-                        .await
-                    {
+                    match self.send_panesmith_input_transaction(
+                        pane_id,
+                        super::panesmith::panesmith_enter_transaction(),
+                    ) {
                         Ok(Some(outcome)) => {
                             if outcome.is_success() {
                                 if let Some(pane) = self.panes.get_mut(pane_id) {
@@ -2115,11 +2114,11 @@ impl Mux {
                                 }
                                 tracing::warn!(
                                     pane = %pane_id,
-                                    "Forced supervisor prompt injection through Panesmith transaction after Teams inbox nudge remained blocked"
+                                    "Forced supervisor inbox nudge through Panesmith Enter transaction after Teams inbox remained blocked"
                                 );
                             } else {
                                 let error = super::panesmith::ensure_panesmith_mux_outcome(
-                                    "supervisor recovery prompt transaction",
+                                    "supervisor recovery inbox nudge",
                                     &outcome,
                                 )
                                 .err();
@@ -2127,7 +2126,7 @@ impl Mux {
                                     pane = %pane_id,
                                     error = ?error,
                                     outcome = ?outcome,
-                                    "Failed to force supervisor prompt injection through Panesmith transaction"
+                                    "Failed to force supervisor inbox nudge through Panesmith Enter transaction"
                                 );
                             }
                         }
@@ -2136,7 +2135,7 @@ impl Mux {
                             tracing::warn!(
                                 pane = %pane_id,
                                 error = %err,
-                                "Failed to force supervisor prompt injection through Panesmith transaction"
+                                "Failed to force supervisor inbox nudge through Panesmith Enter transaction"
                             );
                         }
                     }
@@ -2151,21 +2150,21 @@ impl Mux {
                     Some(handle) => handle,
                     None => return,
                 };
-                match injector.inject_prompt_echo_verified(prompt).await {
+                match injector.nudge_inbox().await {
                     Ok(()) => {
                         if let Some(pane) = self.panes.get_mut(pane_id) {
                             pane.set_pending_inbox_nudge(false);
                         }
                         tracing::warn!(
                             pane = %pane_id,
-                            "Forced supervisor prompt injection after Teams inbox nudge remained blocked"
+                            "Forced supervisor inbox nudge after Teams inbox remained blocked"
                         );
                     }
                     Err(err) => {
                         tracing::warn!(
                             pane = %pane_id,
                             error = %err,
-                            "Failed to force supervisor prompt injection for stuck Teams inbox nudge"
+                            "Failed to force supervisor inbox nudge for stuck Teams inbox"
                         );
                     }
                 }
