@@ -123,6 +123,10 @@ enum Decision {
 struct PolicyContext {
     /// Absolute path to the worker's worktree (BREHON_WORKSPACE_ROOT).
     worktree_root: Option<PathBuf>,
+    /// Agent role for role-specific exceptions, such as supervisor repairs.
+    agent_role: Option<String>,
+    /// Brehon runtime root. Used to identify Brehon-owned integration worktrees.
+    brehon_root: Option<PathBuf>,
     /// Extra protected branch from the task's merge_target, if any.
     merge_target: Option<String>,
 }
@@ -133,6 +137,10 @@ impl PolicyContext {
             worktree_root: std::env::var("BREHON_WORKSPACE_ROOT")
                 .ok()
                 .map(PathBuf::from),
+            agent_role: std::env::var("BREHON_AGENT_ROLE")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            brehon_root: std::env::var("BREHON_ROOT").ok().map(PathBuf::from),
             merge_target: std::env::var("BREHON_MERGE_TARGET")
                 .ok()
                 .filter(|s| !s.is_empty()),
@@ -315,7 +323,7 @@ fn check_cd_outside_worktree(segment: &str, ctx: &PolicyContext) -> Decision {
     // doesn't need the directory to exist.
     let normalized = lexical_normalize(&candidate);
 
-    if !normalized.starts_with(worktree) {
+    if !normalized.starts_with(worktree) && !is_supervisor_integration_worktree(&normalized, ctx) {
         return Decision::Block(format!(
             "`cd {target_token}` resolves to `{}`, outside the worktree (`{}`). \
              Stay in the worktree.",
@@ -324,6 +332,24 @@ fn check_cd_outside_worktree(segment: &str, ctx: &PolicyContext) -> Decision {
         ));
     }
     Decision::Allow
+}
+
+fn is_supervisor_integration_worktree(path: &Path, ctx: &PolicyContext) -> bool {
+    if ctx.agent_role.as_deref() != Some("supervisor") {
+        return false;
+    }
+    let Some(brehon_root) = ctx.brehon_root.as_deref() else {
+        return false;
+    };
+
+    let worktrees_root = lexical_normalize(&brehon_root.join("worktrees"));
+    let integration_roots = [
+        worktrees_root.join("epic"),
+        worktrees_root.join("initiative"),
+    ];
+    integration_roots
+        .iter()
+        .any(|integration_root| path.starts_with(integration_root))
 }
 
 /// Resolve `.` and `..` components without touching the filesystem.
@@ -386,7 +412,18 @@ mod tests {
     fn ctx_with(worktree: &str, merge_target: Option<&str>) -> PolicyContext {
         PolicyContext {
             worktree_root: Some(PathBuf::from(worktree)),
+            agent_role: None,
+            brehon_root: None,
             merge_target: merge_target.map(str::to_string),
+        }
+    }
+
+    fn supervisor_ctx(worktree: &str, brehon_root: &str) -> PolicyContext {
+        PolicyContext {
+            worktree_root: Some(PathBuf::from(worktree)),
+            agent_role: Some("supervisor".to_string()),
+            brehon_root: Some(PathBuf::from(brehon_root)),
+            merge_target: None,
         }
     }
 
@@ -476,6 +513,51 @@ mod tests {
     }
 
     #[test]
+    fn supervisor_can_cd_to_integration_worktree() {
+        let ctx = supervisor_ctx(
+            "/repo/.brehon/worktrees/runs/session/supervisor/claude-supervisor",
+            "/repo/.brehon",
+        );
+        let decision = evaluate("Bash", &bash("cd /repo/.brehon/worktrees/epic/T-123"), &ctx);
+        assert_eq!(decision, Decision::Allow);
+
+        let decision = evaluate(
+            "Bash",
+            &bash("cd /repo/.brehon/worktrees/initiative/T-init"),
+            &ctx,
+        );
+        assert_eq!(decision, Decision::Allow);
+    }
+
+    #[test]
+    fn supervisor_cannot_cd_to_worker_worktree() {
+        let ctx = supervisor_ctx(
+            "/repo/.brehon/worktrees/runs/session/supervisor/claude-supervisor",
+            "/repo/.brehon",
+        );
+        let decision = evaluate(
+            "Bash",
+            &bash("cd /repo/.brehon/worktrees/runs/session/worker-1"),
+            &ctx,
+        );
+        assert!(matches!(decision, Decision::Block(_)));
+    }
+
+    #[test]
+    fn worker_cannot_cd_to_integration_worktree() {
+        let ctx = PolicyContext {
+            worktree_root: Some(PathBuf::from(
+                "/repo/.brehon/worktrees/runs/session/worker-1",
+            )),
+            agent_role: Some("worker".to_string()),
+            brehon_root: Some(PathBuf::from("/repo/.brehon")),
+            merge_target: None,
+        };
+        let decision = evaluate("Bash", &bash("cd /repo/.brehon/worktrees/epic/T-123"), &ctx);
+        assert!(matches!(decision, Decision::Block(_)));
+    }
+
+    #[test]
     fn allows_cd_with_shell_variable() {
         // We can't resolve $VAR safely, so we let it through. The worker
         // prompt still tells the model not to do this.
@@ -506,6 +588,8 @@ mod tests {
         // changes (those don't need the worktree root).
         let ctx = PolicyContext {
             worktree_root: None,
+            agent_role: None,
+            brehon_root: None,
             merge_target: None,
         };
         assert_eq!(evaluate("Bash", &bash("cd .."), &ctx), Decision::Allow);
