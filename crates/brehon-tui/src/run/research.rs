@@ -19,9 +19,6 @@ use unicode_width::UnicodeWidthStr;
 use crate::components::Panel;
 use crate::theme::chrome::{self, TEXT_DIM, TEXT_MUTED};
 
-use super::advisors::{
-    advisor_author_color, bubble_line, markdown_bubble_lines, message_bubble_width,
-};
 use super::composer::enqueue_composer_message;
 use super::rendering::truncate_to;
 use super::session::read_session_files;
@@ -571,6 +568,13 @@ fn room_detail_lines(
 fn research_events(room: &ResearchRoomFile, brehon_root: Option<&Path>) -> Vec<ResearchEvent> {
     let mut events = Vec::new();
     for job in &room.jobs {
+        let has_artifact = room
+            .artifacts
+            .iter()
+            .any(|artifact| artifact.job_id == job.job_id);
+        if job.status == JOB_STATUS_COMPLETED && has_artifact {
+            continue;
+        }
         events.push(ResearchEvent {
             seq: 0,
             author: if job.requested_by.trim().is_empty() {
@@ -622,75 +626,188 @@ fn research_event_block_lines(event: &ResearchEvent, width: usize) -> Vec<Line<'
         return research_request_block_lines(event, width);
     }
 
-    let bubble_width = message_bubble_width(width);
-    let author_color = research_author_color(event);
-    let bubble_bg = if event.role == "request" {
-        chrome::BG_ELEVATED
-    } else {
-        chrome::PANEL_BG_ELEVATED
-    };
-    let bubble_style = Style::default().fg(chrome::TEXT_BODY).bg(bubble_bg);
-    let meta_style = Style::default().fg(TEXT_DIM).bg(bubble_bg);
+    research_artifact_block_lines(event, width)
+}
+
+fn research_artifact_block_lines(event: &ResearchEvent, width: usize) -> Vec<Line<'static>> {
     let time = event
         .created_at
         .map(|time| time.format("%H:%M").to_string())
         .unwrap_or_default();
-    let role = if event.role.is_empty() {
-        event.kind.clone()
+    let status = event.status.as_deref().unwrap_or("attached");
+    let status_style = Style::default()
+        .fg(artifact_status_color(status))
+        .add_modifier(Modifier::BOLD);
+    let role = if event.role.trim().is_empty() {
+        "artifact".to_string()
     } else {
-        format!("{}/{}", event.kind, event.role)
+        event.role.clone()
     };
 
     let mut lines = vec![Line::from(vec![
         Span::styled(
-            truncate_to(
-                &format!("#{:03} ", event.seq),
-                width.saturating_sub(time.width() + 1),
-            ),
+            truncate_to(&format!("#{:03} ", event.seq), width),
             Style::default().fg(TEXT_DIM),
         ),
+        Span::styled(truncate_to(status, 18), status_style),
+        Span::styled(" artifact/", Style::default().fg(TEXT_MUTED)),
         Span::styled(
-            truncate_to(
-                &format!("{} ({role})", event.author),
-                width.saturating_sub(time.width() + 6),
-            ),
-            Style::default()
-                .fg(author_color)
-                .add_modifier(Modifier::BOLD),
+            truncate_to(&role, width.saturating_sub(36)),
+            Style::default().fg(crate::theme::brand::PRIMARY),
+        ),
+        Span::styled("  by ", Style::default().fg(TEXT_DIM)),
+        Span::styled(
+            truncate_to(&event.author, 18),
+            Style::default().fg(chrome::TEXT_BODY),
         ),
         Span::styled(format!(" {time}"), Style::default().fg(TEXT_MUTED)),
     ])];
 
-    let mut meta = Vec::new();
-    if let Some(status) = event.status.as_deref() {
-        meta.push(format!("status: {status}"));
-    }
-    if let Some(pool) = event.pool.as_deref() {
-        meta.push(format!("pool: {pool}"));
-    }
-    if let Some(title) = event.title.as_deref() {
-        meta.push(format!("title: {title}"));
-    }
-    if !meta.is_empty() {
-        lines.push(bubble_line(
-            &meta.join(" / "),
-            bubble_width,
-            meta_style,
-            author_color,
-        ));
+    if let Some(title) = event
+        .title
+        .as_deref()
+        .filter(|title| !title.trim().is_empty())
+    {
+        lines.push(Line::from(Span::styled(
+            truncate_to(&format!("  {title}"), width),
+            Style::default()
+                .fg(chrome::TEXT_BODY)
+                .add_modifier(Modifier::BOLD),
+        )));
     }
 
-    let mut body = markdown_bubble_lines(&event.content, bubble_width, bubble_style, author_color);
-    if body.is_empty() {
-        body.push(bubble_line(
-            "(empty research event)",
-            bubble_width,
-            bubble_style,
-            author_color,
-        ));
+    let parsed = parse_artifact_content(&event.content);
+    for summary in wrap_text_lines(&parsed.summary, width.saturating_sub(4), 2) {
+        lines.push(Line::from(Span::styled(
+            format!("    {summary}"),
+            Style::default().fg(chrome::TEXT_SOFT),
+        )));
     }
-    lines.extend(body);
+
+    let mut meta = Vec::new();
+    if let Some(pool) = event.pool.as_deref().filter(|pool| !pool.trim().is_empty()) {
+        meta.push(format!("pool {pool}"));
+    }
+    meta.extend(parsed.meta.iter().cloned());
+    if !meta.is_empty() {
+        lines.push(Line::from(Span::styled(
+            truncate_to(&format!("    {}", meta.join(" / ")), width),
+            Style::default().fg(TEXT_DIM),
+        )));
+    }
+
+    for line in parsed.paths.iter().take(2) {
+        lines.push(Line::from(Span::styled(
+            truncate_to(&format!("    {line}"), width),
+            Style::default().fg(TEXT_MUTED),
+        )));
+    }
+    for line in parsed.delivery.iter().take(3) {
+        lines.push(Line::from(Span::styled(
+            truncate_to(&format!("    {line}"), width),
+            if line.starts_with("Warnings:") {
+                Style::default().fg(crate::theme::status::WARNING)
+            } else {
+                Style::default().fg(TEXT_DIM)
+            },
+        )));
+    }
+
+    if lines.len() == 1 {
+        lines.push(Line::from(Span::styled(
+            "    (empty research artifact)",
+            Style::default().fg(TEXT_MUTED),
+        )));
+    }
     lines
+}
+
+#[derive(Default)]
+struct ParsedArtifactContent {
+    summary: String,
+    meta: Vec<String>,
+    paths: Vec<String>,
+    delivery: Vec<String>,
+}
+
+fn parse_artifact_content(content: &str) -> ParsedArtifactContent {
+    let mut parsed = ParsedArtifactContent::default();
+    for raw_line in content.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with("## ") {
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("Confidence:") {
+            parsed.meta.push(format!("confidence {}", value.trim()));
+        } else if let Some(value) = line.strip_prefix("Citations:") {
+            parsed.meta.push(format!("citations {}", value.trim()));
+        } else if let Some(value) = line.strip_prefix("Supersedes:") {
+            parsed.meta.push(format!("supersedes {}", value.trim()));
+        } else if let Some(value) = line.strip_prefix("Brief:") {
+            parsed.paths.push(format!("brief {}", value.trim()));
+        } else if let Some(value) = line.strip_prefix("Data:") {
+            parsed.paths.push(format!("data {}", value.trim()));
+        } else if let Some(value) = line.strip_prefix("Handoff:") {
+            for delivery in value
+                .split(';')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                parsed.delivery.push(format!("handoff {delivery}"));
+            }
+        } else if let Some(value) = line.strip_prefix("Warnings:") {
+            parsed.delivery.push(format!("Warnings: {}", value.trim()));
+        } else if parsed.summary.is_empty() {
+            parsed.summary = line.to_string();
+        } else {
+            parsed.summary.push(' ');
+            parsed.summary.push_str(line);
+        }
+    }
+    parsed
+}
+
+fn wrap_text_lines(value: &str, width: usize, max_lines: usize) -> Vec<String> {
+    if width == 0 || max_lines == 0 {
+        return Vec::new();
+    }
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in value.split_whitespace() {
+        let next_width = if current.is_empty() {
+            word.width()
+        } else {
+            current.width() + 1 + word.width()
+        };
+        if !current.is_empty() && next_width > width {
+            lines.push(current);
+            current = String::new();
+            if lines.len() == max_lines {
+                break;
+            }
+        }
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(word);
+    }
+    if !current.is_empty() && lines.len() < max_lines {
+        lines.push(current);
+    }
+    lines
+        .into_iter()
+        .map(|line| truncate_to(&line, width))
+        .collect()
+}
+
+fn artifact_status_color(status: &str) -> Color {
+    if status.contains("warning") || status.contains("failed") {
+        crate::theme::status::WARNING
+    } else if status.contains("queued") || status.contains("running") {
+        crate::theme::brand::PRIMARY
+    } else {
+        crate::theme::status::SUCCESS
+    }
 }
 
 fn research_request_block_lines(event: &ResearchEvent, width: usize) -> Vec<Line<'static>> {
@@ -742,13 +859,6 @@ fn research_request_block_lines(event: &ResearchEvent, width: usize) -> Vec<Line
         )));
     }
     lines
-}
-
-fn research_author_color(event: &ResearchEvent) -> Color {
-    if event.role == "request" || event.author == "operator" {
-        return crate::theme::brand::PRIMARY;
-    }
-    advisor_author_color(&event.author, &event.role)
 }
 
 fn artifact_handoff_status(artifact: &ResearchArtifactFile) -> String {
@@ -1517,7 +1627,7 @@ research:
     }
 
     #[test]
-    fn render_research_room_shows_request_and_artifact_blocks() {
+    fn render_research_room_shows_compact_artifact_blocks() {
         let temp = tempfile::tempdir().unwrap();
         let brehon_root = temp.path().join(".brehon");
         std::fs::create_dir_all(brehon_root.join("runtime/research/T-3/jobs")).unwrap();
@@ -1603,7 +1713,10 @@ research:
         let rendered = buffer_text(terminal.backend().buffer());
         assert!(rendered.contains("Research"));
         assert!(rendered.contains("Protocol parser"));
-        assert!(rendered.contains("Summarize the protocol requirements"));
+        assert!(
+            !rendered.contains("Summarize the protocol requirements"),
+            "completed request rows with artifacts should collapse out of the detail view"
+        );
         assert!(rendered.contains("Protocol Requirements"));
         assert!(rendered.contains("The protocol requires strict ordering."));
         assert!(rendered.contains("handoff warning"));
