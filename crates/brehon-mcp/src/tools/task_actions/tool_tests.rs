@@ -5288,6 +5288,12 @@ async fn test_complete_ignores_dirty_shared_root_when_worker_worktree_has_change
     assert_ne!(commit, initial_commit);
     assert_eq!(result_json["created_commit"], true);
     assert_eq!(result_json["task_status"], "review_ready");
+    assert_eq!(
+        result_json["warning"]["kind"],
+        "primary_project_checkout_dirty"
+    );
+    assert_eq!(result_json["warning"]["branch"], "main");
+    assert_eq!(result_json["warning"]["entries"][0], "?? leaked.txt");
     assert_eq!(run_git(workspace.path(), &["rev-parse", "HEAD"]), commit);
     assert_eq!(run_git(workspace.path(), &["status", "--porcelain"]), "");
     assert_eq!(
@@ -5298,6 +5304,65 @@ async fn test_complete_ignores_dirty_shared_root_when_worker_worktree_has_change
     let task = read_test_task(root.path(), "T-shared-dirty");
     assert_eq!(task["status"], "review_ready");
     assert_eq!(task["latest_commit"], commit);
+    assert_eq!(
+        task["checkpoint_warnings"][0]["kind"],
+        "primary_project_checkout_dirty"
+    );
+    assert_eq!(task["checkpoint_warnings"][0]["branch"], "main");
+    assert_eq!(
+        task["checkpoint_warnings"][0]["entries"][0],
+        "?? leaked.txt"
+    );
+}
+
+#[tokio::test]
+async fn test_complete_rejects_empty_worker_handoff_even_when_shared_root_is_dirty() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let root = make_test_root();
+    let project = tempfile::tempdir().unwrap();
+    init_git_workspace(project.path());
+    std::fs::write(project.path().join("leaked.txt"), "wrong tree\n").unwrap();
+
+    let workspace = tempfile::tempdir().unwrap();
+    let initial_commit = init_git_workspace(workspace.path());
+    let _env = ScopedEnv::set(&[
+        ("BREHON_ROOT", root.path().to_str().unwrap()),
+        ("BREHON_PROJECT_ROOT", project.path().to_str().unwrap()),
+        ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
+        ("BREHON_AGENT_ROLE", "worker"),
+        ("BREHON_AGENT_NAME", "worker-1"),
+        ("BREHON_SUPERVISOR_NAME", "sup-1"),
+    ]);
+    let tool = TaskActionsTool::new();
+    write_test_task(root.path(), "T-empty-handoff", "in_progress", "task");
+
+    let result = tool
+        .execute(serde_json::json!({
+            "action": "complete",
+            "id": "T-empty-handoff",
+            "notes": "implementation complete"
+        }))
+        .await
+        .unwrap();
+
+    let text = extract_text(&result);
+    assert!(
+        result.is_error.unwrap_or(false),
+        "expected empty-handoff rejection, got: {text}"
+    );
+    assert!(
+        text.contains("Refusing empty checkpoint"),
+        "rejection should explain empty checkpoint safety; got: {text}"
+    );
+    assert_eq!(
+        run_git(workspace.path(), &["rev-parse", "HEAD"]),
+        initial_commit
+    );
+
+    let task = read_test_task(root.path(), "T-empty-handoff");
+    assert_eq!(task["status"], "in_progress");
+    assert!(task.get("latest_commit").is_none());
+    assert!(task.get("checkpoint_warnings").is_none());
 }
 
 #[tokio::test]
@@ -5454,11 +5519,15 @@ async fn test_complete_is_idempotent_when_task_already_in_review() {
 }
 
 #[tokio::test]
-async fn test_complete_defaults_to_existing_head_and_default_notes() {
+async fn test_complete_defaults_to_existing_worker_commit_and_default_notes() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
     let workspace = tempfile::tempdir().unwrap();
-    let initial_commit = init_git_workspace(workspace.path());
+    init_git_workspace(workspace.path());
+    std::fs::write(workspace.path().join("manual.txt"), "manual commit\n").unwrap();
+    run_git(workspace.path(), &["add", "manual.txt"]);
+    run_git(workspace.path(), &["commit", "-m", "manual worker commit"]);
+    let existing_commit = run_git(workspace.path(), &["rev-parse", "HEAD"]);
     let _env = ScopedEnv::set(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
@@ -5480,13 +5549,13 @@ async fn test_complete_defaults_to_existing_head_and_default_notes() {
     assert!(result.is_error.is_none(), "{}", extract_text(&result));
     let result_json: Value = serde_json::from_str(&extract_text(&result)).unwrap();
     assert_eq!(result_json["created_commit"], false);
-    assert_eq!(result_json["latest_commit"], initial_commit);
+    assert_eq!(result_json["latest_commit"], existing_commit);
     assert_eq!(result_json["task_status"], "review_ready");
 
     let task = read_test_task(root.path(), "T-complete-defaults");
     assert_eq!(task["status"], "review_ready");
     assert_eq!(task["notes"], "Implementation complete");
-    assert_eq!(task["latest_commit"], initial_commit);
+    assert_eq!(task["latest_commit"], existing_commit);
 }
 
 #[tokio::test]

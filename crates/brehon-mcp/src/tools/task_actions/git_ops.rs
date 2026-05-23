@@ -198,6 +198,62 @@ pub(super) fn non_brehon_status_entries(status: &str) -> Vec<&str> {
         .collect()
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct PrimaryCheckoutWarning {
+    pub project_root: String,
+    pub branch: Option<String>,
+    pub entries: Vec<String>,
+    pub truncated_count: usize,
+    pub inspect_error: Option<String>,
+}
+
+fn explicit_project_root() -> Option<PathBuf> {
+    std::env::var("BREHON_PROJECT_ROOT")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+pub(super) fn primary_checkout_status_warning(cwd: &Path) -> Option<PrimaryCheckoutWarning> {
+    let project = explicit_project_root()?;
+    let canonical_project = project.canonicalize().ok()?;
+    let canonical_cwd = cwd.canonicalize().ok()?;
+    if canonical_project == canonical_cwd || !canonical_project.join(".git").exists() {
+        return None;
+    }
+
+    let status = match git_status_porcelain_in(&canonical_project) {
+        Ok(status) => status,
+        Err(err) => {
+            return Some(PrimaryCheckoutWarning {
+                project_root: canonical_project.display().to_string(),
+                branch: git_stdout_in(&canonical_project, &["branch", "--show-current"]).ok(),
+                entries: Vec::new(),
+                truncated_count: 0,
+                inspect_error: Some(err),
+            });
+        }
+    };
+    let entries = non_brehon_status_entries(&status);
+    if entries.is_empty() {
+        return None;
+    }
+
+    let preview_limit = 12;
+    Some(PrimaryCheckoutWarning {
+        project_root: canonical_project.display().to_string(),
+        branch: git_stdout_in(&canonical_project, &["branch", "--show-current"]).ok(),
+        entries: entries
+            .iter()
+            .take(preview_limit)
+            .map(|entry| (*entry).to_string())
+            .collect(),
+        truncated_count: entries.len().saturating_sub(preview_limit),
+        inspect_error: None,
+    })
+}
+
 pub(super) fn current_workspace_root() -> Result<PathBuf, String> {
     std::env::var("BREHON_WORKSPACE_ROOT")
         .ok()

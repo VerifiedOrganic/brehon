@@ -26,7 +26,8 @@ use super::epic::{
 use super::followups::resolve_promoted_followups_for_terminal_task;
 use super::git_ops::{
     commit_workspace_checkpoint, current_git_head, current_workspace_root,
-    ensure_worker_branch_safe_for_task,
+    detect_default_branch_in, ensure_worker_branch_safe_for_task, git_stdout_in,
+    primary_checkout_status_warning, PrimaryCheckoutWarning,
 };
 use super::lifecycle::{
     caller_name, caller_role, caller_supervisor, is_container_task, is_valid_subtask,
@@ -174,12 +175,36 @@ async fn execute_checkpoint_inner(
         Ok(path) => path,
         Err(err) => return Ok(error_result(err)),
     };
+    let primary_checkout_warning = primary_checkout_status_warning(&workspace)
+        .map(|warning| primary_checkout_warning_json(&warning));
     let (commit, created_commit) = match commit_workspace_checkpoint(&workspace, message) {
         Ok(result) => result,
         Err(err) => return Ok(error_result(err)),
     };
+    if !checkpoint_has_reviewable_evidence(
+        &workspace,
+        &task,
+        &current_status,
+        &commit,
+        created_commit,
+    ) {
+        return Ok(error_result(format!(
+            "Refusing empty checkpoint for task {id}: the assigned worker worktree is clean, \
+             HEAD has no commits beyond the task base/default branch, and the task has no recorded latest_commit. \
+             This would create an empty or incomplete review. Make or commit the task-scoped work in the worker worktree, \
+             then call task action=complete again."
+        )));
+    }
 
     task.insert("latest_commit".into(), Value::String(commit.clone()));
+    if let Some(warning) = primary_checkout_warning.as_ref() {
+        task.insert(
+            "checkpoint_warnings".into(),
+            Value::Array(vec![warning.clone()]),
+        );
+    } else {
+        task.remove("checkpoint_warnings");
+    }
     task.insert(
         "updated_at".into(),
         Value::String(chrono::Utc::now().to_rfc3339()),
@@ -201,6 +226,9 @@ async fn execute_checkpoint_inner(
             format!("Task {id} already had a clean worktree; recorded existing HEAD.")
         }
     });
+    if let Some(warning) = primary_checkout_warning.as_ref() {
+        attach_checkpoint_warning(&mut result, warning);
+    }
     proof_recorder
         .record_checkpoint(id, &workspace, &commit, created_commit, message)
         .await
@@ -277,6 +305,109 @@ fn task_has_recorded_worker_handoff_commit(task: &serde_json::Map<String, Value>
     task.get("latest_commit")
         .and_then(|value| value.as_str())
         .is_some_and(|value| !value.trim().is_empty())
+}
+
+fn latest_commit_value(task: &serde_json::Map<String, Value>) -> Option<&str> {
+    task.get("latest_commit")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn git_ref_exists(cwd: &std::path::Path, reference: &str) -> bool {
+    git_stdout_in(cwd, &["rev-parse", "--verify", reference]).is_ok()
+}
+
+fn head_has_commits_not_in(cwd: &std::path::Path, reference: &str) -> Option<bool> {
+    if !git_ref_exists(cwd, reference) {
+        return None;
+    }
+    let range = format!("{reference}..HEAD");
+    git_stdout_in(cwd, &["rev-list", "--count", &range])
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(|count| count > 0)
+}
+
+fn worker_head_has_reviewable_commit(
+    cwd: &std::path::Path,
+    task: &serde_json::Map<String, Value>,
+) -> bool {
+    let mut references = Vec::new();
+    if let Some(merge_target) = task
+        .get("merge_target")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        references.push(merge_target.to_string());
+    }
+    if let Ok(default_branch) = detect_default_branch_in(cwd) {
+        references.push(default_branch);
+    }
+
+    references.sort();
+    references.dedup();
+    references
+        .iter()
+        .filter_map(|reference| head_has_commits_not_in(cwd, reference))
+        .any(|has_unique_commits| has_unique_commits)
+}
+
+fn checkpoint_has_reviewable_evidence(
+    cwd: &std::path::Path,
+    task: &serde_json::Map<String, Value>,
+    current_status: &str,
+    commit: &str,
+    created_commit: bool,
+) -> bool {
+    if created_commit {
+        return true;
+    }
+    if matches!(
+        normalize_task_status(current_status),
+        Some("review_ready" | "in_review")
+    ) {
+        return true;
+    }
+    if let Some(previous) = latest_commit_value(task) {
+        if previous == commit {
+            return true;
+        }
+    }
+    worker_head_has_reviewable_commit(cwd, task)
+}
+
+fn primary_checkout_warning_json(warning: &PrimaryCheckoutWarning) -> Value {
+    serde_json::json!({
+        "kind": "primary_project_checkout_dirty",
+        "message": if warning.inspect_error.is_some() {
+            "Brehon could not inspect the primary project checkout while checkpointing. The checkpoint still used only the assigned worker worktree."
+        } else {
+            "Primary project checkout has local changes. The checkpoint still used only the assigned worker worktree."
+        },
+        "project_root": warning.project_root,
+        "branch": warning.branch,
+        "entries": warning.entries,
+        "truncated_count": warning.truncated_count,
+        "inspect_error": warning.inspect_error,
+    })
+}
+
+fn attach_checkpoint_warning(result: &mut Value, warning: &Value) {
+    result["warnings"] = Value::Array(vec![warning.clone()]);
+    result["warning"] = warning.clone();
+}
+
+fn copy_checkpoint_warning(result: &mut Value, checkpoint_json: &Value) {
+    if let Some(warnings) = checkpoint_json.get("warnings") {
+        result["warnings"] = warnings.clone();
+    }
+    if result.get("warning").is_none() {
+        if let Some(warning) = checkpoint_json.get("warning") {
+            result["warning"] = warning.clone();
+        }
+    }
 }
 
 fn supervisor_worker_state_review_recovery_allowed(
@@ -406,6 +537,7 @@ pub(super) async fn execute_complete(
                     result["latest_commit"] = value.clone();
                 }
                 copy_proof_result(&mut result, &Value::Null, &checkpoint_json);
+                copy_checkpoint_warning(&mut result, &checkpoint_json);
                 result["worktree_cleanup"] =
                     super::build_artifact_cleanup::cleanup_current_worker_build_artifacts(
                         "after_task_complete",
@@ -468,6 +600,7 @@ pub(super) async fn execute_complete(
     if let Some(value) = progress_json.get("warning") {
         result["warning"] = value.clone();
     }
+    copy_checkpoint_warning(&mut result, &checkpoint_json);
     copy_proof_result(&mut result, &progress_json, &checkpoint_json);
     if already_handed_off {
         result["already_handed_off"] = Value::Bool(true);
