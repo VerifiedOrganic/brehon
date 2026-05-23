@@ -1298,6 +1298,101 @@ async fn test_assign_workers_moves_changes_requested_task_to_assigned() {
 }
 
 #[tokio::test]
+async fn test_assign_workers_rejects_live_changes_requested_transfer() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let root = make_test_root();
+    let _env = ScopedEnv::set(&[
+        ("BREHON_ROOT", root.path().to_str().unwrap()),
+        ("BREHON_AGENT_ROLE", "supervisor"),
+    ]);
+    write_test_task_with_assignee(
+        root.path(),
+        "T-live-revision",
+        "changes_requested",
+        "task",
+        Value::String("worker-1".to_string()),
+    );
+    crate::tools::agent::write_session_file(
+        "worker-1",
+        "worker",
+        "worker-1-session",
+        Some("opencode"),
+    );
+    crate::tools::agent::write_session_file(
+        "worker-2",
+        "worker",
+        "worker-2-session",
+        Some("opencode"),
+    );
+    let tool = FactoryTool::new();
+
+    for args in [
+        serde_json::json!({
+            "action": "assign_workers",
+            "task_id": "T-live-revision",
+            "worker": "worker-2"
+        }),
+        serde_json::json!({
+            "action": "assign_workers",
+            "task_id": "T-live-revision",
+            "worker": "worker-2",
+            "force_reassign": true
+        }),
+    ] {
+        let result = tool.execute(args).await.unwrap();
+        assert_eq!(result.is_error, Some(true));
+        let text = extract_text(&result);
+        assert!(
+            text.contains("already owned by live worker 'worker-1'"),
+            "{text}"
+        );
+        assert!(text.contains("two worker panes"), "{text}");
+    }
+
+    let task = read_test_task(root.path(), "T-live-revision");
+    assert_eq!(task["status"], "changes_requested");
+    assert_eq!(task["assignee"], "worker-1");
+}
+
+#[tokio::test]
+async fn test_assign_workers_allows_live_changes_requested_same_worker() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let root = make_test_root();
+    let _env = ScopedEnv::set(&[
+        ("BREHON_ROOT", root.path().to_str().unwrap()),
+        ("BREHON_AGENT_ROLE", "supervisor"),
+    ]);
+    write_test_task_with_assignee(
+        root.path(),
+        "T-same-revision",
+        "changes_requested",
+        "task",
+        Value::String("worker-1".to_string()),
+    );
+    crate::tools::agent::write_session_file(
+        "worker-1",
+        "worker",
+        "worker-1-session",
+        Some("opencode"),
+    );
+    let tool = FactoryTool::new();
+
+    let result = tool
+        .execute(serde_json::json!({
+            "action": "assign_workers",
+            "task_id": "T-same-revision",
+            "worker": "worker-1"
+        }))
+        .await
+        .unwrap();
+
+    assert!(result.is_error.is_none(), "{}", extract_text(&result));
+    let task = read_test_task(root.path(), "T-same-revision");
+    assert_eq!(task["status"], "assigned");
+    assert_eq!(task["assignee"], "worker-1");
+}
+
+#[tokio::test]
 async fn test_assign_workers_reseeds_changes_requested_task_from_latest_commit() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let repo_root = make_git_repo_with_brehon_root();

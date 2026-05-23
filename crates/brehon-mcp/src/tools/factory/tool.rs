@@ -684,6 +684,19 @@ impl Tool for FactoryTool {
                         )));
                     }
 
+                    if normalized_status == "changes_requested" {
+                        if let Some(existing_owner) = previous_assignee
+                            .as_deref()
+                            .filter(|existing| *existing != assignee)
+                            .filter(|existing| live_workers.contains(*existing))
+                        {
+                            return Ok(error_result(format!(
+                                "Cannot assign task {task_id} to worker '{assignee}': task is already owned by live worker '{existing_owner}' while changes are requested. \
+                                 Transferring a live owner can leave two worker panes acting on the same task. Assign '{existing_owner}' again, or recycle/mark that worker unavailable before assigning another worker."
+                            )));
+                        }
+                    }
+
                     let orphaned_active_reassignment = matches!(
                         recovery_status,
                         "assigned" | "in_progress" | "changes_requested"

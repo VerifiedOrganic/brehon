@@ -2416,6 +2416,7 @@ async fn test_repair_frontier_requires_supervisor_with_structured_error() {
     let _env = ScopedEnv::set(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "worker"),
+        ("BREHON_AGENT_NAME", "worker-1"),
     ]);
     let tool = TaskActionsTool::new();
 
@@ -4683,6 +4684,7 @@ async fn test_progress_rejects_review_and_terminal_states() {
     let _env = ScopedEnv::set(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "worker"),
+        ("BREHON_AGENT_NAME", "worker-1"),
     ]);
     let tool = TaskActionsTool::new();
 
@@ -4709,6 +4711,42 @@ async fn test_progress_rejects_review_and_terminal_states() {
         let task = read_test_task(root.path(), &format!("T-{}", status));
         assert_eq!(task["status"], status, "status mutated for {status}");
     }
+}
+
+#[tokio::test]
+async fn test_progress_rejects_non_assignee_worker() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let root = make_test_root();
+    let _env = ScopedEnv::set(&[
+        ("BREHON_ROOT", root.path().to_str().unwrap()),
+        ("BREHON_AGENT_ROLE", "worker"),
+        ("BREHON_AGENT_NAME", "worker-2"),
+    ]);
+    let tool = TaskActionsTool::new();
+    write_test_task(root.path(), "T-owned-progress", "in_progress", "task");
+
+    let result = tool
+        .execute(serde_json::json!({
+            "action": "progress",
+            "id": "T-owned-progress",
+            "percent": 50,
+            "notes": "still working"
+        }))
+        .await
+        .unwrap();
+
+    assert_eq!(result.is_error, Some(true));
+    let text = extract_text(&result);
+    assert!(
+        text.contains("assigned to 'worker-1' not 'worker-2'"),
+        "{text}"
+    );
+    assert!(text.contains("Only the assigned worker can report progress"));
+
+    let task = read_test_task(root.path(), "T-owned-progress");
+    assert_eq!(task["status"], "in_progress");
+    assert_eq!(task["percent"], 0);
+    assert!(task.get("notes").is_none());
 }
 
 #[tokio::test]
@@ -6171,6 +6209,7 @@ async fn test_update_rejects_worker_merge_and_close_of_approved_task() {
     let _env = ScopedEnv::set(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "worker"),
+        ("BREHON_AGENT_NAME", "worker-1"),
     ]);
     let tool = TaskActionsTool::new();
 
@@ -6197,6 +6236,40 @@ async fn test_update_rejects_worker_merge_and_close_of_approved_task() {
         .unwrap();
     assert_eq!(close_result.is_error, Some(true));
     assert!(extract_text(&close_result).contains("Only supervisors can set status to 'closed'"));
+}
+
+#[tokio::test]
+async fn test_update_rejects_non_assignee_worker() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let root = make_test_root();
+    let _env = ScopedEnv::set(&[
+        ("BREHON_ROOT", root.path().to_str().unwrap()),
+        ("BREHON_AGENT_ROLE", "worker"),
+        ("BREHON_AGENT_NAME", "worker-2"),
+    ]);
+    let tool = TaskActionsTool::new();
+    write_test_task(root.path(), "T-owned-update", "in_progress", "task");
+
+    let result = tool
+        .execute(serde_json::json!({
+            "action": "update",
+            "id": "T-owned-update",
+            "notes": "trying to update"
+        }))
+        .await
+        .unwrap();
+
+    assert_eq!(result.is_error, Some(true));
+    let text = extract_text(&result);
+    assert!(
+        text.contains("assigned to 'worker-1' not 'worker-2'"),
+        "{text}"
+    );
+    assert!(text.contains("Only the assigned worker can update"));
+
+    let task = read_test_task(root.path(), "T-owned-update");
+    assert_eq!(task["status"], "in_progress");
+    assert!(task.get("notes").is_none());
 }
 
 #[tokio::test]

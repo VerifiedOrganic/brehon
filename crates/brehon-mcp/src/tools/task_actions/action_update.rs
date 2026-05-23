@@ -143,16 +143,13 @@ async fn execute_checkpoint_inner(
         )));
     }
 
-    let assignee = task
-        .get("assignee")
-        .and_then(|v| v.as_str())
-        .filter(|v| !v.is_empty());
     let caller_name = caller_name(args, "worker");
-    if assignee != Some(caller_name.as_str()) {
+    if let Some(err) = worker_task_ownership_error(id, &task, &caller_name, "checkpoint") {
+        return Ok(error_result(err));
+    }
+    if task_assignee(&task).is_none() {
         return Ok(error_result(format!(
-            "Task {id} is assigned to '{}' not '{}'. Only the assigned worker can checkpoint this task.",
-            assignee.unwrap_or(""),
-            caller_name
+            "Task {id} is assigned to '' not '{caller_name}'. Only the assigned worker can checkpoint this task."
         )));
     }
 
@@ -299,6 +296,28 @@ fn caller_owns_started_pending_task(args: &Value, task: &serde_json::Map<String,
         return false;
     };
     assignee == caller_name(args, "worker") && task_has_started_worker_execution(task)
+}
+
+fn task_assignee(task: &serde_json::Map<String, Value>) -> Option<&str> {
+    task.get("assignee")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn worker_task_ownership_error(
+    id: &str,
+    task: &serde_json::Map<String, Value>,
+    caller_name: &str,
+    action: &str,
+) -> Option<String> {
+    let assignee = task_assignee(task)?;
+    if assignee == caller_name {
+        return None;
+    }
+    Some(format!(
+        "Task {id} is assigned to '{assignee}' not '{caller_name}'. Only the assigned worker can {action} this task."
+    ))
 }
 
 fn task_has_recorded_worker_handoff_commit(task: &serde_json::Map<String, Value>) -> bool {
@@ -655,6 +674,21 @@ pub(super) async fn execute_progress(
     let completion_mode = task_completion_mode_from_task(&task);
     let percent = args.get("percent").and_then(|v| v.as_i64()).unwrap_or(0);
     let caller_role = caller_role(args);
+    let worker_caller_name = if caller_role == "worker" {
+        Some(caller_name(args, "worker"))
+    } else {
+        None
+    };
+    if caller_role == "worker" && task_type == "task" {
+        if let Some(err) = worker_task_ownership_error(
+            id,
+            &task,
+            worker_caller_name.as_deref().unwrap_or("worker"),
+            "report progress for",
+        ) {
+            return Ok(error_result(err));
+        }
+    }
     let normalized_status = normalize_task_status(&current_status);
     let resume_started_pending_task = caller_role == "worker"
         && task_type == "task"
@@ -744,6 +778,19 @@ pub(super) async fn execute_progress(
         }
     }
 
+    if caller_role == "worker"
+        && task_type == "task"
+        && task_assignee(&task).is_none()
+        && matches!(
+            effective_normalized_status,
+            Some("assigned" | "in_progress" | "changes_requested")
+        )
+    {
+        if let Some(worker) = worker_caller_name.as_ref() {
+            task.insert("assignee".into(), Value::String(worker.clone()));
+        }
+    }
+
     task.insert("percent".into(), Value::Number(percent.into()));
     if let Some(activity) = args.get("activity").and_then(|v| v.as_str()) {
         task.insert("activity".into(), Value::String(activity.to_string()));
@@ -793,7 +840,9 @@ pub(super) async fn execute_progress(
             .filter(|value| !value.is_empty())
             .map(String::from)
             .or_else(|| {
-                let caller = caller_name(args, "worker");
+                let caller = worker_caller_name
+                    .clone()
+                    .unwrap_or_else(|| caller_name(args, "worker"));
                 (!caller.trim().is_empty()).then_some(caller)
             });
         task.insert("status".into(), Value::String("review_ready".to_string()));
@@ -828,7 +877,9 @@ pub(super) async fn execute_progress(
         ));
 
         // Best-effort notify supervisor
-        let agent_name = caller_name(args, "worker");
+        let agent_name = worker_caller_name
+            .clone()
+            .unwrap_or_else(|| caller_name(args, "worker"));
         let supervisor = caller_supervisor(args);
         let title = task.get("title").and_then(|v| v.as_str()).unwrap_or("?");
         let commit_line = current_commit
@@ -883,6 +934,17 @@ pub(super) async fn execute_update(
         return Ok(error_result(format!("Task not found: {id}")));
     };
     let caller_role = caller_role(args);
+    if caller_role == "worker" {
+        let caller = caller_name(args, "worker");
+        if let Some(err) = worker_task_ownership_error(id, &task, &caller, "update") {
+            return Ok(error_result(err));
+        }
+        if args.get("assignee").is_some() {
+            return Ok(error_result(
+                "Workers cannot change task assignee. Use factory action=assign_workers.",
+            ));
+        }
+    }
 
     if let Some(raw_mode) = args.get("completion_mode").and_then(|v| v.as_str()) {
         if caller_role != "supervisor" {
