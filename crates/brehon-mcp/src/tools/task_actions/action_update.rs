@@ -15,7 +15,8 @@ use crate::tools::verification::{
 use crate::tools::{error_result, text_result};
 
 use super::dependencies::{
-    parse_task_id_list_arg, task_has_recoverable_worker_state_blocker_text, write_string_list_field,
+    parse_task_id_list_arg, task_has_legacy_completed_worker_status,
+    task_has_recoverable_worker_state_blocker_text, write_string_list_field,
 };
 use super::epic::{
     apply_integration_conflict_cleanup, container_base_branch_for_parent,
@@ -364,8 +365,10 @@ pub(super) async fn execute_complete(
                 .and_then(|value| value.as_str())
                 .unwrap_or("unknown")
                 .to_string();
-            if normalize_task_status(&current_status) == Some("blocked")
-                && task_has_recoverable_worker_state_blocker_text(&task)
+            let recoverable_blocked = normalize_task_status(&current_status) == Some("blocked")
+                && task_has_recoverable_worker_state_blocker_text(&task);
+            let recoverable_legacy_completed = task_has_legacy_completed_worker_status(&task);
+            if (recoverable_blocked || recoverable_legacy_completed)
                 && task_has_recorded_worker_handoff_commit(&task)
             {
                 apply_worker_state_review_recovery_cleanup(&mut task);
@@ -552,6 +555,7 @@ pub(super) async fn execute_progress(
         && percent >= 100
         && task_type == "task"
         && matches!(normalized_status, Some("review_ready" | "in_review"))
+        && !task_has_legacy_completed_worker_status(&task)
     {
         let mut result = serde_json::json!({
             "status": "ok",

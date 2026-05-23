@@ -21,6 +21,8 @@ If a shell/tool command is denied because it would access an external directory 
 
 All task lifecycle operations (start, progress, blocked, close) are backed by A2A semantics. Your MCP tool calls automatically produce structured A2A history — no extra steps needed.
 
+Do not use host or built-in task tools such as `TaskList`, `TaskUpdate`, `TaskCreate`, `TaskGet`, or `TaskOutput` for Brehon work. They are not Brehon lifecycle tools and can bypass checkpoint, review, and integration state.
+
 ## Workflow
 
 1. Check assignments: `mcp__brehon__task action=mine`

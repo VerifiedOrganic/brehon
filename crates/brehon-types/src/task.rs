@@ -145,6 +145,7 @@ pub fn normalize_task_status(status: &str) -> Option<&'static str> {
         "assigned" | "Assigned" => Some("assigned"),
         "in_progress" | "InProgress" => Some("in_progress"),
         "review_ready" | "ReviewReady" => Some("review_ready"),
+        "complete" | "Complete" | "completed" | "Completed" => Some("review_ready"),
         "in_review" | "InReview" => Some("in_review"),
         "changes_requested" | "ChangesRequested" => Some("changes_requested"),
         "approved" | "Approved" => Some("approved"),
@@ -228,6 +229,12 @@ mod tests {
         assert_eq!(json, r#""InProgress""#);
         let parsed: TaskStatus = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, TaskStatus::InProgress);
+    }
+
+    #[test]
+    fn normalize_legacy_completed_status_as_review_ready() {
+        assert_eq!(normalize_task_status("completed"), Some("review_ready"));
+        assert_eq!(normalize_task_status("Completed"), Some("review_ready"));
     }
 
     #[test]

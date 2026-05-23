@@ -8,7 +8,9 @@ use crate::error::McpError;
 use crate::server::ToolResult;
 use crate::tools::{structured_error_result, text_result};
 
-use super::dependencies::task_has_recoverable_worker_state_blocker_text;
+use super::dependencies::{
+    task_has_legacy_completed_worker_status, task_has_recoverable_worker_state_blocker_text,
+};
 use super::lifecycle::{ancestor_chain_has_closed_parent, caller_role};
 use super::locking::acquire_task_lock;
 use super::persistence::{read_all_tasks, read_task, write_task};
@@ -112,10 +114,11 @@ fn task_is_safe_handoff_repair_candidate(
         .get("task_type")
         .and_then(|value| value.as_str())
         .unwrap_or("task");
-    normalize_task_status(status) == Some("blocked")
-        && task_type == "task"
+    task_type == "task"
         && latest_commit(task).is_some()
-        && task_has_recoverable_worker_state_blocker_text(task)
+        && (normalize_task_status(status) == Some("blocked")
+            && task_has_recoverable_worker_state_blocker_text(task)
+            || task_has_legacy_completed_worker_status(task))
         && !ancestor_chain_has_closed_parent(all_tasks, task)
         && control_plane_scope_issue_for_task(task).is_none()
 }
@@ -176,6 +179,7 @@ async fn recover_handoff_by_id(id: &str) -> Result<RecoverOutcome, ToolResult> {
         .unwrap_or("unknown")
         .to_string();
     let normalized_status = normalize_task_status(&current_status);
+    let legacy_completed = task_has_legacy_completed_worker_status(&task);
     let task_type = task
         .get("task_type")
         .and_then(|value| value.as_str())
@@ -205,7 +209,7 @@ async fn recover_handoff_by_id(id: &str) -> Result<RecoverOutcome, ToolResult> {
         ));
     };
 
-    if matches!(normalized_status, Some("review_ready" | "in_review")) {
+    if !legacy_completed && matches!(normalized_status, Some("review_ready" | "in_review")) {
         return Ok(RecoverOutcome {
             task_id: id.to_string(),
             from_status: current_status.clone(),
@@ -228,10 +232,12 @@ async fn recover_handoff_by_id(id: &str) -> Result<RecoverOutcome, ToolResult> {
         ));
     }
 
-    if normalized_status != Some("blocked") {
+    if normalized_status != Some("blocked") && !legacy_completed {
         return Err(structured_repair_error(
             "handoff_wrong_status",
-            format!("Task {id} is {current_status}; recover_handoff only repairs blocked tasks."),
+            format!(
+                "Task {id} is {current_status}; recover_handoff only repairs blocked tasks or legacy completed worker handoffs."
+            ),
             false,
             repair_current_state(id, Some(&task)),
             vec![ready_next_action()],
@@ -239,7 +245,9 @@ async fn recover_handoff_by_id(id: &str) -> Result<RecoverOutcome, ToolResult> {
         ));
     }
 
-    if !task_has_recoverable_worker_state_blocker_text(&task) {
+    if normalized_status == Some("blocked")
+        && !task_has_recoverable_worker_state_blocker_text(&task)
+    {
         return Err(structured_repair_error(
             "handoff_not_recoverable",
             format!(

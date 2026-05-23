@@ -2233,6 +2233,50 @@ async fn test_recover_handoff_action_repairs_blocked_worker_handoff() {
 }
 
 #[tokio::test]
+async fn test_recover_handoff_action_repairs_legacy_completed_worker_handoff() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let root = make_test_root();
+    let _env = ScopedEnv::set(&[
+        ("BREHON_ROOT", root.path().to_str().unwrap()),
+        ("BREHON_AGENT_ROLE", "supervisor"),
+    ]);
+    let tool = TaskActionsTool::new();
+
+    write_test_task(root.path(), "T-completed-action", "completed", "task");
+    let mut task = read_test_task(root.path(), "T-completed-action");
+    task["latest_commit"] = Value::String("feedface".to_string());
+    task["percent"] = Value::Number(serde_json::Number::from(100_u64));
+    std::fs::write(
+        root.path()
+            .join("runtime")
+            .join("tasks")
+            .join("T-completed-action.json"),
+        serde_json::to_string_pretty(&task).unwrap(),
+    )
+    .unwrap();
+
+    let result = tool
+        .execute(serde_json::json!({
+            "action": "recover_handoff",
+            "id": "T-completed-action"
+        }))
+        .await
+        .unwrap();
+
+    assert!(result.is_error.is_none(), "{}", extract_text(&result));
+    let payload: Value = serde_json::from_str(&extract_text(&result)).unwrap();
+    assert_eq!(payload["from_status"], "completed");
+    assert_eq!(payload["to_status"], "review_ready");
+    assert_eq!(payload["next_action"]["kind"], "request_review");
+
+    let after = read_test_task(root.path(), "T-completed-action");
+    assert_eq!(after["status"], "review_ready");
+    assert_eq!(after["latest_commit"], "feedface");
+    assert_eq!(after["assignee"], Value::Null);
+    assert_eq!(after["review_owner"], Value::Null);
+}
+
+#[tokio::test]
 async fn test_repair_frontier_repairs_all_safe_blocked_handoffs() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
@@ -2847,6 +2891,55 @@ async fn test_ready_surfaces_recoverable_blocked_worker_handoffs() {
     assert_eq!(
         payload["blocked_handoff_tasks"][0]["liveness"]["state"],
         "missing_session"
+    );
+}
+
+#[tokio::test]
+async fn test_ready_surfaces_legacy_completed_handoff_without_commit() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let root = make_test_root();
+    let _env = ScopedEnv::set(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
+    let tool = TaskActionsTool::new();
+
+    write_test_task(root.path(), "T-completed-no-commit", "completed", "task");
+    let mut task = read_test_task(root.path(), "T-completed-no-commit");
+    task["percent"] = Value::Number(serde_json::Number::from(100_u64));
+    std::fs::write(
+        root.path()
+            .join("runtime")
+            .join("tasks")
+            .join("T-completed-no-commit.json"),
+        serde_json::to_string_pretty(&task).unwrap(),
+    )
+    .unwrap();
+
+    let ready = tool
+        .execute(serde_json::json!({"action": "ready"}))
+        .await
+        .unwrap();
+    let payload: Value = serde_json::from_str(&extract_text(&ready)).unwrap();
+
+    assert_eq!(payload["count"], 0, "{payload}");
+    assert_eq!(payload["blocked_handoff_count"], 1, "{payload}");
+    assert_eq!(payload["recoverable_blocked_count"], 0, "{payload}");
+    assert_eq!(
+        payload["blocked_handoff_tasks"][0]["task_id"],
+        "T-completed-no-commit"
+    );
+    assert_eq!(
+        payload["blocked_handoff_tasks"][0]["repair_blocker"],
+        "latest_commit is missing"
+    );
+    assert_eq!(
+        payload["next_action"]["kind"],
+        "wait_for_worker_checkpoint_or_reassign"
+    );
+    assert!(
+        payload["message"]
+            .as_str()
+            .unwrap()
+            .contains("worker handoff task"),
+        "{payload}"
     );
 }
 
@@ -5094,6 +5187,63 @@ async fn test_complete_recovers_blocked_handoff_after_checkpoint_succeeds() {
     assert_eq!(task["status"], "review_ready");
     assert_eq!(task["latest_commit"], commit);
     assert!(task.get("blockers").is_none(), "blockers should be cleared");
+    assert!(task["assignee"].is_null());
+    assert!(task["review_owner"].is_null());
+    assert_eq!(task["activity"], "awaiting_review");
+    assert_eq!(task["percent"], 100);
+}
+
+#[tokio::test]
+async fn test_complete_recovers_legacy_completed_handoff_after_checkpoint_succeeds() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let root = make_test_root();
+    let project = tempfile::tempdir().unwrap();
+    init_git_workspace(project.path());
+    let workspace = tempfile::tempdir().unwrap();
+    let initial_commit = init_git_workspace(workspace.path());
+    std::fs::write(
+        workspace.path().join("feature.txt"),
+        "completed from legacy state\n",
+    )
+    .unwrap();
+    let _env = ScopedEnv::set(&[
+        ("BREHON_ROOT", root.path().to_str().unwrap()),
+        ("BREHON_PROJECT_ROOT", project.path().to_str().unwrap()),
+        ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
+        ("BREHON_AGENT_ROLE", "worker"),
+        ("BREHON_AGENT_NAME", "worker-1"),
+        ("BREHON_SUPERVISOR_NAME", "sup-1"),
+    ]);
+    let tool = TaskActionsTool::new();
+    write_test_task(
+        root.path(),
+        "T-complete-legacy-completed",
+        "completed",
+        "task",
+    );
+
+    let result = tool
+        .execute(serde_json::json!({
+            "action": "complete",
+            "id": "T-complete-legacy-completed",
+            "notes": "implementation complete after legacy completed state"
+        }))
+        .await
+        .unwrap();
+
+    assert!(result.is_error.is_none(), "{}", extract_text(&result));
+    let result_json: Value = serde_json::from_str(&extract_text(&result)).unwrap();
+    let commit = result_json["latest_commit"].as_str().unwrap();
+    assert_ne!(commit, initial_commit);
+    assert_eq!(result_json["created_commit"], true);
+    assert_eq!(result_json["task_status"], "review_ready");
+    assert_eq!(result_json["recovered_handoff"], true);
+    assert_eq!(run_git(workspace.path(), &["rev-parse", "HEAD"]), commit);
+    assert_eq!(run_git(workspace.path(), &["status", "--porcelain"]), "");
+
+    let task = read_test_task(root.path(), "T-complete-legacy-completed");
+    assert_eq!(task["status"], "review_ready");
+    assert_eq!(task["latest_commit"], commit);
     assert!(task["assignee"].is_null());
     assert!(task["review_owner"].is_null());
     assert_eq!(task["activity"], "awaiting_review");

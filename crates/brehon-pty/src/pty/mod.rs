@@ -2178,6 +2178,8 @@ key = "oauth/kimi-code"
         assert!(prompt.contains("action=progress id=<task> percent=<n>"));
         assert!(prompt.contains("action=complete id=<task>"));
         assert!(prompt.contains("moves the task to `review_ready`"));
+        assert!(prompt.contains("Do NOT use host or built-in task tools"));
+        assert!(prompt.contains("`TaskUpdate`"));
         assert!(prompt.contains("status=blocked"));
         assert!(
             prompt.contains("Do NOT proactively call `mcp__brehon__agent action=session_start`")
@@ -2197,6 +2199,8 @@ key = "oauth/kimi-code"
 
         assert!(prompt.contains("Do NOT send readiness acknowledgements"));
         assert!(prompt.contains("Do NOT use built-in messaging tools like `SendMessage`"));
+        assert!(prompt.contains("Do NOT use host or built-in task tools"));
+        assert!(prompt.contains("`TaskUpdate`"));
         assert!(prompt.contains("reply with one short status line and stop"));
         assert!(prompt.contains("After any action that may change the frontier"));
         assert!(prompt.contains("Call these silently, without narrating each step"));

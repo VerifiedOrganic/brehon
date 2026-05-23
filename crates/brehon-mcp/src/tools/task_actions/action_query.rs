@@ -10,7 +10,9 @@ use crate::tools::routing::routing_summary;
 use crate::tools::verification::{find_panel_lease_by_task, read_review_state, read_round_request};
 use crate::tools::{error_result, text_result};
 
-use super::dependencies::task_has_recoverable_worker_state_blocker_text;
+use super::dependencies::{
+    task_has_legacy_completed_worker_status, task_has_recoverable_worker_state_blocker_text,
+};
 use super::epic::{
     check_child_completion, check_epic_integration_status, task_has_supervisor_integration_conflict,
 };
@@ -240,10 +242,10 @@ fn blocked_handoff_context(
         .get("task_type")
         .and_then(|v| v.as_str())
         .unwrap_or("task");
-    if status != "blocked"
-        || task_type != "task"
-        || !task_has_recoverable_worker_state_blocker_text(task)
-    {
+    let recoverable_blocked =
+        status == "blocked" && task_has_recoverable_worker_state_blocker_text(task);
+    let legacy_completed = task_has_legacy_completed_worker_status(task);
+    if task_type != "task" || (!recoverable_blocked && !legacy_completed) {
         return None;
     }
 
@@ -285,6 +287,8 @@ fn blocked_handoff_context(
         Value::Null
     } else if !has_commit {
         Value::String("latest_commit is missing".to_string())
+    } else if legacy_completed {
+        Value::String("legacy completed handoff state is not safe to repair".to_string())
     } else if closed_parent {
         Value::String("task has a closed ancestor".to_string())
     } else {
@@ -889,6 +893,12 @@ pub(super) async fn execute_ready(args: &Value) -> Result<ToolResult, McpError> 
             "{recoverable_blocked_count} blocked task(s) have recoverable worker handoff state and should be repaired with task action=repair_frontier"
         ));
     }
+    if blocked_handoff_count > recoverable_blocked_count {
+        priority_notes.push(format!(
+            "{} worker handoff task(s) require worker checkpoint/reassignment before review can proceed",
+            blocked_handoff_count - recoverable_blocked_count
+        ));
+    }
     if stalled_count > 0 {
         priority_notes.push(format!(
             "{stalled_count} assigned changes_requested task(s) have been silent past the stall threshold — check worker liveness and `agent action=delivery_status` before assuming they are still working"
@@ -932,6 +942,12 @@ pub(super) async fn execute_ready(args: &Value) -> Result<ToolResult, McpError> 
                 "action": "repair_frontier"
             }
         })
+    } else if let Some(action) = blocked_handoff_tasks
+        .first()
+        .and_then(|task| task.get("repair_action"))
+        .cloned()
+    {
+        action
     } else if let Some(task_id) = review_ready_tasks.first().and_then(queued_task_id) {
         serde_json::json!({
             "kind": "request_review",

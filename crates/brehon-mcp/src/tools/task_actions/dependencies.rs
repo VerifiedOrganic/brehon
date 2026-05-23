@@ -167,6 +167,22 @@ pub(super) fn task_has_recoverable_worker_state_blocker_text(
             && blockers_lower.contains("in_progress"))
 }
 
+pub(super) fn task_has_legacy_completed_worker_status(
+    task: &serde_json::Map<String, Value>,
+) -> bool {
+    let status = task
+        .get("status")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .unwrap_or("");
+    let task_type = task
+        .get("task_type")
+        .and_then(|value| value.as_str())
+        .unwrap_or("task");
+
+    task_type == "task" && matches!(status, "complete" | "Complete" | "completed" | "Completed")
+}
+
 pub(super) fn parse_optional_text_arg(args: &Value, key: &str) -> Result<Option<String>, String> {
     match args.get(key) {
         None => Ok(None),

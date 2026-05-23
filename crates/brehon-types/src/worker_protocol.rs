@@ -74,6 +74,10 @@ pub fn build_worker_protocol(
             "Use Brehon MCP tools for task/state coordination, and normal shell/CLI commands \
              for repo work — always within the current worktree (see worktree rules above)."
         ),
+        "Do NOT use host or built-in task tools such as `TaskList`, `TaskUpdate`, `TaskCreate`, \
+         `TaskGet`, or `TaskOutput` for Brehon work. They are not Brehon lifecycle tools and can \
+         bypass checkpoint, review, and integration state."
+            .to_string(),
         "Brehon is separate from legacy Agora. Use `brehon`, `.brehon/`, `BREHON_*`, and \
          `mcp__brehon__*`; do not inspect, mutate, migrate, or invoke `.agora/`, `AGORA_*`, \
          `agora`, or `mcp__agora__*` unless the operator explicitly asks for legacy migration."
@@ -168,6 +172,8 @@ mod tests {
         assert!(protocol.contains("The supervisor owns reviewer assignment"));
         assert!(protocol.contains("Never `cd` to the shared repo root"));
         assert!(protocol.contains("Do NOT wait for approval"));
+        assert!(protocol.contains("Do NOT use host or built-in task tools"));
+        assert!(protocol.contains("`TaskUpdate`"));
     }
 
     #[test]
