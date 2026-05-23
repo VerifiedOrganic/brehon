@@ -1066,6 +1066,29 @@ pub(super) fn verify_container_branch_ready(
     Ok(integration_branch.to_string())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ContainerMergeStrategy {
+    Merge,
+    Squash,
+}
+
+impl ContainerMergeStrategy {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::Merge => "merge",
+            Self::Squash => "squash",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ContainerMergeOutcome {
+    pub(super) commit: String,
+    pub(super) strategy: ContainerMergeStrategy,
+    pub(super) squash_source_tip: Option<String>,
+}
+
+#[cfg(test)]
 pub(super) fn merge_container_branch_into_target(
     container_id: &str,
     container_type: &str,
@@ -1073,6 +1096,28 @@ pub(super) fn merge_container_branch_into_target(
     target_branch: &str,
     target_worktree: &Path,
 ) -> Result<String, String> {
+    merge_container_branch_into_target_with_strategy(
+        container_id,
+        None,
+        container_type,
+        integration_branch,
+        target_branch,
+        target_worktree,
+        ContainerMergeStrategy::Merge,
+    )
+    .map(|outcome| outcome.commit)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn merge_container_branch_into_target_with_strategy(
+    container_id: &str,
+    container_title: Option<&str>,
+    container_type: &str,
+    integration_branch: &str,
+    target_branch: &str,
+    target_worktree: &Path,
+    strategy: ContainerMergeStrategy,
+) -> Result<ContainerMergeOutcome, String> {
     let current_branch =
         git_stdout_in(target_worktree, &["branch", "--show-current"]).map_err(|err| {
             format!(
@@ -1091,6 +1136,7 @@ pub(super) fn merge_container_branch_into_target(
         ));
     }
 
+    let target_head_before_merge = git_stdout_in(target_worktree, &["rev-parse", "HEAD"])?;
     let dirty = git_status_porcelain_in(target_worktree)?;
     let dirty_entries = non_brehon_status_entries(&dirty);
     if !dirty_entries.is_empty() {
@@ -1102,6 +1148,58 @@ pub(super) fn merge_container_branch_into_target(
             container_id,
             target_branch
         ));
+    }
+
+    let squash_source_tip = if strategy == ContainerMergeStrategy::Squash {
+        Some(git_stdout_in(
+            target_worktree,
+            &["rev-parse", integration_branch],
+        )?)
+    } else {
+        None
+    };
+
+    if strategy == ContainerMergeStrategy::Squash {
+        let squash_result = crate::git_exec::run_git_allow_protected_branch_commit(
+            target_worktree,
+            &["merge", "--squash", integration_branch],
+        )?;
+
+        if !squash_result.status.success() {
+            reset_target_worktree_after_failed_merge(target_worktree, &target_head_before_merge);
+            return Err(format!(
+                "Failed to squash merge {} branch '{}' into '{}'. Merge conflict or error: {}",
+                container_type,
+                integration_branch,
+                target_branch,
+                String::from_utf8_lossy(&squash_result.stderr)
+            ));
+        }
+
+        let commit_message =
+            squash_commit_message(container_id, container_title, container_type, target_branch);
+        let commit_result = crate::git_exec::run_git_allow_protected_branch_commit(
+            target_worktree,
+            &["commit", "--allow-empty", "-m", &commit_message],
+        )?;
+
+        if !commit_result.status.success() {
+            reset_target_worktree_after_failed_merge(target_worktree, &target_head_before_merge);
+            return Err(format!(
+                "Failed to commit squash merge of {} branch '{}' into '{}': {}",
+                container_type,
+                integration_branch,
+                target_branch,
+                String::from_utf8_lossy(&commit_result.stderr)
+            ));
+        }
+
+        let merge_commit = git_stdout_in(target_worktree, &["rev-parse", "HEAD"])?;
+        return Ok(ContainerMergeOutcome {
+            commit: merge_commit,
+            strategy,
+            squash_source_tip,
+        });
     }
 
     let merge_result = crate::git_exec::run_git_allow_protected_branch_commit(
@@ -1117,6 +1215,7 @@ pub(super) fn merge_container_branch_into_target(
 
     if !merge_result.status.success() {
         let _ = crate::git_exec::run_git(target_worktree, &["merge", "--abort"]);
+        reset_target_worktree_after_failed_merge(target_worktree, &target_head_before_merge);
         return Err(format!(
             "Failed to merge {} branch '{}' into '{}'. Merge conflict or error: {}",
             container_type,
@@ -1128,7 +1227,32 @@ pub(super) fn merge_container_branch_into_target(
 
     let merge_commit = git_stdout_in(target_worktree, &["rev-parse", "HEAD"])?;
 
-    Ok(merge_commit)
+    Ok(ContainerMergeOutcome {
+        commit: merge_commit,
+        strategy,
+        squash_source_tip,
+    })
+}
+
+fn squash_commit_message(
+    container_id: &str,
+    container_title: Option<&str>,
+    container_type: &str,
+    target_branch: &str,
+) -> String {
+    if let Some(title) = container_title
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+    {
+        format!("Merge {container_type} {container_id}: {title}")
+    } else {
+        format!("Merge {container_type} {container_id} into {target_branch}")
+    }
+}
+
+fn reset_target_worktree_after_failed_merge(target_worktree: &Path, target_head: &str) {
+    let _ = crate::git_exec::run_git(target_worktree, &["merge", "--abort"]);
+    let _ = crate::git_exec::run_git(target_worktree, &["reset", "--hard", target_head]);
 }
 
 #[cfg(test)]
@@ -1136,7 +1260,10 @@ mod tests {
     use super::{
         continue_cherry_pick, ensure_container_integration_worktree,
         existing_integration_worktree_reuse_issues, merge_container_branch_into_target,
+        merge_container_branch_into_target_with_strategy, ContainerMergeStrategy,
     };
+    use crate::tools::TEST_ENV_LOCK;
+    use std::ffi::OsString;
     use std::path::Path;
     use std::process::Command;
 
@@ -1179,6 +1306,41 @@ mod tests {
         let dir = root.join(".brehon").join("worktrees");
         std::fs::create_dir_all(&dir).unwrap();
         dir.join(name)
+    }
+
+    struct ScopedEnv {
+        saved: Vec<(&'static str, Option<OsString>)>,
+    }
+
+    impl ScopedEnv {
+        fn set(vars: &[(&'static str, &str)]) -> Self {
+            let mut saved = Vec::with_capacity(vars.len());
+            for (key, value) in vars {
+                saved.push((*key, std::env::var_os(key)));
+                std::env::set_var(key, value);
+            }
+            Self { saved }
+        }
+    }
+
+    impl Drop for ScopedEnv {
+        fn drop(&mut self) {
+            for (key, value) in self.saved.iter().rev() {
+                if let Some(value) = value {
+                    std::env::set_var(key, value);
+                } else {
+                    std::env::remove_var(key);
+                }
+            }
+        }
+    }
+
+    fn scoped_brehon_root(root: &Path) -> ScopedEnv {
+        ScopedEnv::set(&[
+            ("BREHON_ROOT", root.join(".brehon").to_str().unwrap()),
+            ("BREHON_PROJECT_ROOT", ""),
+            ("BREHON_WORKSPACE_ROOT", ""),
+        ])
     }
 
     #[cfg(unix)]
@@ -1228,6 +1390,88 @@ mod tests {
         assert_eq!(
             run_git(root.path(), &["log", "-1", "--format=%s"]),
             "Merge initiative I-1 into main"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn squash_merge_container_branch_uses_protected_branch_bypass_env_and_records_source_tip() {
+        let root = tempfile::tempdir().unwrap();
+        init_repo(root.path());
+
+        run_git(root.path(), &["checkout", "-b", "initiative/test"]);
+        std::fs::write(root.path().join("initiative.txt"), "initiative\n").unwrap();
+        run_git(root.path(), &["add", "initiative.txt"]);
+        run_git(root.path(), &["commit", "-m", "initiative work"]);
+        let source_tip = run_git(root.path(), &["rev-parse", "HEAD"]);
+        run_git(root.path(), &["checkout", "main"]);
+
+        install_bypass_required_hook(root.path(), "commit-msg");
+        install_bypass_required_hook(root.path(), "reference-transaction");
+
+        let outcome = merge_container_branch_into_target_with_strategy(
+            "I-1",
+            Some("Test Program"),
+            "initiative",
+            "initiative/test",
+            "main",
+            root.path(),
+            ContainerMergeStrategy::Squash,
+        )
+        .expect("controlled squash merge should pass the protected branch hook");
+
+        assert_eq!(outcome.strategy, ContainerMergeStrategy::Squash);
+        assert_eq!(
+            outcome.squash_source_tip.as_deref(),
+            Some(source_tip.as_str())
+        );
+        assert_eq!(run_git(root.path(), &["rev-parse", "HEAD"]), outcome.commit);
+        assert_eq!(
+            run_git(root.path(), &["log", "-1", "--format=%s"]),
+            "Merge initiative I-1: Test Program"
+        );
+    }
+
+    #[test]
+    fn squash_merge_conflict_resets_target_worktree_to_pre_merge_head() {
+        let root = tempfile::tempdir().unwrap();
+        init_repo(root.path());
+
+        std::fs::write(root.path().join("shared.txt"), "base\n").unwrap();
+        run_git(root.path(), &["add", "shared.txt"]);
+        run_git(root.path(), &["commit", "-m", "add shared file"]);
+
+        run_git(root.path(), &["checkout", "-b", "initiative/test"]);
+        std::fs::write(root.path().join("shared.txt"), "initiative change\n").unwrap();
+        run_git(root.path(), &["add", "shared.txt"]);
+        run_git(root.path(), &["commit", "-m", "initiative change"]);
+
+        run_git(root.path(), &["checkout", "main"]);
+        std::fs::write(root.path().join("shared.txt"), "main change\n").unwrap();
+        run_git(root.path(), &["add", "shared.txt"]);
+        run_git(root.path(), &["commit", "-m", "main change"]);
+        let target_head = run_git(root.path(), &["rev-parse", "HEAD"]);
+
+        let err = merge_container_branch_into_target_with_strategy(
+            "I-1",
+            Some("Test Program"),
+            "initiative",
+            "initiative/test",
+            "main",
+            root.path(),
+            ContainerMergeStrategy::Squash,
+        )
+        .expect_err("conflicting squash merge should fail");
+
+        assert!(
+            err.contains("Failed to squash merge initiative branch 'initiative/test'"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(run_git(root.path(), &["rev-parse", "HEAD"]), target_head);
+        assert_eq!(run_git(root.path(), &["status", "--porcelain"]), "");
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("shared.txt")).unwrap(),
+            "main change\n"
         );
     }
 
@@ -1389,7 +1633,9 @@ mod tests {
 
     #[tokio::test]
     async fn ensure_container_integration_worktree_rejects_dirty_existing_worktree() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         let root = tempfile::tempdir().unwrap();
+        let _env = scoped_brehon_root(root.path());
         init_repo(root.path());
 
         let worktree_path = owned_worktree_path(root.path(), "epic-worktree");
@@ -1440,7 +1686,9 @@ mod tests {
 
     #[tokio::test]
     async fn ensure_container_integration_worktree_rejects_external_requested_path() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         let root = tempfile::tempdir().unwrap();
+        let _env = scoped_brehon_root(root.path());
         init_repo(root.path());
 
         let worktree_path = root.path().join("external-worktree");
@@ -1476,7 +1724,9 @@ mod tests {
 
     #[tokio::test]
     async fn ensure_container_integration_worktree_rejects_unstaged_tracked_changes() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         let root = tempfile::tempdir().unwrap();
+        let _env = scoped_brehon_root(root.path());
         init_repo(root.path());
 
         let worktree_path = owned_worktree_path(root.path(), "epic-worktree");
@@ -1517,7 +1767,9 @@ mod tests {
 
     #[tokio::test]
     async fn ensure_container_integration_worktree_rejects_merge_and_rebase_state() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         let root = tempfile::tempdir().unwrap();
+        let _env = scoped_brehon_root(root.path());
         init_repo(root.path());
 
         let worktree_path = owned_worktree_path(root.path(), "epic-worktree");

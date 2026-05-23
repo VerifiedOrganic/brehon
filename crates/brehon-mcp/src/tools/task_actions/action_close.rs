@@ -15,8 +15,8 @@ use super::epic::{
     check_child_completion, check_epic_integration_status,
     check_initiative_epic_integration_status, container_base_branch_for_task,
     container_target_worktree_for_task, ensure_container_integration_worktree,
-    merge_container_branch_into_target, read_current_review_request, read_parent_task,
-    verify_container_branch_ready, verify_merge_ready,
+    merge_container_branch_into_target_with_strategy, read_current_review_request,
+    read_parent_task, verify_container_branch_ready, verify_merge_ready, ContainerMergeStrategy,
 };
 use super::followups::{
     collect_container_open_followup_blockers, resolve_promoted_followups_for_terminal_task,
@@ -313,21 +313,41 @@ pub(super) async fn execute(args: &Value) -> Result<ToolResult, McpError> {
                             )))
                         }
                     };
-                    let merge_commit = match merge_container_branch_into_target(
+
+                    let default_branch =
+                        detect_default_branch().unwrap_or_else(|_| "main".to_string());
+                    // Final initiative close is the public-history boundary:
+                    // preserve detailed commits on initiative/epic branches, but land one
+                    // audited squash commit on the default branch.
+                    let merge_strategy = if is_initiative(&task_type)
+                        && parent_id.is_none()
+                        && base_branch == default_branch
+                    {
+                        ContainerMergeStrategy::Squash
+                    } else {
+                        ContainerMergeStrategy::Merge
+                    };
+                    let container_title = task_data
+                        .get("title")
+                        .and_then(|value| value.as_str())
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty());
+                    let merge_outcome = match merge_container_branch_into_target_with_strategy(
                         id,
+                        container_title,
                         &task_type,
                         branch,
                         &base_branch,
                         &target_worktree,
+                        merge_strategy,
                     ) {
-                        Ok(commit) => commit,
+                        Ok(outcome) => outcome,
                         Err(err) => return Ok(error_result(err)),
                     };
+                    let merge_commit = merge_outcome.commit.clone();
 
                     let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
                     let closed_by = caller_name(args, "agent");
-                    let default_branch =
-                        detect_default_branch().unwrap_or_else(|_| "main".to_string());
                     let parent_task = read_parent_task(&task_data);
                     let merged_into_parent_branch = is_epic(&task_type)
                         && parent_task
@@ -366,6 +386,16 @@ pub(super) async fn execute(args: &Value) -> Result<ToolResult, McpError> {
                     task.insert("completion_mode".into(), Value::String("merge".to_string()));
                     task.insert("merged_branch".into(), Value::String(base_branch.clone()));
                     task.insert("merged_commit".into(), Value::String(merge_commit.clone()));
+                    task.insert(
+                        "merge_strategy".into(),
+                        Value::String(merge_outcome.strategy.as_str().to_string()),
+                    );
+                    if let Some(ref source_tip) = merge_outcome.squash_source_tip {
+                        task.insert(
+                            "squash_source_tip".into(),
+                            Value::String(source_tip.clone()),
+                        );
+                    }
                     task.insert(
                         "integration_worktree".into(),
                         Value::String(integration_worktree.to_string_lossy().to_string()),
@@ -419,18 +449,33 @@ pub(super) async fn execute(args: &Value) -> Result<ToolResult, McpError> {
                         "integration_branch": branch,
                         "integration_worktree": integration_worktree.to_string_lossy().to_string(),
                         "merged_commit": merge_commit,
+                        "merge_strategy": merge_outcome.strategy.as_str(),
                         "closed_by": closed_by,
                         "closed_role": caller_role,
                         "closed_at": now,
                         "worker_recycle_queued": worker_recycle_queued,
                     });
+                    if let Some(ref source_tip) = merge_outcome.squash_source_tip {
+                        result["squash_source_tip"] = Value::String(source_tip.clone());
+                    }
                     if terminal_status == "closed" {
                         result["integration_status"] = Value::String("integrated".to_string());
                     }
                     if let Some(warning) = recycle_outcome.warning {
                         result["warnings"] = Value::Array(vec![warning]);
                     }
-                    let base_message = if is_initiative(&task_type) {
+                    let base_message = if is_initiative(&task_type)
+                        && merge_outcome.strategy == ContainerMergeStrategy::Squash
+                    {
+                        let source_tip = merge_outcome
+                            .squash_source_tip
+                            .as_deref()
+                            .unwrap_or("unknown");
+                        format!(
+                            "Initiative {} squash-merged into {} from integration branch '{}' at source tip {} with commit {}.",
+                            id, default_branch, branch, source_tip, merge_commit
+                        )
+                    } else if is_initiative(&task_type) {
                         format!(
                             "Initiative {} merged into {} from integration branch '{}' with commit {}.",
                             id, default_branch, branch, merge_commit

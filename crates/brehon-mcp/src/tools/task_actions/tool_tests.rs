@@ -10068,6 +10068,7 @@ async fn test_feature_epic_close_merges_branch_to_main() {
     let result: Value = serde_json::from_str(&extract_text(&close_result)).unwrap();
     assert_eq!(result["action"], "merged");
     assert_eq!(result["integration_branch"], "epic/test-feature");
+    assert_eq!(result["merge_strategy"], "merge");
     assert!(
         result.get("merged_commit").is_some(),
         "should have merged_commit"
@@ -10084,6 +10085,11 @@ async fn test_feature_epic_close_merges_branch_to_main() {
         "epic status should be 'merged'"
     );
     assert_eq!(stored_epic["epic_branch_merged"], "epic/test-feature");
+    assert_eq!(stored_epic["merge_strategy"], "merge");
+    assert!(
+        stored_epic.get("squash_source_tip").is_none(),
+        "top-level epic direct-to-main close should not use squash metadata"
+    );
     assert!(
         stored_epic.get("closed_at").is_some(),
         "epic should have closed_at"
@@ -10198,11 +10204,17 @@ async fn test_child_epic_close_integrates_into_initiative_branch() {
     assert_eq!(result["action"], "closed");
     assert_eq!(result["merged_branch"], initiative_branch);
     assert_eq!(result["integration_status"], "integrated");
+    assert_eq!(result["merge_strategy"], "merge");
 
     let stored_epic = read_test_task(&brehon_root, epic_id);
     assert_eq!(stored_epic["status"], "closed");
     assert_eq!(stored_epic["integration_status"], "integrated");
     assert_eq!(stored_epic["merged_branch"], initiative_branch);
+    assert_eq!(stored_epic["merge_strategy"], "merge");
+    assert!(
+        stored_epic.get("squash_source_tip").is_none(),
+        "child epic close into initiative branch should not use squash metadata"
+    );
 
     assert!(initiative_worktree.join("phase1.txt").exists());
     let is_ancestor = Command::new("git")
@@ -10311,6 +10323,7 @@ async fn test_initiative_close_merges_initiative_branch_to_main() {
         "{}",
         extract_text(&epic_close)
     );
+    let squash_source_tip = run_git(workspace.path(), &["rev-parse", initiative_branch]);
 
     let initiative_close = tool
         .execute(serde_json::json!({
@@ -10327,10 +10340,26 @@ async fn test_initiative_close_merges_initiative_branch_to_main() {
     let result: Value = serde_json::from_str(&extract_text(&initiative_close)).unwrap();
     assert_eq!(result["action"], "merged");
     assert_eq!(result["merged_branch"], "main");
+    assert_eq!(result["merge_strategy"], "squash");
+    assert_eq!(result["squash_source_tip"], squash_source_tip);
 
     let stored_initiative = read_test_task(&brehon_root, initiative_id);
     assert_eq!(stored_initiative["status"], "merged");
     assert_eq!(stored_initiative["merged_branch"], "main");
+    assert_eq!(stored_initiative["merge_strategy"], "squash");
+    assert_eq!(stored_initiative["squash_source_tip"], squash_source_tip);
+    assert_eq!(
+        run_git(workspace.path(), &["rev-parse", "main"]),
+        result["merged_commit"].as_str().unwrap()
+    );
+    assert_eq!(
+        stored_initiative["merged_commit"], result["merged_commit"],
+        "stored merged_commit should be the final squash commit"
+    );
+    assert_eq!(
+        run_git(workspace.path(), &["log", "-1", "--format=%s"]),
+        format!("Merge initiative {initiative_id}: Program")
+    );
 
     let on_main = Command::new("git")
         .args(["merge-base", "--is-ancestor", &epic_commit, "main"])
@@ -10338,8 +10367,8 @@ async fn test_initiative_close_merges_initiative_branch_to_main() {
         .status()
         .unwrap();
     assert!(
-        on_main.success(),
-        "initiative close should land the epic commit on main"
+        !on_main.success(),
+        "squash close should land content on main without preserving child commit ancestry"
     );
     let initiative_branch_is_ancestor = Command::new("git")
         .args(["merge-base", "--is-ancestor", initiative_branch, "main"])
@@ -10347,8 +10376,116 @@ async fn test_initiative_close_merges_initiative_branch_to_main() {
         .status()
         .unwrap();
     assert!(
-        initiative_branch_is_ancestor.success(),
-        "initiative branch should be an ancestor of main after close"
+        !initiative_branch_is_ancestor.success(),
+        "initiative squash close should not require the source branch to become a main ancestor"
+    );
+    let initiative_tree_spec = format!("{initiative_branch}^{{tree}}");
+    assert_eq!(
+        run_git(workspace.path(), &["rev-parse", "main^{tree}"]),
+        run_git(workspace.path(), &["rev-parse", &initiative_tree_spec]),
+        "main content tree should match the initiative branch after squash"
+    );
+}
+
+#[tokio::test]
+async fn test_initiative_squash_close_rejects_dirty_default_branch_worktree_without_task_update() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let workspace = make_test_root();
+    let brehon_root = workspace.path().join(".brehon");
+    std::fs::create_dir_all(&brehon_root).unwrap();
+    init_git_workspace(workspace.path());
+    let _env = ScopedEnv::set(&[
+        ("BREHON_ROOT", brehon_root.to_str().unwrap()),
+        ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
+        ("BREHON_AGENT_ROLE", "supervisor"),
+        ("BREHON_AGENT_NAME", "sup-1"),
+    ]);
+    let tool = TaskActionsTool::new();
+
+    let initiative = create_initiative_for_test(&tool, "Program").await;
+    let initiative_id = initiative["task_id"].as_str().unwrap();
+
+    let epic_result = tool
+        .execute(serde_json::json!({
+            "action": "create",
+            "task_type": "epic",
+            "parent_id": initiative_id,
+            "title": "Phase 1",
+            "description": "Phase 1 delivers the first implementation slice.",
+            "acceptance_criteria": ["Phase 1 closes with all worker tasks complete"],
+            "plan_steps": ["Create tasks", "Run review", "Close phase"]
+        }))
+        .await
+        .unwrap();
+    assert!(
+        epic_result.is_error.is_none(),
+        "{}",
+        extract_text(&epic_result)
+    );
+    let epic: Value = serde_json::from_str(&extract_text(&epic_result)).unwrap();
+    let epic_id = epic["task_id"].as_str().unwrap();
+    let epic_worktree = PathBuf::from(epic["integration_worktree"].as_str().unwrap());
+
+    std::fs::write(epic_worktree.join("phase1.txt"), "phase 1\n").unwrap();
+    run_git(&epic_worktree, &["add", "phase1.txt"]);
+    run_git(&epic_worktree, &["commit", "-m", "phase 1 implementation"]);
+
+    let subtask = create_subtask_for_test(&tool, "Subtask 1", epic_id).await;
+    let subtask_id = subtask["task_id"].as_str().unwrap();
+    let mut task = read_test_task(&brehon_root, subtask_id);
+    task["status"] = "closed".into();
+    task["integration_status"] = "integrated".into();
+    std::fs::write(
+        brehon_root
+            .join("runtime")
+            .join("tasks")
+            .join(format!("{}.json", subtask_id)),
+        serde_json::to_string_pretty(&task).unwrap(),
+    )
+    .unwrap();
+    run_git(workspace.path(), &["checkout", "main"]);
+
+    let epic_close = tool
+        .execute(serde_json::json!({
+            "action": "close",
+            "id": epic_id
+        }))
+        .await
+        .unwrap();
+    assert!(
+        epic_close.is_error.is_none(),
+        "{}",
+        extract_text(&epic_close)
+    );
+
+    let stored_before = read_test_task(&brehon_root, initiative_id);
+    std::fs::write(
+        workspace.path().join("README.md"),
+        "dirty target worktree\n",
+    )
+    .unwrap();
+
+    let initiative_close = tool
+        .execute(serde_json::json!({
+            "action": "close",
+            "id": initiative_id
+        }))
+        .await
+        .unwrap();
+
+    assert!(
+        initiative_close.is_error.is_some(),
+        "dirty target worktree should block final squash close"
+    );
+    let text = extract_text(&initiative_close);
+    assert!(
+        text.contains("Target worktree") && text.contains("dirty"),
+        "expected dirty target worktree error, got: {text}"
+    );
+    let stored_after = read_test_task(&brehon_root, initiative_id);
+    assert_eq!(
+        stored_after, stored_before,
+        "failed squash close must leave initiative task JSON unchanged"
     );
 }
 
