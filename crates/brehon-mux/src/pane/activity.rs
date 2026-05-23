@@ -1048,6 +1048,7 @@ mod tests {
             80,
             None,
             None,
+            None,
         )
         .expect("create claude worker pane");
         assert!(pane.activity_buffer().is_none());
@@ -1069,6 +1070,7 @@ mod tests {
             None,
             24,
             80,
+            None,
             None,
             None,
         )

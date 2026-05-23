@@ -2029,9 +2029,13 @@ pub async fn execute(
         direct_tool_bridge_factory: Some(BrehonDirectToolBridgeFactory::new()),
         runtime_event_sink: Some(mux_runtime_event_sink),
         policy_gate: Some(runtime_policy_gate.clone()),
+        launch_policy: Some(brehon_pty::LaunchPolicy::from_security_config(
+            &config.security,
+        )),
         include_director: false, // No director pane for now
         rows,
         cols,
+        sandbox_profile: Some(config.security.sandbox_profile),
         ..Default::default()
     };
 
@@ -3799,6 +3803,7 @@ mod tests {
                 }),
                 reasoning_effort: Some("high".to_string()),
                 system_prompt: None,
+                profile: None,
             },
         );
         config.roles.supervisor.name = "codex-supervisor".to_string();

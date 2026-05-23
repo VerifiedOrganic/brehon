@@ -274,6 +274,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "brehon-adapter-sdk",
+ "brehon-config",
  "brehon-types",
  "serde",
  "serde_json",
@@ -479,6 +480,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "tempfile",
  "thiserror 2.0.18",
  "tracing",
 ]
@@ -902,6 +904,8 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
+ "serde_yaml",
+ "strum",
  "tempfile",
  "thiserror 2.0.18",
  "uuid",
@@ -2782,6 +2786,7 @@ dependencies = [
 [[package]]
 name = "panesmith"
 version = "0.1.1"
+source = "git+ssh://git@github.com/VerifiedOrganic/panesmith.git?rev=118ceab3f79ccbe04e9bd5569686e74dd65bf40a#118ceab3f79ccbe04e9bd5569686e74dd65bf40a"
 dependencies = [
  "panesmith-attach",
  "panesmith-core",
@@ -2792,6 +2797,7 @@ dependencies = [
 [[package]]
 name = "panesmith-attach"
 version = "0.1.1"
+source = "git+ssh://git@github.com/VerifiedOrganic/panesmith.git?rev=118ceab3f79ccbe04e9bd5569686e74dd65bf40a#118ceab3f79ccbe04e9bd5569686e74dd65bf40a"
 dependencies = [
  "crossterm 0.28.1",
  "libc",
@@ -2802,6 +2808,7 @@ dependencies = [
 [[package]]
 name = "panesmith-core"
 version = "0.1.1"
+source = "git+ssh://git@github.com/VerifiedOrganic/panesmith.git?rev=118ceab3f79ccbe04e9bd5569686e74dd65bf40a#118ceab3f79ccbe04e9bd5569686e74dd65bf40a"
 dependencies = [
  "crossterm 0.28.1",
  "libc",
@@ -2813,6 +2820,7 @@ dependencies = [
 [[package]]
 name = "panesmith-ratatui"
 version = "0.1.1"
+source = "git+ssh://git@github.com/VerifiedOrganic/panesmith.git?rev=118ceab3f79ccbe04e9bd5569686e74dd65bf40a#118ceab3f79ccbe04e9bd5569686e74dd65bf40a"
 dependencies = [
  "panesmith-core",
  "ratatui",
@@ -2821,6 +2829,7 @@ dependencies = [
 [[package]]
 name = "panesmith-vt100"
 version = "0.1.1"
+source = "git+ssh://git@github.com/VerifiedOrganic/panesmith.git?rev=118ceab3f79ccbe04e9bd5569686e74dd65bf40a#118ceab3f79ccbe04e9bd5569686e74dd65bf40a"
 dependencies = [
  "panesmith-core",
  "vt100",
@@ -2851,9 +2860,9 @@ dependencies = [
 
 [[package]]
 name = "pastey"
-version = "0.2.2"
+version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c5a797f0e07bdf071d15742978fc3128ec6c22891c31a3a931513263904c982a"
+checksum = "2ee67f1008b1ba2321834326597b8e186293b049a023cdef258527550b9935b4"
 
 [[package]]
 name = "path-absolutize"
@@ -3933,9 +3942,9 @@ checksum = "bbbb5d9659141646ae647b42fe094daf6c6192d1620870b449d9557f748b2daa"
 
 [[package]]
 name = "siphasher"
-version = "1.0.2"
+version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b2aa850e253778c88a04c3d7323b043aeda9d3e30d5971937c1855769763678e"
+checksum = "8ee5873ec9cce0195efcb7a4e9507a04cd49aec9c83d0389df45b1ef7ba2e649"
 
 [[package]]
 name = "sketches-ddsketch"

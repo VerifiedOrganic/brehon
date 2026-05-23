@@ -114,6 +114,7 @@ impl PtyConfig {
         factory_worker_cli: Option<&str>,
         model: Option<&str>,
         reasoning_effort: Option<&str>,
+        launch_policy: Option<&crate::pty::config::LaunchPolicy>,
     ) -> Self {
         let session_id = uuid::Uuid::new_v4().to_string();
         let brehon_exe = current_brehon_exe();
@@ -176,6 +177,17 @@ impl PtyConfig {
         if let Some(model) = model {
             args.push("--model".to_string());
             args.push(model.to_string());
+        }
+
+        if let Some(policy) = launch_policy {
+            env.push((
+                "BREHON_SANDBOX_PROFILE".to_string(),
+                policy.profile_name().to_string(),
+            ));
+            env.push((
+                "BREHON_LAUNCH_POLICY_UNSAFE".to_string(),
+                policy.is_unsafe().to_string(),
+            ));
         }
 
         Self {

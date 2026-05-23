@@ -241,6 +241,9 @@ enum ConfigCommands {
 
     #[command(name = "validate")]
     Validate,
+
+    #[command(name = "profiles")]
+    Profiles,
 }
 
 #[derive(Subcommand)]
@@ -425,6 +428,15 @@ async fn main() -> ExitCode {
                     }
                     Err(e) => {
                         tracing::error!("Configuration validation failed: {:?}", e);
+                        ExitCode::FAILURE
+                    }
+                }
+            }
+            ConfigCommands::Profiles => {
+                match config::profiles(project_path.as_deref(), config_override.as_deref()) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(e) => {
+                        tracing::error!("Error showing config profiles: {:?}", e);
                         ExitCode::FAILURE
                     }
                 }

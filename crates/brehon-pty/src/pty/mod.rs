@@ -12,7 +12,7 @@ mod dump;
 pub(crate) mod filesystem;
 pub(crate) mod prompts;
 
-pub use config::{PtyConfig, TeamsSpawnConfig};
+pub use config::{LaunchPolicy, PtyConfig, TeamsSpawnConfig};
 pub use core::{Pty, PtyEvent, format_cursor_position_report};
 pub use prompts::{
     build_advisor_startup_prompt, build_research_startup_prompt, build_reviewer_startup_prompt,
@@ -40,6 +40,7 @@ mod tests {
     };
     use crate::pty::core::{descendant_process_ids_from_snapshot, kill_child};
     use crate::pty::*;
+    use brehon_types::config::SandboxProfile;
     use portable_pty::{Child, ChildKiller, ExitStatus};
     use std::collections::VecDeque;
     use std::io;
@@ -50,6 +51,67 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    fn write_unsafe_sandbox_profile(project_root: &std::path::Path) {
+        let brehon_dir = project_root.join(".brehon");
+        std::fs::create_dir_all(&brehon_dir).unwrap();
+        std::fs::write(
+            brehon_dir.join("config.yaml"),
+            "security:\n  sandbox_profile: None\n",
+        )
+        .unwrap();
+    }
+
+    fn assert_claude_unattended_permission_args(config: &PtyConfig) {
+        assert!(
+            config
+                .args
+                .windows(2)
+                .any(|window| window[0] == "--permission-mode" && window[1] == "dontAsk"),
+            "safe Claude factory agents must use dontAsk so Brehon runs remain unattended"
+        );
+
+        let allowlist = config
+            .args
+            .windows(2)
+            .find_map(|window| {
+                if window[0] == "--allowedTools" {
+                    Some(window[1].as_str())
+                } else {
+                    None
+                }
+            })
+            .expect("safe Claude factory agents must include an explicit tool allowlist");
+        for tool in [
+            "Bash",
+            "Read",
+            "Edit",
+            "MultiEdit",
+            "Write",
+            "NotebookEdit",
+            "Grep",
+            "Glob",
+            "LS",
+            "TodoWrite",
+            "mcp__brehon__*",
+        ] {
+            assert!(
+                allowlist.split(',').any(|entry| entry == tool),
+                "Claude unattended allowlist missing {tool}: {allowlist}"
+            );
+        }
+    }
+
+    fn assert_claude_unsafe_args_do_not_mix_permission_modes(config: &PtyConfig) {
+        assert!(
+            !config.args.iter().any(|arg| arg == "--permission-mode"),
+            "unsafe Claude launch should not mix bypassPermissions with permission-mode"
+        );
+        assert!(
+            !config.args.iter().any(|arg| arg == "--allowedTools"),
+            "unsafe Claude launch should not mix bypassPermissions with allowedTools"
+        );
     }
 
     fn setup_fake_linked_worktree(prefix: &str) -> (PathBuf, PathBuf) {
@@ -239,13 +301,17 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert_eq!(config.command, "claude");
+        // Default is safe: no --dangerously-skip-permissions when neither
+        // sandbox_profile nor brehon_root is provided.
         assert!(
-            config
+            !config
                 .args
                 .contains(&"--dangerously-skip-permissions".to_string())
         );
+        assert_claude_unattended_permission_args(&config);
         assert!(
             config
                 .env
@@ -260,6 +326,194 @@ mod tests {
         );
         // No BREHON_ROOT when not provided
         assert!(!config.env.iter().any(|(k, _)| k == "BREHON_ROOT"));
+    }
+
+    #[tokio::test]
+    async fn test_pty_config_claude_safe_profile_omits_skip_permissions() {
+        let temp_dir = fresh_temp_dir("brehon-claude-safe-profile");
+        let config = PtyConfig::claude(
+            "claude-supervisor",
+            "supervisor",
+            None,
+            None,
+            temp_dir.clone(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(SandboxProfile::OsDefault),
+        );
+        assert_eq!(config.command, "claude");
+        assert!(
+            !config
+                .args
+                .contains(&"--dangerously-skip-permissions".to_string()),
+            "safe profile should NOT include --dangerously-skip-permissions"
+        );
+        assert_claude_unattended_permission_args(&config);
+        // MCP config and supervisor skills should still be present under safe profiles
+        assert!(
+            config.args.contains(&"--mcp-config".to_string()),
+            "safe profile should still include --mcp-config"
+        );
+        assert!(
+            config.args.contains(&"--strict-mcp-config".to_string()),
+            "safe profile should still include --strict-mcp-config"
+        );
+        let add_dir_idx = config
+            .args
+            .iter()
+            .position(|arg| arg == "--add-dir")
+            .expect("supervisor should receive a native Brehon skill project dir");
+        let skill_project_dir = temp_dir
+            .join(".brehon/factory-runtime/claude/claude-supervisor/skills-project")
+            .to_string_lossy()
+            .to_string();
+        assert_eq!(config.args.get(add_dir_idx + 1), Some(&skill_project_dir));
+        assert!(
+            config
+                .env
+                .iter()
+                .any(|(k, v)| k == "BREHON_AGENT_NAME" && v == "claude-supervisor")
+        );
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_pty_config_claude_custom_profile_omits_skip_permissions() {
+        let temp_dir = fresh_temp_dir("brehon-claude-custom-profile");
+        let config = PtyConfig::claude(
+            "claude-supervisor",
+            "supervisor",
+            None,
+            None,
+            temp_dir.clone(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(SandboxProfile::Custom),
+        );
+        assert!(
+            !config
+                .args
+                .contains(&"--dangerously-skip-permissions".to_string()),
+            "custom profile should NOT include --dangerously-skip-permissions"
+        );
+        assert_claude_unattended_permission_args(&config);
+        // MCP config and supervisor skills should still be present under custom profiles
+        assert!(
+            config.args.contains(&"--mcp-config".to_string()),
+            "custom profile should still include --mcp-config"
+        );
+        assert!(
+            config.args.contains(&"--strict-mcp-config".to_string()),
+            "custom profile should still include --strict-mcp-config"
+        );
+        let add_dir_idx = config
+            .args
+            .iter()
+            .position(|arg| arg == "--add-dir")
+            .expect("supervisor should receive a native Brehon skill project dir");
+        let skill_project_dir = temp_dir
+            .join(".brehon/factory-runtime/claude/claude-supervisor/skills-project")
+            .to_string_lossy()
+            .to_string();
+        assert_eq!(config.args.get(add_dir_idx + 1), Some(&skill_project_dir));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_pty_config_claude_unsafe_profile_keeps_skip_permissions() {
+        let config = PtyConfig::claude(
+            "test-agent",
+            "worker",
+            None,
+            None,
+            PathBuf::from("/tmp"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(SandboxProfile::None),
+        );
+        assert!(
+            config
+                .args
+                .contains(&"--dangerously-skip-permissions".to_string()),
+            "unsafe profile should include --dangerously-skip-permissions"
+        );
+        assert_claude_unsafe_args_do_not_mix_permission_modes(&config);
+    }
+
+    #[tokio::test]
+    async fn test_pty_config_claude_derives_unsafe_from_brehon_root_when_none() {
+        let workdir = fresh_temp_dir("brehon-claude-unsafe-root");
+        write_unsafe_sandbox_profile(&workdir);
+        let brehon_root = workdir.join(".brehon");
+        let config = PtyConfig::claude(
+            "test-agent",
+            "worker",
+            None,
+            None,
+            workdir.clone(),
+            Some(&brehon_root),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(
+            config
+                .args
+                .contains(&"--dangerously-skip-permissions".to_string()),
+            "should derive unsafe from brehon_root config when sandbox_profile is None"
+        );
+        assert_claude_unsafe_args_do_not_mix_permission_modes(&config);
+        let _ = std::fs::remove_dir_all(&workdir);
+    }
+
+    #[tokio::test]
+    async fn test_pty_config_claude_derives_safe_from_brehon_root_when_none() {
+        let workdir = fresh_temp_dir("brehon-claude-safe-root");
+        let brehon_dir = workdir.join(".brehon");
+        std::fs::create_dir_all(&brehon_dir).unwrap();
+        std::fs::write(
+            brehon_dir.join("config.yaml"),
+            "security:\n  sandbox_profile: OsDefault\n",
+        )
+        .unwrap();
+        let brehon_root = workdir.join(".brehon");
+        let config = PtyConfig::claude(
+            "test-agent",
+            "worker",
+            None,
+            None,
+            workdir.clone(),
+            Some(&brehon_root),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(
+            !config
+                .args
+                .contains(&"--dangerously-skip-permissions".to_string()),
+            "should derive safe from brehon_root config when sandbox_profile is None"
+        );
+        assert_claude_unattended_permission_args(&config);
+        let _ = std::fs::remove_dir_all(&workdir);
     }
 
     #[test]
@@ -342,6 +596,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         let add_dir_idx = config
@@ -395,6 +650,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert!(
             config
@@ -418,6 +674,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert!(
             config
@@ -435,6 +692,7 @@ mod tests {
             None,
             None,
             PathBuf::from("/tmp/worktree"),
+            None,
             None,
             None,
             None,
@@ -470,6 +728,7 @@ mod tests {
             Some("claude-opus-4-6"),
             None,
             None,
+            None,
         );
         assert!(config.args.contains(&"--model".to_string()));
         assert!(config.args.contains(&"claude-opus-4-6".to_string()));
@@ -489,6 +748,7 @@ mod tests {
             None,
             None,
             Some("high"),
+            None,
         );
         assert!(config.args.contains(&"--effort".to_string()));
         assert!(config.args.contains(&"high".to_string()));
@@ -503,6 +763,7 @@ mod tests {
             None,
             None,
             PathBuf::from("/tmp"),
+            None,
             None,
             None,
             None,
@@ -527,6 +788,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert!(
             config
@@ -544,6 +806,7 @@ mod tests {
             "supervisor",
             workdir.clone(),
             None,
+            &[],
             None,
             None,
             Some("gpt-5.3-codex"),
@@ -586,6 +849,7 @@ mod tests {
             "worker",
             workdir.clone(),
             None,
+            &[],
             Some("supervisor"),
             Some("codex"),
             Some("gpt-5.4"),
@@ -626,6 +890,7 @@ mod tests {
             None,
             None,
             Some(&teams),
+            None,
             None,
         );
         assert!(config.args.contains(&"--team-name".to_string()));
@@ -670,6 +935,7 @@ mod tests {
             None,
             Some(&teams),
             None,
+            None,
         );
         // Lead also gets --teammate-mode so it polls its inbox
         assert!(config.args.contains(&"--teammate-mode".to_string()));
@@ -693,9 +959,8 @@ mod tests {
             None,
         );
         assert_eq!(config.command, "gemini");
-        assert!(config.args.contains(&"--approval-mode".to_string()));
-        assert!(config.args.contains(&"--sandbox".to_string()));
-        assert!(config.args.contains(&"false".to_string()));
+        assert!(!config.args.contains(&"--approval-mode".to_string()));
+        assert!(!config.args.contains(&"--sandbox".to_string()));
         assert!(config.args.contains(&"--model".to_string()));
         assert!(config.args.contains(&"pro".to_string()));
         assert!(config.args.contains(&"-i".to_string()));
@@ -705,11 +970,12 @@ mod tests {
                 .iter()
                 .any(|(k, v)| k == "BREHON_AGENT_NAME" && v == "test-worker")
         );
+        assert!(!config.env.iter().any(|(k, _)| k == "GEMINI_SANDBOX"));
         assert!(
-            config
+            !config
                 .env
                 .iter()
-                .any(|(k, v)| k == "GEMINI_SANDBOX" && v == "false")
+                .any(|(k, _)| k == "BREHON_GEMINI_ALLOW_YOLO")
         );
         assert!(
             config
@@ -742,6 +1008,109 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_pty_config_gemini_worker_unsafe_profile_enables_yolo() {
+        let workdir = fresh_temp_dir("brehon-gemini-worker-unsafe");
+        write_unsafe_sandbox_profile(&workdir);
+        let brehon_root = workdir.join(".brehon");
+        let config = PtyConfig::gemini(
+            "test-worker",
+            "worker",
+            workdir.clone(),
+            Some(&brehon_root),
+            Some("test-supervisor"),
+            None,
+            Some("pro"),
+            None,
+            None,
+        );
+
+        assert!(config.args.contains(&"--approval-mode".to_string()));
+        assert!(config.args.contains(&"--sandbox".to_string()));
+        assert!(config.args.contains(&"false".to_string()));
+        assert!(
+            config
+                .env
+                .iter()
+                .any(|(k, v)| k == "GEMINI_SANDBOX" && v == "false")
+        );
+        assert!(
+            config
+                .env
+                .iter()
+                .any(|(k, v)| k == "BREHON_GEMINI_ALLOW_YOLO" && v == "1")
+        );
+
+        let _ = std::fs::remove_dir_all(workdir);
+    }
+
+    /// Regression test: the ACP path (`gemini_acp`) delegates to `gemini` internally,
+    /// so env-var gating is preserved by construction. This test guards against a
+    /// future refactoring that decouples the two paths and accidentally drops the
+    /// `BREHON_GEMINI_ALLOW_YOLO` env contract.
+    #[tokio::test]
+    async fn test_pty_config_gemini_acp_unsafe_profile_propagates_yolo_env() {
+        let workdir = fresh_temp_dir("brehon-gemini-acp-unsafe");
+        write_unsafe_sandbox_profile(&workdir);
+        let brehon_root = workdir.join(".brehon");
+        let config = PtyConfig::gemini_acp(
+            "test-worker",
+            "worker",
+            workdir.clone(),
+            Some(&brehon_root),
+            Some("test-supervisor"),
+            None,
+            Some("pro"),
+            Some("medium"),
+            None,
+        );
+
+        assert_eq!(config.args.first().map(String::as_str), Some("--acp"));
+        assert!(
+            config
+                .env
+                .iter()
+                .any(|(k, v)| k == "BREHON_GEMINI_ALLOW_YOLO" && v == "1")
+        );
+        assert!(
+            config
+                .env
+                .iter()
+                .any(|(k, v)| k == "GEMINI_SANDBOX" && v == "false")
+        );
+
+        let _ = std::fs::remove_dir_all(workdir);
+    }
+
+    /// Defense-in-depth: verify that gemini_acp does NOT propagate the yolo env
+    /// contract when the sandbox profile is NOT None.
+    #[tokio::test]
+    async fn test_pty_config_gemini_acp_safe_profile_omits_yolo_env() {
+        let workdir = fresh_temp_dir("brehon-gemini-acp-safe");
+        let config = PtyConfig::gemini_acp(
+            "test-worker",
+            "worker",
+            workdir.clone(),
+            None,
+            Some("test-supervisor"),
+            None,
+            Some("pro"),
+            Some("medium"),
+            None,
+        );
+
+        assert_eq!(config.args.first().map(String::as_str), Some("--acp"));
+        assert!(
+            !config
+                .env
+                .iter()
+                .any(|(k, _)| k == "BREHON_GEMINI_ALLOW_YOLO")
+        );
+        assert!(!config.env.iter().any(|(k, _)| k == "GEMINI_SANDBOX"));
+
+        let _ = std::fs::remove_dir_all(workdir);
+    }
+
+    #[tokio::test]
     async fn test_pty_config_gemini_supervisor() {
         let workdir = fresh_temp_dir("brehon-gemini-supervisor");
         let config = PtyConfig::gemini(
@@ -756,7 +1125,7 @@ mod tests {
             None,
         );
         assert_eq!(config.command, "gemini");
-        assert!(config.args.contains(&"--approval-mode".to_string()));
+        assert!(!config.args.contains(&"--approval-mode".to_string()));
         assert!(config.args.contains(&"-i".to_string()));
         assert!(config.args.iter().any(|arg| {
             arg.contains("action=session_start name=supervisor agent_type=supervisor")
@@ -784,6 +1153,7 @@ mod tests {
             None,
             Some("pro"),
             Some("medium"),
+            None,
         );
         assert_eq!(config.command, "gemini");
         assert_eq!(config.args.first().map(String::as_str), Some("--acp"));
@@ -865,6 +1235,7 @@ mod tests {
             Some("openai/gpt-4.1"),
             Some("high"),
             None,
+            None,
         );
         assert_eq!(config.command, "opencode");
         assert!(config.args.contains(&"-m".to_string()));
@@ -937,6 +1308,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert_eq!(config.command, "opencode");
         assert!(!config.args.contains(&"-m".to_string()));
@@ -971,6 +1343,7 @@ mod tests {
             Some("medium"),
             43123,
             None,
+            None,
         );
         assert_eq!(config.command, "zsh");
         assert_eq!(config.args.first().map(String::as_str), Some("-lc"));
@@ -1004,6 +1377,7 @@ mod tests {
             None,
             43124,
             None,
+            None,
         );
         assert_eq!(config.command, "zsh");
         assert_eq!(config.args.first().map(String::as_str), Some("-lc"));
@@ -1036,6 +1410,7 @@ mod tests {
             Some("google/gemini-3.1-pro-preview"),
             Some("medium"),
             43125,
+            None,
             None,
         );
         assert_eq!(config.command, "opencode");
@@ -1077,6 +1452,7 @@ mod tests {
             None,
             Some("google/gemini-3.1-pro-preview"),
             Some("medium"),
+            None,
         );
         assert_eq!(config.command, "opencode");
         assert_eq!(config.args.first().map(String::as_str), Some("acp"));
@@ -1148,6 +1524,7 @@ mod tests {
             Some(&brehon_root),
             Some("supervisor"),
             Some("goose"),
+            None,
         );
 
         assert_eq!(config.command, "goose");
@@ -1196,7 +1573,8 @@ mod tests {
     fn test_prepare_local_opencode_runtime_writes_local_mcp_block() {
         let temp_dir = fresh_temp_dir("brehon-opencode-runtime");
         let (xdg_root, content) =
-            prepare_local_opencode_runtime(&temp_dir, None, "/tmp/brehon", None, None).unwrap();
+            prepare_local_opencode_runtime(&temp_dir, None, "/tmp/brehon", None, None, None)
+                .unwrap();
         let config_path = xdg_root.join("opencode/opencode.json");
         let config: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(config_path).unwrap()).unwrap();
@@ -1230,6 +1608,7 @@ mod tests {
             "opencode-supervisor",
             "supervisor",
             temp_dir.clone(),
+            None,
             None,
             None,
             None,
@@ -1298,6 +1677,7 @@ mod tests {
             &temp_dir,
             "/tmp/brehon",
             Some(&global_config_dir),
+            None,
             None,
             None,
             None,
@@ -1370,6 +1750,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
 
@@ -1403,6 +1784,7 @@ mod tests {
             "/tmp/brehon",
             Some("google/gemini-3.1-pro-preview"),
             Some("high"),
+            None,
         )
         .unwrap();
         let config_path = xdg_root.join("opencode/opencode.json");
@@ -1462,6 +1844,7 @@ mod tests {
             None,
             Some("kimi-for-coding-oauth/kimi-for-coding"),
             Some("high"),
+            None,
         )
         .unwrap();
         let config_path = xdg_root.join("opencode/opencode.json");
@@ -1501,6 +1884,7 @@ mod tests {
             &worker_cwd,
             Some(&project_root),
             "/tmp/brehon",
+            None,
             None,
             None,
         )
@@ -1704,6 +2088,7 @@ key = "oauth/kimi-code"
             Some(&global_root),
             Some("kimi-for-coding"),
             Some("high"),
+            false,
         )
         .unwrap();
 
@@ -1714,7 +2099,7 @@ key = "oauth/kimi-code"
         let config_text = std::fs::read_to_string(share_dir.join("config.toml")).unwrap();
         assert!(config_text.contains(r#"default_model = "kimi-code/kimi-for-coding""#));
         assert!(config_text.contains("default_thinking = true"));
-        assert!(config_text.contains("default_yolo = true"));
+        assert!(config_text.contains("default_yolo = false"));
 
         let mcp_json: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(share_dir.join("mcp.json")).unwrap())
@@ -1787,10 +2172,18 @@ key = "oauth/kimi-code"
             None,
             Some("kimi-for-coding"),
             Some("high"),
+            None,
         );
 
         assert_eq!(config.command, "kimi");
-        assert_eq!(config.args, vec!["acp".to_string()]);
+        assert_eq!(
+            config.args,
+            vec![
+                "--work-dir".to_string(),
+                workdir.to_string_lossy().to_string(),
+                "acp".to_string(),
+            ]
+        );
         assert!(
             config
                 .env
@@ -1813,7 +2206,7 @@ key = "oauth/kimi-code"
 
         let runtime_config = workdir.join(".brehon/factory-runtime/kimi/share/config.toml");
         let config_text = std::fs::read_to_string(runtime_config).unwrap();
-        assert!(config_text.contains(r#"default_yolo = true"#));
+        assert!(config_text.contains(r#"default_yolo = false"#));
 
         let runtime_mcp = workdir.join(".brehon/factory-runtime/kimi/share/mcp.json");
         let mcp_json: serde_json::Value =
@@ -1906,7 +2299,7 @@ key = "oauth/kimi-code"
 
         assert_eq!(config.command, "kimi");
         assert!(config.args.contains(&"--work-dir".to_string()));
-        assert!(config.args.contains(&"--yolo".to_string()));
+        assert!(!config.args.contains(&"--yolo".to_string()));
         assert!(config.args.contains(&"--no-thinking".to_string()));
         assert!(config.args.contains(&"--prompt".to_string()));
         assert!(
@@ -1914,6 +2307,80 @@ key = "oauth/kimi-code"
                 .env
                 .iter()
                 .any(|(k, v)| k == "BREHON_FACTORY_WORKER_CLI" && v == "kimi")
+        );
+
+        let _ = std::fs::remove_dir_all(workdir);
+    }
+
+    #[tokio::test]
+    async fn test_pty_config_kimi_supervisor_unsafe_profile_enables_yolo() {
+        let workdir = fresh_temp_dir("brehon-kimi-supervisor-unsafe");
+        write_unsafe_sandbox_profile(&workdir);
+        let brehon_root = workdir.join(".brehon");
+        let config = PtyConfig::kimi(
+            "supervisor",
+            "supervisor",
+            workdir.clone(),
+            Some(&brehon_root),
+            None,
+            Some("kimi"),
+            Some("kimi-for-coding"),
+            Some("off"),
+        );
+
+        assert!(config.args.contains(&"--yolo".to_string()));
+        let runtime_config = workdir.join(".brehon/factory-runtime/kimi/share/config.toml");
+        let config_text = std::fs::read_to_string(runtime_config).unwrap();
+        assert!(config_text.contains(r#"default_yolo = true"#));
+
+        let _ = std::fs::remove_dir_all(workdir);
+    }
+
+    #[test]
+    fn test_pty_config_agy_safe_profile_omits_dangerous_skip_permissions() {
+        let config = PtyConfig::agy(
+            "agy-worker",
+            "worker",
+            PathBuf::from("/tmp"),
+            None,
+            Some("supervisor"),
+            None,
+            None,
+            None,
+        );
+
+        assert_eq!(config.command, "agy");
+        assert!(
+            !config
+                .args
+                .contains(&"--dangerously-skip-permissions".to_string())
+        );
+        assert_eq!(
+            config.args.first().map(String::as_str),
+            Some("--prompt-interactive")
+        );
+    }
+
+    #[test]
+    fn test_pty_config_agy_unsafe_profile_enables_dangerous_skip_permissions() {
+        let workdir = fresh_temp_dir("brehon-agy-unsafe");
+        write_unsafe_sandbox_profile(&workdir);
+        let brehon_root = workdir.join(".brehon");
+        let config = PtyConfig::agy(
+            "agy-worker",
+            "worker",
+            workdir.clone(),
+            Some(&brehon_root),
+            Some("supervisor"),
+            None,
+            None,
+            None,
+        );
+
+        assert!(
+            config
+                .args
+                .contains(&"--dangerously-skip-permissions".to_string())
         );
 
         let _ = std::fs::remove_dir_all(workdir);
@@ -1958,6 +2425,7 @@ key = "oauth/kimi-code"
             None,
             Some("claude-sonnet-4.6"),
             Some("high"),
+            None,
         );
 
         assert!(matches!(config.command.as_str(), "copilot" | "gh"));
@@ -2015,6 +2483,7 @@ key = "oauth/kimi-code"
             Some("copilot"),
             None,
             None,
+            None,
         );
         assert!(matches!(config.command.as_str(), "copilot" | "gh"));
         assert!(config.args.contains(&"--acp".to_string()));
@@ -2050,6 +2519,7 @@ key = "oauth/kimi-code"
             None,
             None,
             None,
+            None,
         );
         assert!(
             config
@@ -2071,6 +2541,7 @@ key = "oauth/kimi-code"
             None,
             Some("gpt-4.1"),
             None,
+            None,
         );
         assert!(config.args.contains(&"--model".to_string()));
         assert!(config.args.contains(&"gpt-4.1".to_string()));
@@ -2084,6 +2555,7 @@ key = "oauth/kimi-code"
             "copilot-worker",
             "worker",
             workdir.clone(),
+            None,
             None,
             None,
             None,
@@ -2240,6 +2712,7 @@ key = "oauth/kimi-code"
             "worker",
             PathBuf::from("/tmp"),
             None,
+            &[],
             None,
             None,
             None,
@@ -2263,6 +2736,7 @@ key = "oauth/kimi-code"
             "supervisor",
             PathBuf::from("/tmp"),
             None,
+            &[],
             None,
             None,
             None,
@@ -2290,14 +2764,148 @@ key = "oauth/kimi-code"
             "reviewer",
             PathBuf::from("/tmp"),
             None,
+            &[],
             None,
             None,
             Some("gpt-5.4"),
+            None,
             None,
         );
 
         assert_eq!(config.command, "codex");
         assert!(config.args.contains(&"app-server".to_string()));
+        assert!(
+            !config
+                .args
+                .contains(&"--dangerously-bypass-approvals-and-sandbox".to_string())
+        );
+        assert!(
+            config
+                .args
+                .windows(2)
+                .any(|window| window == ["--ask-for-approval", "never"])
+        );
+        assert!(
+            config
+                .args
+                .windows(2)
+                .any(|window| window == ["--sandbox", "workspace-write"])
+        );
+        assert!(
+            !config
+                .args
+                .contains(&"shell_environment_policy.inherit=all".to_string())
+        );
+        assert!(
+            !config
+                .args
+                .contains(&"sandbox_permissions=[\"disk-full-read-access\"]".to_string())
+        );
+        assert!(
+            config
+                .env
+                .iter()
+                .any(|(k, v)| k == "CODEX_PERMISSION_PROFILE" && v == "reviewer")
+        );
+        assert!(
+            !config
+                .args
+                .iter()
+                .any(|arg| arg.contains("Brehon reviewer startup"))
+        );
+    }
+
+    #[test]
+    fn test_codex_acp_config_uses_read_only_profile_for_research() {
+        let config = PtyConfig::codex_acp(
+            "research-1",
+            "research",
+            PathBuf::from("/tmp"),
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        assert!(
+            config
+                .args
+                .windows(2)
+                .any(|window| window == ["--ask-for-approval", "never"])
+        );
+        assert!(
+            config
+                .args
+                .windows(2)
+                .any(|window| window == ["--sandbox", "read-only"])
+        );
+        assert!(
+            config
+                .env
+                .iter()
+                .any(|(k, v)| k == "CODEX_PERMISSION_PROFILE" && v == "observe")
+        );
+    }
+
+    #[test]
+    fn test_codex_acp_config_respects_dependency_profile_override_from_launcher_env() {
+        let launcher_env = vec![(
+            "CODEX_PERMISSION_PROFILE".to_string(),
+            "dependency".to_string(),
+        )];
+        let config = PtyConfig::codex_acp(
+            "worker-1",
+            "worker",
+            PathBuf::from("/tmp"),
+            None,
+            &launcher_env,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        assert!(
+            config
+                .args
+                .windows(2)
+                .any(|window| window == ["--ask-for-approval", "never"])
+        );
+        assert!(
+            config
+                .args
+                .windows(2)
+                .any(|window| window == ["--sandbox", "read-only"])
+        );
+        assert!(config.args.contains(&"--search".to_string()));
+        assert!(
+            config
+                .env
+                .iter()
+                .any(|(k, v)| k == "CODEX_PERMISSION_PROFILE" && v == "dependency")
+        );
+    }
+
+    #[test]
+    fn test_codex_acp_config_respects_unsafe_profile_override_from_launcher_env() {
+        let launcher_env = vec![("CODEX_PERMISSION_PROFILE".to_string(), "unsafe".to_string())];
+        let config = PtyConfig::codex_acp(
+            "reviewer-1",
+            "reviewer",
+            PathBuf::from("/tmp"),
+            None,
+            &launcher_env,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
         assert!(
             config
                 .args
@@ -2313,19 +2921,13 @@ key = "oauth/kimi-code"
                 .args
                 .contains(&"sandbox_permissions=[\"disk-full-read-access\"]".to_string())
         );
+        assert!(!config.args.contains(&"--ask-for-approval".to_string()));
+        assert!(!config.args.contains(&"--sandbox".to_string()));
         assert!(
-            !config.args.contains(&"--ask-for-approval".to_string()),
-            "bypass mode must not also pass explicit approval policy"
-        );
-        assert!(
-            !config.args.contains(&"--sandbox".to_string()),
-            "bypass mode must not also pass an explicit sandbox mode"
-        );
-        assert!(
-            !config
-                .args
+            config
+                .env
                 .iter()
-                .any(|arg| arg.contains("Brehon reviewer startup"))
+                .any(|(k, v)| k == "CODEX_PERMISSION_PROFILE" && v == "unsafe")
         );
     }
 
@@ -2336,10 +2938,12 @@ key = "oauth/kimi-code"
             "reviewer",
             PathBuf::from("/tmp"),
             None,
+            &[],
             None,
             None,
             Some("gpt-5.4"),
             Some("xhigh"),
+            None,
         );
 
         assert!(
@@ -2357,6 +2961,7 @@ key = "oauth/kimi-code"
             "worker",
             workdir.clone(),
             None,
+            &[],
             None,
             None,
             Some("gpt-5.3-codex"),
@@ -2388,9 +2993,11 @@ key = "oauth/kimi-code"
             "worker",
             workdir.clone(),
             None,
+            &[],
             None,
             None,
             Some("gpt-5.3-codex"),
+            None,
             None,
         );
 
@@ -2424,6 +3031,7 @@ key = "oauth/kimi-code"
             cwd.clone(),
             Some("codex-ollama-worker"),
             Some(&brehon_root),
+            &[],
             Some("supervisor"),
             Some("codex-ollama-worker"),
             None,
@@ -2434,6 +3042,7 @@ key = "oauth/kimi-code"
                 "model_provider=\"ollama_cloud\"".to_string(),
                 "app-server".to_string(),
             ],
+            None,
         );
 
         assert_eq!(config.command, "codex");
@@ -2461,6 +3070,73 @@ key = "oauth/kimi-code"
             config.env.iter().any(|(k, _)| k == "CODEX_HOME"),
             "custom Codex ACP launch should still provision CODEX_HOME"
         );
+        assert!(
+            config
+                .args
+                .windows(2)
+                .any(|window| window == ["--ask-for-approval", "never"])
+        );
+        assert!(
+            config
+                .args
+                .windows(2)
+                .any(|window| window == ["--sandbox", "workspace-write"])
+        );
+        assert!(
+            !config
+                .args
+                .contains(&"--dangerously-bypass-approvals-and-sandbox".to_string())
+        );
+
+        let _ = std::fs::remove_dir_all(cwd);
+    }
+
+    #[test]
+    fn test_custom_codex_acp_config_preserves_explicit_unsafe_bootstrap() {
+        let cwd = fresh_temp_dir("brehon-custom-codex-acp-unsafe");
+        let brehon_root = cwd.join(".brehon");
+        let instructions_dir = brehon_root.join("instructions");
+        std::fs::create_dir_all(&instructions_dir).unwrap();
+        std::fs::write(
+            instructions_dir.join("codex-worker-instructions.md"),
+            "worker instructions\n",
+        )
+        .unwrap();
+
+        let config = PtyConfig::custom_codex_acp(
+            "worker-unsafe",
+            "worker",
+            cwd.clone(),
+            Some("codex-unsafe-worker"),
+            Some(&brehon_root),
+            &[],
+            Some("supervisor"),
+            Some("codex-unsafe-worker"),
+            None,
+            &[
+                "--dangerously-bypass-approvals-and-sandbox".to_string(),
+                "app-server".to_string(),
+            ],
+            None,
+        );
+
+        assert!(
+            config
+                .args
+                .contains(&"--dangerously-bypass-approvals-and-sandbox".to_string())
+        );
+        assert!(
+            config
+                .args
+                .contains(&"shell_environment_policy.inherit=all".to_string())
+        );
+        assert!(
+            config
+                .args
+                .contains(&"sandbox_permissions=[\"disk-full-read-access\"]".to_string())
+        );
+        assert!(!config.args.contains(&"--ask-for-approval".to_string()));
+        assert!(!config.args.contains(&"--sandbox".to_string()));
 
         let _ = std::fs::remove_dir_all(cwd);
     }
@@ -2478,6 +3154,7 @@ key = "oauth/kimi-code"
             "reviewer",
             PathBuf::from("/tmp"),
             Some(&temp),
+            &[],
             None,
             None,
             None,
@@ -2508,6 +3185,7 @@ key = "oauth/kimi-code"
             "reviewer",
             workdir.clone(),
             None,
+            &[],
             None,
             None,
             Some("gpt-5.4"),
@@ -2584,6 +3262,7 @@ key = "oauth/kimi-code"
             Some("ollama-cloud/glm-5.1"),
             None,
             None,
+            None,
         );
 
         assert!(config.args.contains(&"--prompt".to_string()));
@@ -2602,5 +3281,200 @@ key = "oauth/kimi-code"
         assert!(config.args.iter().any(|arg| {
             arg.contains("Treat every file path in review prompts, findings, and task titles as repository-relative to that root")
         }));
+    }
+
+    #[test]
+    fn test_launch_policy_is_unsafe_for_none() {
+        let policy = LaunchPolicy::from_security_config(&brehon_types::config::SecurityConfig {
+            sandbox_profile: brehon_types::config::SandboxProfile::None,
+            persist_transcripts: false,
+            redact_patterns: vec![],
+            env_allowlist: vec![],
+        });
+        assert!(policy.is_unsafe());
+        assert_eq!(policy.profile_name(), "unsafe");
+    }
+
+    #[test]
+    fn test_launch_policy_profile_names() {
+        let os_default =
+            LaunchPolicy::from_security_config(&brehon_types::config::SecurityConfig {
+                sandbox_profile: brehon_types::config::SandboxProfile::OsDefault,
+                persist_transcripts: false,
+                redact_patterns: vec![],
+                env_allowlist: vec![],
+            });
+        assert!(!os_default.is_unsafe());
+        assert_eq!(os_default.profile_name(), "os_default");
+
+        let custom = LaunchPolicy::from_security_config(&brehon_types::config::SecurityConfig {
+            sandbox_profile: brehon_types::config::SandboxProfile::Custom,
+            persist_transcripts: false,
+            redact_patterns: vec![],
+            env_allowlist: vec![],
+        });
+        assert!(!custom.is_unsafe());
+        assert_eq!(custom.profile_name(), "custom");
+    }
+
+    #[tokio::test]
+    async fn test_opencode_config_includes_launch_policy() {
+        let workdir = fresh_temp_dir("brehon-opencode-policy");
+        let policy = LaunchPolicy::from_security_config(&brehon_types::config::SecurityConfig {
+            sandbox_profile: brehon_types::config::SandboxProfile::Custom,
+            persist_transcripts: false,
+            redact_patterns: vec![],
+            env_allowlist: vec![],
+        });
+        let config = PtyConfig::opencode(
+            "oc-policy",
+            "worker",
+            workdir.clone(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&policy),
+        );
+        let local_config_path =
+            workdir.join(".brehon/factory-runtime/opencode/xdg/opencode/opencode.json");
+        let local_config: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(local_config_path).unwrap()).unwrap();
+        let policy_json = local_config
+            .get("experimental")
+            .and_then(|e| e.get("brehon_launch_policy"))
+            .expect("experimental.brehon_launch_policy should exist");
+        assert_eq!(policy_json["sandbox_profile"], "custom");
+        assert_eq!(policy_json["unsafe"], false);
+        assert!(
+            config
+                .env
+                .iter()
+                .any(|(k, v)| { k == "BREHON_SANDBOX_PROFILE" && v == "custom" })
+        );
+        assert!(
+            config
+                .env
+                .iter()
+                .any(|(k, v)| { k == "BREHON_LAUNCH_POLICY_UNSAFE" && v == "false" })
+        );
+        let _ = std::fs::remove_dir_all(workdir);
+    }
+
+    #[tokio::test]
+    async fn test_opencode_config_labels_unsafe_policy() {
+        let workdir = fresh_temp_dir("brehon-opencode-unsafe");
+        let policy = LaunchPolicy::from_security_config(&brehon_types::config::SecurityConfig {
+            sandbox_profile: brehon_types::config::SandboxProfile::None,
+            persist_transcripts: false,
+            redact_patterns: vec![],
+            env_allowlist: vec![],
+        });
+        let config = PtyConfig::opencode(
+            "oc-unsafe",
+            "worker",
+            workdir.clone(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&policy),
+        );
+        let local_config_path =
+            workdir.join(".brehon/factory-runtime/opencode/xdg/opencode/opencode.json");
+        let local_config: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(local_config_path).unwrap()).unwrap();
+        let policy_json = local_config
+            .get("experimental")
+            .and_then(|e| e.get("brehon_launch_policy"))
+            .expect("experimental.brehon_launch_policy should exist");
+        assert_eq!(policy_json["sandbox_profile"], "unsafe");
+        assert_eq!(policy_json["unsafe"], true);
+        assert!(
+            config
+                .env
+                .iter()
+                .any(|(k, v)| { k == "BREHON_SANDBOX_PROFILE" && v == "unsafe" })
+        );
+        assert!(
+            config
+                .env
+                .iter()
+                .any(|(k, v)| { k == "BREHON_LAUNCH_POLICY_UNSAFE" && v == "true" })
+        );
+        let _ = std::fs::remove_dir_all(workdir);
+    }
+
+    #[tokio::test]
+    async fn test_custom_acp_env_carries_launch_policy() {
+        let policy = LaunchPolicy::from_security_config(&brehon_types::config::SecurityConfig {
+            sandbox_profile: brehon_types::config::SandboxProfile::OsDefault,
+            persist_transcripts: false,
+            redact_patterns: vec![],
+            env_allowlist: vec![],
+        });
+        let config = PtyConfig::custom_acp(
+            "custom-worker",
+            "worker",
+            "goose",
+            &[],
+            Some("goose"),
+            PathBuf::from("/tmp"),
+            None,
+            None,
+            None,
+            Some(&policy),
+        );
+        assert!(
+            config
+                .env
+                .iter()
+                .any(|(k, v)| { k == "BREHON_SANDBOX_PROFILE" && v == "os_default" })
+        );
+        assert!(
+            config
+                .env
+                .iter()
+                .any(|(k, v)| k == "BREHON_LAUNCH_POLICY_UNSAFE" && v == "false")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_custom_codex_acp_env_labels_unsafe() {
+        let policy = LaunchPolicy::from_security_config(&brehon_types::config::SecurityConfig {
+            sandbox_profile: brehon_types::config::SandboxProfile::None,
+            persist_transcripts: false,
+            redact_patterns: vec![],
+            env_allowlist: vec![],
+        });
+        let config = PtyConfig::custom_codex_acp(
+            "codex-unsafe",
+            "worker",
+            PathBuf::from("/tmp"),
+            Some("codex"),
+            None,
+            &[],
+            None,
+            None,
+            None,
+            &[],
+            Some(&policy),
+        );
+        assert!(
+            config
+                .env
+                .iter()
+                .any(|(k, v)| { k == "BREHON_SANDBOX_PROFILE" && v == "unsafe" })
+        );
+        assert!(
+            config
+                .env
+                .iter()
+                .any(|(k, v)| { k == "BREHON_LAUNCH_POLICY_UNSAFE" && v == "true" })
+        );
     }
 }

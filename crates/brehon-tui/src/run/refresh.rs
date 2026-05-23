@@ -7,7 +7,8 @@ use brehon_mux::{Mux, PaneKind, PaneState};
 use super::dashboard::read_task_files;
 use super::helpers::read_live_reviewer_panels;
 use super::recovery::{
-    detect_shared_root_mutation, push_dashboard_event, sync_worker_task_contexts,
+    detect_shared_root_mutation, push_dashboard_event, sync_reviewer_review_contexts,
+    sync_worker_task_contexts,
 };
 use super::session::{read_session_files, refresh_session_file};
 use super::types::{AgentInfo, DashboardData, ReviewerPanel, TaskInfo};
@@ -111,6 +112,10 @@ pub(crate) fn apply_dashboard_refresh_snapshot(
     }
     apply_reviewer_selection_state(panels, reviewer_selection, selected_panel, selected_member);
     sync_worker_task_contexts(mux, &tasks, &sessions);
+    let brehon_root = { dashboard_data.lock().unwrap().brehon_root.clone() };
+    if let Some(brehon_root) = brehon_root {
+        sync_reviewer_review_contexts(mux, &brehon_root, &tasks);
+    }
 
     let mut data = dashboard_data.lock().unwrap();
     data.tasks = tasks;

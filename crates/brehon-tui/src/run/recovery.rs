@@ -20,10 +20,11 @@ use brehon_types::task::{
 };
 
 use brehon_mux::{
-    Mux, PaneKind, SessionScopedQueue, StoredScopedEntry, TaskBlockedReason, TaskContextDetails,
-    TaskContextSnapshot,
+    Mux, PaneKind, ReviewContextSnapshot, SessionScopedQueue, StoredScopedEntry, TaskBlockedReason,
+    TaskContextDetails, TaskContextSnapshot,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use super::types::*;
 
@@ -894,7 +895,7 @@ pub(crate) fn detect_shared_root_mutation(brehon_root: &std::path::Path) -> Opti
     let output = Command::new("git")
         .arg("-C")
         .arg(project_root)
-        .args(["status", "--porcelain", "--untracked-files=no"])
+        .args(["status", "--porcelain", "--untracked-files=all"])
         .output()
         .ok()?;
     if !output.status.success() {
@@ -908,6 +909,10 @@ pub(crate) fn detect_shared_root_mutation(brehon_root: &std::path::Path) -> Opti
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
+        .filter(|line| {
+            let path = line.get(3..).unwrap_or_default();
+            !path.starts_with(".brehon/")
+        })
         .take(5)
         .map(str::to_string)
         .collect::<Vec<_>>();
@@ -1371,6 +1376,127 @@ pub(crate) fn sync_worker_task_contexts(
             }
         } else {
             mux.clear_pane_task_context_by_session(&session_id);
+        }
+    }
+}
+
+fn read_json_string(value: &Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(|item| item.as_str())
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::to_string)
+}
+
+fn read_json_string_list(value: Option<&Value>) -> Vec<String> {
+    value
+        .and_then(|item| item.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str())
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn active_reviewer_review_contexts(
+    brehon_root: &Path,
+    tasks: &[TaskInfo],
+) -> std::collections::HashMap<String, ReviewContextSnapshot> {
+    let tasks_by_id = tasks
+        .iter()
+        .map(|task| (task.id.as_str(), task))
+        .collect::<std::collections::HashMap<_, _>>();
+    let reviews_dir = brehon_root.join("runtime").join("reviews");
+    let Ok(entries) = std::fs::read_dir(&reviews_dir) else {
+        return std::collections::HashMap::new();
+    };
+
+    let mut candidates = Vec::<(String, String, ReviewContextSnapshot)>::new();
+    for entry in entries.flatten() {
+        if !entry.path().is_dir() {
+            continue;
+        }
+        let state_path = entry.path().join("state.json");
+        let Ok(content) = std::fs::read_to_string(&state_path) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(&content) else {
+            continue;
+        };
+        if read_json_string(&value, "status").as_deref() != Some("collecting") {
+            continue;
+        }
+        let fallback_task_id = entry.file_name().to_string_lossy().to_string();
+        let task_id = read_json_string(&value, "task_id").unwrap_or(fallback_task_id);
+        let Some(task) = tasks_by_id.get(task_id.as_str()).copied() else {
+            continue;
+        };
+        if normalize_task_status(&task.status) != Some("in_review") {
+            continue;
+        }
+        let Some(review_id) = read_json_string(&value, "current_review_id") else {
+            continue;
+        };
+        let round = value
+            .get("current_round")
+            .and_then(|item| item.as_u64())
+            .unwrap_or(0) as u32;
+        let panel = read_json_string_list(value.get("panel"));
+        if panel.is_empty() {
+            continue;
+        }
+        let submissions = read_json_string_list(value.get("submissions_received"));
+        let panel_done = submissions.len();
+        let panel_total = panel.len();
+        let updated_at = read_json_string(&value, "updated_at").unwrap_or_default();
+        for reviewer in panel {
+            if submissions.iter().any(|submitted| submitted == &reviewer) {
+                continue;
+            }
+            candidates.push((
+                reviewer,
+                updated_at.clone(),
+                ReviewContextSnapshot {
+                    review_id: review_id.clone(),
+                    task_id: task_id.clone(),
+                    round,
+                    panel_total,
+                    panel_done,
+                    verdict: None,
+                    score: None,
+                    findings_summary: None,
+                    updated_at: std::time::Instant::now(),
+                },
+            ));
+        }
+    }
+
+    candidates.sort_by(|left, right| left.1.cmp(&right.1).then(left.0.cmp(&right.0)));
+    candidates
+        .into_iter()
+        .map(|(reviewer, _, context)| (reviewer, context))
+        .collect()
+}
+
+pub(crate) fn sync_reviewer_review_contexts(mux: &mut Mux, brehon_root: &Path, tasks: &[TaskInfo]) {
+    let contexts = active_reviewer_review_contexts(brehon_root, tasks);
+    let reviewer_names = mux
+        .panes()
+        .filter(|pane| *pane.kind() == PaneKind::Reviewer)
+        .map(|pane| pane.id().to_string())
+        .collect::<Vec<_>>();
+
+    for reviewer in reviewer_names {
+        if let Some(context) = contexts.get(&reviewer) {
+            mux.set_pane_review_context(&reviewer, context.clone());
+        } else {
+            mux.clear_pane_review_context(&reviewer);
         }
     }
 }

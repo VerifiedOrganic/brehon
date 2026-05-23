@@ -461,6 +461,41 @@ fn parse_normalized_plan_rejects_details_doc_list() {
 }
 
 #[test]
+fn parse_normalized_plan_rejects_execution_manifest_with_import_hint() {
+    let _lock = IMPORT_PLAN_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let dir = TempDir::new().unwrap();
+    let manifest_path = dir.path().join("execution-order.manifest.json");
+    fs::write(
+        &manifest_path,
+        serde_json::to_string(&json!({
+            "name": "execution manifest",
+            "import_file": "initiative.import.json",
+            "do_not_import": ["execution-order.manifest.json"],
+            "import_order": [
+                {
+                    "order": 1,
+                    "file": "initiative.import.json",
+                    "command": "brehon import-plan initiative.import.json"
+                }
+            ]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let err = parse_normalized_plan(&manifest_path).unwrap_err();
+    let message = format!("{err:#}");
+    assert!(message.contains("execution manifest"), "{message}");
+    assert!(message.contains("initiative.import.json"), "{message}");
+    assert!(
+        message.contains("brehon import-plan initiative.import.json"),
+        "{message}"
+    );
+}
+
+#[test]
 fn parse_normalized_plan_rejects_invalid_reference_list_entries() {
     let _lock = IMPORT_PLAN_TEST_LOCK
         .lock()
@@ -524,6 +559,7 @@ fn resolve_extractor_launch_for_claude_supervisor() {
             base_url: None,
             api_key_env: None,
             permission_mode: None,
+            profile: None,
             max_parallel_tool_calls: None,
             assistant_message_passthrough_fields: Vec::new(),
             reasoning_effort_param: None,
@@ -593,6 +629,7 @@ printf '%s' "$FAKE_EXTRACT_RESPONSE"
             base_url: None,
             api_key_env: None,
             permission_mode: None,
+            profile: None,
             max_parallel_tool_calls: None,
             assistant_message_passthrough_fields: Vec::new(),
             reasoning_effort_param: None,
@@ -669,6 +706,7 @@ exit 9
             base_url: None,
             api_key_env: None,
             permission_mode: None,
+            profile: None,
             max_parallel_tool_calls: None,
             assistant_message_passthrough_fields: Vec::new(),
             reasoning_effort_param: None,

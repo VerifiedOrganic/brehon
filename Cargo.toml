@@ -68,9 +68,10 @@ crossterm = "0.29"
 directories = "5"
 indexmap = "2"
 unicode-width = "0.2"
+strum = { version = "0.27", features = ["derive"] }
 rmcp = { version = "0.16", features = ["server", "transport-io"] }
 portable-pty = "0.9"
-panesmith = { path = "../projects/github/panesmith/crates/panesmith", features = ["crossterm"] }
+panesmith = { git = "ssh://git@github.com/VerifiedOrganic/panesmith.git", rev = "118ceab3f79ccbe04e9bd5569686e74dd65bf40a", features = ["crossterm"] }
 
 [profile.release-fast]
 inherits = "release"

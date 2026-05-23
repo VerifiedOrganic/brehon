@@ -84,6 +84,7 @@ fn generate_config_for_agents(agents: &[DetectedAgent]) -> String {
             base_url: None,
             api_key_env: None,
             permission_mode: None,
+            profile: None,
             max_parallel_tool_calls: None,
             assistant_message_passthrough_fields: Vec::new(),
             reasoning_effort_param: None,
@@ -112,6 +113,7 @@ fn generate_config_for_agents(agents: &[DetectedAgent]) -> String {
                 }),
                 reasoning_effort: reasoning_effort.map(str::to_string),
                 system_prompt,
+                profile: None,
             },
         );
     }
@@ -150,10 +152,7 @@ fn generate_config_for_agents(agents: &[DetectedAgent]) -> String {
                     &[],
                 ),
             ),
-            (
-                "gemini".to_string(),
-                launcher("gemini", &["--acp"], &[]),
-            ),
+            ("gemini".to_string(), launcher("gemini", &["--acp"], &[])),
             ("kimi".to_string(), launcher("kimi", &["acp"], &[])),
             (
                 "opencode".to_string(),
@@ -168,13 +167,14 @@ fn generate_config_for_agents(agents: &[DetectedAgent]) -> String {
                 AgentConnectionConfig {
                     adapter: AdapterKind::Agy,
                     command: Some("agy".to_string()),
-                    args: arg_list(&["--dangerously-skip-permissions"]),
+                    args: Vec::new(),
                     provider: None,
                     transport: None,
                     control_plane: None,
                     base_url: None,
                     api_key_env: None,
                     permission_mode: None,
+                    profile: None,
                     max_parallel_tool_calls: None,
                     assistant_message_passthrough_fields: Vec::new(),
                     reasoning_effort_param: None,
@@ -248,6 +248,7 @@ fn generate_config_for_agents(agents: &[DetectedAgent]) -> String {
                 }),
                 reasoning_effort: Some("high".to_string()),
                 system_prompt: reviewer_prompt.clone(),
+                profile: None,
             },
         );
         lanes.insert(
@@ -260,6 +261,7 @@ fn generate_config_for_agents(agents: &[DetectedAgent]) -> String {
                 }),
                 reasoning_effort: Some("medium".to_string()),
                 system_prompt: None,
+                profile: None,
             },
         );
         lanes.insert(
@@ -272,6 +274,7 @@ fn generate_config_for_agents(agents: &[DetectedAgent]) -> String {
                 }),
                 reasoning_effort: Some("xhigh".to_string()),
                 system_prompt: None,
+                profile: None,
             },
         );
         lanes.insert(
@@ -284,6 +287,7 @@ fn generate_config_for_agents(agents: &[DetectedAgent]) -> String {
                 }),
                 reasoning_effort: Some("high".to_string()),
                 system_prompt: reviewer_prompt.clone(),
+                profile: None,
             },
         );
 
@@ -456,6 +460,112 @@ fn generate_config_for_agents(agents: &[DetectedAgent]) -> String {
         Value::Mapping(value)
     }
 
+    fn safe_default_profiles() -> brehon_types::ProfilesConfig {
+        use brehon_types::{
+            CredentialClass, EnvPolicy, NetworkClass, PermissionProfile, SandboxBackend,
+            SandboxSpec,
+        };
+        let mut defaults = std::collections::BTreeMap::new();
+        defaults.insert("supervisor".to_string(), PermissionProfile::Operator);
+        defaults.insert("worker".to_string(), PermissionProfile::Workspace);
+        defaults.insert("reviewer".to_string(), PermissionProfile::Reviewer);
+
+        let mut specs = std::collections::BTreeMap::new();
+        specs.insert(
+            "observe".to_string(),
+            SandboxSpec {
+                backend: SandboxBackend::OsDefault,
+                read_roots: vec![],
+                write_roots: vec![],
+                denied_roots: vec![],
+                network_class: NetworkClass::Denied,
+                credential_class: CredentialClass::None,
+                env_policy: EnvPolicy::Minimal,
+                unsafe_marker: false,
+            },
+        );
+        specs.insert(
+            "dependency".to_string(),
+            SandboxSpec {
+                backend: SandboxBackend::OsDefault,
+                read_roots: vec![],
+                write_roots: vec![],
+                denied_roots: vec![],
+                network_class: NetworkClass::Allowlisted,
+                credential_class: CredentialClass::EnvAllowlist,
+                env_policy: EnvPolicy::Minimal,
+                unsafe_marker: false,
+            },
+        );
+        specs.insert(
+            "integrator".to_string(),
+            SandboxSpec {
+                backend: SandboxBackend::OsDefault,
+                read_roots: vec![],
+                write_roots: vec![],
+                denied_roots: vec![],
+                network_class: NetworkClass::ModelOnly,
+                credential_class: CredentialClass::EnvAllowlist,
+                env_policy: EnvPolicy::Minimal,
+                unsafe_marker: false,
+            },
+        );
+        specs.insert(
+            "workspace".to_string(),
+            SandboxSpec {
+                backend: SandboxBackend::OsDefault,
+                read_roots: vec![],
+                write_roots: vec![],
+                denied_roots: vec![],
+                network_class: NetworkClass::ModelOnly,
+                credential_class: CredentialClass::EnvAllowlist,
+                env_policy: EnvPolicy::Minimal,
+                unsafe_marker: false,
+            },
+        );
+        specs.insert(
+            "reviewer".to_string(),
+            SandboxSpec {
+                backend: SandboxBackend::OsDefault,
+                read_roots: vec![],
+                write_roots: vec![],
+                denied_roots: vec![],
+                network_class: NetworkClass::ModelOnly,
+                credential_class: CredentialClass::EnvAllowlist,
+                env_policy: EnvPolicy::Minimal,
+                unsafe_marker: false,
+            },
+        );
+        specs.insert(
+            "operator".to_string(),
+            SandboxSpec {
+                backend: SandboxBackend::OsDefault,
+                read_roots: vec![],
+                write_roots: vec![],
+                denied_roots: vec![],
+                network_class: NetworkClass::ModelOnly,
+                credential_class: CredentialClass::EnvAllowlist,
+                env_policy: EnvPolicy::Minimal,
+                unsafe_marker: false,
+            },
+        );
+        specs.insert(
+            "unsafe".to_string(),
+            SandboxSpec {
+                backend: SandboxBackend::None,
+                read_roots: vec![],
+                write_roots: vec![],
+                denied_roots: vec![],
+                network_class: NetworkClass::Unrestricted,
+                credential_class: CredentialClass::Unrestricted,
+                env_policy: EnvPolicy::Inherit,
+                unsafe_marker: true,
+            },
+        );
+
+        brehon_types::ProfilesConfig { defaults, specs }
+    }
+
     fn active_overlay(
         config: &brehon_types::BrehonConfig,
         defaults: &brehon_types::BrehonConfig,
@@ -586,6 +696,14 @@ fn generate_config_for_agents(agents: &[DetectedAgent]) -> String {
             serde_yaml::to_value(config.orchestration.max_active_workers).unwrap(),
         );
         put_str(&mut root, "orchestration", Value::Mapping(orchestration));
+
+        if !config.profiles.is_default() {
+            put_str(
+                &mut root,
+                "profiles",
+                serde_yaml::to_value(&config.profiles).expect("profiles should serialize"),
+            );
+        }
 
         Value::Mapping(root)
     }
@@ -754,6 +872,8 @@ fn generate_config_for_agents(agents: &[DetectedAgent]) -> String {
                 .min(config.review.default_reviewers.len().max(1) as u8);
         }
     }
+
+    config.profiles = safe_default_profiles();
 
     // Serialize a small project overlay, not the full resolved config. Built-in
     // defaults supply the advanced sections.
@@ -1185,13 +1305,139 @@ mod tests {
     fn generated_config_is_compact_overlay() {
         let yaml = generate_config_for_agents(&[]);
 
-        assert!(yaml.lines().count() < 80, "{yaml}");
+        // Profiles section adds safe default profile specs; allow room for them.
+        assert!(yaml.lines().count() < 140, "{yaml}");
         assert!(!yaml.contains("budget:"));
         assert!(!yaml.contains("retention:"));
         assert!(!yaml.contains("terminal_host:"));
         let config = load_generated_config(&yaml);
         assert_eq!(config.version, 1);
         assert!(config.launchers.contains_key("claude"));
+    }
+
+    #[test]
+    fn generated_config_includes_safe_permission_profiles() {
+        let yaml = generate_config_for_agents(&[]);
+        let config = load_generated_config(&yaml);
+
+        assert!(
+            yaml.contains("profiles:"),
+            "generated config should include profiles section"
+        );
+        assert!(
+            yaml.contains("defaults:"),
+            "generated config should include profiles.defaults"
+        );
+        assert!(
+            yaml.contains("specs:"),
+            "generated config should include profiles.specs"
+        );
+
+        assert_eq!(
+            config.profiles.defaults.get("supervisor"),
+            Some(&brehon_types::PermissionProfile::Operator)
+        );
+        assert_eq!(
+            config.profiles.defaults.get("worker"),
+            Some(&brehon_types::PermissionProfile::Workspace)
+        );
+        assert_eq!(
+            config.profiles.defaults.get("reviewer"),
+            Some(&brehon_types::PermissionProfile::Reviewer)
+        );
+
+        assert!(
+            config.profiles.specs.contains_key("observe"),
+            "observe spec should be present"
+        );
+        assert!(
+            config.profiles.specs.contains_key("dependency"),
+            "dependency spec should be present"
+        );
+        assert!(
+            config.profiles.specs.contains_key("integrator"),
+            "integrator spec should be present"
+        );
+        assert!(
+            config.profiles.specs.contains_key("workspace"),
+            "workspace spec should be present"
+        );
+        assert!(
+            config.profiles.specs.contains_key("reviewer"),
+            "reviewer spec should be present"
+        );
+        assert!(
+            config.profiles.specs.contains_key("operator"),
+            "operator spec should be present"
+        );
+        assert!(
+            config.profiles.specs.contains_key("unsafe"),
+            "unsafe spec should be present"
+        );
+
+        let observe_spec = config.profiles.specs.get("observe").unwrap();
+        assert_eq!(
+            observe_spec.backend,
+            brehon_types::SandboxBackend::OsDefault
+        );
+        assert_eq!(
+            observe_spec.network_class,
+            brehon_types::NetworkClass::Denied
+        );
+        assert_eq!(
+            observe_spec.credential_class,
+            brehon_types::CredentialClass::None
+        );
+        assert!(!observe_spec.unsafe_marker);
+
+        let dependency_spec = config.profiles.specs.get("dependency").unwrap();
+        assert_eq!(
+            dependency_spec.network_class,
+            brehon_types::NetworkClass::Allowlisted
+        );
+        assert_eq!(
+            dependency_spec.credential_class,
+            brehon_types::CredentialClass::EnvAllowlist
+        );
+        assert!(!dependency_spec.unsafe_marker);
+
+        let integrator_spec = config.profiles.specs.get("integrator").unwrap();
+        assert_eq!(
+            integrator_spec.network_class,
+            brehon_types::NetworkClass::ModelOnly
+        );
+        assert_eq!(
+            integrator_spec.credential_class,
+            brehon_types::CredentialClass::EnvAllowlist
+        );
+        assert!(!integrator_spec.unsafe_marker);
+
+        let workspace_spec = config.profiles.specs.get("workspace").unwrap();
+        assert_eq!(
+            workspace_spec.backend,
+            brehon_types::SandboxBackend::OsDefault
+        );
+        assert_eq!(
+            workspace_spec.network_class,
+            brehon_types::NetworkClass::ModelOnly
+        );
+        assert_eq!(
+            workspace_spec.credential_class,
+            brehon_types::CredentialClass::EnvAllowlist
+        );
+        assert!(!workspace_spec.unsafe_marker);
+
+        let unsafe_spec = config.profiles.specs.get("unsafe").unwrap();
+        assert_eq!(unsafe_spec.backend, brehon_types::SandboxBackend::None);
+        assert_eq!(
+            unsafe_spec.network_class,
+            brehon_types::NetworkClass::Unrestricted
+        );
+        assert_eq!(
+            unsafe_spec.credential_class,
+            brehon_types::CredentialClass::Unrestricted
+        );
+        assert!(unsafe_spec.unsafe_marker);
     }
 
     #[test]
@@ -1213,10 +1459,7 @@ mod tests {
         );
         assert_eq!(config.launchers["agy"].adapter, AdapterKind::Agy);
         assert_eq!(config.launchers["agy"].command, Some("agy".to_string()));
-        assert_eq!(
-            config.launchers["agy"].args,
-            vec!["--dangerously-skip-permissions".to_string()]
-        );
+        assert!(config.launchers["agy"].args.is_empty());
         assert_eq!(
             config.lanes["agy-worker"].model.as_ref().unwrap().name,
             "antigravity-2.0"

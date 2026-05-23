@@ -15,4 +15,5 @@ serde_json = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+brehon-config = { path = "../brehon-config" }
 tokio = { workspace = true, features = ["test-util"] }

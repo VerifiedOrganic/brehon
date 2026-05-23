@@ -430,6 +430,48 @@ cross-field consistency before the orchestrator starts.
 Config files are merged in a layered fashion: defaults < project
 (`.brehon/config.yaml`) < local override (`.brehon/local.yaml`) < flags.
 
+### Permission profiles
+
+The `profiles` section declares sandbox specifications and role defaults
+for agent runtime isolation. It is optional: when omitted, every role
+falls back to a built-in default profile.
+
+The model has two sub-sections:
+
+- **`profiles.defaults`** — maps role-kind keys (`supervisor`, `worker`,
+  `reviewer`, `custom`) to a canonical profile name.
+- **`profiles.specs`** — maps canonical profile names to concrete
+  `SandboxSpec` values (backend, filesystem roots, network class,
+  credential class, environment policy, and an `unsafe_marker` bit).
+
+Canonical profile names are: `observe`, `reviewer`, `workspace`,
+`dependency`, `integrator`, `operator`, `unsafe`. The `unsafe` profile
+must set `unsafe_marker: true`; every other profile must set it to
+`false`. Validation is split by severity:
+
+- **Fatal** (config load fails): unknown profile names in
+  `profiles.specs`, unknown role-kind keys in `profiles.defaults`.
+- **Non-fatal warning** (config still loads): missing `profiles.specs`
+  entries referenced by `profiles.defaults`, launcher, or lane overrides;
+  `unsafe_marker` mismatches.
+
+Resolution order for an agent's effective profile (from `BrehonConfig::effective_permission_profile`):
+
+1. Runtime/agent-level override (e.g. a task's execution policy).
+2. Lane-level `profile` override.
+3. Launcher-level `profile` override.
+4. `profiles.defaults` for the agent's role kind.
+5. Built-in fallback per role (`operator` for supervisor, `workspace` for
+   worker, `reviewer` for reviewer, `observe` for advisor/research/custom,
+   `integrator` for integrator).
+
+The legacy `security.sandbox_profile` field is preserved for backward
+compatibility. Configs that contain only `security.sandbox_profile` and
+no `profiles` section continue to load and validate cleanly; the runtime
+profile resolver simply falls back to the built-in defaults. The CLI
+`brehon config describe profiles` renders the resolved profile for every
+active lane, including the concrete spec when one is configured.
+
 ---
 
 ## 13. Detection and policy

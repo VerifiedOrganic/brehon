@@ -553,7 +553,7 @@ fn test_panesmith_supervisor_exit_mirrors_to_brehon_state() {
 }
 
 #[test]
-fn test_factory_falls_back_to_ghostty_when_panesmith_spawn_fails() {
+fn test_factory_fails_when_panesmith_spawn_fails() {
     let project_root = super::fresh_temp_dir("brehon-mux-panesmith-fallback");
     let supervisor_id = FORCE_PANESMITH_SPAWN_FAILURE_PANE_ID;
     let config = MuxConfig {
@@ -566,20 +566,15 @@ fn test_factory_falls_back_to_ghostty_when_panesmith_spawn_fails() {
         cols: 100,
         ..Default::default()
     };
-    let mut mux = Mux::factory(config).expect("create mux with ghostty fallback");
+    let err = match Mux::factory(config) {
+        Ok(_) => panic!("panesmith spawn failure should be fatal"),
+        Err(err) => err,
+    };
 
-    let supervisor = mux.get(supervisor_id).expect("supervisor pane");
-    assert!(!supervisor.is_panesmith_managed());
-    assert!(!mux.is_panesmith_managed(supervisor_id));
-    assert!(matches!(supervisor.backend, PaneBackend::Pty(_)));
-    assert_eq!(
-        mux.pane_backend_ownership(supervisor_id),
-        Some(PaneBackendOwnership::GhosttyVt)
+    assert!(
+        err.to_string().contains("legacy PTY fallback is disabled"),
+        "unexpected error: {err}"
     );
-
-    tokio::runtime::Runtime::new()
-        .expect("runtime")
-        .block_on(mux.shutdown_all());
 }
 
 #[test]
@@ -852,6 +847,7 @@ fn terminal_host_agent_factory_plan_aggregates_pane_launch_contracts() {
             None,
             24,
             80,
+            None,
             None,
             None,
         )
@@ -1364,6 +1360,7 @@ async fn test_deliver_prompt_routes_claude_supervisor_to_teams_inbox() {
         None,
         None,
         &std::collections::HashMap::new(),
+        None,
     )
     .expect("create supervisor pane");
     mux.add_pane(pane);

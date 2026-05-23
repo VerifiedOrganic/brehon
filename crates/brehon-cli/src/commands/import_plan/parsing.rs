@@ -635,12 +635,34 @@ pub(crate) fn validate_plan_document(
 pub(crate) fn parse_normalized_plan(path: &Path) -> Result<PlanDocument> {
     let content = fs::read_to_string(path)
         .with_context(|| format!("Failed to read normalized plan '{}'", path.display()))?;
-    let mut plan: PlanDocument = serde_json::from_str(&content)
+    let value: serde_json::Value = serde_json::from_str(&content)
+        .with_context(|| format!("Failed to parse normalized plan JSON '{}'", path.display()))?;
+    if let Some(import_file) = execution_manifest_import_file(&value) {
+        bail!(
+            "'{}' is an execution manifest, not a normalized import plan. Import '{}' instead:\n  brehon import-plan {}",
+            path.display(),
+            import_file,
+            import_file
+        );
+    }
+    let mut plan: PlanDocument = serde_json::from_value(value)
         .with_context(|| format!("Failed to parse normalized plan JSON '{}'", path.display()))?;
     if plan.path.as_os_str().is_empty() {
         plan.path = path.to_path_buf();
     }
     validate_plan_document(&plan, path)
+}
+
+fn execution_manifest_import_file(value: &serde_json::Value) -> Option<&str> {
+    let object = value.as_object()?;
+    let import_file = object.get("import_file")?.as_str()?.trim();
+    if import_file.is_empty() {
+        return None;
+    }
+    let looks_like_manifest =
+        object.contains_key("import_order") || object.contains_key("do_not_import");
+    let lacks_plan_shape = !object.contains_key("phases");
+    (looks_like_manifest && lacks_plan_shape).then_some(import_file)
 }
 
 pub(crate) fn map_source_status_to_brehon_status(source_status: &str) -> Option<&'static str> {

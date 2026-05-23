@@ -53,6 +53,9 @@ pub struct AgySpawnParams {
     pub supervisor_name: Option<String>,
     pub factory_worker_cli: Option<String>,
     pub model: Option<String>,
+    /// If true, the spawned Agy CLI will run with `--dangerously-skip-permissions`.
+    /// Should only be set when the sandbox profile is `None`.
+    pub allow_privileged_mode: bool,
 }
 
 /// Session configuration for the Agy CLI.
@@ -109,7 +112,10 @@ impl AgySessionConfig {
         ));
         configure_mcp_in_workspace(&params.cwd, &current_brehon_exe());
 
-        let mut args = vec!["--dangerously-skip-permissions".to_string()];
+        let mut args = Vec::new();
+        if params.allow_privileged_mode {
+            args.push("--dangerously-skip-permissions".to_string());
+        }
 
         if params.role == "worker" {
             let project_policy = project_policy_for_role(params.brehon_root.as_ref(), &params.role);
@@ -749,17 +755,17 @@ mod tests {
             supervisor_name: Some("supervisor".to_string()),
             factory_worker_cli: None,
             model: None,
+            allow_privileged_mode: false,
         };
         let config = AgySessionConfig::from_params(&params);
         assert_eq!(config.command, "agy");
-        assert_eq!(config.args[0], "--dangerously-skip-permissions");
-        assert_eq!(config.args[1], "--prompt-interactive");
-        assert!(config.args[2].contains("Brehon worker startup"));
-        assert!(config.args[2].contains("Antigravity MCP usage for this Brehon session"));
-        assert!(config.args[2].contains("call MCP tool `task` with {\"action\":\"mine\"}"));
-        assert!(config.args[2].contains("Do not inspect `~/.gemini/antigravity-cli/mcp/`"));
-        assert!(config.args[2].contains("You are worker 'agy-worker'"));
-        assert!(config.args[2].contains("target=supervisor"));
+        assert_eq!(config.args[0], "--prompt-interactive");
+        assert!(config.args[1].contains("Brehon worker startup"));
+        assert!(config.args[1].contains("Antigravity MCP usage for this Brehon session"));
+        assert!(config.args[1].contains("call MCP tool `task` with {\"action\":\"mine\"}"));
+        assert!(config.args[1].contains("Do not inspect `~/.gemini/antigravity-cli/mcp/`"));
+        assert!(config.args[1].contains("You are worker 'agy-worker'"));
+        assert!(config.args[1].contains("target=supervisor"));
         assert!(config
             .env
             .iter()
@@ -768,6 +774,25 @@ mod tests {
             .env
             .iter()
             .any(|(k, v)| k == "BREHON_AGENT_ROLE" && v == "worker"));
+        assert!(!config
+            .args
+            .contains(&"--dangerously-skip-permissions".to_string()));
+    }
+
+    #[test]
+    fn agy_session_config_unsafe_profile_enables_skip_permissions() {
+        let params = AgySpawnParams {
+            name: "agy-worker".to_string(),
+            role: "worker".to_string(),
+            cwd: PathBuf::from("/tmp"),
+            brehon_root: None,
+            supervisor_name: Some("supervisor".to_string()),
+            factory_worker_cli: None,
+            model: None,
+            allow_privileged_mode: true,
+        };
+        let config = AgySessionConfig::from_params(&params);
+        assert_eq!(config.args[0], "--dangerously-skip-permissions");
     }
 
     #[test]

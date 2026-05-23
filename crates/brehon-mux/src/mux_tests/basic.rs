@@ -435,6 +435,7 @@ fn test_mux_runtime_command_attempt_prompt_bypasses_pending_teams_nudge_cooldown
         None,
         None,
         None,
+        None,
     )
     .expect("create reviewer pane");
     mux.add_pane(pane);

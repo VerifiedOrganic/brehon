@@ -36,6 +36,7 @@ type CodexSink = SplitSink<CodexSocket, Message>;
 type PendingRequests = Arc<Mutex<HashMap<String, oneshot::Sender<CodexResponse>>>>;
 
 const CODEX_PROTOCOL_VERSION: &str = "2025-03-26";
+const CODEX_PERMISSION_PROFILE_ENV: &str = "CODEX_PERMISSION_PROFILE";
 const CONNECT_TIMEOUT_MS: u64 = 8_000;
 const CONNECT_ATTEMPT_TIMEOUT_MS: u64 = 1_000;
 const REQUEST_TIMEOUT_MS: u64 = 15_000;
@@ -164,15 +165,89 @@ struct CodexMcpServerStatus {
     error: Option<String>,
 }
 
-impl Default for CodexLaunchConfig {
-    fn default() -> Self {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexPermissionProfile {
+    Observe,
+    Dependency,
+    Workspace,
+    Reviewer,
+    Operator,
+    Unsafe,
+}
+
+impl CodexPermissionProfile {
+    fn from_env_or_role(env: &[(String, String)]) -> Self {
+        env.iter()
+            .rev()
+            .find_map(|(key, value)| {
+                (key == CODEX_PERMISSION_PROFILE_ENV)
+                    .then(|| Self::from_env_value(value))
+                    .flatten()
+            })
+            .or_else(|| {
+                env.iter().rev().find_map(|(key, value)| {
+                    (key == "BREHON_AGENT_ROLE").then(|| Self::from_role(value))
+                })
+            })
+            .unwrap_or(Self::Workspace)
+    }
+
+    fn from_env_value(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "observe" => Some(Self::Observe),
+            "dependency" => Some(Self::Dependency),
+            "workspace" => Some(Self::Workspace),
+            "reviewer" => Some(Self::Reviewer),
+            "operator" => Some(Self::Operator),
+            "unsafe" => Some(Self::Unsafe),
+            _ => None,
+        }
+    }
+
+    fn from_role(role: &str) -> Self {
+        match role.trim() {
+            "supervisor" => Self::Operator,
+            "reviewer" => Self::Reviewer,
+            "advisor" => Self::Observe,
+            "research" => Self::Observe,
+            _ => Self::Workspace,
+        }
+    }
+
+    fn default_sandbox(self) -> &'static str {
+        match self {
+            Self::Observe | Self::Dependency => "read-only",
+            Self::Workspace | Self::Reviewer | Self::Operator => "workspace-write",
+            Self::Unsafe => "danger-full-access",
+        }
+    }
+}
+
+fn sandbox_policy_for_mode(mode: &str) -> serde_json::Value {
+    match mode {
+        "danger-full-access" => serde_json::json!({ "type": "dangerFullAccess" }),
+        "workspace-write" => serde_json::json!({ "type": "workspaceWrite" }),
+        "read-only" => serde_json::json!({ "type": "readOnly" }),
+        other => serde_json::json!({ "type": other }),
+    }
+}
+
+impl CodexLaunchConfig {
+    fn from_profile(profile: CodexPermissionProfile) -> Self {
+        let thread_sandbox = profile.default_sandbox().to_string();
         Self {
             model: None,
             approval_policy: "never".to_string(),
-            thread_sandbox: "danger-full-access".to_string(),
-            turn_sandbox_policy: serde_json::json!({ "type": "dangerFullAccess" }),
+            turn_sandbox_policy: sandbox_policy_for_mode(&thread_sandbox),
+            thread_sandbox,
             config: serde_json::Map::new(),
         }
+    }
+}
+
+impl Default for CodexLaunchConfig {
+    fn default() -> Self {
+        Self::from_profile(CodexPermissionProfile::Workspace)
     }
 }
 
@@ -187,7 +262,7 @@ impl CodexWsSession {
         let session_id = SessionId::new(uuid::Uuid::new_v4().to_string());
         let created_at = chrono::Utc::now();
         let ws_url = allocate_ws_url()?;
-        let launch_config = extract_codex_launch_config(args);
+        let launch_config = extract_codex_launch_config(args, env);
 
         let mut spawn_args = args.to_vec();
         spawn_args.push("--listen".to_string());
@@ -1199,7 +1274,7 @@ fn build_turn_start_params(
     );
     params.insert(
         "sandboxPolicy".to_string(),
-        launch_config.turn_sandbox_policy.clone(),
+        sandbox_policy_for_worktree(&launch_config.turn_sandbox_policy, worktree_path),
     );
     if let Some(model) = launch_config.model.as_ref() {
         params.insert(
@@ -1219,8 +1294,28 @@ fn build_turn_start_params(
     serde_json::Value::Object(params)
 }
 
-fn extract_codex_launch_config(args: &[String]) -> CodexLaunchConfig {
-    let mut config = CodexLaunchConfig::default();
+fn sandbox_policy_for_worktree(
+    policy: &serde_json::Value,
+    worktree_path: &str,
+) -> serde_json::Value {
+    let mut policy = policy.clone();
+    if policy.get("type").and_then(serde_json::Value::as_str) == Some("workspaceWrite") {
+        if let serde_json::Value::Object(map) = &mut policy {
+            map.insert(
+                "writableRoots".to_string(),
+                serde_json::Value::Array(vec![serde_json::Value::String(
+                    worktree_path.to_string(),
+                )]),
+            );
+            map.entry("networkAccess".to_string())
+                .or_insert(serde_json::Value::Bool(false));
+        }
+    }
+    policy
+}
+
+fn extract_codex_launch_config(args: &[String], env: &[(String, String)]) -> CodexLaunchConfig {
+    let mut config = CodexLaunchConfig::from_profile(CodexPermissionProfile::from_env_or_role(env));
     let mut idx = 0;
 
     while idx < args.len() {
@@ -1272,12 +1367,7 @@ fn extract_codex_launch_config(args: &[String]) -> CodexLaunchConfig {
 
 fn apply_sandbox_mode(config: &mut CodexLaunchConfig, mode: &str) {
     config.thread_sandbox = mode.to_string();
-    config.turn_sandbox_policy = match mode {
-        "danger-full-access" => serde_json::json!({ "type": "dangerFullAccess" }),
-        "workspace-write" => serde_json::json!({ "type": "workspaceWrite" }),
-        "read-only" => serde_json::json!({ "type": "readOnly" }),
-        other => serde_json::json!({ "type": other }),
-    };
+    config.turn_sandbox_policy = sandbox_policy_for_mode(mode);
 }
 
 fn apply_config_override(config: &mut CodexLaunchConfig, override_arg: &str) {
@@ -2071,25 +2161,36 @@ mod tests {
     }
 
     #[test]
-    fn test_build_thread_start_params_requests_danger_full_access() {
+    fn test_build_thread_start_params_defaults_to_workspace_write() {
         let launch = CodexLaunchConfig::default();
         let params = build_thread_start_params("/tmp/worktree", &launch);
         assert_eq!(params["cwd"], "/tmp/worktree");
         assert_eq!(params["approvalPolicy"], "never");
         assert_eq!(params["personality"], "none");
-        assert_eq!(params["sandbox"], "danger-full-access");
+        assert_eq!(params["sandbox"], "workspace-write");
     }
 
     #[test]
-    fn test_build_turn_start_params_requests_danger_full_access() {
+    fn test_build_turn_start_params_defaults_to_workspace_write() {
         let launch = CodexLaunchConfig::default();
         let params = build_turn_start_params("thread-1", "/tmp/worktree", "hello", &launch);
         assert_eq!(params["threadId"], "thread-1");
         assert_eq!(params["cwd"], "/tmp/worktree");
         assert_eq!(params["approvalPolicy"], "never");
-        assert_eq!(params["sandboxPolicy"]["type"], "dangerFullAccess");
+        assert_eq!(params["sandboxPolicy"]["type"], "workspaceWrite");
+        assert_eq!(params["sandboxPolicy"]["writableRoots"][0], "/tmp/worktree");
+        assert_eq!(params["sandboxPolicy"]["networkAccess"], false);
         assert_eq!(params["input"][0]["type"], "text");
         assert_eq!(params["input"][0]["text"], "hello");
+    }
+
+    #[test]
+    fn test_build_turn_start_params_does_not_add_writable_roots_to_read_only() {
+        let launch = CodexLaunchConfig::from_profile(CodexPermissionProfile::Observe);
+        let params = build_turn_start_params("thread-1", "/tmp/worktree", "hello", &launch);
+
+        assert_eq!(params["sandboxPolicy"]["type"], "readOnly");
+        assert!(params["sandboxPolicy"].get("writableRoots").is_none());
     }
 
     #[test]
@@ -2106,7 +2207,7 @@ mod tests {
             "shell_environment_policy.inherit=all".to_string(),
         ];
 
-        let config = extract_codex_launch_config(&args);
+        let config = extract_codex_launch_config(&args, &[]);
 
         assert_eq!(config.model.as_deref(), Some("gpt-5.4"));
         assert_eq!(config.approval_policy, "never");
@@ -2125,13 +2226,16 @@ mod tests {
 
     #[test]
     fn test_build_thread_start_params_carries_model_and_config() {
-        let launch = extract_codex_launch_config(&[
-            "--dangerously-bypass-approvals-and-sandbox".to_string(),
-            "-c".to_string(),
-            "model=\"gpt-5.4\"".to_string(),
-            "-c".to_string(),
-            "shell_environment_policy.inherit=all".to_string(),
-        ]);
+        let launch = extract_codex_launch_config(
+            &[
+                "--dangerously-bypass-approvals-and-sandbox".to_string(),
+                "-c".to_string(),
+                "model=\"gpt-5.4\"".to_string(),
+                "-c".to_string(),
+                "shell_environment_policy.inherit=all".to_string(),
+            ],
+            &[],
+        );
 
         let params = build_thread_start_params("/tmp/worktree", &launch);
 
@@ -2140,6 +2244,34 @@ mod tests {
             params["config"]["shell_environment_policy"]["inherit"],
             "all"
         );
+    }
+
+    #[test]
+    fn test_extract_codex_launch_config_uses_observe_profile_defaults() {
+        let env = vec![
+            (
+                CODEX_PERMISSION_PROFILE_ENV.to_string(),
+                "observe".to_string(),
+            ),
+            ("BREHON_AGENT_ROLE".to_string(), "research".to_string()),
+        ];
+
+        let config = extract_codex_launch_config(&[], &env);
+
+        assert_eq!(config.approval_policy, "never");
+        assert_eq!(config.thread_sandbox, "read-only");
+        assert_eq!(config.turn_sandbox_policy["type"], "readOnly");
+    }
+
+    #[test]
+    fn test_extract_codex_launch_config_falls_back_to_role_defaults() {
+        let env = vec![("BREHON_AGENT_ROLE".to_string(), "advisor".to_string())];
+
+        let config = extract_codex_launch_config(&[], &env);
+
+        assert_eq!(config.approval_policy, "never");
+        assert_eq!(config.thread_sandbox, "read-only");
+        assert_eq!(config.turn_sandbox_policy["type"], "readOnly");
     }
 
     #[test]

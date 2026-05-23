@@ -2457,6 +2457,16 @@ pub(super) fn run(ctx: &mut EventLoopCtx) -> io::Result<()> {
                             snapshot,
                         );
                         ctx.needs_redraw = true;
+                        if let Some(issue) = &ctx.last_shared_root_issue {
+                            push_dashboard_event(
+                                &ctx.dashboard_data,
+                                format!(
+                                    "Stopping Brehon immediately after shared-root mutation detection: {issue}"
+                                ),
+                            );
+                            ctx.shutdown.store(true, Ordering::SeqCst);
+                            break;
+                        }
                     }
                     Err(err) => {
                         tracing::warn!(error = %err, "Dashboard refresh task failed");
@@ -3586,6 +3596,7 @@ mod tests {
             80,
             None,
             None,
+            None,
         )
         .expect("worker pane")
     }
@@ -3606,6 +3617,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .expect("reviewer pane")
     }
@@ -3626,6 +3638,7 @@ mod tests {
             None,
             None,
             &std::collections::HashMap::new(),
+            None,
         )
         .expect("supervisor pane")
     }

@@ -4,7 +4,9 @@ use crate::error::{Error, Result};
 use crate::harness::AgentAdapter;
 use crate::pane::{DeathReason, Generation, Pane, PaneId, PaneKind, PaneState};
 use crate::pty::TeamsSpawnConfig;
+use brehon_types::config::SandboxProfile;
 use brehon_types::{RuntimeCommandKind, RuntimePolicyContext, RuntimePolicyDecision};
+use std::env;
 use std::path::PathBuf;
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -17,6 +19,14 @@ use super::types::{
 use super::{AgentPaneMaterialization, Mux, MuxConfig};
 
 impl Mux {
+    const ALLOW_LEGACY_PTY_FALLBACK_ENV: &'static str = "BREHON_ALLOW_LEGACY_PTY_FALLBACK";
+
+    fn legacy_pty_fallback_allowed() -> bool {
+        env::var(Self::ALLOW_LEGACY_PTY_FALLBACK_ENV)
+            .ok()
+            .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+    }
+
     fn panesmith_materialization_for_factory(
         materialization: AgentPaneMaterialization,
     ) -> AgentPaneMaterialization {
@@ -37,15 +47,23 @@ impl Mux {
 
         match self.spawn_panesmith_for_pane(pane) {
             Ok(()) => Ok(()),
-            Err(err) => {
+            Err(err) if Self::legacy_pty_fallback_allowed() => {
                 tracing::warn!(
                     pane = %pane.id(),
                     error = %err,
+                    env_var = Self::ALLOW_LEGACY_PTY_FALLBACK_ENV,
                     "Panesmith pane spawn failed; falling back to ghostty_vt PTY path"
                 );
                 pane.set_panesmith_managed(false);
                 pane.start_pty_from_spawn_config()
             }
+            Err(err) => Err(Error::pty(format!(
+                "Panesmith pane spawn failed for '{}' and legacy PTY fallback is disabled; \
+                 refusing to run on the ghostty_vt PTY path. Set {}=1 only for emergency debugging. \
+                 error: {err}",
+                pane.id(),
+                Self::ALLOW_LEGACY_PTY_FALLBACK_ENV
+            ))),
         }
     }
 
@@ -156,6 +174,11 @@ impl Mux {
         let pane_cols = left_cols;
         let pane_materialization =
             Self::panesmith_materialization_for_factory(config.pane_materialization);
+        let sandbox_profile = config
+            .launch_policy
+            .as_ref()
+            .map(|policy| policy.sandbox_profile)
+            .or(config.sandbox_profile);
 
         // Create worker panes
         let worker_names: Vec<String> = if config.worker_names.is_empty() {
@@ -223,6 +246,7 @@ impl Mux {
                     .map(Vec::as_slice)
                     .unwrap_or(&[]),
                 pane_materialization,
+                sandbox_profile,
             )?;
             if pane_materialization == AgentPaneMaterialization::Panesmith {
                 mux.start_panesmith_or_legacy_pty(&mut pane)?;
@@ -272,6 +296,7 @@ impl Mux {
             config.supervisor_reasoning_effort.as_deref(),
             &config.supervisor_env,
             pane_materialization,
+            sandbox_profile,
         )?;
         if pane_materialization == AgentPaneMaterialization::Panesmith {
             mux.start_panesmith_or_legacy_pty(&mut supervisor)?;
@@ -341,6 +366,7 @@ impl Mux {
                     .map(Vec::as_slice)
                     .unwrap_or(&[]),
                 pane_materialization,
+                sandbox_profile,
             )?;
             if pane_materialization == AgentPaneMaterialization::Panesmith {
                 mux.start_panesmith_or_legacy_pty(&mut reviewer)?;
@@ -410,6 +436,7 @@ impl Mux {
                     .map(Vec::as_slice)
                     .unwrap_or(&[]),
                 pane_materialization,
+                sandbox_profile,
             )?;
             if pane_materialization == AgentPaneMaterialization::Panesmith {
                 mux.start_panesmith_or_legacy_pty(&mut advisor)?;
@@ -474,6 +501,7 @@ impl Mux {
                     .map(Vec::as_slice)
                     .unwrap_or(&[]),
                 pane_materialization,
+                sandbox_profile,
             )?;
             if pane_materialization == AgentPaneMaterialization::Panesmith {
                 mux.start_panesmith_or_legacy_pty(&mut research)?;
@@ -823,6 +851,7 @@ impl Mux {
         model: Option<&str>,
         server_url: Option<&str>,
         reasoning_effort: Option<&str>,
+        sandbox_profile: Option<SandboxProfile>,
     ) -> Result<PaneId> {
         // Check if pane with this name already exists
         if self.panes.contains_key(name) {
@@ -859,6 +888,7 @@ impl Mux {
             self.cols,
             teams,
             reasoning_effort,
+            sandbox_profile,
         )?;
         let id = pane.id().to_string();
         self.add_pane(pane);

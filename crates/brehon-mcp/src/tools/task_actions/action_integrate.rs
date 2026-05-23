@@ -30,8 +30,8 @@ use super::epic::{
 use super::followups::resolve_promoted_followups_for_terminal_task;
 use super::git_ops::{
     cherry_pick_in_progress_in, cherry_pick_sha_in, detect_default_branch,
-    git_commit_is_ancestor_in, git_run_ok_in, is_patch_equivalent_in_window_in, tree_matches_after,
-    unmerged_files,
+    dirty_primary_checkout_terminal_blocker, git_commit_is_ancestor_in, git_run_ok_in,
+    is_patch_equivalent_in_window_in, tree_matches_after, unmerged_files,
 };
 use super::integration_state::{
     next_state, read_integration_state, validate_raw_integration_phase, write_integration_state,
@@ -117,6 +117,10 @@ pub(super) async fn execute(
                 "description": "Wait for a supervisor to perform the integration step."
             }),
         );
+    }
+
+    if let Some(err) = dirty_primary_checkout_terminal_blocker(&format!("integrate task {id}")) {
+        return Ok(error_result(err));
     }
 
     let current_status = task_data

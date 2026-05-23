@@ -11,3 +11,21 @@ pub(crate) fn project_policy_for_role(brehon_root: Option<&PathBuf>, role: &str)
     let config = brehon_config::load_config(Some(project_root)).ok()?;
     config.project_prompt_for_role_name(role)
 }
+
+pub(crate) fn sandbox_profile_allows_privileged_mode(brehon_root: Option<&PathBuf>) -> bool {
+    let Some(project_root) = brehon_root.and_then(|root| root.parent()) else {
+        return false;
+    };
+    let Ok(config) = brehon_config::load_config(Some(project_root)) else {
+        return false;
+    };
+
+    matches!(
+        config.security.sandbox_profile,
+        brehon_types::SandboxProfile::None
+    )
+}
+
+pub(crate) fn provider_cli_allows_privileged_mode(brehon_root: Option<&PathBuf>) -> bool {
+    sandbox_profile_allows_privileged_mode(brehon_root)
+}

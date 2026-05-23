@@ -1257,7 +1257,15 @@ impl VerificationTool {
                 enqueue_reviewer_reset_with_logging(&task_id, &review_id, &reviewer);
         }
 
-        if !all_submitted {
+        let submissions = read_round_submissions(&task_id, state.current_round);
+        let mut report = self.evaluate_round(&task_id, &review_id, &state, &submissions);
+        let completed_early = !all_submitted
+            && matches!(
+                report.outcome.as_str(),
+                "changes_requested" | "rejected" | "escalated"
+            );
+
+        if !all_submitted && !completed_early {
             let progress = format!("{}/{}", state.submissions_received.len(), state.panel.len());
             let result = serde_json::json!({
                 "status": "ok",
@@ -1278,10 +1286,8 @@ impl VerificationTool {
             ));
         }
 
-        // -- Panel complete -- run evaluation pipeline ---------------------
+        // -- Panel complete, or an irreversible negative verdict arrived ----
 
-        let submissions = read_round_submissions(&task_id, state.current_round);
-        let mut report = self.evaluate_round(&task_id, &review_id, &state, &submissions);
         if report.outcome == "collecting" {
             report.outcome = "escalated".to_string();
             report.threshold_reason = format!(
@@ -1334,6 +1340,16 @@ impl VerificationTool {
                 )));
             }
         }
+
+        let pending_reviewers_notified = if completed_early {
+            let cancellation_message = format!(
+                "Review {review_id} for task {task_id} closed early as {} after reviewer {reviewer} submitted. Stop reviewing this round; late submissions will be ignored. The task will return to the worker/supervisor flow.",
+                report.outcome
+            );
+            self.notify_pending_panel_reviewers(&state, "review-coordinator", &cancellation_message)
+        } else {
+            Vec::new()
+        };
 
         // Update review state
         state.status = report.outcome.clone();
@@ -1427,7 +1443,9 @@ impl VerificationTool {
             "status": "ok",
             "review_id": review_id,
             "task_id": task_id,
-            "panel_progress": format!("{}/{}", state.panel.len(), state.panel.len()),
+            "panel_progress": format!("{}/{}", state.submissions_received.len(), state.panel.len()),
+            "completed_early": completed_early,
+            "pending_reviewers_notified": pending_reviewers_notified,
             "outcome": &report.outcome,
             "average_score": report.average_score,
             "min_score": report.min_score,
@@ -1436,7 +1454,11 @@ impl VerificationTool {
             "notified_worker": worker_notified,
             "reviewer_reset_queued": reviewer_reset_queued,
             "next_action": next_action_after_review_outcome(&task_id, &report.outcome),
-            "message": "Panel complete. Consolidated report delivered to supervisor."
+            "message": if completed_early {
+                "Review round closed early after an irreversible negative verdict. Consolidated report delivered to supervisor."
+            } else {
+                "Panel complete. Consolidated report delivered to supervisor."
+            }
         });
         proof_outcome.attach_to_result(&mut result);
         Ok(text_result(

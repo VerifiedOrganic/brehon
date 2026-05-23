@@ -9,10 +9,11 @@
 
 mod runtime_policy;
 
-use std::collections::HashSet;
+use std::{collections::HashSet, sync::LazyLock};
 
 use brehon_types::{
-    BrehonConfig, ResearchPermissions, RuntimeTerminalHostKind, RuntimeTerminalHostPaneOwnership,
+    BrehonConfig, PermissionProfile, ResearchPermissions, RoleKind, RuntimeTerminalHostKind,
+    RuntimeTerminalHostPaneOwnership,
 };
 
 use runtime_policy::validate_runtime_policy;
@@ -33,6 +34,10 @@ const SUPPORTED_HARNESS_CONTROL_PLANES: &[&str] = &[
     "pty_injection",
     "one_shot",
 ];
+static VALID_PERMISSION_PROFILES: LazyLock<HashSet<&'static str>> =
+    LazyLock::new(|| PermissionProfile::names().collect());
+static VALID_ROLE_KINDS: LazyLock<HashSet<&'static str>> =
+    LazyLock::new(|| RoleKind::profile_defaults_keys().collect());
 
 /// A warning produced during config validation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,6 +88,7 @@ pub enum ValidationWarningKind {
     RoutingPolicyConflict,
     AdvisorPolicyConflict,
     ResearchPolicyConflict,
+    ProfilePolicyConflict,
 }
 
 impl ValidationWarningKind {
@@ -98,6 +104,7 @@ impl ValidationWarningKind {
                 | ValidationWarningKind::LauncherCapabilityConflict
                 | ValidationWarningKind::InvalidContextConfig
                 | ValidationWarningKind::ResearchPolicyConflict
+                | ValidationWarningKind::ProfilePolicyConflict
         )
     }
 }
@@ -154,6 +161,7 @@ impl std::fmt::Display for ValidationWarningKind {
             ValidationWarningKind::RoutingPolicyConflict => write!(f, "Routing policy conflict"),
             ValidationWarningKind::AdvisorPolicyConflict => write!(f, "Advisor policy conflict"),
             ValidationWarningKind::ResearchPolicyConflict => write!(f, "Research policy conflict"),
+            ValidationWarningKind::ProfilePolicyConflict => write!(f, "Profile policy conflict"),
         }
     }
 }
@@ -180,6 +188,7 @@ pub fn validate(config: &BrehonConfig) -> Vec<ValidationWarning> {
     warnings.extend(validate_terminal_mode(config));
     warnings.extend(validate_retention(config));
     warnings.extend(validate_context(config));
+    warnings.extend(validate_profiles(config));
 
     warnings
 }
@@ -715,6 +724,87 @@ fn validate_context(config: &BrehonConfig) -> Vec<ValidationWarning> {
             ValidationWarningKind::InvalidContextConfig,
             "context.compression.enabled=true has no effect because all compact_* toggles are false",
         ));
+    }
+
+    warnings
+}
+
+fn validate_profiles(config: &BrehonConfig) -> Vec<ValidationWarning> {
+    let mut warnings = Vec::new();
+
+    for (role_kind, _profile) in &config.profiles.defaults {
+        if !VALID_ROLE_KINDS.contains(role_kind.as_str()) {
+            warnings.push(ValidationWarning::new(
+                ValidationWarningKind::ProfilePolicyConflict,
+                format!("profiles.defaults contains unknown role kind '{role_kind}'"),
+            ));
+        }
+    }
+
+    for (profile_name, spec) in &config.profiles.specs {
+        if !VALID_PERMISSION_PROFILES.contains(profile_name.as_str()) {
+            warnings.push(ValidationWarning::new(
+                ValidationWarningKind::ProfilePolicyConflict,
+                format!("profiles.specs contains unknown profile name '{profile_name}'"),
+            ));
+        }
+        if spec.unsafe_marker && profile_name != "unsafe" {
+            warnings.push(ValidationWarning::non_fatal(
+                ValidationWarningKind::ProfilePolicyConflict,
+                format!(
+                    "profiles.specs['{profile_name}'] has unsafe_marker=true but profile name is not 'unsafe'"
+                ),
+            ));
+        }
+        if !spec.unsafe_marker && profile_name == "unsafe" {
+            warnings.push(ValidationWarning::non_fatal(
+                ValidationWarningKind::ProfilePolicyConflict,
+                "profiles.specs['unsafe'] should have unsafe_marker=true",
+            ));
+        }
+    }
+
+    // Cross-validate: every profile referenced in defaults must have a spec entry.
+    for (role_kind, profile) in &config.profiles.defaults {
+        let profile_name = profile.as_str();
+        if !config.profiles.specs.contains_key(profile_name) {
+            warnings.push(ValidationWarning::non_fatal(
+                ValidationWarningKind::ProfilePolicyConflict,
+                format!(
+                    "profiles.defaults['{role_kind}'] references profile '{profile_name}', but no profiles.specs entry exists for it"
+                ),
+            ));
+        }
+    }
+
+    // Cross-validate: launcher profile overrides must have a spec entry.
+    for (launcher_name, launcher) in &config.launchers {
+        if let Some(profile) = launcher.profile {
+            let profile_name = profile.as_str();
+            if !config.profiles.specs.contains_key(profile_name) {
+                warnings.push(ValidationWarning::non_fatal(
+                    ValidationWarningKind::ProfilePolicyConflict,
+                    format!(
+                        "launcher '{launcher_name}' references profile '{profile_name}', but no profiles.specs entry exists for it"
+                    ),
+                ));
+            }
+        }
+    }
+
+    // Cross-validate: lane profile overrides must have a spec entry.
+    for (lane_name, lane) in &config.lanes {
+        if let Some(profile) = lane.profile {
+            let profile_name = profile.as_str();
+            if !config.profiles.specs.contains_key(profile_name) {
+                warnings.push(ValidationWarning::non_fatal(
+                    ValidationWarningKind::ProfilePolicyConflict,
+                    format!(
+                        "lane '{lane_name}' references profile '{profile_name}', but no profiles.specs entry exists for it"
+                    ),
+                ));
+            }
+        }
     }
 
     warnings
@@ -1463,12 +1553,13 @@ mod tests {
     use super::*;
     use brehon_types::{
         AdapterKind, AgentConnectionConfig, AgentsMdMode, AutonomyLevel, BudgetConfig,
-        BudgetEnforcement, ChunkStrategy, ContextConfig, EscalationConfig, LaneConfig,
-        LayoutPreset, ModelConfig, NotificationConfig, NotifyMethod, NudgeConfig,
-        OrchestrationConfig, PermissionsConfig, ResearchConfig, ResearchJobTemplateConfig,
-        ResearchPoolConfig, ResearchRouteConfig, ResearchRouteMatchConfig, RetentionConfig,
-        ReviewConfig, ReviewerPoolConfig, RoleDefinition, RoleKind, RolesConfig, RoutingConfig,
-        RuntimeConfig, RuntimeTerminalHostKind, SandboxProfile, SecurityConfig,
+        BudgetEnforcement, ChunkStrategy, ContextConfig, CredentialClass, EnvPolicy,
+        EscalationConfig, LaneConfig, LayoutPreset, ModelConfig, NetworkClass, NotificationConfig,
+        NotifyMethod, NudgeConfig, OrchestrationConfig, PermissionProfile, PermissionsConfig,
+        ProfilesConfig, ResearchConfig, ResearchJobTemplateConfig, ResearchPoolConfig,
+        ResearchRouteConfig, ResearchRouteMatchConfig, RetentionConfig, ReviewConfig,
+        ReviewerPoolConfig, RoleDefinition, RoleKind, RolesConfig, RoutingConfig, RuntimeConfig,
+        RuntimeTerminalHostKind, SandboxBackend, SandboxProfile, SandboxSpec, SecurityConfig,
         StaleDetectionConfig, StaleStrategy, StuckDetectionConfig, SupervisorConfig, TerminalMode,
         TuiConfig, WorkerIdleBehavior, WorkerPoolConfig,
     };
@@ -1488,6 +1579,7 @@ mod tests {
                 base_url: None,
                 api_key_env: None,
                 permission_mode: None,
+                profile: None,
                 max_parallel_tool_calls: None,
                 assistant_message_passthrough_fields: Vec::new(),
                 reasoning_effort_param: None,
@@ -1508,6 +1600,7 @@ mod tests {
                 base_url: None,
                 api_key_env: None,
                 permission_mode: None,
+                profile: None,
                 max_parallel_tool_calls: None,
                 assistant_message_passthrough_fields: Vec::new(),
                 reasoning_effort_param: None,
@@ -1528,6 +1621,7 @@ mod tests {
                         model: None,
                         reasoning_effort: None,
                         system_prompt: None,
+                        profile: None,
                     },
                 ),
                 (
@@ -1537,6 +1631,7 @@ mod tests {
                         model: None,
                         reasoning_effort: None,
                         system_prompt: None,
+                        profile: None,
                     },
                 ),
             ]),
@@ -1657,6 +1752,7 @@ mod tests {
             permissions: PermissionsConfig {
                 categories: HashMap::new(),
             },
+            profiles: ProfilesConfig::default(),
             retention: RetentionConfig::default(),
             security: SecurityConfig {
                 sandbox_profile: SandboxProfile::OsDefault,
@@ -1956,6 +2052,7 @@ rooms:
                 base_url: None,
                 api_key_env: None,
                 permission_mode: None,
+                profile: None,
                 max_parallel_tool_calls: None,
                 assistant_message_passthrough_fields: Vec::new(),
                 reasoning_effort_param: None,
@@ -1971,6 +2068,7 @@ rooms:
                 model: None,
                 reasoning_effort: None,
                 system_prompt: None,
+                profile: None,
             },
         );
         config.roles.supervisor.name = "goose-supervisor".into();
@@ -1999,6 +2097,7 @@ rooms:
                 base_url: Some("https://api.openai.example/v1".into()),
                 api_key_env: Some("OPENAI_API_KEY".into()),
                 permission_mode: None,
+                profile: None,
                 max_parallel_tool_calls: None,
                 assistant_message_passthrough_fields: Vec::new(),
                 reasoning_effort_param: None,
@@ -2014,6 +2113,7 @@ rooms:
                 model: None,
                 reasoning_effort: None,
                 system_prompt: None,
+                profile: None,
             },
         );
         config.roles.supervisor.name = "api-supervisor".into();
@@ -2042,6 +2142,7 @@ rooms:
                 base_url: None,
                 api_key_env: None,
                 permission_mode: None,
+                profile: None,
                 max_parallel_tool_calls: None,
                 assistant_message_passthrough_fields: Vec::new(),
                 reasoning_effort_param: None,
@@ -2057,6 +2158,7 @@ rooms:
                 model: None,
                 reasoning_effort: None,
                 system_prompt: None,
+                profile: None,
             },
         );
         config.roles.supervisor.name = "goose-supervisor".into();
@@ -2083,6 +2185,7 @@ rooms:
                 base_url: None,
                 api_key_env: None,
                 permission_mode: None,
+                profile: None,
                 max_parallel_tool_calls: None,
                 assistant_message_passthrough_fields: Vec::new(),
                 reasoning_effort_param: None,
@@ -2098,6 +2201,7 @@ rooms:
                 model: None,
                 reasoning_effort: None,
                 system_prompt: None,
+                profile: None,
             },
         );
         config.roles.supervisor.name = "native-supervisor".into();
@@ -2136,6 +2240,7 @@ rooms:
                 base_url: None,
                 api_key_env: None,
                 permission_mode: None,
+                profile: None,
                 max_parallel_tool_calls: None,
                 assistant_message_passthrough_fields: Vec::new(),
                 reasoning_effort_param: None,
@@ -2151,6 +2256,7 @@ rooms:
                 model: None,
                 reasoning_effort: None,
                 system_prompt: None,
+                profile: None,
             },
         );
         config.roles.supervisor.name = "junie-supervisor".into();
@@ -2456,5 +2562,257 @@ rooms:
         assert!(warnings
             .iter()
             .any(|w| w.kind == ValidationWarningKind::MissingAgentRef));
+    }
+
+    #[test]
+    fn profile_policy_rejects_unknown_spec_key() {
+        let mut config = minimal_valid_config();
+        config.profiles.specs.insert(
+            "unknown_profile".into(),
+            SandboxSpec {
+                backend: SandboxBackend::None,
+                read_roots: Vec::new(),
+                write_roots: Vec::new(),
+                denied_roots: Vec::new(),
+                network_class: NetworkClass::Denied,
+                credential_class: CredentialClass::None,
+                env_policy: EnvPolicy::Inherit,
+                unsafe_marker: false,
+            },
+        );
+
+        let warnings = validate(&config);
+        assert!(warnings.iter().any(|w| {
+            w.kind == ValidationWarningKind::ProfilePolicyConflict
+                && w.is_fatal
+                && w.message.contains("unknown profile name 'unknown_profile'")
+        }));
+    }
+
+    #[test]
+    fn profile_policy_warns_when_unsafe_marker_on_non_unsafe_profile() {
+        let mut config = minimal_valid_config();
+        config.profiles.specs.insert(
+            "operator".into(),
+            SandboxSpec {
+                backend: SandboxBackend::OsDefault,
+                read_roots: Vec::new(),
+                write_roots: Vec::new(),
+                denied_roots: Vec::new(),
+                network_class: NetworkClass::ModelOnly,
+                credential_class: CredentialClass::EnvAllowlist,
+                env_policy: EnvPolicy::Minimal,
+                unsafe_marker: true,
+            },
+        );
+
+        let warnings = validate(&config);
+        assert!(warnings.iter().any(|w| {
+            w.kind == ValidationWarningKind::ProfilePolicyConflict
+                && !w.is_fatal
+                && w.message
+                    .contains("unsafe_marker=true but profile name is not 'unsafe'")
+        }));
+    }
+
+    #[test]
+    fn profile_policy_warns_when_unsafe_profile_lacks_unsafe_marker() {
+        let mut config = minimal_valid_config();
+        config.profiles.specs.insert(
+            "unsafe".into(),
+            SandboxSpec {
+                backend: SandboxBackend::None,
+                read_roots: Vec::new(),
+                write_roots: Vec::new(),
+                denied_roots: Vec::new(),
+                network_class: NetworkClass::Unrestricted,
+                credential_class: CredentialClass::Unrestricted,
+                env_policy: EnvPolicy::Inherit,
+                unsafe_marker: false,
+            },
+        );
+
+        let warnings = validate(&config);
+        assert!(warnings.iter().any(|w| {
+            w.kind == ValidationWarningKind::ProfilePolicyConflict
+                && !w.is_fatal
+                && w.message
+                    .contains("profiles.specs['unsafe'] should have unsafe_marker=true")
+        }));
+    }
+
+    #[test]
+    fn profile_policy_accepts_unsafe_profile_with_unsafe_marker() {
+        let mut config = minimal_valid_config();
+        config.profiles.specs.insert(
+            "unsafe".into(),
+            SandboxSpec {
+                backend: SandboxBackend::None,
+                read_roots: Vec::new(),
+                write_roots: Vec::new(),
+                denied_roots: Vec::new(),
+                network_class: NetworkClass::Unrestricted,
+                credential_class: CredentialClass::Unrestricted,
+                env_policy: EnvPolicy::Inherit,
+                unsafe_marker: true,
+            },
+        );
+
+        let warnings = validate(&config);
+        assert!(!warnings
+            .iter()
+            .any(|w| w.kind == ValidationWarningKind::ProfilePolicyConflict));
+    }
+
+    #[test]
+    fn profile_policy_rejects_unknown_defaults_key() {
+        let mut config = minimal_valid_config();
+        config
+            .profiles
+            .defaults
+            .insert("reviewre".into(), PermissionProfile::Reviewer);
+
+        let warnings = validate(&config);
+        assert!(warnings.iter().any(|w| {
+            w.kind == ValidationWarningKind::ProfilePolicyConflict
+                && w.is_fatal
+                && w.message.contains("unknown role kind 'reviewre'")
+        }));
+    }
+
+    #[test]
+    fn profile_policy_rejects_non_role_kind_defaults_key() {
+        let mut config = minimal_valid_config();
+        config
+            .profiles
+            .defaults
+            .insert("advisor".into(), PermissionProfile::Reviewer);
+
+        let warnings = validate(&config);
+        assert!(warnings.iter().any(|w| {
+            w.kind == ValidationWarningKind::ProfilePolicyConflict
+                && w.is_fatal
+                && w.message.contains("unknown role kind 'advisor'")
+        }));
+    }
+
+    #[test]
+    fn profile_policy_accepts_custom_defaults_key() {
+        let mut config = minimal_valid_config();
+        config
+            .profiles
+            .defaults
+            .insert("custom".into(), PermissionProfile::Reviewer);
+        config.profiles.specs.insert(
+            "reviewer".into(),
+            SandboxSpec {
+                backend: SandboxBackend::OsDefault,
+                read_roots: Vec::new(),
+                write_roots: Vec::new(),
+                denied_roots: Vec::new(),
+                network_class: NetworkClass::ModelOnly,
+                credential_class: CredentialClass::EnvAllowlist,
+                env_policy: EnvPolicy::Minimal,
+                unsafe_marker: false,
+            },
+        );
+
+        let warnings = validate(&config);
+        assert!(!warnings
+            .iter()
+            .any(|w| w.kind == ValidationWarningKind::ProfilePolicyConflict));
+    }
+
+    #[test]
+    fn profile_policy_accepts_valid_profiles_in_launchers_and_lanes() {
+        let mut config = minimal_valid_config();
+        config.launchers.get_mut("codex").unwrap().profile = Some(PermissionProfile::Workspace);
+        config.lanes.get_mut("codex").unwrap().profile = Some(PermissionProfile::Dependency);
+        config.profiles.specs.insert(
+            "workspace".into(),
+            SandboxSpec {
+                backend: SandboxBackend::OsDefault,
+                read_roots: Vec::new(),
+                write_roots: Vec::new(),
+                denied_roots: Vec::new(),
+                network_class: NetworkClass::ModelOnly,
+                credential_class: CredentialClass::EnvAllowlist,
+                env_policy: EnvPolicy::Minimal,
+                unsafe_marker: false,
+            },
+        );
+        config.profiles.specs.insert(
+            "dependency".into(),
+            SandboxSpec {
+                backend: SandboxBackend::OsDefault,
+                read_roots: Vec::new(),
+                write_roots: Vec::new(),
+                denied_roots: Vec::new(),
+                network_class: NetworkClass::Allowlisted,
+                credential_class: CredentialClass::EnvAllowlist,
+                env_policy: EnvPolicy::Minimal,
+                unsafe_marker: false,
+            },
+        );
+
+        let warnings = validate(&config);
+        assert!(!warnings
+            .iter()
+            .any(|w| w.kind == ValidationWarningKind::ProfilePolicyConflict));
+    }
+
+    #[test]
+    fn profile_policy_no_warnings_for_empty_profiles() {
+        let config = minimal_valid_config();
+
+        let warnings = validate(&config);
+        assert!(!warnings
+            .iter()
+            .any(|w| w.kind == ValidationWarningKind::ProfilePolicyConflict));
+    }
+
+    #[test]
+    fn profile_policy_warns_when_default_references_missing_spec() {
+        let mut config = minimal_valid_config();
+        config
+            .profiles
+            .defaults
+            .insert("worker".into(), PermissionProfile::Workspace);
+
+        let warnings = validate(&config);
+        assert!(warnings.iter().any(|w| {
+            w.kind == ValidationWarningKind::ProfilePolicyConflict
+                && !w.is_fatal
+                && w.message
+                    .contains("profiles.defaults['worker'] references profile 'workspace'")
+        }));
+    }
+
+    #[test]
+    fn profile_policy_warns_when_launcher_references_missing_spec() {
+        let mut config = minimal_valid_config();
+        config.launchers.get_mut("codex").unwrap().profile = Some(PermissionProfile::Workspace);
+
+        let warnings = validate(&config);
+        assert!(warnings.iter().any(|w| {
+            w.kind == ValidationWarningKind::ProfilePolicyConflict
+                && !w.is_fatal
+                && w.message
+                    .contains("launcher 'codex' references profile 'workspace'")
+        }));
+    }
+
+    #[test]
+    fn profile_policy_warns_when_lane_references_missing_spec() {
+        let mut config = minimal_valid_config();
+        config.lanes.get_mut("codex").unwrap().profile = Some(PermissionProfile::Dependency);
+
+        let warnings = validate(&config);
+        assert!(warnings.iter().any(|w| {
+            w.kind == ValidationWarningKind::ProfilePolicyConflict
+                && !w.is_fatal
+                && w.message
+                    .contains("lane 'codex' references profile 'dependency'")
+        }));
     }
 }

@@ -1,0 +1,13 @@
+[package]
+name = "panesmith"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Local compatibility shim for Panesmith APIs used by Brehon builds"
+
+[features]
+default = []
+crossterm = []
+
+[dependencies]
+ratatui = "0.30"

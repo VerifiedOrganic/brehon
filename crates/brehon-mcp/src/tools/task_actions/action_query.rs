@@ -89,6 +89,11 @@ pub(super) fn read_active_review_obligations(reviewer: &str) -> Vec<Value> {
             .unwrap_or_else(|| "(untitled)".to_string());
 
         let mut obligation = serde_json::Map::new();
+        obligation.insert(
+            "assignment_kind".into(),
+            Value::String("review".to_string()),
+        );
+        obligation.insert("reviewer".into(), Value::String(reviewer.to_string()));
         obligation.insert("task_id".into(), Value::String(task_id.clone()));
         obligation.insert(
             "review_id".into(),
@@ -99,6 +104,11 @@ pub(super) fn read_active_review_obligations(reviewer: &str) -> Vec<Value> {
             Value::Number(serde_json::Number::from(state.current_round)),
         );
         obligation.insert("status".into(), Value::String(state.status.clone()));
+        obligation.insert("task_status".into(), Value::String("in_review".to_string()));
+        obligation.insert(
+            "action_required".into(),
+            Value::String("submit_review".to_string()),
+        );
         obligation.insert("panel_id".into(), Value::String(state.panel_id.clone()));
         obligation.insert("title".into(), Value::String(title));
         obligation.insert(
@@ -120,6 +130,18 @@ pub(super) fn read_active_review_obligations(reviewer: &str) -> Vec<Value> {
                     .map(|_| "leased".to_string())
                     .unwrap_or_else(|| "missing".to_string()),
             ),
+        );
+        obligation.insert(
+            "next_action".into(),
+            serde_json::json!({
+                "kind": "submit_review",
+                "tool": "verification",
+                "args": {
+                    "action": "submit_review",
+                    "review_id": state.current_review_id.clone(),
+                    "reviewer": reviewer
+                }
+            }),
         );
         if let Some(request) = request {
             obligation.insert(
@@ -571,15 +593,25 @@ pub(super) async fn execute_mine(args: &Value) -> Result<ToolResult, McpError> {
         .map(|task| Value::Object(sanitize_task_for_agent(task, &role)))
         .collect();
 
-    let review_obligations = if role == "reviewer" {
-        read_active_review_obligations(&agent_name)
-    } else {
-        Vec::new()
-    };
+    // Do not gate this on BREHON_AGENT_ROLE. Some launchers expose the lane
+    // name or lose role env propagation across the CLI -> MCP boundary. Panel
+    // membership by agent name is the durable source of truth.
+    let review_obligations = read_active_review_obligations(&agent_name);
 
     let task_count = tasks.len();
     let review_count = review_obligations.len();
     let count = task_count + review_count;
+    let assignments = tasks
+        .iter()
+        .cloned()
+        .map(|mut task| {
+            if let Value::Object(ref mut object) = task {
+                object.insert("assignment_kind".into(), Value::String("task".to_string()));
+            }
+            task
+        })
+        .chain(review_obligations.iter().cloned())
+        .collect::<Vec<_>>();
     let worktree_cleanup = if role == "worker" && task_count > 0 {
         Some(
             super::build_artifact_cleanup::cleanup_current_worker_build_artifacts(
@@ -592,9 +624,11 @@ pub(super) async fn execute_mine(args: &Value) -> Result<ToolResult, McpError> {
     let mut result = serde_json::json!({
         "tasks": tasks,
         "review_obligations": review_obligations,
+        "assignments": assignments,
         "count": count,
         "task_count": task_count,
         "review_count": review_count,
+        "has_assigned_work": count > 0,
         "agent": agent_name,
         "role": role
     });

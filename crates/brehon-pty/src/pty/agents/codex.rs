@@ -35,6 +35,142 @@ pub(crate) fn toml_basic_string(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
+pub(crate) const CODEX_PERMISSION_PROFILE_ENV: &str = "CODEX_PERMISSION_PROFILE";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexPermissionProfile {
+    Observe,
+    Dependency,
+    Workspace,
+    Reviewer,
+    Operator,
+    Unsafe,
+}
+
+impl CodexPermissionProfile {
+    fn from_role(role: &str) -> Self {
+        match role {
+            "supervisor" => Self::Operator,
+            "reviewer" => Self::Reviewer,
+            "advisor" => Self::Observe,
+            "research" => Self::Observe,
+            _ => Self::Workspace,
+        }
+    }
+
+    fn from_env_value(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "observe" => Some(Self::Observe),
+            "dependency" => Some(Self::Dependency),
+            "workspace" => Some(Self::Workspace),
+            "reviewer" => Some(Self::Reviewer),
+            "operator" => Some(Self::Operator),
+            "unsafe" => Some(Self::Unsafe),
+            _ => None,
+        }
+    }
+
+    fn as_env_value(self) -> &'static str {
+        match self {
+            Self::Observe => "observe",
+            Self::Dependency => "dependency",
+            Self::Workspace => "workspace",
+            Self::Reviewer => "reviewer",
+            Self::Operator => "operator",
+            Self::Unsafe => "unsafe",
+        }
+    }
+
+    fn is_unsafe(self) -> bool {
+        matches!(self, Self::Unsafe)
+    }
+
+    fn enables_search(self) -> bool {
+        matches!(self, Self::Dependency)
+    }
+
+    fn default_sandbox(self) -> &'static str {
+        match self {
+            Self::Observe | Self::Dependency => "read-only",
+            Self::Workspace | Self::Reviewer | Self::Operator => "workspace-write",
+            Self::Unsafe => "danger-full-access",
+        }
+    }
+}
+
+fn codex_permission_profile_for_role(
+    role: &str,
+    launcher_env: &[(String, String)],
+) -> CodexPermissionProfile {
+    launcher_env
+        .iter()
+        .rev()
+        .find_map(|(key, value)| {
+            (key == CODEX_PERMISSION_PROFILE_ENV)
+                .then(|| CodexPermissionProfile::from_env_value(value))
+                .flatten()
+        })
+        .or_else(|| {
+            std::env::var(CODEX_PERMISSION_PROFILE_ENV)
+                .ok()
+                .as_deref()
+                .and_then(CodexPermissionProfile::from_env_value)
+        })
+        .unwrap_or_else(|| CodexPermissionProfile::from_role(role))
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct CodexPermissionArgOverrides {
+    has_approval_policy: bool,
+    has_bypass: bool,
+    has_sandbox_mode: bool,
+    has_search: bool,
+    has_disk_full_read_access: bool,
+    inherits_all_shell_env: bool,
+}
+
+fn scan_codex_permission_args(custom_args: &[String]) -> CodexPermissionArgOverrides {
+    let mut overrides = CodexPermissionArgOverrides::default();
+    let mut idx = 0;
+
+    while idx < custom_args.len() {
+        match custom_args[idx].as_str() {
+            "--dangerously-bypass-approvals-and-sandbox" => {
+                overrides.has_bypass = true;
+                idx += 1;
+            }
+            "--ask-for-approval" | "-a" => {
+                overrides.has_approval_policy = true;
+                idx += 2;
+            }
+            "--sandbox" | "-s" => {
+                overrides.has_sandbox_mode = true;
+                idx += 2;
+            }
+            "--search" => {
+                overrides.has_search = true;
+                idx += 1;
+            }
+            "-c" | "--config" => {
+                if let Some(value) = custom_args.get(idx + 1) {
+                    if value == "shell_environment_policy.inherit=all" {
+                        overrides.inherits_all_shell_env = true;
+                    }
+                    if value.contains("disk-full-read-access") {
+                        overrides.has_disk_full_read_access = true;
+                    }
+                    idx += 2;
+                } else {
+                    idx += 1;
+                }
+            }
+            _ => idx += 1,
+        }
+    }
+
+    overrides
+}
+
 pub(crate) fn prepare_local_codex_home(
     cwd: &Path,
     exe: &str,
@@ -93,23 +229,58 @@ pub(crate) fn prepare_local_codex_home(
     Ok(home_root)
 }
 
-pub(crate) fn push_codex_unrestricted_args(args: &mut Vec<String>) {
-    args.push("--dangerously-bypass-approvals-and-sandbox".to_string());
-    args.push("-c".to_string());
-    args.push("shell_environment_policy.inherit=all".to_string());
-    args.push("-c".to_string());
-    args.push("sandbox_permissions=[\"disk-full-read-access\"]".to_string());
+fn push_codex_unsafe_args(args: &mut Vec<String>, overrides: CodexPermissionArgOverrides) {
+    if !overrides.has_bypass {
+        args.push("--dangerously-bypass-approvals-and-sandbox".to_string());
+    }
+    if !overrides.inherits_all_shell_env {
+        args.push("-c".to_string());
+        args.push("shell_environment_policy.inherit=all".to_string());
+    }
+    if !overrides.has_disk_full_read_access {
+        args.push("-c".to_string());
+        args.push("sandbox_permissions=[\"disk-full-read-access\"]".to_string());
+    }
+}
+
+fn push_codex_permission_args(
+    args: &mut Vec<String>,
+    permission_profile: CodexPermissionProfile,
+    overrides: CodexPermissionArgOverrides,
+) {
+    if permission_profile.is_unsafe() || overrides.has_bypass {
+        push_codex_unsafe_args(args, overrides);
+        return;
+    }
+
+    if !overrides.has_approval_policy {
+        args.push("--ask-for-approval".to_string());
+        args.push("never".to_string());
+    }
+    if !overrides.has_sandbox_mode {
+        args.push("--sandbox".to_string());
+        args.push(permission_profile.default_sandbox().to_string());
+    }
+    if permission_profile.enables_search() && !overrides.has_search {
+        args.push("--search".to_string());
+    }
 }
 
 fn push_codex_common_args(
     args: &mut Vec<String>,
     cwd: &Path,
     role: &str,
+    permission_profile: CodexPermissionProfile,
+    custom_args: &[String],
     brehon_root: Option<&PathBuf>,
     model: Option<&str>,
     reasoning_effort: Option<&str>,
 ) {
-    push_codex_unrestricted_args(args);
+    push_codex_permission_args(
+        args,
+        permission_profile,
+        scan_codex_permission_args(custom_args),
+    );
     if role != "supervisor" {
         args.push("--no-alt-screen".to_string());
     }
@@ -194,6 +365,7 @@ impl PtyConfig {
         role: &str,
         cwd: PathBuf,
         brehon_root: Option<&PathBuf>,
+        launcher_env: &[(String, String)],
         supervisor_name: Option<&str>,
         factory_worker_cli: Option<&str>,
         model: Option<&str>,
@@ -203,6 +375,7 @@ impl PtyConfig {
         // Native Agent Teams is Claude Code-only; Codex CLI does not support it.
         let session_id = uuid::Uuid::new_v4().to_string();
         let brehon_exe = current_brehon_exe();
+        let permission_profile = codex_permission_profile_for_role(role, launcher_env);
         let mut env = vec![
             ("BREHON_AGENT_NAME".to_string(), name.to_string()),
             ("BREHON_AGENT_ROLE".to_string(), role.to_string()),
@@ -212,6 +385,10 @@ impl PtyConfig {
             (
                 "BREHON_CLONE_PATH".to_string(),
                 cwd.to_string_lossy().to_string(),
+            ),
+            (
+                CODEX_PERMISSION_PROFILE_ENV.to_string(),
+                permission_profile.as_env_value().to_string(),
             ),
             // Suppress interactive prompts, telemetry, and updates for factory agents
             (
@@ -262,7 +439,16 @@ impl PtyConfig {
         ));
 
         let mut args = Vec::new();
-        push_codex_common_args(&mut args, &cwd, role, brehon_root, model, reasoning_effort);
+        push_codex_common_args(
+            &mut args,
+            &cwd,
+            role,
+            permission_profile,
+            &[],
+            brehon_root,
+            model,
+            reasoning_effort,
+        );
 
         if role == "supervisor" {
             let project_policy = project_policy_for_role(brehon_root, role);
@@ -291,16 +477,19 @@ impl PtyConfig {
         role: &str,
         cwd: PathBuf,
         brehon_root: Option<&PathBuf>,
+        launcher_env: &[(String, String)],
         supervisor_name: Option<&str>,
         factory_worker_cli: Option<&str>,
         model: Option<&str>,
         reasoning_effort: Option<&str>,
+        launch_policy: Option<&crate::pty::config::LaunchPolicy>,
     ) -> Self {
         let mut config = Self::codex(
             name,
             role,
             cwd.clone(),
             brehon_root,
+            launcher_env,
             supervisor_name,
             factory_worker_cli,
             model,
@@ -309,13 +498,32 @@ impl PtyConfig {
         );
 
         let mut args = Vec::new();
-        push_codex_common_args(&mut args, &cwd, role, brehon_root, None, reasoning_effort);
+        push_codex_common_args(
+            &mut args,
+            &cwd,
+            role,
+            codex_permission_profile_for_role(role, launcher_env),
+            &[],
+            brehon_root,
+            None,
+            reasoning_effort,
+        );
         if let Some(m) = model {
             args.push("-c".to_string());
             args.push(format!("model={m:?}"));
         }
         args.push("app-server".to_string());
         config.args = args;
+        if let Some(policy) = launch_policy {
+            config.env.push((
+                "BREHON_SANDBOX_PROFILE".to_string(),
+                policy.profile_name().to_string(),
+            ));
+            config.env.push((
+                "BREHON_LAUNCH_POLICY_UNSAFE".to_string(),
+                policy.is_unsafe().to_string(),
+            ));
+        }
         config
     }
 
@@ -326,16 +534,19 @@ impl PtyConfig {
         cwd: PathBuf,
         agent_type: Option<&str>,
         brehon_root: Option<&PathBuf>,
+        launcher_env: &[(String, String)],
         supervisor_name: Option<&str>,
         factory_worker_cli: Option<&str>,
         model: Option<&str>,
         custom_args: &[String],
+        launch_policy: Option<&crate::pty::config::LaunchPolicy>,
     ) -> Self {
         let mut config = Self::codex(
             name,
             role,
             cwd.clone(),
             brehon_root,
+            launcher_env,
             supervisor_name,
             factory_worker_cli,
             None,
@@ -350,8 +561,28 @@ impl PtyConfig {
             *value = agent_type.unwrap_or("codex").to_string();
         }
 
+        if let Some(policy) = launch_policy {
+            config.env.push((
+                "BREHON_SANDBOX_PROFILE".to_string(),
+                policy.profile_name().to_string(),
+            ));
+            config.env.push((
+                "BREHON_LAUNCH_POLICY_UNSAFE".to_string(),
+                policy.is_unsafe().to_string(),
+            ));
+        }
+
         let mut args = Vec::new();
-        push_codex_common_args(&mut args, &cwd, role, brehon_root, None, None);
+        push_codex_common_args(
+            &mut args,
+            &cwd,
+            role,
+            codex_permission_profile_for_role(role, launcher_env),
+            custom_args,
+            brehon_root,
+            None,
+            None,
+        );
         if let Some(m) = model {
             args.push("-c".to_string());
             args.push(format!("model={m:?}"));
@@ -368,6 +599,7 @@ impl PtyConfig {
         role: &str,
         cwd: PathBuf,
         brehon_root: Option<&PathBuf>,
+        launcher_env: &[(String, String)],
         supervisor_name: Option<&str>,
         factory_worker_cli: Option<&str>,
         model: Option<&str>,
@@ -380,6 +612,7 @@ impl PtyConfig {
             role,
             cwd.clone(),
             brehon_root,
+            launcher_env,
             supervisor_name,
             factory_worker_cli,
             model,

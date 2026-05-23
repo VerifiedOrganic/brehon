@@ -267,11 +267,12 @@ fn build_minimal_kimi_config(
     model_key: &str,
     raw_model_name: &str,
     thinking_enabled: bool,
+    allow_yolo: bool,
 ) -> String {
     format!(
         "default_model = {default_model}\n\
          default_thinking = {default_thinking}\n\
-         default_yolo = true\n\n\
+         default_yolo = {default_yolo}\n\n\
          [models.{model_key}]\n\
          provider = \"managed:kimi-code\"\n\
          model = {raw_model_name}\n\
@@ -284,10 +285,11 @@ fn build_minimal_kimi_config(
          [providers.\"managed:kimi-code\".oauth]\n\
          storage = \"file\"\n\
          key = \"oauth/kimi-code\"\n\n\
-         [mcp.client]\n\
-         tool_call_timeout_ms = 60000\n",
+        [mcp.client]\n\
+        tool_call_timeout_ms = 60000\n",
         default_model = quote_toml_string(model_key),
         default_thinking = if thinking_enabled { "true" } else { "false" },
+        default_yolo = if allow_yolo { "true" } else { "false" },
         model_key = quote_toml_string(model_key),
         raw_model_name = quote_toml_string(raw_kimi_model_name(raw_model_name)),
         max_context_size = KIMI_DEFAULT_MAX_CONTEXT_SIZE,
@@ -299,10 +301,15 @@ fn patch_existing_kimi_config(
     content: &str,
     model_key: &str,
     reasoning_effort: Option<&str>,
+    allow_yolo: bool,
 ) -> String {
     let mut patched =
         upsert_toml_assignment(content, "default_model", &quote_toml_string(model_key));
-    patched = upsert_toml_assignment(&patched, "default_yolo", "true");
+    patched = upsert_toml_assignment(
+        &patched,
+        "default_yolo",
+        if allow_yolo { "true" } else { "false" },
+    );
     if let Some(reasoning_effort) = reasoning_effort {
         let thinking_enabled = kimi_thinking_enabled(reasoning_effort);
         patched = upsert_toml_assignment(
@@ -353,6 +360,7 @@ pub fn prepare_local_kimi_runtime_with_global_share(
     global_share_dir: Option<&Path>,
     model: Option<&str>,
     reasoning_effort: Option<&str>,
+    allow_yolo: bool,
 ) -> std::result::Result<(PathBuf, Option<String>), &'static str> {
     let share_dir = kimi_share_dir(cwd);
     std::fs::create_dir_all(&share_dir)
@@ -375,7 +383,12 @@ pub fn prepare_local_kimi_runtime_with_global_share(
                 .filter(|requested_model| *requested_model != model_key)
                 .map(|requested_model| raw_kimi_model_name(requested_model).to_string());
             (
-                patch_existing_kimi_config(&global_config, &model_key, reasoning_effort),
+                patch_existing_kimi_config(
+                    &global_config,
+                    &model_key,
+                    reasoning_effort,
+                    allow_yolo,
+                ),
                 model_name_override,
             )
         } else {
@@ -385,6 +398,7 @@ pub fn prepare_local_kimi_runtime_with_global_share(
                     model_key,
                     raw_kimi_model_name(model_key),
                     reasoning_effort.map(kimi_thinking_enabled).unwrap_or(true),
+                    allow_yolo,
                 ),
                 None,
             )
@@ -396,6 +410,7 @@ pub fn prepare_local_kimi_runtime_with_global_share(
                 model_key,
                 raw_kimi_model_name(model_key),
                 reasoning_effort.map(kimi_thinking_enabled).unwrap_or(true),
+                allow_yolo,
             ),
             None,
         )
@@ -418,6 +433,7 @@ pub fn prepare_local_kimi_runtime(
     brehon_root: Option<&PathBuf>,
     model: Option<&str>,
     reasoning_effort: Option<&str>,
+    allow_yolo: bool,
 ) -> std::result::Result<(PathBuf, Option<String>), &'static str> {
     let global_share_dir = kimi_global_share_dir();
     prepare_local_kimi_runtime_with_global_share(
@@ -427,6 +443,7 @@ pub fn prepare_local_kimi_runtime(
         global_share_dir.as_deref(),
         model,
         reasoning_effort,
+        allow_yolo,
     )
 }
 
@@ -531,16 +548,23 @@ pub fn build_kimi_spawn_config(
     factory_worker_cli: Option<&str>,
     model: Option<&str>,
     reasoning_effort: Option<&str>,
+    allow_yolo: bool,
 ) -> KimiSpawnConfig {
     let brehon_exe = current_brehon_exe();
-    let (share_dir, model_name_override) =
-        prepare_local_kimi_runtime(&cwd, &brehon_exe, brehon_root, model, reasoning_effort)
-            .unwrap_or_else(|_| {
-                (
-                    kimi_share_dir(&cwd),
-                    model.map(raw_kimi_model_name).map(ToString::to_string),
-                )
-            });
+    let (share_dir, model_name_override) = prepare_local_kimi_runtime(
+        &cwd,
+        &brehon_exe,
+        brehon_root,
+        model,
+        reasoning_effort,
+        allow_yolo,
+    )
+    .unwrap_or_else(|_| {
+        (
+            kimi_share_dir(&cwd),
+            model.map(raw_kimi_model_name).map(ToString::to_string),
+        )
+    });
 
     let _ = write_json_config(
         &kimi_mcp_path(&share_dir),
@@ -619,13 +643,14 @@ pub fn build_kimi_spawn_config(
         ));
     }
 
+    let mut args = vec!["--work-dir".to_string(), cwd.to_string_lossy().to_string()];
+    if allow_yolo {
+        args.push("--yolo".to_string());
+    }
+
     KimiSpawnConfig {
         command: "kimi".to_string(),
-        args: vec![
-            "--work-dir".to_string(),
-            cwd.to_string_lossy().to_string(),
-            "--yolo".to_string(),
-        ],
+        args,
         env,
         cwd: Some(cwd),
         rows: 24,
@@ -1598,9 +1623,13 @@ mod tests {
     #[test]
     fn test_build_minimal_kimi_config() {
         let config =
-            build_minimal_kimi_config("kimi-code/kimi-for-coding", "kimi-for-coding", true);
+            build_minimal_kimi_config("kimi-code/kimi-for-coding", "kimi-for-coding", true, false);
         assert!(config.contains("default_model = \"kimi-code/kimi-for-coding\""));
         assert!(config.contains("default_thinking = true"));
+        assert!(config.contains("default_yolo = false"));
+
+        let config =
+            build_minimal_kimi_config("kimi-code/kimi-for-coding", "kimi-for-coding", true, true);
         assert!(config.contains("default_yolo = true"));
     }
 

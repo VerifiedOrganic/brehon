@@ -6,6 +6,7 @@ use crate::mux::AgentPaneMaterialization;
 use crate::pane::types::{GatewaySpawnConfig, Pane, PaneBackend, PaneKind};
 use crate::pty::{Pty, PtyConfig, TeamsSpawnConfig};
 use brehon_acp::GatewayProtocol;
+use brehon_types::config::SandboxProfile;
 use ghostty_vt::{Rgb, Terminal};
 use std::collections::HashMap;
 use std::collections::VecDeque;
@@ -255,11 +256,23 @@ fn validate_codex_gateway_bootstrap(
         ));
     }
 
-    if !config
+    let has_bypass = config
         .args
         .iter()
-        .any(|arg| arg == "--dangerously-bypass-approvals-and-sandbox")
-    {
+        .any(|arg| arg == "--dangerously-bypass-approvals-and-sandbox");
+    let has_safe_approval_policy = config
+        .args
+        .windows(2)
+        .any(|window| window == ["--ask-for-approval", "never"] || window == ["-a", "never"]);
+    let has_safe_sandbox = config.args.windows(2).any(|window| {
+        window == ["--sandbox", "read-only"]
+            || window == ["--sandbox", "workspace-write"]
+            || window == ["-s", "read-only"]
+            || window == ["-s", "workspace-write"]
+    });
+    let has_safe_policy = has_safe_approval_policy && has_safe_sandbox;
+
+    if !has_bypass && !has_safe_policy {
         return Err(Error::pty(
             "Codex app-server launch is missing the standard approval/sandbox bootstrap flags. Refusing to start."
                 .to_string(),
@@ -353,12 +366,39 @@ fn is_grok_agent_stdio(command: &str, args: &[String]) -> bool {
         && args.iter().any(|arg| arg == "stdio")
 }
 
-fn apply_grok_acp_mcp_servers(env: &mut Vec<(String, String)>, command: &str, args: &[String]) {
-    if !is_grok_agent_stdio(command, args) {
+fn args_contain_option(args: &[String], option: &str) -> bool {
+    args.iter().any(|arg| {
+        arg == option
+            || arg
+                .strip_prefix(option)
+                .is_some_and(|rest| rest.starts_with('='))
+    })
+}
+
+fn apply_grok_acp_hardening(config: &mut PtyConfig, command: &str) {
+    if !is_grok_agent_stdio(command, &config.args) {
         return;
     }
 
-    let server_env = env
+    let mut prefix_args = Vec::new();
+    if !args_contain_option(&config.args, "--sandbox")
+        && config_env_value(&config.env, "GROK_SANDBOX").is_none()
+    {
+        prefix_args.push("--sandbox".to_string());
+        prefix_args.push("workspace".to_string());
+    }
+    if !args_contain_option(&config.args, "--cwd")
+        && let Some(cwd) = config.cwd.as_ref()
+    {
+        prefix_args.push("--cwd".to_string());
+        prefix_args.push(cwd.to_string_lossy().to_string());
+    }
+    if !prefix_args.is_empty() {
+        config.args.splice(0..0, prefix_args);
+    }
+
+    let server_env = config
+        .env
         .iter()
         .filter(|(key, _)| key.starts_with("BREHON_"))
         .map(|(name, value)| serde_json::json!({ "name": name, "value": value }))
@@ -370,7 +410,11 @@ fn apply_grok_acp_mcp_servers(env: &mut Vec<(String, String)>, command: &str, ar
         "args": ["serve"],
         "env": server_env,
     }]);
-    set_config_env_value(env, "BREHON_ACP_MCP_SERVERS_JSON", &mcp_servers.to_string());
+    set_config_env_value(
+        &mut config.env,
+        "BREHON_ACP_MCP_SERVERS_JSON",
+        &mcp_servers.to_string(),
+    );
 }
 
 fn apply_runtime_session_name(env: &mut Vec<(String, String)>, session_name: Option<&str>) {
@@ -867,6 +911,7 @@ impl Pane {
         cols: u16,
         teams: Option<&TeamsSpawnConfig>,
         reasoning_effort: Option<&str>,
+        sandbox_profile: Option<SandboxProfile>,
     ) -> Result<Self> {
         Self::worker_with_agent_type(
             name,
@@ -883,6 +928,7 @@ impl Pane {
             reasoning_effort,
             None,
             &[],
+            sandbox_profile,
         )
     }
 
@@ -903,6 +949,7 @@ impl Pane {
         reasoning_effort: Option<&str>,
         configured_agent_type: Option<&str>,
         launcher_env: &[(String, String)],
+        sandbox_profile: Option<SandboxProfile>,
     ) -> Result<Self> {
         Self::worker_with_agent_type_materialized(
             name,
@@ -920,6 +967,7 @@ impl Pane {
             configured_agent_type,
             launcher_env,
             AgentPaneMaterialization::Spawn,
+            sandbox_profile,
         )
     }
 
@@ -941,7 +989,11 @@ impl Pane {
         configured_agent_type: Option<&str>,
         launcher_env: &[(String, String)],
         materialization: AgentPaneMaterialization,
+        sandbox_profile: Option<SandboxProfile>,
     ) -> Result<Self> {
+        let launch_policy =
+            sandbox_profile.map(|sandbox_profile| crate::pty::LaunchPolicy { sandbox_profile });
+        let launch_policy = launch_policy.as_ref();
         let worker_cli_str = Some(adapter.name());
         let adapter_owned = adapter.clone();
 
@@ -961,10 +1013,12 @@ impl Pane {
                             cwd,
                             configured_agent_type.or(Some(adapter.name())),
                             brehon_root,
+                            launcher_env,
                             Some(supervisor_name),
                             worker_cli_str,
                             model,
                             &custom.args,
+                            launch_policy,
                         )
                     } else {
                         PtyConfig::custom_acp(
@@ -977,13 +1031,14 @@ impl Pane {
                             brehon_root,
                             Some(supervisor_name),
                             worker_cli_str,
+                            launch_policy,
                         )
                     };
                     apply_runtime_session_name(&mut config.env, session_name);
                     apply_configured_agent_type(&mut config, configured_agent_type);
                     merge_launcher_env(&mut config.env, launcher_env);
                     apply_runtime_model_metadata(&mut config.env, model, reasoning_effort);
-                    apply_grok_acp_mcp_servers(&mut config.env, command, &custom.args);
+                    apply_grok_acp_hardening(&mut config, command);
                     return Self::gateway_pane_from_config(
                         name,
                         PaneKind::Worker,
@@ -1055,6 +1110,7 @@ impl Pane {
                         brehon_root,
                         Some(supervisor_name),
                         worker_cli_str,
+                        launch_policy,
                     );
                     apply_runtime_session_name(&mut config.env, session_name);
                     apply_configured_agent_type(&mut config, configured_agent_type);
@@ -1100,6 +1156,7 @@ impl Pane {
                     model,
                     teams,
                     reasoning_effort,
+                    sandbox_profile,
                 );
                 apply_runtime_session_name(&mut config.env, session_name);
                 apply_configured_agent_type(&mut config, configured_agent_type);
@@ -1128,6 +1185,7 @@ impl Pane {
                         "worker",
                         cwd,
                         brehon_root,
+                        launcher_env,
                         Some(supervisor_name),
                         worker_cli_str,
                         model,
@@ -1156,10 +1214,12 @@ impl Pane {
                     "worker",
                     cwd,
                     brehon_root,
+                    launcher_env,
                     Some(supervisor_name),
                     worker_cli_str,
                     model,
                     reasoning_effort,
+                    launch_policy,
                 );
                 apply_runtime_session_name(&mut config.env, session_name);
                 apply_configured_agent_type(&mut config, configured_agent_type);
@@ -1214,6 +1274,7 @@ impl Pane {
                     worker_cli_str,
                     model,
                     reasoning_effort,
+                    launch_policy,
                 );
                 apply_runtime_session_name(&mut config.env, session_name);
                 apply_configured_agent_type(&mut config, configured_agent_type);
@@ -1267,6 +1328,7 @@ impl Pane {
                     worker_cli_str,
                     model,
                     reasoning_effort,
+                    launch_policy,
                 );
                 apply_runtime_session_name(&mut config.env, session_name);
                 apply_configured_agent_type(&mut config, configured_agent_type);
@@ -1295,6 +1357,7 @@ impl Pane {
                         model,
                         reasoning_effort,
                         teams,
+                        launch_policy,
                     );
                     apply_runtime_session_name(&mut config.env, session_name);
                     apply_configured_agent_type(&mut config, configured_agent_type);
@@ -1325,6 +1388,7 @@ impl Pane {
                     reasoning_effort,
                     server_port,
                     teams,
+                    launch_policy,
                 );
                 apply_runtime_session_name(&mut config.env, session_name);
                 apply_configured_agent_type(&mut config, configured_agent_type);
@@ -1434,6 +1498,7 @@ impl Pane {
                     worker_cli_str,
                     model,
                     reasoning_effort,
+                    launch_policy,
                 );
                 apply_runtime_session_name(&mut config.env, session_name);
                 apply_configured_agent_type(&mut config, configured_agent_type);
@@ -1464,6 +1529,7 @@ impl Pane {
         model: Option<&str>,
         server_url: Option<&str>,
         teams: Option<&TeamsSpawnConfig>,
+        sandbox_profile: Option<SandboxProfile>,
     ) -> Result<Self> {
         Self::reviewer_with_agent_type(
             name,
@@ -1479,6 +1545,7 @@ impl Pane {
             None,
             None,
             &[],
+            sandbox_profile,
         )
     }
 
@@ -1498,6 +1565,7 @@ impl Pane {
         configured_agent_type: Option<&str>,
         reasoning_effort: Option<&str>,
         launcher_env: &[(String, String)],
+        sandbox_profile: Option<SandboxProfile>,
     ) -> Result<Self> {
         Self::reviewer_with_agent_type_materialized(
             name,
@@ -1514,6 +1582,7 @@ impl Pane {
             reasoning_effort,
             launcher_env,
             AgentPaneMaterialization::Spawn,
+            sandbox_profile,
         )
     }
 
@@ -1533,6 +1602,7 @@ impl Pane {
         configured_agent_type: Option<&str>,
         reasoning_effort: Option<&str>,
         launcher_env: &[(String, String)],
+        sandbox_profile: Option<SandboxProfile>,
     ) -> Result<Self> {
         Self::advisor_with_agent_type_materialized(
             name,
@@ -1549,6 +1619,7 @@ impl Pane {
             reasoning_effort,
             launcher_env,
             AgentPaneMaterialization::Spawn,
+            sandbox_profile,
         )
     }
 
@@ -1569,6 +1640,7 @@ impl Pane {
         reasoning_effort: Option<&str>,
         launcher_env: &[(String, String)],
         materialization: AgentPaneMaterialization,
+        sandbox_profile: Option<SandboxProfile>,
     ) -> Result<Self> {
         Self::role_agent_with_agent_type_materialized(
             "reviewer",
@@ -1587,6 +1659,7 @@ impl Pane {
             reasoning_effort,
             launcher_env,
             materialization,
+            sandbox_profile,
         )
     }
 
@@ -1607,6 +1680,7 @@ impl Pane {
         reasoning_effort: Option<&str>,
         launcher_env: &[(String, String)],
         materialization: AgentPaneMaterialization,
+        sandbox_profile: Option<SandboxProfile>,
     ) -> Result<Self> {
         Self::role_agent_with_agent_type_materialized(
             "advisor",
@@ -1625,6 +1699,7 @@ impl Pane {
             reasoning_effort,
             launcher_env,
             materialization,
+            sandbox_profile,
         )
     }
 
@@ -1645,6 +1720,7 @@ impl Pane {
         reasoning_effort: Option<&str>,
         launcher_env: &[(String, String)],
         materialization: AgentPaneMaterialization,
+        sandbox_profile: Option<SandboxProfile>,
     ) -> Result<Self> {
         Self::role_agent_with_agent_type_materialized(
             "research",
@@ -1663,6 +1739,7 @@ impl Pane {
             reasoning_effort,
             launcher_env,
             materialization,
+            sandbox_profile,
         )
     }
 
@@ -1685,7 +1762,11 @@ impl Pane {
         reasoning_effort: Option<&str>,
         launcher_env: &[(String, String)],
         materialization: AgentPaneMaterialization,
+        sandbox_profile: Option<SandboxProfile>,
     ) -> Result<Self> {
+        let launch_policy =
+            sandbox_profile.map(|sandbox_profile| crate::pty::LaunchPolicy { sandbox_profile });
+        let launch_policy = launch_policy.as_ref();
         let adapter_owned = adapter.clone();
 
         if let AgentAdapter::Custom(custom) = adapter {
@@ -1704,10 +1785,12 @@ impl Pane {
                             cwd,
                             configured_agent_type.or(Some(adapter.name())),
                             brehon_root,
+                            launcher_env,
                             None,
                             None,
                             model,
                             &custom.args,
+                            launch_policy,
                         )
                     } else {
                         PtyConfig::custom_acp(
@@ -1720,13 +1803,14 @@ impl Pane {
                             brehon_root,
                             None,
                             None,
+                            launch_policy,
                         )
                     };
                     apply_runtime_session_name(&mut config.env, session_name);
                     apply_configured_agent_type(&mut config, configured_agent_type);
                     merge_launcher_env(&mut config.env, launcher_env);
                     apply_runtime_model_metadata(&mut config.env, model, reasoning_effort);
-                    apply_grok_acp_mcp_servers(&mut config.env, command, &custom.args);
+                    apply_grok_acp_hardening(&mut config, command);
                     return Self::gateway_pane_from_config(
                         name,
                         pane_kind.clone(),
@@ -1798,6 +1882,7 @@ impl Pane {
                         brehon_root,
                         None,
                         None,
+                        launch_policy,
                     );
                     apply_runtime_session_name(&mut config.env, session_name);
                     apply_configured_agent_type(&mut config, configured_agent_type);
@@ -1843,6 +1928,7 @@ impl Pane {
                     model,
                     teams,
                     reasoning_effort,
+                    sandbox_profile,
                 );
                 apply_runtime_session_name(&mut config.env, session_name);
                 apply_configured_agent_type(&mut config, configured_agent_type);
@@ -1870,6 +1956,7 @@ impl Pane {
                         role,
                         cwd,
                         brehon_root,
+                        launcher_env,
                         None,
                         None,
                         model,
@@ -1898,10 +1985,12 @@ impl Pane {
                     role,
                     cwd,
                     brehon_root,
+                    launcher_env,
                     None,
                     None,
                     model,
                     reasoning_effort,
+                    launch_policy,
                 );
                 apply_runtime_session_name(&mut config.env, session_name);
                 apply_configured_agent_type(&mut config, configured_agent_type);
@@ -1956,6 +2045,7 @@ impl Pane {
                     None,
                     model,
                     reasoning_effort,
+                    launch_policy,
                 );
                 apply_runtime_session_name(&mut config.env, session_name);
                 apply_configured_agent_type(&mut config, configured_agent_type);
@@ -2009,6 +2099,7 @@ impl Pane {
                     None,
                     model,
                     reasoning_effort,
+                    launch_policy,
                 );
                 apply_runtime_session_name(&mut config.env, session_name);
                 apply_configured_agent_type(&mut config, configured_agent_type);
@@ -2037,6 +2128,7 @@ impl Pane {
                         model,
                         reasoning_effort,
                         teams,
+                        launch_policy,
                     );
                     apply_runtime_session_name(&mut config.env, session_name);
                     apply_configured_agent_type(&mut config, configured_agent_type);
@@ -2067,6 +2159,7 @@ impl Pane {
                     reasoning_effort,
                     server_port,
                     teams,
+                    launch_policy,
                 );
                 apply_runtime_session_name(&mut config.env, session_name);
                 apply_configured_agent_type(&mut config, configured_agent_type);
@@ -2160,6 +2253,7 @@ impl Pane {
                     None,
                     model,
                     reasoning_effort,
+                    launch_policy,
                 );
                 apply_runtime_session_name(&mut config.env, session_name);
                 apply_configured_agent_type(&mut config, configured_agent_type);
@@ -2193,6 +2287,7 @@ impl Pane {
         server_url: Option<&str>,
         teams: Option<&TeamsSpawnConfig>,
         worker_cli_map: &HashMap<String, AgentAdapter>,
+        sandbox_profile: Option<SandboxProfile>,
     ) -> Result<Self> {
         Self::supervisor_with_agent_type(
             name,
@@ -2212,6 +2307,7 @@ impl Pane {
             &HashMap::new(),
             None,
             &[],
+            sandbox_profile,
         )
     }
 
@@ -2235,6 +2331,7 @@ impl Pane {
         worker_agent_type_map: &HashMap<String, String>,
         reasoning_effort: Option<&str>,
         launcher_env: &[(String, String)],
+        sandbox_profile: Option<SandboxProfile>,
     ) -> Result<Self> {
         Self::supervisor_with_agent_type_materialized(
             name,
@@ -2255,6 +2352,7 @@ impl Pane {
             reasoning_effort,
             launcher_env,
             AgentPaneMaterialization::Spawn,
+            sandbox_profile,
         )
     }
 
@@ -2279,7 +2377,11 @@ impl Pane {
         reasoning_effort: Option<&str>,
         launcher_env: &[(String, String)],
         materialization: AgentPaneMaterialization,
+        sandbox_profile: Option<SandboxProfile>,
     ) -> Result<Self> {
+        let launch_policy =
+            sandbox_profile.map(|sandbox_profile| crate::pty::LaunchPolicy { sandbox_profile });
+        let launch_policy = launch_policy.as_ref();
         let worker_cli_str = worker_adapter.name();
         let worker_names_csv = if worker_names.is_empty() {
             None
@@ -2325,6 +2427,7 @@ impl Pane {
                 brehon_root,
                 None,
                 Some(worker_cli_str),
+                launch_policy,
             );
             apply_runtime_session_name(&mut config.env, session_name);
             apply_configured_agent_type(&mut config, configured_agent_type);
@@ -2383,6 +2486,7 @@ impl Pane {
                     model,
                     teams,
                     reasoning_effort,
+                    sandbox_profile,
                 );
                 apply_runtime_session_name(&mut config.env, session_name);
                 apply_configured_agent_type(&mut config, configured_agent_type);
@@ -2414,6 +2518,7 @@ impl Pane {
                     "supervisor",
                     cwd,
                     brehon_root,
+                    launcher_env,
                     None,
                     Some(worker_cli_str),
                     model,
@@ -2525,6 +2630,7 @@ impl Pane {
                     model,
                     reasoning_effort,
                     teams,
+                    launch_policy,
                 );
                 apply_runtime_session_name(&mut config.env, session_name);
                 apply_configured_agent_type(&mut config, configured_agent_type);

@@ -20,6 +20,7 @@ fn test_duplicate_tool_call_started_events_refresh_without_duplicate_entries() {
         80,
         None,
         None,
+        None,
     )
     .expect("create kimi worker");
 
@@ -79,6 +80,7 @@ fn test_gateway_operation_lifecycle_keeps_pane_busy_until_outer_completion() {
         None,
         24,
         80,
+        None,
         None,
         None,
     )

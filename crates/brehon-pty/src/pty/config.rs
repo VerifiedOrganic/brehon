@@ -1,5 +1,38 @@
 use std::path::PathBuf;
 
+/// Provider-neutral launch policy derived from the resolved permission profile.
+///
+/// Carries sandbox intent so that each provider launcher can map it to its
+/// native CLI flags and config without silently falling back to unsafe
+/// behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LaunchPolicy {
+    pub sandbox_profile: brehon_types::SandboxProfile,
+}
+
+impl LaunchPolicy {
+    /// Create a launch policy from the project security configuration.
+    pub fn from_security_config(security: &brehon_types::config::SecurityConfig) -> Self {
+        Self {
+            sandbox_profile: security.sandbox_profile,
+        }
+    }
+
+    /// Whether this policy represents an explicit no-sandbox / unsafe state.
+    pub fn is_unsafe(&self) -> bool {
+        matches!(self.sandbox_profile, brehon_types::SandboxProfile::None)
+    }
+
+    /// Human-readable profile name for telemetry and UI labels.
+    pub fn profile_name(&self) -> &'static str {
+        match self.sandbox_profile {
+            brehon_types::SandboxProfile::None => "unsafe",
+            brehon_types::SandboxProfile::OsDefault => "os_default",
+            brehon_types::SandboxProfile::Custom => "custom",
+        }
+    }
+}
+
 /// Configuration for spawning a PTY
 #[derive(Debug, Clone)]
 pub struct PtyConfig {

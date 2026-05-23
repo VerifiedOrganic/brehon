@@ -1,2 +1,5 @@
 [build]
 incremental = false
+
+[net]
+git-fetch-with-cli = true

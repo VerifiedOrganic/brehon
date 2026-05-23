@@ -7,6 +7,7 @@ use crate::pane::{AgentTerminalLaunchPlan, Generation, Pane, PaneKind};
 use crate::pty::PtyConfig;
 use brehon_acp::GatewayProtocol;
 use brehon_types::RuntimePaneKind;
+use brehon_types::config::SandboxProfile;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -51,6 +52,7 @@ fn test_codex_worker_is_placeholder_without_manual_input() {
         80,
         None,
         None,
+        None,
     )
     .expect("create codex worker pane");
 
@@ -74,6 +76,7 @@ fn test_placeholder_worker_normalizes_lf_output_to_crlf() {
         None,
         24,
         80,
+        None,
         None,
         None,
     )
@@ -109,6 +112,7 @@ fn test_gateway_worker_starts_without_placeholder_banner() {
         None,
         24,
         80,
+        None,
         None,
         None,
     )
@@ -220,6 +224,7 @@ fn gateway_backed_pane_reports_terminal_host_ineligible() {
         80,
         None,
         None,
+        None,
     )
     .expect("create codex worker pane");
 
@@ -251,6 +256,7 @@ fn test_gateway_session_spawns_increment_generation_monotonically() {
         None,
         24,
         80,
+        None,
         None,
         None,
     )
@@ -312,6 +318,7 @@ fn test_builtin_supervisors_use_pty_sessions() {
             None,
             None,
             &HashMap::new(),
+            None,
         )
         .expect("create supervisor pane");
 
@@ -333,6 +340,248 @@ fn test_builtin_supervisors_use_pty_sessions() {
 }
 
 #[test]
+fn test_claude_worker_safe_profile_omits_skip_permissions() {
+    let pane = Pane::worker(
+        "worker-1",
+        PathBuf::from("/tmp"),
+        None,
+        "supervisor",
+        &AgentAdapter::BuiltIn(SupervisorCli::Claude),
+        None,
+        None,
+        24,
+        80,
+        None,
+        None,
+        Some(SandboxProfile::OsDefault),
+    )
+    .expect("create claude worker pane");
+
+    let config = pane
+        .pty_spawn_config
+        .as_ref()
+        .expect("pty config should exist");
+    assert!(
+        !config
+            .args
+            .contains(&"--dangerously-skip-permissions".to_string()),
+        "safe profile should NOT include --dangerously-skip-permissions"
+    );
+}
+
+#[test]
+fn test_claude_worker_unsafe_profile_includes_skip_permissions() {
+    let pane = Pane::worker(
+        "worker-1",
+        PathBuf::from("/tmp"),
+        None,
+        "supervisor",
+        &AgentAdapter::BuiltIn(SupervisorCli::Claude),
+        None,
+        None,
+        24,
+        80,
+        None,
+        None,
+        Some(SandboxProfile::None),
+    )
+    .expect("create claude worker pane");
+
+    let config = pane
+        .pty_spawn_config
+        .as_ref()
+        .expect("pty config should exist");
+    assert!(
+        config
+            .args
+            .contains(&"--dangerously-skip-permissions".to_string()),
+        "unsafe profile should include --dangerously-skip-permissions"
+    );
+}
+
+#[test]
+fn test_claude_supervisor_safe_profile_omits_skip_permissions() {
+    let pane = Pane::supervisor(
+        "supervisor",
+        PathBuf::from("/tmp"),
+        None,
+        24,
+        80,
+        &AgentAdapter::BuiltIn(SupervisorCli::Claude),
+        &AgentAdapter::BuiltIn(SupervisorCli::Codex),
+        &[],
+        None,
+        None,
+        None,
+        &HashMap::new(),
+        Some(SandboxProfile::OsDefault),
+    )
+    .expect("create claude supervisor pane");
+
+    let config = pane
+        .pty_spawn_config
+        .as_ref()
+        .expect("pty config should exist");
+    assert!(
+        !config
+            .args
+            .contains(&"--dangerously-skip-permissions".to_string()),
+        "safe profile should NOT include --dangerously-skip-permissions"
+    );
+}
+
+#[test]
+fn test_claude_supervisor_unsafe_profile_includes_skip_permissions() {
+    let pane = Pane::supervisor(
+        "supervisor",
+        PathBuf::from("/tmp"),
+        None,
+        24,
+        80,
+        &AgentAdapter::BuiltIn(SupervisorCli::Claude),
+        &AgentAdapter::BuiltIn(SupervisorCli::Codex),
+        &[],
+        None,
+        None,
+        None,
+        &HashMap::new(),
+        Some(SandboxProfile::None),
+    )
+    .expect("create claude supervisor pane");
+
+    let config = pane
+        .pty_spawn_config
+        .as_ref()
+        .expect("pty config should exist");
+    assert!(
+        config
+            .args
+            .contains(&"--dangerously-skip-permissions".to_string()),
+        "unsafe profile should include --dangerously-skip-permissions"
+    );
+}
+
+#[test]
+fn test_claude_reviewer_safe_profile_omits_skip_permissions() {
+    let pane = Pane::reviewer(
+        "reviewer-1",
+        PathBuf::from("/tmp"),
+        None,
+        24,
+        80,
+        &AgentAdapter::BuiltIn(SupervisorCli::Claude),
+        None,
+        None,
+        None,
+        Some(SandboxProfile::OsDefault),
+    )
+    .expect("create claude reviewer pane");
+
+    let config = pane
+        .pty_spawn_config
+        .as_ref()
+        .expect("pty config should exist");
+    assert!(
+        !config
+            .args
+            .contains(&"--dangerously-skip-permissions".to_string()),
+        "safe profile should NOT include --dangerously-skip-permissions"
+    );
+}
+
+#[test]
+fn test_claude_reviewer_unsafe_profile_includes_skip_permissions() {
+    let pane = Pane::reviewer(
+        "reviewer-1",
+        PathBuf::from("/tmp"),
+        None,
+        24,
+        80,
+        &AgentAdapter::BuiltIn(SupervisorCli::Claude),
+        None,
+        None,
+        None,
+        Some(SandboxProfile::None),
+    )
+    .expect("create claude reviewer pane");
+
+    let config = pane
+        .pty_spawn_config
+        .as_ref()
+        .expect("pty config should exist");
+    assert!(
+        config
+            .args
+            .contains(&"--dangerously-skip-permissions".to_string()),
+        "unsafe profile should include --dangerously-skip-permissions"
+    );
+}
+
+#[test]
+fn test_claude_advisor_safe_profile_omits_skip_permissions() {
+    let pane = Pane::advisor_with_agent_type(
+        "advisor-1",
+        PathBuf::from("/tmp"),
+        None,
+        None,
+        24,
+        80,
+        &AgentAdapter::BuiltIn(SupervisorCli::Claude),
+        None,
+        None,
+        None,
+        None,
+        None,
+        &[],
+        Some(SandboxProfile::OsDefault),
+    )
+    .expect("create claude advisor pane");
+
+    let config = pane
+        .pty_spawn_config
+        .as_ref()
+        .expect("pty config should exist");
+    assert!(
+        !config
+            .args
+            .contains(&"--dangerously-skip-permissions".to_string()),
+        "safe profile should NOT include --dangerously-skip-permissions"
+    );
+}
+
+#[test]
+fn test_claude_advisor_unsafe_profile_includes_skip_permissions() {
+    let pane = Pane::advisor_with_agent_type(
+        "advisor-1",
+        PathBuf::from("/tmp"),
+        None,
+        None,
+        24,
+        80,
+        &AgentAdapter::BuiltIn(SupervisorCli::Claude),
+        None,
+        None,
+        None,
+        None,
+        None,
+        &[],
+        Some(SandboxProfile::None),
+    )
+    .expect("create claude advisor pane");
+
+    let config = pane
+        .pty_spawn_config
+        .as_ref()
+        .expect("pty config should exist");
+    assert!(
+        config
+            .args
+            .contains(&"--dangerously-skip-permissions".to_string()),
+        "unsafe profile should include --dangerously-skip-permissions"
+    );
+}
+
+#[test]
 fn test_gateway_reviewer_preserves_configured_agent_type_alias() {
     let pane = Pane::reviewer_with_agent_type(
         "reviewer-1",
@@ -348,6 +597,7 @@ fn test_gateway_reviewer_preserves_configured_agent_type_alias() {
         Some("safety-codex"),
         None,
         &[],
+        None,
     )
     .expect("create aliased codex reviewer pane");
 
@@ -377,6 +627,7 @@ fn test_gemini_worker_uses_stdio_gateway_protocol() {
         80,
         None,
         None,
+        None,
     )
     .expect("create gemini worker pane");
 
@@ -399,6 +650,7 @@ fn test_opencode_worker_uses_server_gateway_protocol() {
         None,
         24,
         80,
+        None,
         None,
         None,
     )
@@ -434,6 +686,7 @@ fn test_kimi_worker_uses_acp_stdio_gateway_protocol() {
         80,
         None,
         Some("high"),
+        None,
     )
     .expect("create kimi worker pane");
 
@@ -443,7 +696,14 @@ fn test_kimi_worker_uses_acp_stdio_gateway_protocol() {
         .expect("gateway config should exist");
     assert_eq!(config.protocol, GatewayProtocol::AcpStdio);
     assert_eq!(config.command.as_deref(), Some("kimi"));
-    assert_eq!(config.args, vec!["acp".to_string()]);
+    assert_eq!(
+        config.args,
+        vec![
+            "--work-dir".to_string(),
+            "/tmp".to_string(),
+            "acp".to_string(),
+        ]
+    );
     assert!(
         config
             .env
@@ -475,6 +735,7 @@ fn test_kimi_reviewer_uses_acp_stdio_gateway_protocol() {
         None,
         Some("off"),
         &[],
+        None,
     )
     .expect("create kimi reviewer pane");
 
@@ -484,7 +745,14 @@ fn test_kimi_reviewer_uses_acp_stdio_gateway_protocol() {
         .expect("gateway config should exist");
     assert_eq!(config.protocol, GatewayProtocol::AcpStdio);
     assert_eq!(config.command.as_deref(), Some("kimi"));
-    assert_eq!(config.args, vec!["acp".to_string()]);
+    assert_eq!(
+        config.args,
+        vec![
+            "--work-dir".to_string(),
+            "/tmp".to_string(),
+            "acp".to_string(),
+        ]
+    );
 }
 
 #[test]
@@ -496,6 +764,7 @@ fn test_opencode_reviewer_uses_server_gateway_protocol() {
         24,
         80,
         &AgentAdapter::BuiltIn(SupervisorCli::OpenCode),
+        None,
         None,
         None,
         None,
@@ -532,6 +801,7 @@ fn test_copilot_worker_uses_stdio_acp_gateway_protocol() {
         80,
         None,
         Some("high"),
+        None,
     )
     .expect("create copilot worker pane");
 
@@ -553,6 +823,7 @@ fn test_copilot_reviewer_uses_stdio_acp_gateway_protocol() {
         24,
         80,
         &AgentAdapter::BuiltIn(SupervisorCli::Copilot),
+        None,
         None,
         None,
         None,
@@ -582,6 +853,7 @@ fn test_codex_advisor_uses_advisor_role_metadata() {
         Some("codex-worker"),
         Some("medium"),
         &[],
+        None,
     )
     .expect("create codex advisor pane");
 
@@ -625,6 +897,7 @@ fn test_copilot_supervisor_uses_interactive_pty() {
         None,
         None,
         &worker_cli_map,
+        None,
     )
     .expect("create copilot supervisor pane");
 
@@ -674,6 +947,7 @@ fn test_custom_acp_worker_uses_stdio_gateway_protocol() {
         None,
         24,
         80,
+        None,
         None,
         None,
     )
@@ -748,12 +1022,25 @@ fn test_grok_acp_worker_receives_brehon_mcp_server() {
         None,
         None,
         &[],
+        None,
     )
     .expect("create grok worker pane");
 
     let config = pane
         .gateway_spawn_config()
         .expect("gateway config should exist");
+    assert!(
+        config
+            .args
+            .windows(2)
+            .any(|window| window == ["--cwd", "/tmp"])
+    );
+    assert!(
+        config
+            .args
+            .windows(2)
+            .any(|window| window == ["--sandbox", "workspace"])
+    );
     let mcp_servers = config
         .env
         .iter()
@@ -838,6 +1125,7 @@ fn test_custom_codex_app_server_worker_uses_codex_ws_gateway_protocol() {
         80,
         None,
         None,
+        None,
     )
     .expect("create custom codex app-server worker pane");
 
@@ -869,6 +1157,158 @@ fn test_custom_codex_app_server_worker_uses_codex_ws_gateway_protocol() {
     assert!(
         config.env.iter().any(|(k, _)| k == "CODEX_HOME"),
         "custom Codex lane should bootstrap a local CODEX_HOME"
+    );
+
+    let _ = std::fs::remove_dir_all(cwd);
+}
+
+#[test]
+fn test_custom_codex_app_server_worker_accepts_long_form_safe_bootstrap() {
+    let cwd = std::env::temp_dir().join(format!(
+        "brehon-custom-codex-pane-long-safe-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let brehon_root = cwd.join(".brehon");
+    let instructions_dir = brehon_root.join("instructions");
+    std::fs::create_dir_all(&instructions_dir).expect("create instructions dir");
+    std::fs::write(
+        instructions_dir.join("codex-worker-instructions.md"),
+        "worker instructions\n",
+    )
+    .expect("write worker instructions");
+
+    let adapter = AgentAdapter::Custom(CustomAgentConfig {
+        name: "codex-ollama-worker".to_string(),
+        command: Some("codex".to_string()),
+        args: vec![
+            "--ask-for-approval".to_string(),
+            "never".to_string(),
+            "--sandbox".to_string(),
+            "workspace-write".to_string(),
+            "app-server".to_string(),
+        ],
+        base_url: None,
+        api_key_env: None,
+        headers: Vec::new(),
+        capabilities: HarnessCapabilities {
+            supports_hooks: false,
+            supports_subagents: false,
+            supports_textbox_submit: false,
+            supports_teams: false,
+            one_shot: false,
+            uses_ink_prompt: false,
+            tool_prefix: std::borrow::Cow::Borrowed("mcp__brehon__"),
+            transport: HarnessTransport::AppServer,
+            preferred_control_plane: HarnessControlPlane::Acp,
+        },
+    });
+
+    let pane = Pane::worker(
+        "worker-1",
+        cwd.clone(),
+        Some(&brehon_root),
+        "supervisor",
+        &adapter,
+        None,
+        None,
+        24,
+        80,
+        None,
+        None,
+        None,
+    )
+    .expect("create custom codex app-server worker pane with long safe bootstrap");
+
+    let config = pane
+        .gateway_spawn_config()
+        .expect("gateway config should exist");
+    assert!(
+        config
+            .args
+            .windows(2)
+            .any(|window| window == ["--ask-for-approval", "never"])
+    );
+    assert!(
+        config
+            .args
+            .windows(2)
+            .any(|window| window == ["--sandbox", "workspace-write"])
+    );
+
+    let _ = std::fs::remove_dir_all(cwd);
+}
+
+#[test]
+fn test_custom_codex_app_server_worker_accepts_short_form_safe_bootstrap() {
+    let cwd = std::env::temp_dir().join(format!(
+        "brehon-custom-codex-pane-short-safe-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let brehon_root = cwd.join(".brehon");
+    let instructions_dir = brehon_root.join("instructions");
+    std::fs::create_dir_all(&instructions_dir).expect("create instructions dir");
+    std::fs::write(
+        instructions_dir.join("codex-worker-instructions.md"),
+        "worker instructions\n",
+    )
+    .expect("write worker instructions");
+
+    let adapter = AgentAdapter::Custom(CustomAgentConfig {
+        name: "codex-ollama-worker".to_string(),
+        command: Some("codex".to_string()),
+        args: vec![
+            "-a".to_string(),
+            "never".to_string(),
+            "-s".to_string(),
+            "workspace-write".to_string(),
+            "app-server".to_string(),
+        ],
+        base_url: None,
+        api_key_env: None,
+        headers: Vec::new(),
+        capabilities: HarnessCapabilities {
+            supports_hooks: false,
+            supports_subagents: false,
+            supports_textbox_submit: false,
+            supports_teams: false,
+            one_shot: false,
+            uses_ink_prompt: false,
+            tool_prefix: std::borrow::Cow::Borrowed("mcp__brehon__"),
+            transport: HarnessTransport::AppServer,
+            preferred_control_plane: HarnessControlPlane::Acp,
+        },
+    });
+
+    let pane = Pane::worker(
+        "worker-1",
+        cwd.clone(),
+        Some(&brehon_root),
+        "supervisor",
+        &adapter,
+        None,
+        None,
+        24,
+        80,
+        None,
+        None,
+        None,
+    )
+    .expect("create custom codex app-server worker pane with short safe bootstrap");
+
+    let config = pane
+        .gateway_spawn_config()
+        .expect("gateway config should exist");
+    assert!(
+        config
+            .args
+            .windows(2)
+            .any(|window| window == ["-a", "never"])
+    );
+    assert!(
+        config
+            .args
+            .windows(2)
+            .any(|window| window == ["-s", "workspace-write"])
     );
 
     let _ = std::fs::remove_dir_all(cwd);
@@ -919,6 +1359,7 @@ fn test_custom_codex_app_server_worker_requires_instructions_bootstrap() {
         80,
         None,
         None,
+        None,
     )
     .err()
     .expect("missing instructions should fail fast");
@@ -960,6 +1401,7 @@ fn test_custom_acp_reviewer_uses_stdio_gateway_protocol() {
         24,
         80,
         &adapter,
+        None,
         None,
         None,
         None,
@@ -1032,6 +1474,7 @@ fn test_custom_acp_supervisor_is_rejected_without_pty_contract() {
         None,
         None,
         &worker_cli_map,
+        None,
     )
     .err()
     .expect("custom ACP supervisor should fail without PTY contract");
@@ -1082,6 +1525,7 @@ fn test_custom_pty_supervisor_uses_pty_launch_contract() {
         None,
         None,
         &worker_cli_map,
+        None,
     )
     .expect("create custom pty supervisor pane");
 
@@ -1171,6 +1615,7 @@ fn test_custom_acp_sidecar_supervisor_has_pty_and_gateway_contract() {
         None,
         &[],
         AgentPaneMaterialization::PlanOnly,
+        None,
     )
     .expect("create custom ACP sidecar supervisor pane");
 
@@ -1263,6 +1708,7 @@ fn test_custom_acp_sidecar_supervisor_rejects_non_interactive_transport() {
         None,
         &[],
         AgentPaneMaterialization::PlanOnly,
+        None,
     )
     .err()
     .expect("custom ACP sidecar supervisor should reject app-server transport");
@@ -1306,6 +1752,7 @@ fn test_custom_openai_worker_uses_managed_api_gateway_protocol() {
         None,
         24,
         80,
+        None,
         None,
         None,
     )
@@ -1368,6 +1815,7 @@ fn test_custom_openai_supervisor_is_rejected_without_pty_command() {
         None,
         None,
         &worker_cli_map,
+        None,
     )
     .err()
     .expect("custom API supervisor should fail without PTY command");

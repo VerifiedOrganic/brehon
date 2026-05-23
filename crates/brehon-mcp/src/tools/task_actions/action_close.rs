@@ -21,7 +21,7 @@ use super::epic::{
 use super::followups::{
     collect_container_open_followup_blockers, resolve_promoted_followups_for_terminal_task,
 };
-use super::git_ops::detect_default_branch;
+use super::git_ops::{detect_default_branch, dirty_primary_checkout_terminal_blocker};
 use super::lifecycle::{
     caller_name, caller_role, caller_supervisor, child_collection_label,
     clear_terminal_task_ownership, close_terminal_status, is_container_task, is_epic,
@@ -59,6 +59,10 @@ pub(super) async fn execute(args: &Value) -> Result<ToolResult, McpError> {
         .get("parent_id")
         .and_then(|v| v.as_str())
         .map(String::from);
+
+    if let Some(err) = dirty_primary_checkout_terminal_blocker(&format!("close {task_type} {id}")) {
+        return Ok(error_result(err));
+    }
 
     if is_container_task(&task_type) {
         let blockers = archived_review_obligation_blockers_under(id);

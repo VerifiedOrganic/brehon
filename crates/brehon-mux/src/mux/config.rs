@@ -1,6 +1,7 @@
 use crate::harness::{AgentAdapter, SupervisorCli};
 use crate::pty::TeamsSpawnConfig;
 use brehon_ports::{PolicyGate, RuntimeEventSink};
+use brehon_types::config::SandboxProfile;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -171,6 +172,10 @@ pub struct MuxConfig {
     pub runtime_event_sink: Option<Arc<dyn RuntimeEventSink>>,
     /// Optional policy gate for audited mutating runtime operations.
     pub policy_gate: Option<Arc<dyn PolicyGate>>,
+    /// Resolved launch policy (sandbox profile) to propagate to agent PTYs.
+    pub launch_policy: Option<crate::pty::LaunchPolicy>,
+    /// Optional sandbox profile for deriving launcher permission flags.
+    pub sandbox_profile: Option<SandboxProfile>,
 }
 
 impl Default for MuxConfig {
@@ -240,6 +245,8 @@ impl Default for MuxConfig {
             direct_tool_bridge_factory: None,
             runtime_event_sink: None,
             policy_gate: None,
+            launch_policy: None,
+            sandbox_profile: None,
         }
     }
 }

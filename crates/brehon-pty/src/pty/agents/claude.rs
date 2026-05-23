@@ -1,7 +1,10 @@
 use std::path::{Path, PathBuf};
 
+use brehon_types::config::SandboxProfile;
+
 use crate::pty::config::{PtyConfig, TeamsSpawnConfig};
 use crate::pty::filesystem::write_json_config;
+use crate::pty::prompts::provider_cli_allows_privileged_mode;
 
 use super::brehon_skills::{builtin_skill_names_for_role, write_builtin_skills};
 use super::{
@@ -40,6 +43,16 @@ pub(crate) fn prepare_local_claude_skills(
     let project_dir = claude_skill_project_dir(cwd, name);
     write_builtin_skills(&claude_skill_root(cwd, name), role)?;
     Ok(project_dir)
+}
+
+const CLAUDE_UNATTENDED_ALLOWED_TOOLS: &str =
+    "Bash,Read,Edit,MultiEdit,Write,NotebookEdit,Grep,Glob,LS,TodoWrite,mcp__brehon__*";
+
+fn push_claude_unattended_permission_args(args: &mut Vec<String>) {
+    args.push("--permission-mode".to_string());
+    args.push("dontAsk".to_string());
+    args.push("--allowedTools".to_string());
+    args.push(CLAUDE_UNATTENDED_ALLOWED_TOOLS.to_string());
 }
 
 /// Build the BREHON_* env block that the per-agent MCP server config must
@@ -194,6 +207,7 @@ impl PtyConfig {
         model: Option<&str>,
         teams: Option<&TeamsSpawnConfig>,
         reasoning_effort: Option<&str>,
+        sandbox_profile: Option<SandboxProfile>,
     ) -> Self {
         // Generate a stable session ID for this agent so the MCP server can
         // auto-register even when Claude Code hooks don't fire (e.g. in
@@ -322,7 +336,24 @@ impl PtyConfig {
             ));
         }
 
-        let mut args = vec!["--dangerously-skip-permissions".to_string()];
+        let mut args = vec![];
+        // Derive the effective sandbox profile. Explicit None means unsafe;
+        // OsDefault/Custom mean safe. When no profile is provided we derive
+        // from brehon_root the same way Gemini does, so Claude is safe by
+        // default on every supported entrypoint.
+        let is_unsafe = match sandbox_profile {
+            Some(SandboxProfile::None) => true,
+            Some(SandboxProfile::OsDefault) | Some(SandboxProfile::Custom) => false,
+            None => provider_cli_allows_privileged_mode(brehon_root),
+        };
+        if is_unsafe {
+            args.push("--dangerously-skip-permissions".to_string());
+        } else {
+            // Brehon factory agents are unattended. Claude's provider-level
+            // approval UI must not block the run; Brehon's PreToolUse hook and
+            // OS sandbox are the enforcement layers for these tool calls.
+            push_claude_unattended_permission_args(&mut args);
+        }
         // Point Claude at the per-agent MCP config we just wrote. Strict mode
         // ensures Claude ignores the repo-root `.mcp.json` (which has no env
         // block) and uses only our config. Factory agents don't need any other

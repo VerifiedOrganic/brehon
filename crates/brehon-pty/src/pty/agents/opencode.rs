@@ -277,6 +277,7 @@ pub(crate) fn ensure_opencode_spawn_config(
     project_root: Option<&Path>,
     model: Option<&str>,
     reasoning_effort: Option<&str>,
+    launch_policy: Option<&crate::pty::config::LaunchPolicy>,
 ) -> std::result::Result<bool, &'static str> {
     let Some(root) = config.as_object_mut() else {
         return Err(
@@ -302,6 +303,16 @@ pub(crate) fn ensure_opencode_spawn_config(
             serde_json::Value::Number(OPENCODE_MCP_TIMEOUT_MS.into()),
         );
         changed = true;
+    }
+    if let Some(policy) = launch_policy {
+        let policy_json = serde_json::json!({
+            "sandbox_profile": policy.profile_name(),
+            "unsafe": policy.is_unsafe(),
+        });
+        if experimental_map.get("brehon_launch_policy") != Some(&policy_json) {
+            experimental_map.insert("brehon_launch_policy".to_string(), policy_json);
+            changed = true;
+        }
     }
     let _ = root;
     changed |= ensure_opencode_factory_permissions(config, cwd, project_root)?;
@@ -332,6 +343,7 @@ pub(crate) fn prepare_local_opencode_runtime_with_global_config(
     project_root: Option<&Path>,
     model: Option<&str>,
     reasoning_effort: Option<&str>,
+    launch_policy: Option<&crate::pty::config::LaunchPolicy>,
 ) -> std::result::Result<(PathBuf, String), &'static str> {
     let xdg_root = cwd.join(".brehon/factory-runtime/opencode/xdg");
     let local_config_dir = xdg_root.join("opencode");
@@ -359,8 +371,15 @@ pub(crate) fn prepare_local_opencode_runtime_with_global_config(
         .as_deref()
         .map(load_json_config)
         .unwrap_or_else(|| serde_json::json!({}));
-    let _ =
-        ensure_opencode_spawn_config(&mut config, exe, cwd, project_root, model, reasoning_effort)?;
+    let _ = ensure_opencode_spawn_config(
+        &mut config,
+        exe,
+        cwd,
+        project_root,
+        model,
+        reasoning_effort,
+        launch_policy,
+    )?;
     write_json_config(&local_config_dir.join("opencode.json"), &config)?;
 
     let content = serde_json::to_string(&config)
@@ -374,6 +393,7 @@ pub(crate) fn prepare_local_opencode_runtime(
     exe: &str,
     model: Option<&str>,
     reasoning_effort: Option<&str>,
+    launch_policy: Option<&crate::pty::config::LaunchPolicy>,
 ) -> std::result::Result<(PathBuf, String), &'static str> {
     let global_config_dir = opencode_config_dir();
     prepare_local_opencode_runtime_with_global_config(
@@ -383,6 +403,7 @@ pub(crate) fn prepare_local_opencode_runtime(
         project_root,
         model,
         reasoning_effort,
+        launch_policy,
     )
 }
 
@@ -401,6 +422,7 @@ pub(crate) fn build_opencode_env(
     model: Option<&str>,
     reasoning_effort: Option<&str>,
     teams: Option<&TeamsSpawnConfig>,
+    launch_policy: Option<&crate::pty::config::LaunchPolicy>,
 ) -> Vec<(String, String)> {
     let session_id = uuid::Uuid::new_v4().to_string();
     let brehon_exe = current_brehon_exe();
@@ -413,6 +435,7 @@ pub(crate) fn build_opencode_env(
         &brehon_exe,
         model,
         reasoning_effort,
+        launch_policy,
     )
     .unwrap_or_else(|_| {
         let mut config = serde_json::json!({});
@@ -424,6 +447,7 @@ pub(crate) fn build_opencode_env(
             project_root.as_deref(),
             model,
             reasoning_effort,
+            launch_policy,
         );
         let _ = write_builtin_skills(&xdg_root.join("opencode/skills"), role);
         (
@@ -491,6 +515,17 @@ pub(crate) fn build_opencode_env(
         env.push(("BREHON_TEAM_NAME".to_string(), t.team_name.clone()));
     }
 
+    if let Some(policy) = launch_policy {
+        env.push((
+            "BREHON_SANDBOX_PROFILE".to_string(),
+            policy.profile_name().to_string(),
+        ));
+        env.push((
+            "BREHON_LAUNCH_POLICY_UNSAFE".to_string(),
+            policy.is_unsafe().to_string(),
+        ));
+    }
+
     env
 }
 
@@ -534,6 +569,7 @@ impl PtyConfig {
         model: Option<&str>,
         reasoning_effort: Option<&str>,
         teams: Option<&TeamsSpawnConfig>,
+        launch_policy: Option<&crate::pty::config::LaunchPolicy>,
     ) -> Self {
         let env = build_opencode_env(
             name,
@@ -545,6 +581,7 @@ impl PtyConfig {
             model,
             reasoning_effort,
             teams,
+            launch_policy,
         );
 
         let mut args = Vec::new();
@@ -609,6 +646,7 @@ impl PtyConfig {
         factory_worker_cli: Option<&str>,
         model: Option<&str>,
         reasoning_effort: Option<&str>,
+        launch_policy: Option<&crate::pty::config::LaunchPolicy>,
     ) -> Self {
         let mut env = build_opencode_env(
             name,
@@ -620,6 +658,7 @@ impl PtyConfig {
             model,
             reasoning_effort,
             None,
+            launch_policy,
         );
         if let Some(model) = model {
             env.push(("BREHON_AGENT_MODEL".to_string(), model.to_string()));
@@ -660,6 +699,7 @@ impl PtyConfig {
         reasoning_effort: Option<&str>,
         server_port: u16,
         teams: Option<&TeamsSpawnConfig>,
+        launch_policy: Option<&crate::pty::config::LaunchPolicy>,
     ) -> Self {
         let mut env = build_opencode_env(
             name,
@@ -671,6 +711,7 @@ impl PtyConfig {
             model,
             reasoning_effort,
             teams,
+            launch_policy,
         );
         append_opencode_server_auth(&mut env);
         let session_id_path = opencode_session_id_path(&cwd);
@@ -705,6 +746,7 @@ impl PtyConfig {
         reasoning_effort: Option<&str>,
         server_port: u16,
         teams: Option<&TeamsSpawnConfig>,
+        launch_policy: Option<&crate::pty::config::LaunchPolicy>,
     ) -> Self {
         let mut env = build_opencode_env(
             name,
@@ -716,6 +758,7 @@ impl PtyConfig {
             model,
             reasoning_effort,
             teams,
+            launch_policy,
         );
         append_opencode_server_auth(&mut env);
         let server_url = format!("http://127.0.0.1:{server_port}");

@@ -2,10 +2,11 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
+use strum::{EnumIter, IntoEnumIterator, IntoStaticStr};
 
 use crate::agent::AdapterKind;
 use crate::review::ReviewPolicy;
-use crate::role::{ModelConfig, RoleDefinition};
+use crate::role::{ModelConfig, RoleDefinition, RoleKind};
 
 /// Root configuration structure.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -59,6 +60,9 @@ pub struct BrehonConfig {
     pub retention: RetentionConfig,
     /// Security configuration.
     pub security: SecurityConfig,
+    /// Permission profiles and sandbox specifications.
+    #[serde(default, skip_serializing_if = "ProfilesConfig::is_default")]
+    pub profiles: ProfilesConfig,
 }
 
 /// Runtime side-channel and daemon configuration.
@@ -211,6 +215,9 @@ pub struct AgentConnectionConfig {
     /// Permission mode for the Brehon-native runtime.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_mode: Option<String>,
+    /// Explicit permission profile override for this launcher.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<PermissionProfile>,
     /// Maximum native tool calls to execute concurrently.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_parallel_tool_calls: Option<usize>,
@@ -287,6 +294,9 @@ pub struct LaneConfig {
     /// Optional default system prompt for this lane.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system_prompt: Option<String>,
+    /// Optional permission profile override for this lane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<PermissionProfile>,
 }
 
 /// Named project-wide prompt fragment.
@@ -1330,6 +1340,49 @@ impl BrehonConfig {
         })
     }
 
+    /// Resolve the effective permission profile for a runtime role, optional
+    /// lane/launcher identity, and optional explicit per-agent override.
+    ///
+    /// Resolution order is deterministic:
+    /// 1. per-agent override
+    /// 2. lane-level `profile`
+    /// 3. launcher-level `profile`
+    /// 4. `profiles.defaults` for supported role kinds
+    /// 5. built-in runtime-role fallback
+    pub fn effective_permission_profile(
+        &self,
+        role: PermissionProfileRole,
+        lane: Option<&str>,
+        override_profile: Option<PermissionProfile>,
+    ) -> EffectivePermissionProfile<'_> {
+        let lane = lane.map(str::trim).filter(|value| !value.is_empty());
+        let lane_cfg = lane.and_then(|lane_name| self.lanes.get(lane_name));
+
+        let (profile, source) = if let Some(profile) = override_profile {
+            (profile, EffectivePermissionProfileSource::AgentOverride)
+        } else if let Some(profile) = lane_cfg.and_then(|cfg| cfg.profile) {
+            (profile, EffectivePermissionProfileSource::Lane)
+        } else if let Some(profile) = lane
+            .and_then(|lane_name| self.lane_launcher(lane_name))
+            .and_then(|cfg| cfg.profile)
+        {
+            (profile, EffectivePermissionProfileSource::Launcher)
+        } else if let Some(profile) = self.profiles.role_default(role) {
+            (profile, EffectivePermissionProfileSource::ConfigRoleDefault)
+        } else {
+            (
+                role.default_profile(),
+                EffectivePermissionProfileSource::BuiltInRoleDefault,
+            )
+        };
+
+        EffectivePermissionProfile {
+            profile,
+            source,
+            spec: self.profiles.spec_for(profile),
+        }
+    }
+
     /// Resolve enabled project-wide prompt fragments for a role into a single
     /// prompt block ordered by priority, then fragment id.
     pub fn project_prompt_for_role(&self, role: PromptTarget) -> Option<String> {
@@ -1634,7 +1687,9 @@ pub struct SecurityConfig {
     pub env_allowlist: Vec<String>,
 }
 
-/// Sandbox profile.
+/// Legacy coarse-grained sandbox profile.
+///
+/// `ProfilesConfig`/`SandboxSpec` carries the newer per-profile sandbox model.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum SandboxProfile {
     /// No sandboxing.
@@ -1643,6 +1698,307 @@ pub enum SandboxProfile {
     OsDefault,
     /// Use a custom sandbox profile.
     Custom,
+}
+
+/// Named permission profile for agent sandboxing and capability restrictions.
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, EnumIter, IntoStaticStr,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum PermissionProfile {
+    /// Read-only repo context; no shell writes; no network except model API.
+    Observe,
+    /// Read-only repo, review metadata, diffs, and artifacts; no file writes.
+    Reviewer,
+    /// Read/write only inside assigned worktree; local tests allowed.
+    Workspace,
+    /// Workspace plus allowlisted dependency/source-control egress.
+    Dependency,
+    /// Write only in integration worktree; controlled git/cherry-pick/test.
+    Integrator,
+    /// Can request elevated actions; high-risk actions are never auto-run.
+    Operator,
+    /// Current broad behavior; must be explicit, visible, and audited.
+    Unsafe,
+}
+
+impl PermissionProfile {
+    /// Iterate the canonical permission profiles recognized by the config model.
+    pub fn variants() -> impl Iterator<Item = Self> {
+        <Self as IntoEnumIterator>::iter()
+    }
+
+    /// Canonical serialized profile name used in config files.
+    pub fn as_str(self) -> &'static str {
+        self.into()
+    }
+
+    /// Iterate the canonical serialized profile names used in config files.
+    pub fn names() -> impl Iterator<Item = &'static str> {
+        Self::variants().map(Self::as_str)
+    }
+}
+
+/// Runtime role classification for permission-profile resolution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PermissionProfileRole {
+    /// Supervisor runtime.
+    Supervisor,
+    /// Worker runtime.
+    Worker,
+    /// Reviewer runtime.
+    Reviewer,
+    /// Advisor runtime.
+    Advisor,
+    /// Research runtime.
+    Research,
+    /// Integration/runtime-maintenance role.
+    Integrator,
+    /// Custom or otherwise unclassified runtime.
+    Custom,
+}
+
+impl PermissionProfileRole {
+    /// Return the `profiles.defaults` key for roles that participate in
+    /// config-level default overrides.
+    pub fn defaults_key(self) -> Option<&'static str> {
+        match self {
+            Self::Supervisor => Some(RoleKind::Supervisor.profile_defaults_key()),
+            Self::Worker => Some(RoleKind::Worker.profile_defaults_key()),
+            Self::Reviewer => Some(RoleKind::Reviewer.profile_defaults_key()),
+            Self::Custom => Some(RoleKind::Custom.profile_defaults_key()),
+            Self::Advisor | Self::Research | Self::Integrator => None,
+        }
+    }
+
+    /// Built-in fallback profile when neither config nor per-agent overrides
+    /// are present.
+    pub fn default_profile(self) -> PermissionProfile {
+        match self {
+            Self::Supervisor => PermissionProfile::Operator,
+            Self::Worker => PermissionProfile::Workspace,
+            Self::Reviewer => PermissionProfile::Reviewer,
+            Self::Advisor | Self::Research | Self::Custom => PermissionProfile::Observe,
+            Self::Integrator => PermissionProfile::Integrator,
+        }
+    }
+}
+
+impl From<RoleKind> for PermissionProfileRole {
+    fn from(value: RoleKind) -> Self {
+        match value {
+            RoleKind::Supervisor => Self::Supervisor,
+            RoleKind::Worker => Self::Worker,
+            RoleKind::Reviewer => Self::Reviewer,
+            RoleKind::Custom => Self::Custom,
+        }
+    }
+}
+
+/// Sandbox backend selection.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxBackend {
+    /// No sandbox enforcement.
+    #[serde(alias = "None")]
+    None,
+    /// Use the OS-provided default sandbox mechanism.
+    #[serde(alias = "OsDefault")]
+    OsDefault,
+    /// Linux bubblewrap namespace sandbox.
+    #[serde(alias = "Bubblewrap")]
+    Bubblewrap,
+    /// macOS seatbelt sandbox.
+    #[serde(alias = "Seatbelt")]
+    Seatbelt,
+}
+
+impl std::fmt::Display for SandboxBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::None => write!(f, "None"),
+            Self::OsDefault => write!(f, "OS Default"),
+            Self::Bubblewrap => write!(f, "Bubblewrap"),
+            Self::Seatbelt => write!(f, "Seatbelt"),
+        }
+    }
+}
+
+/// Network access classification.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkClass {
+    /// No network access.
+    Denied,
+    /// Only provider model API required by runtime.
+    ModelOnly,
+    /// Explicit allowlist of endpoints.
+    Allowlisted,
+    /// No network restrictions.
+    Unrestricted,
+}
+
+impl std::fmt::Display for NetworkClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Denied => write!(f, "Denied"),
+            Self::ModelOnly => write!(f, "Model Only"),
+            Self::Allowlisted => write!(f, "Allowlisted"),
+            Self::Unrestricted => write!(f, "Unrestricted"),
+        }
+    }
+}
+
+/// Credential access classification.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialClass {
+    /// No credential access.
+    None,
+    /// Only explicitly allowlisted environment variables.
+    EnvAllowlist,
+    /// Read access to OS keychain.
+    KeychainRead,
+    /// No credential restrictions.
+    Unrestricted,
+}
+
+impl std::fmt::Display for CredentialClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::None => write!(f, "None"),
+            Self::EnvAllowlist => write!(f, "Env Allowlist"),
+            Self::KeychainRead => write!(f, "Keychain Read"),
+            Self::Unrestricted => write!(f, "Unrestricted"),
+        }
+    }
+}
+
+/// Environment variable inheritance policy.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum EnvPolicy {
+    /// Inherit ambient environment (legacy behavior).
+    #[default]
+    Inherit,
+    /// Minimal clean environment.
+    Minimal,
+    /// Strict environment with explicit allowlist only.
+    Strict,
+}
+
+impl std::fmt::Display for EnvPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Inherit => write!(f, "Inherit"),
+            Self::Minimal => write!(f, "Minimal"),
+            Self::Strict => write!(f, "Strict"),
+        }
+    }
+}
+
+/// Filesystem root specification.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct FsRootSpec {
+    /// Repository-relative or absolute path.
+    pub path: String,
+    /// Whether to include subdirectories.
+    #[serde(default = "default_true")]
+    pub recursive: bool,
+}
+
+/// Concrete sandbox specification for a permission profile.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct SandboxSpec {
+    /// Sandbox backend to use.
+    pub backend: SandboxBackend,
+    /// Readable filesystem roots.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub read_roots: Vec<FsRootSpec>,
+    /// Writable filesystem roots.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub write_roots: Vec<FsRootSpec>,
+    /// Explicitly denied filesystem roots.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub denied_roots: Vec<FsRootSpec>,
+    /// Network access level.
+    pub network_class: NetworkClass,
+    /// Credential access level.
+    pub credential_class: CredentialClass,
+    /// Environment variable policy.
+    #[serde(default)]
+    pub env_policy: EnvPolicy,
+    /// Whether this spec represents the explicit unsafe profile.
+    #[serde(default)]
+    pub unsafe_marker: bool,
+}
+
+/// Permission profiles configuration.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProfilesConfig {
+    /// Default profile assigned to each lowercase role kind key (`supervisor`,
+    /// `worker`, `reviewer`, or `custom`) when no override is present.
+    #[serde(default)]
+    pub defaults: BTreeMap<String, PermissionProfile>,
+    /// Per-profile sandbox specifications. Keys must be valid profile names.
+    #[serde(default)]
+    pub specs: BTreeMap<String, SandboxSpec>,
+}
+
+impl ProfilesConfig {
+    pub fn is_default(&self) -> bool {
+        self.defaults.is_empty() && self.specs.is_empty()
+    }
+
+    /// Resolve a config-level default profile for the given runtime role.
+    pub fn role_default(&self, role: PermissionProfileRole) -> Option<PermissionProfile> {
+        role.defaults_key()
+            .and_then(|key| self.defaults.get(key).copied())
+    }
+
+    /// Resolve the configured sandbox spec for a profile, if present.
+    pub fn spec_for(&self, profile: PermissionProfile) -> Option<&SandboxSpec> {
+        self.specs.get(profile.as_str())
+    }
+}
+
+/// Source of an effective permission-profile decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EffectivePermissionProfileSource {
+    /// Explicit runtime/per-agent override.
+    AgentOverride,
+    /// Lane-level override.
+    Lane,
+    /// Launcher-level override.
+    Launcher,
+    /// Configured role default from `profiles.defaults`.
+    ConfigRoleDefault,
+    /// Built-in fallback for the runtime role.
+    BuiltInRoleDefault,
+}
+
+impl std::fmt::Display for EffectivePermissionProfileSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AgentOverride => write!(f, "Agent Override"),
+            Self::Lane => write!(f, "Lane Override"),
+            Self::Launcher => write!(f, "Launcher Override"),
+            Self::ConfigRoleDefault => write!(f, "Config Role Default"),
+            Self::BuiltInRoleDefault => write!(f, "Built-in Role Default"),
+        }
+    }
+}
+
+/// Deterministic effective permission-profile resolution result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct EffectivePermissionProfile<'a> {
+    /// Resolved profile name.
+    pub profile: PermissionProfile,
+    /// Where the resolved profile came from.
+    pub source: EffectivePermissionProfileSource,
+    /// Concrete sandbox spec for the profile when configured.
+    pub spec: Option<&'a SandboxSpec>,
 }
 
 /// Retention and boundedness configuration.
@@ -1758,6 +2114,7 @@ mod tests {
             base_url: None,
             api_key_env: None,
             permission_mode: None,
+            profile: None,
             max_parallel_tool_calls: None,
             assistant_message_passthrough_fields: Vec::new(),
             reasoning_effort_param: None,
@@ -1992,6 +2349,7 @@ mod tests {
                 compression: ContextCompressionConfig::default(),
             },
             permissions: PermissionsConfig::default(),
+            profiles: ProfilesConfig::default(),
             retention: RetentionConfig::default(),
             security: SecurityConfig {
                 sandbox_profile: SandboxProfile::OsDefault,
@@ -2016,5 +2374,197 @@ mod tests {
             .unwrap();
         assert!(supervisor_prompt.contains("[architecture.hexagonal]"));
         assert!(!supervisor_prompt.contains("[process.tdd]"));
+    }
+
+    #[test]
+    fn permission_profile_roundtrip() {
+        for profile in PermissionProfile::variants() {
+            let json = serde_json::to_string(&profile).unwrap();
+            let parsed: PermissionProfile = serde_json::from_str(&json).unwrap();
+            assert_eq!(profile, parsed);
+        }
+    }
+
+    #[test]
+    fn permission_profile_snake_case_serialization() {
+        for profile in PermissionProfile::variants() {
+            assert_eq!(
+                serde_json::to_string(&profile).unwrap(),
+                format!("\"{}\"", profile.as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_permission_profile_is_rejected() {
+        let err = serde_json::from_str::<PermissionProfile>("\"not_a_profile\"").unwrap_err();
+        assert!(err.to_string().contains("unknown variant"));
+    }
+
+    #[test]
+    fn sandbox_spec_roundtrip() {
+        let spec = SandboxSpec {
+            backend: SandboxBackend::OsDefault,
+            read_roots: vec![FsRootSpec {
+                path: ".".to_string(),
+                recursive: true,
+            }],
+            write_roots: vec![FsRootSpec {
+                path: ".brehon/worktrees".to_string(),
+                recursive: true,
+            }],
+            denied_roots: vec![FsRootSpec {
+                path: "/etc".to_string(),
+                recursive: false,
+            }],
+            network_class: NetworkClass::ModelOnly,
+            credential_class: CredentialClass::EnvAllowlist,
+            env_policy: EnvPolicy::Minimal,
+            unsafe_marker: false,
+        };
+        let json = serde_json::to_string(&spec).unwrap();
+        let parsed: SandboxSpec = serde_json::from_str(&json).unwrap();
+        assert_eq!(spec, parsed);
+    }
+
+    #[test]
+    fn sandbox_spec_omitted_fields_use_defaults() {
+        let parsed: SandboxSpec = serde_json::from_str(
+            r#"{"backend":"none","network_class":"denied","credential_class":"none"}"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.backend, SandboxBackend::None);
+        assert!(parsed.read_roots.is_empty());
+        assert!(parsed.write_roots.is_empty());
+        assert!(parsed.denied_roots.is_empty());
+        assert_eq!(parsed.network_class, NetworkClass::Denied);
+        assert_eq!(parsed.credential_class, CredentialClass::None);
+        assert_eq!(parsed.env_policy, EnvPolicy::Inherit);
+        assert!(!parsed.unsafe_marker);
+    }
+
+    #[test]
+    fn invalid_sandbox_backend_is_rejected() {
+        let err = serde_json::from_str::<SandboxSpec>(
+            r#"{"backend":"bogus","network_class":"denied","credential_class":"none"}"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown variant"));
+    }
+
+    #[test]
+    fn sandbox_backend_accepts_pascal_case_aliases() {
+        // OsDefault is the overlapping legacy spelling from SandboxProfile.
+        let parsed: SandboxBackend = serde_json::from_str("\"OsDefault\"").unwrap();
+        assert_eq!(parsed, SandboxBackend::OsDefault);
+
+        let parsed: SandboxBackend = serde_json::from_str("\"None\"").unwrap();
+        assert_eq!(parsed, SandboxBackend::None);
+
+        let parsed: SandboxBackend = serde_json::from_str("\"Bubblewrap\"").unwrap();
+        assert_eq!(parsed, SandboxBackend::Bubblewrap);
+
+        let parsed: SandboxBackend = serde_json::from_str("\"Seatbelt\"").unwrap();
+        assert_eq!(parsed, SandboxBackend::Seatbelt);
+    }
+
+    #[test]
+    fn profiles_config_defaults_to_empty() {
+        let parsed: ProfilesConfig = serde_json::from_str("{}").unwrap();
+        assert!(parsed.defaults.is_empty());
+        assert!(parsed.specs.is_empty());
+        assert!(parsed.is_default());
+    }
+
+    #[test]
+    fn brehon_config_without_profiles_parses() {
+        let yaml = r#"
+version: 1
+roles:
+  supervisor:
+    name: claude-supervisor
+    kind: Supervisor
+    description: "Test"
+    permissions: []
+  workers:
+    - lane: codex-worker
+      min: 1
+      max: 3
+  reviewers:
+    - lane: claude-reviewer
+      min: 1
+      max: 2
+review:
+  policy:
+    min_average_score: 7
+    min_individual_score: 6
+    blocking_score: 5
+    min_approvals: 1
+    require_blocking_feedback_resolution: true
+    max_review_rounds: 3
+  timeout_minutes: 30
+  auto_assign: true
+  default_reviewers: []
+  panel_mode: full_council
+  lease_mode: exclusive
+  panels: []
+  max_diff_tokens: 8000
+  chunk_strategy: ByDirectory
+  stale_detection:
+    enabled: true
+    ignore_files: []
+    strategy: DeltaReview
+supervisor:
+  autonomy: Guided
+  heartbeat_minutes: 15
+  stuck_detection:
+    time_threshold_minutes: 10
+    operation_aware: true
+    pattern_detection: true
+  nudge:
+    soft_after_minutes: 5
+    guidance_after_minutes: 10
+orchestration:
+  max_active_workers: 3
+  worktree_isolation: true
+  branch_prefix: "brehon/"
+  auto_cleanup_worktrees: true
+  worker_idle_behavior: Wait
+  allow_mutating_idle_work: false
+  self_improve_tasks: []
+budget:
+  alert_threshold_percent: 80
+  enforcement: Soft
+context:
+  db_path: ".brehon/brehon.db"
+  search_index_path: ".brehon/indexes/tantivy"
+  memory_ttl_days: null
+  max_memories: 10000
+  agents_md: Auto
+tui:
+  default_layout: Balanced
+  terminal_mode: Auto
+  notifications:
+    toast_duration_seconds: 5
+    flash_tabs: true
+    modal_on_critical: true
+  keybindings: default
+escalation:
+  human_in_loop: true
+  notify_via: Terminal
+  escalation_timeout_minutes: 15
+permissions:
+  categories: {}
+security:
+  sandbox_profile: OsDefault
+  persist_transcripts: true
+  redact_patterns: []
+  env_allowlist: []
+"#;
+        let parsed: BrehonConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(parsed.profiles.defaults.is_empty());
+        assert!(parsed.profiles.specs.is_empty());
+        let json = serde_json::to_value(&parsed).unwrap();
+        assert!(json.get("profiles").is_none());
     }
 }

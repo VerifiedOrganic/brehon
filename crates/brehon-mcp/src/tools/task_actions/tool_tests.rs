@@ -4088,6 +4088,79 @@ async fn test_mine_only_returns_worker_actionable_assignments() {
 }
 
 #[tokio::test]
+async fn test_mine_surfaces_review_obligations_even_when_role_env_is_lane_name() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let root = make_test_root();
+    let _env = ScopedEnv::set(&[
+        ("BREHON_ROOT", root.path().to_str().unwrap()),
+        ("BREHON_AGENT_NAME", "reviewer-b"),
+        ("BREHON_AGENT_ROLE", "gemini-reviewer"),
+    ]);
+    let tool = TaskActionsTool::new();
+
+    write_test_task(root.path(), "T-review", "in_review", "task");
+    let review_dir = root.path().join("runtime").join("reviews").join("T-review");
+    let round_dir = review_dir.join("round-2");
+    std::fs::create_dir_all(&round_dir).unwrap();
+    std::fs::write(
+        review_dir.join("state.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "task_id": "T-review",
+            "status": "collecting",
+            "current_round": 2,
+            "current_review_id": "REV-live",
+            "max_rounds": 3,
+            "panel_id": "primary",
+            "panel_mode": "configured_panel",
+            "panel": ["reviewer-a", "reviewer-b", "reviewer-c"],
+            "submissions_received": ["reviewer-a"],
+            "created_at": "2026-05-23T00:00:00Z",
+            "updated_at": "2026-05-23T00:01:00Z"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        round_dir.join("request.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "task_id": "T-review",
+            "review_id": "REV-live",
+            "requested_by": "supervisor-1",
+            "requested_at": "2026-05-23T00:00:00Z",
+            "title": "Reviewable task",
+            "description": "review this",
+            "commit": "abc123",
+            "context": ""
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let mine = tool
+        .execute(serde_json::json!({"action": "mine"}))
+        .await
+        .unwrap();
+    let payload: Value = serde_json::from_str(&extract_text(&mine)).unwrap();
+
+    assert_eq!(payload["task_count"], 0);
+    assert_eq!(payload["review_count"], 1);
+    assert_eq!(payload["count"], 1);
+    assert_eq!(payload["has_assigned_work"], true);
+    assert_eq!(
+        payload["review_obligations"][0]["assignment_kind"],
+        "review"
+    );
+    assert_eq!(payload["review_obligations"][0]["task_id"], "T-review");
+    assert_eq!(payload["review_obligations"][0]["review_id"], "REV-live");
+    assert_eq!(payload["review_obligations"][0]["reviewer"], "reviewer-b");
+    assert_eq!(
+        payload["review_obligations"][0]["next_action"]["args"]["action"],
+        "submit_review"
+    );
+    assert_eq!(payload["assignments"][0]["assignment_kind"], "review");
+}
+
+#[tokio::test]
 async fn test_close_initiative_requires_child_epics_closed() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
@@ -5351,6 +5424,95 @@ async fn test_complete_ignores_dirty_shared_root_when_worker_worktree_has_change
         task["checkpoint_warnings"][0]["entries"][0],
         "?? leaked.txt"
     );
+}
+
+#[tokio::test]
+async fn test_close_rejects_dirty_shared_root_before_terminal_status() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let root = make_test_root();
+    let project = tempfile::tempdir().unwrap();
+    init_git_workspace(project.path());
+    run_git(project.path(), &["checkout", "main"]);
+    std::fs::write(project.path().join("leaked.txt"), "wrong tree\n").unwrap();
+
+    let _env = ScopedEnv::set(&[
+        ("BREHON_ROOT", root.path().to_str().unwrap()),
+        ("BREHON_PROJECT_ROOT", project.path().to_str().unwrap()),
+        ("BREHON_WORKSPACE_ROOT", project.path().to_str().unwrap()),
+        ("BREHON_AGENT_ROLE", "supervisor"),
+        ("BREHON_AGENT_NAME", "sup-1"),
+        ("BREHON_SUPERVISOR_NAME", "sup-1"),
+    ]);
+    let tool = TaskActionsTool::new();
+    write_test_task_with_mode(
+        root.path(),
+        "T-dirty-terminal-close",
+        "approved",
+        "task",
+        "close",
+        "close-mode task",
+    );
+
+    let result = tool
+        .execute(serde_json::json!({
+            "action": "close",
+            "id": "T-dirty-terminal-close"
+        }))
+        .await
+        .unwrap();
+
+    assert_eq!(result.is_error, Some(true));
+    let text = extract_text(&result);
+    assert!(text.contains("shared repo root"), "{text}");
+    assert!(text.contains("Refusing to record closed/merged"), "{text}");
+
+    let task = read_test_task(root.path(), "T-dirty-terminal-close");
+    assert_eq!(task["status"], "approved");
+}
+
+#[tokio::test]
+async fn test_update_rejects_terminal_status_when_shared_root_is_dirty() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let root = make_test_root();
+    let project = tempfile::tempdir().unwrap();
+    init_git_workspace(project.path());
+    run_git(project.path(), &["checkout", "main"]);
+    std::fs::write(project.path().join("leaked.txt"), "wrong tree\n").unwrap();
+
+    let _env = ScopedEnv::set(&[
+        ("BREHON_ROOT", root.path().to_str().unwrap()),
+        ("BREHON_PROJECT_ROOT", project.path().to_str().unwrap()),
+        ("BREHON_WORKSPACE_ROOT", project.path().to_str().unwrap()),
+        ("BREHON_AGENT_ROLE", "supervisor"),
+        ("BREHON_AGENT_NAME", "sup-1"),
+        ("BREHON_SUPERVISOR_NAME", "sup-1"),
+    ]);
+    let tool = TaskActionsTool::new();
+    write_test_task_with_mode(
+        root.path(),
+        "T-dirty-terminal-update",
+        "approved",
+        "task",
+        "close",
+        "close-mode task",
+    );
+
+    let result = tool
+        .execute(serde_json::json!({
+            "action": "update",
+            "id": "T-dirty-terminal-update",
+            "status": "closed"
+        }))
+        .await
+        .unwrap();
+
+    assert_eq!(result.is_error, Some(true));
+    let text = extract_text(&result);
+    assert!(text.contains("shared repo root"), "{text}");
+    assert!(text.contains("Refusing to record closed/merged"), "{text}");
+
+    let task = read_test_task(root.path(), "T-dirty-terminal-update");
+    assert_eq!(task["status"], "approved");
 }
 
 #[tokio::test]
@@ -10764,8 +10926,8 @@ async fn test_initiative_squash_close_rejects_dirty_default_branch_worktree_with
     );
     let text = extract_text(&initiative_close);
     assert!(
-        text.contains("Target worktree") && text.contains("dirty"),
-        "expected dirty target worktree error, got: {text}"
+        text.contains("shared repo root") && text.contains("dirty"),
+        "expected shared-root dirty error, got: {text}"
     );
     let stored_after = read_test_task(&brehon_root, initiative_id);
     assert_eq!(

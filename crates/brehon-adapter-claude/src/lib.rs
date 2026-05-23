@@ -15,9 +15,11 @@
 
 pub mod harness;
 
+#[cfg(test)]
 use brehon_adapter_sdk::{
     prepend_current_exe_dir_to_path, push_brehon_root_env, push_workspace_root_env,
 };
+use brehon_types::config::SandboxProfile;
 
 /// Claude-specific session configuration.
 ///
@@ -43,11 +45,40 @@ pub struct ClaudeSessionConfig {
 impl ClaudeSessionConfig {
     /// Build the standard Claude CLI argument list from a [`ClaudeSpawnParams`].
     ///
-    /// This is the core of the PTY harness: it assembles all CLI flags,
-    /// session IDs, model overrides, and Agent Teams parameters that the
-    /// Claude Code CLI expects.
+    /// This is a **test-only helper** that mirrors the production logic in
+    /// `PtyConfig::claude()` for unit-test assertions. It is NOT the PTY
+    /// harness core — the real harness lives in `brehon-pty` and derives
+    /// the effective sandbox profile from `brehon_root` when `sandbox_profile`
+    /// is `None`. Do not wire this into production code paths without aligning
+    /// the derivation logic.
+    #[cfg(test)]
     pub fn from_params(params: &ClaudeSpawnParams) -> Self {
-        let mut args = vec!["--dangerously-skip-permissions".to_string()];
+        let mut args = vec![];
+        // Derive the effective sandbox profile. Explicit None means unsafe;
+        // OsDefault/Custom mean safe. When no profile is provided we derive
+        // from brehon_root the same way production does in PtyConfig::claude().
+        let is_unsafe = match params.sandbox_profile {
+            Some(SandboxProfile::None) => true,
+            Some(SandboxProfile::OsDefault) | Some(SandboxProfile::Custom) => false,
+            None => {
+                if let Some(ref root) = params.brehon_root {
+                    if let Some(project_root) = root.parent() {
+                        if let Ok(config) = brehon_config::load_config(Some(project_root)) {
+                            matches!(config.security.sandbox_profile, SandboxProfile::None)
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            }
+        };
+        if is_unsafe {
+            args.push("--dangerously-skip-permissions".to_string());
+        }
 
         if params.teams.is_none() {
             args.push("--session-id".to_string());
@@ -177,6 +208,8 @@ pub struct ClaudeSpawnParams {
     pub reasoning_effort: Option<String>,
     /// Optional Agent Teams configuration.
     pub teams: Option<ClaudeTeamsConfig>,
+    /// Optional sandbox profile for permission derivation.
+    pub sandbox_profile: Option<SandboxProfile>,
 }
 
 impl ClaudeSpawnParams {
@@ -193,6 +226,7 @@ impl ClaudeSpawnParams {
         model: Option<&str>,
         teams: Option<&ClaudeTeamsConfig>,
         reasoning_effort: Option<&str>,
+        sandbox_profile: Option<SandboxProfile>,
     ) -> Self {
         let agent_type = brehon_agent_type
             .filter(|v| !v.trim().is_empty())
@@ -210,6 +244,7 @@ impl ClaudeSpawnParams {
             model: model.map(|m| m.to_string()),
             reasoning_effort: reasoning_effort.map(|r| r.to_string()),
             teams: teams.cloned(),
+            sandbox_profile,
         }
     }
 }
@@ -276,6 +311,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert_eq!(params.brehon_agent_type, "claude-code");
         assert_eq!(params.name, "worker-1");
@@ -290,6 +326,7 @@ mod tests {
             "reviewer",
             Some("claude-reviewer"),
             std::path::PathBuf::from("/tmp/work2"),
+            None,
             None,
             None,
             None,
@@ -313,6 +350,7 @@ mod tests {
             None,
             None,
             None,
+            Some(SandboxProfile::None),
         );
         let config = ClaudeSessionConfig::from_params(&params);
         assert_eq!(config.command, "claude");
@@ -325,12 +363,181 @@ mod tests {
     }
 
     #[test]
+    fn claude_session_config_safe_default_without_profile_or_root() {
+        let params = ClaudeSpawnParams::new(
+            "test",
+            "worker",
+            None,
+            std::path::PathBuf::from("/tmp"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let config = ClaudeSessionConfig::from_params(&params);
+        assert!(
+            !config
+                .args
+                .contains(&"--dangerously-skip-permissions".to_string()),
+            "no profile and no brehon_root should default to safe"
+        );
+    }
+
+    #[test]
+    fn claude_session_config_derives_unsafe_from_brehon_root() {
+        let workdir = std::env::temp_dir().join(format!(
+            "brehon-claude-adapter-unsafe-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let brehon_dir = workdir.join(".brehon");
+        std::fs::create_dir_all(&brehon_dir).unwrap();
+        std::fs::write(
+            brehon_dir.join("config.yaml"),
+            "security:\n  sandbox_profile: None\n",
+        )
+        .unwrap();
+        let params = ClaudeSpawnParams::new(
+            "test",
+            "worker",
+            None,
+            workdir.clone(),
+            Some(&brehon_dir),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let config = ClaudeSessionConfig::from_params(&params);
+        assert!(
+            config
+                .args
+                .contains(&"--dangerously-skip-permissions".to_string()),
+            "unsafe config on disk should derive skip-permissions"
+        );
+        let _ = std::fs::remove_dir_all(&workdir);
+    }
+
+    #[test]
+    fn claude_session_config_derives_safe_from_brehon_root() {
+        let workdir = std::env::temp_dir().join(format!(
+            "brehon-claude-adapter-safe-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let brehon_dir = workdir.join(".brehon");
+        std::fs::create_dir_all(&brehon_dir).unwrap();
+        std::fs::write(
+            brehon_dir.join("config.yaml"),
+            "security:\n  sandbox_profile: OsDefault\n",
+        )
+        .unwrap();
+        let params = ClaudeSpawnParams::new(
+            "test",
+            "worker",
+            None,
+            workdir.clone(),
+            Some(&brehon_dir),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let config = ClaudeSessionConfig::from_params(&params);
+        assert!(
+            !config
+                .args
+                .contains(&"--dangerously-skip-permissions".to_string()),
+            "safe config on disk should NOT derive skip-permissions"
+        );
+        let _ = std::fs::remove_dir_all(&workdir);
+    }
+
+    #[test]
+    fn claude_session_config_safe_profile_omits_skip_permissions() {
+        let params = ClaudeSpawnParams::new(
+            "test",
+            "worker",
+            None,
+            std::path::PathBuf::from("/tmp"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(SandboxProfile::OsDefault),
+        );
+        let config = ClaudeSessionConfig::from_params(&params);
+        assert!(
+            !config
+                .args
+                .contains(&"--dangerously-skip-permissions".to_string()),
+            "safe profile should NOT include --dangerously-skip-permissions"
+        );
+    }
+
+    #[test]
+    fn claude_session_config_custom_profile_omits_skip_permissions() {
+        let params = ClaudeSpawnParams::new(
+            "test",
+            "worker",
+            None,
+            std::path::PathBuf::from("/tmp"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(SandboxProfile::Custom),
+        );
+        let config = ClaudeSessionConfig::from_params(&params);
+        assert!(
+            !config
+                .args
+                .contains(&"--dangerously-skip-permissions".to_string()),
+            "custom profile should NOT include --dangerously-skip-permissions"
+        );
+    }
+
+    #[test]
+    fn claude_session_config_unsafe_profile_keeps_skip_permissions() {
+        let params = ClaudeSpawnParams::new(
+            "test",
+            "worker",
+            None,
+            std::path::PathBuf::from("/tmp"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(SandboxProfile::None),
+        );
+        let config = ClaudeSessionConfig::from_params(&params);
+        assert!(
+            config
+                .args
+                .contains(&"--dangerously-skip-permissions".to_string()),
+            "unsafe profile should include --dangerously-skip-permissions"
+        );
+    }
+
+    #[test]
     fn claude_session_config_without_teams_includes_session_id() {
         let params = ClaudeSpawnParams::new(
             "test",
             "worker",
             None,
             std::path::PathBuf::from("/tmp"),
+            None,
             None,
             None,
             None,
@@ -364,6 +571,7 @@ mod tests {
             None,
             Some(&teams),
             None,
+            None,
         );
         let config = ClaudeSessionConfig::from_params(&params);
         assert!(config.args.contains(&"--team-name".to_string()));
@@ -385,6 +593,7 @@ mod tests {
             Some("claude-opus-4-6"),
             None,
             None,
+            None,
         );
         let config = ClaudeSessionConfig::from_params(&params);
         assert!(config.args.contains(&"--model".to_string()));
@@ -398,6 +607,7 @@ mod tests {
             "worker",
             None,
             std::path::PathBuf::from("/tmp/work"),
+            None,
             None,
             None,
             None,
@@ -433,6 +643,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         let config = ClaudeSessionConfig::from_params(&params);
         assert!(config.args.contains(&"--effort".to_string()));
@@ -446,6 +657,7 @@ mod tests {
             "supervisor",
             None,
             std::path::PathBuf::from("/tmp"),
+            None,
             None,
             None,
             None,
@@ -471,6 +683,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         let config = ClaudeSessionConfig::from_params(&params);
         assert!(
@@ -490,6 +703,7 @@ mod tests {
             std::path::PathBuf::from("/tmp"),
             None,
             Some("my-supervisor"),
+            None,
             None,
             None,
             None,

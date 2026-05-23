@@ -65,6 +65,14 @@ pub fn load_config_with_override(
         merge_yaml_overlay(&mut merged_value, global);
     }
 
+    load_config_from_merged_value(merged_value, project_path, config_override_path)
+}
+
+fn load_config_from_merged_value(
+    mut merged_value: Value,
+    project_path: Option<&Path>,
+    config_override_path: Option<&Path>,
+) -> Result<BrehonConfig, ConfigError> {
     let project_config = match config_override_path {
         Some(path) => load_config_file_value(path, "project config override")?,
         None => match project_path {
@@ -462,6 +470,28 @@ version: 1
 mod tests {
     use super::*;
 
+    /// Load config from project/override paths without merging the global
+    /// config layer. This makes tests hermetic on all platforms (including
+    /// Windows) because it bypasses `directories::ProjectDirs` entirely.
+    fn load_config_hermetic(
+        project_path: Option<&std::path::Path>,
+        config_override_path: Option<&std::path::Path>,
+    ) -> Result<BrehonConfig, ConfigError> {
+        let merged_value = parse_defaults_value()?;
+        load_config_from_merged_value(merged_value, project_path, config_override_path)
+    }
+
+    fn unique_temp_dir(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("unix epoch")
+                .as_nanos()
+        ))
+    }
+
     #[test]
     fn load_config_without_files() {
         let config = load_config(None).expect("Should load defaults");
@@ -791,14 +821,7 @@ orchestration:
 
     #[test]
     fn partial_overlay_can_patch_nested_launcher_without_redeclaring_it() {
-        let project_root = std::env::temp_dir().join(format!(
-            "brehon-config-partial-launcher-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("unix epoch")
-                .as_nanos()
-        ));
+        let project_root = unique_temp_dir("brehon-config-partial-launcher-test");
         if project_root.exists() {
             std::fs::remove_dir_all(&project_root).expect("cleanup tempdir");
         }
@@ -826,6 +849,65 @@ launchers:
             codex.args,
             vec!["app-server".to_string(), "--experimental".to_string()]
         );
+
+        std::fs::remove_dir_all(&project_root).expect("remove tempdir");
+    }
+
+    #[test]
+    fn load_config_with_override_rejects_unknown_profile_spec_name() {
+        let project_root = unique_temp_dir("brehon-config-invalid-profile-spec");
+        if project_root.exists() {
+            std::fs::remove_dir_all(&project_root).expect("cleanup tempdir");
+        }
+        std::fs::create_dir_all(&project_root).expect("create tempdir");
+
+        let override_file = project_root.join("override.yaml");
+        std::fs::write(
+            &override_file,
+            r#"
+version: 1
+profiles:
+  specs:
+    unknown_profile:
+      backend: none
+      network_class: denied
+      credential_class: none
+"#,
+        )
+        .expect("write override");
+
+        let err = load_config_with_override(Some(&project_root), Some(&override_file))
+            .expect_err("unknown profile spec name should be rejected");
+        let message = err.to_string();
+        assert!(message.contains("unknown profile name 'unknown_profile'"));
+
+        std::fs::remove_dir_all(&project_root).expect("remove tempdir");
+    }
+
+    #[test]
+    fn load_config_with_override_rejects_unknown_profile_defaults_key() {
+        let project_root = unique_temp_dir("brehon-config-invalid-profile-defaults-key");
+        if project_root.exists() {
+            std::fs::remove_dir_all(&project_root).expect("cleanup tempdir");
+        }
+        std::fs::create_dir_all(&project_root).expect("create tempdir");
+
+        let override_file = project_root.join("override.yaml");
+        std::fs::write(
+            &override_file,
+            r#"
+version: 1
+profiles:
+  defaults:
+    reviewre: reviewer
+"#,
+        )
+        .expect("write override");
+
+        let err = load_config_with_override(Some(&project_root), Some(&override_file))
+            .expect_err("unknown profile defaults key should be rejected");
+        let message = err.to_string();
+        assert!(message.contains("unknown role kind 'reviewre'"));
 
         std::fs::remove_dir_all(&project_root).expect("remove tempdir");
     }
@@ -1376,6 +1458,7 @@ security:
                 base_url: None,
                 api_key_env: None,
                 permission_mode: None,
+                profile: None,
                 max_parallel_tool_calls: None,
                 assistant_message_passthrough_fields: Vec::new(),
                 reasoning_effort_param: None,
@@ -1442,5 +1525,291 @@ security:
         assert!(load_project_config(&stray).expect("stray ok").is_none());
 
         std::fs::remove_dir_all(&project_root).ok();
+    }
+
+    const LEGACY_CONFIG_YAML: &str = r#"
+version: 1
+launchers:
+  claude:
+    adapter: Acp
+    command: claude
+    args: []
+  codex:
+    adapter: Acp
+    command: codex
+    args: []
+lanes:
+  claude-supervisor:
+    launcher: claude
+  codex-worker:
+    launcher: codex
+roles:
+  supervisor:
+    name: claude-supervisor
+    kind: Supervisor
+    description: legacy
+    permissions: [CreateTasks]
+  workers:
+    - lane: codex-worker
+      min: 1
+      max: 1
+  reviewers:
+    - lane: claude-supervisor
+      min: 1
+      max: 1
+review:
+  policy:
+    min_average_score: 7
+    min_individual_score: 6
+    blocking_score: 5
+    min_approvals: 1
+    require_blocking_feedback_resolution: true
+    max_review_rounds: 3
+  timeout_minutes: 30
+  auto_assign: true
+  default_reviewers: [claude-supervisor]
+  panel_mode: full_council
+  panels:
+    - id: primary
+      reviewers: [claude-supervisor]
+  max_diff_tokens: 8000
+  chunk_strategy: ByDirectory
+  stale_detection:
+    enabled: true
+    ignore_files: []
+    strategy: DeltaReview
+supervisor:
+  autonomy: Guided
+  heartbeat_minutes: 15
+  stuck_detection:
+    time_threshold_minutes: 10
+    operation_aware: true
+    pattern_detection: true
+  nudge:
+    soft_after_minutes: 5
+    guidance_after_minutes: 10
+orchestration:
+  max_active_workers: 3
+  worktree_isolation: true
+  branch_prefix: "brehon/"
+  auto_cleanup_worktrees: true
+  worker_idle_behavior: Wait
+  allow_mutating_idle_work: false
+  self_improve_tasks: []
+budget:
+  alert_threshold_percent: 80
+  enforcement: Soft
+context:
+  db_path: ".brehon/brehon.db"
+  search_index_path: ".brehon/indexes/tantivy"
+  memory_ttl_days: null
+  max_memories: 10000
+  agents_md: Auto
+tui:
+  default_layout: Balanced
+  terminal_mode: Auto
+  notifications:
+    toast_duration_seconds: 5
+    flash_tabs: true
+    modal_on_critical: true
+  keybindings: default
+escalation:
+  human_in_loop: true
+  notify_via: Terminal
+  escalation_timeout_minutes: 15
+permissions:
+  categories: {}
+security:
+  sandbox_profile: OsDefault
+  persist_transcripts: true
+  redact_patterns: []
+  env_allowlist: [PATH]
+"#;
+
+    const MIXED_CONFIG_YAML: &str = r#"
+version: 1
+launchers:
+  claude:
+    adapter: Acp
+    command: claude
+    args: []
+  codex:
+    adapter: Acp
+    command: codex
+    args: []
+lanes:
+  claude-supervisor:
+    launcher: claude
+  codex-worker:
+    launcher: codex
+roles:
+  supervisor:
+    name: claude-supervisor
+    kind: Supervisor
+    description: mixed
+    permissions: [CreateTasks]
+  workers:
+    - lane: codex-worker
+      min: 1
+      max: 1
+  reviewers:
+    - lane: claude-supervisor
+      min: 1
+      max: 1
+review:
+  policy:
+    min_average_score: 7
+    min_individual_score: 6
+    blocking_score: 5
+    min_approvals: 1
+    require_blocking_feedback_resolution: true
+    max_review_rounds: 3
+  timeout_minutes: 30
+  auto_assign: true
+  default_reviewers: [claude-supervisor]
+  panel_mode: full_council
+  panels:
+    - id: primary
+      reviewers: [claude-supervisor]
+  max_diff_tokens: 8000
+  chunk_strategy: ByDirectory
+  stale_detection:
+    enabled: true
+    ignore_files: []
+    strategy: DeltaReview
+supervisor:
+  autonomy: Guided
+  heartbeat_minutes: 15
+  stuck_detection:
+    time_threshold_minutes: 10
+    operation_aware: true
+    pattern_detection: true
+  nudge:
+    soft_after_minutes: 5
+    guidance_after_minutes: 10
+orchestration:
+  max_active_workers: 3
+  worktree_isolation: true
+  branch_prefix: "brehon/"
+  auto_cleanup_worktrees: true
+  worker_idle_behavior: Wait
+  allow_mutating_idle_work: false
+  self_improve_tasks: []
+budget:
+  alert_threshold_percent: 80
+  enforcement: Soft
+context:
+  db_path: ".brehon/brehon.db"
+  search_index_path: ".brehon/indexes/tantivy"
+  memory_ttl_days: null
+  max_memories: 10000
+  agents_md: Auto
+tui:
+  default_layout: Balanced
+  terminal_mode: Auto
+  notifications:
+    toast_duration_seconds: 5
+    flash_tabs: true
+    modal_on_critical: true
+  keybindings: default
+escalation:
+  human_in_loop: true
+  notify_via: Terminal
+  escalation_timeout_minutes: 15
+permissions:
+  categories: {}
+security:
+  sandbox_profile: OsDefault
+  persist_transcripts: true
+  redact_patterns: []
+  env_allowlist: [PATH]
+profiles:
+  defaults:
+    worker: dependency
+  specs:
+    dependency:
+      backend: os_default
+      network_class: allowlisted
+      credential_class: env_allowlist
+      env_policy: minimal
+      unsafe_marker: false
+"#;
+
+    #[test]
+    fn load_config_without_profiles_section_uses_legacy_sandbox_profile() {
+        // Migration compatibility: configs written before the profiles schema
+        // should still load and validate cleanly.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let override_file = temp.path().join("legacy.yaml");
+        std::fs::write(&override_file, LEGACY_CONFIG_YAML).expect("write legacy config");
+
+        let config = load_config_hermetic(None, Some(&override_file))
+            .expect("legacy config should load without profiles section");
+
+        // profiles should default to empty
+        assert!(config.profiles.is_default());
+        assert!(config.profiles.defaults.is_empty());
+        assert!(config.profiles.specs.is_empty());
+
+        // legacy security.sandbox_profile should still be preserved
+        assert_eq!(
+            config.security.sandbox_profile,
+            brehon_types::SandboxProfile::OsDefault
+        );
+
+        // effective_permission_profile should fall back to built-in defaults
+        let eff = config.effective_permission_profile(
+            brehon_types::PermissionProfileRole::Worker,
+            Some("codex-worker"),
+            None,
+        );
+        assert_eq!(eff.profile, brehon_types::PermissionProfile::Workspace);
+        assert_eq!(
+            eff.source,
+            brehon_types::EffectivePermissionProfileSource::BuiltInRoleDefault
+        );
+    }
+
+    #[test]
+    fn load_config_with_profiles_section_and_legacy_sandbox_profile_coexists() {
+        // Migration compatibility: configs that have both the new profiles section
+        // and the legacy security.sandbox_profile should load correctly.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let override_file = temp.path().join("mixed.yaml");
+        std::fs::write(&override_file, MIXED_CONFIG_YAML).expect("write mixed config");
+
+        let config =
+            load_config_hermetic(None, Some(&override_file)).expect("mixed config should load");
+
+        // New profiles section should be populated
+        assert!(!config.profiles.is_default());
+        assert_eq!(
+            config.profiles.defaults.get("worker"),
+            Some(&brehon_types::PermissionProfile::Dependency)
+        );
+        assert!(config.profiles.specs.contains_key("dependency"));
+
+        // Legacy security.sandbox_profile should still be preserved
+        assert_eq!(
+            config.security.sandbox_profile,
+            brehon_types::SandboxProfile::OsDefault
+        );
+
+        // effective_permission_profile should use the new config default
+        let eff = config.effective_permission_profile(
+            brehon_types::PermissionProfileRole::Worker,
+            Some("codex-worker"),
+            None,
+        );
+        assert_eq!(eff.profile, brehon_types::PermissionProfile::Dependency);
+        assert_eq!(
+            eff.source,
+            brehon_types::EffectivePermissionProfileSource::ConfigRoleDefault
+        );
+        assert!(eff.spec.is_some());
+        let spec = eff.spec.unwrap();
+        assert_eq!(spec.backend, brehon_types::SandboxBackend::OsDefault);
+        assert_eq!(spec.network_class, brehon_types::NetworkClass::Allowlisted);
+        assert!(!spec.unsafe_marker);
     }
 }

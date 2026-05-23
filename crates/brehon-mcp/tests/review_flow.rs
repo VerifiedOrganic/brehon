@@ -852,6 +852,127 @@ async fn test_review_changes_requested_then_re_review() {
 }
 
 #[tokio::test]
+async fn test_review_round_closes_early_when_blocking_verdict_arrives() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    let env = TestEnv::new();
+    env.write_session("reviewer-gamma", "reviewer", Some("claude"));
+    let tool = VerificationTool::new().with_config(ReviewConfig {
+        policy: ReviewPolicy {
+            min_average_score: 7,
+            min_individual_score: 6,
+            blocking_score: 5,
+            min_approvals: 2,
+            require_blocking_feedback_resolution: true,
+            max_review_rounds: 3,
+        },
+        timeout_minutes: 30,
+        auto_assign: true,
+        default_reviewers: vec![
+            "codex".to_string(),
+            "gemini".to_string(),
+            "claude".to_string(),
+        ],
+        panel_mode: ReviewPanelMode::FixedSize,
+        panels: vec![ReviewPanelConfig {
+            id: "primary".to_string(),
+            reviewers: vec![
+                "codex".to_string(),
+                "gemini".to_string(),
+                "claude".to_string(),
+            ],
+        }],
+        ..ReviewConfig::default()
+    });
+
+    std::env::set_var("BREHON_AGENT_NAME", "supervisor-1");
+    std::env::set_var("BREHON_AGENT_ROLE", "supervisor");
+    let request = tool
+        .execute(json!({
+            "action": "request_review",
+            "task_id": env.task_id,
+            "title": "Three reviewer task"
+        }))
+        .await
+        .unwrap();
+    assert!(request.is_error.is_none(), "{}", extract_text(&request));
+    let request_json = parse_result(&request);
+    assert_eq!(request_json["panel"].as_array().unwrap().len(), 3);
+    let review_id = request_json["review_id"].as_str().unwrap().to_string();
+
+    std::env::set_var("BREHON_AGENT_NAME", "reviewer-alpha");
+    std::env::set_var("BREHON_AGENT_ROLE", "reviewer");
+    let approval = tool
+        .execute(json!({
+            "action": "submit_review",
+            "review_id": review_id,
+            "score": 8,
+            "verdict": "approved",
+            "summary": "first pass ok"
+        }))
+        .await
+        .unwrap();
+    assert!(approval.is_error.is_none(), "{}", extract_text(&approval));
+    let approval_json = parse_result(&approval);
+    assert_eq!(approval_json["panel_progress"], "1/3");
+    assert_eq!(approval_json["next_action"]["kind"], "wait_for_reviews");
+
+    std::env::set_var("BREHON_AGENT_NAME", "reviewer-beta");
+    let needs_revision = tool
+        .execute(json!({
+            "action": "submit_review",
+            "review_id": review_id,
+            "score": 5,
+            "verdict": "needs_revision",
+            "summary": "blocking issue",
+            "findings": [{
+                "description": "safe path still prompts",
+                "file": "src/lib.rs",
+                "line": 42,
+                "severity": "blocking",
+                "suggestion": "make unattended safe mode explicit"
+            }]
+        }))
+        .await
+        .unwrap();
+    assert!(
+        needs_revision.is_error.is_none(),
+        "{}",
+        extract_text(&needs_revision)
+    );
+    let json = parse_result(&needs_revision);
+    assert_eq!(json["outcome"], "changes_requested");
+    assert_eq!(json["completed_early"], true);
+    assert_eq!(json["panel_progress"], "2/3");
+    assert_eq!(json["next_action"]["kind"], "assign_revision_worker");
+
+    let task: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            env.root
+                .join("runtime")
+                .join("tasks")
+                .join(format!("{}.json", env.task_id)),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(task["status"], "changes_requested");
+
+    let state: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            env.root
+                .join("runtime")
+                .join("reviews")
+                .join(&env.task_id)
+                .join("state.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(state["status"], "changes_requested");
+    assert_eq!(state["submissions_received"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
 async fn test_rereview_refreshes_stale_panel_members_after_restart() {
     let _lock = ENV_LOCK.lock().unwrap();
     let env = TestEnv::new();
@@ -2473,6 +2594,9 @@ async fn test_changes_requested_persists_review_feedback_and_notifies_worker() {
         .await
         .unwrap();
     assert!(alpha.is_error.is_none(), "{}", extract_text(&alpha));
+    let alpha_json = parse_result(&alpha);
+    assert_eq!(alpha_json["outcome"], "changes_requested");
+    assert_eq!(alpha_json["completed_early"], true);
 
     std::env::set_var("BREHON_AGENT_NAME", "reviewer-beta");
     std::env::set_var("BREHON_AGENT_ROLE", "reviewer");
@@ -2521,7 +2645,7 @@ async fn test_changes_requested_persists_review_feedback_and_notifies_worker() {
             .as_array()
             .unwrap()
             .len(),
-        1
+        0
     );
 
     let worker_messages = queued_messages_for(&env.root, "worker-1");

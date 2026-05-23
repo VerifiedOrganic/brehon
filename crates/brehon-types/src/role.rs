@@ -2,9 +2,13 @@
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use strum::{EnumIter, IntoEnumIterator, IntoStaticStr};
 
 /// Kind of role an agent can fill.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, EnumIter, IntoStaticStr,
+)]
+#[strum(serialize_all = "snake_case")]
 pub enum RoleKind {
     /// Supervisor: coordinates work, assigns tasks.
     Supervisor,
@@ -14,6 +18,26 @@ pub enum RoleKind {
     Reviewer,
     /// Custom role defined in configuration.
     Custom,
+}
+
+impl RoleKind {
+    /// Iterate the canonical role kinds recognized by the config model.
+    pub fn variants() -> impl Iterator<Item = Self> {
+        <Self as IntoEnumIterator>::iter()
+    }
+
+    /// Canonical lowercase key used in `profiles.defaults`.
+    ///
+    /// This intentionally differs from `RoleKind`'s default PascalCase serde
+    /// representation (`Supervisor`, `Worker`, etc.).
+    pub fn profile_defaults_key(self) -> &'static str {
+        self.into()
+    }
+
+    /// Iterate the lowercase keys accepted in `profiles.defaults`.
+    pub fn profile_defaults_keys() -> impl Iterator<Item = &'static str> {
+        Self::variants().map(Self::profile_defaults_key)
+    }
 }
 
 /// Permission level for a role.
@@ -144,5 +168,11 @@ mod tests {
         let json = serde_json::to_string(&role).unwrap();
         let parsed: RoleDefinition = serde_json::from_str(&json).unwrap();
         assert_eq!(role, parsed);
+    }
+
+    #[test]
+    fn role_kind_profile_defaults_keys_are_lowercase() {
+        let keys: Vec<_> = RoleKind::profile_defaults_keys().collect();
+        assert_eq!(keys, vec!["supervisor", "worker", "reviewer", "custom"]);
     }
 }

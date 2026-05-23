@@ -706,6 +706,7 @@ mod tests {
             configured_agent_type,
             None,
             &[],
+            None,
         )
         .expect("create reviewer pane")
     }
@@ -751,6 +752,7 @@ mod tests {
             None,
             Some(provider),
             &[],
+            None,
         )
         .expect("create custom worker pane")
     }
@@ -793,6 +795,7 @@ mod tests {
             None,
             24,
             80,
+            None,
             None,
             None,
         )
@@ -855,6 +858,7 @@ mod tests {
             None,
             None,
             &std::collections::HashMap::new(),
+            None,
         )
         .expect("create supervisor pane")
     }
@@ -1027,6 +1031,65 @@ mod tests {
     }
 
     #[test]
+    fn test_sync_reviewer_review_contexts_marks_pending_panel_members() {
+        let temp = tempfile::tempdir().unwrap();
+        write_test_task(temp.path(), "T-review", "in_review");
+        let review_dir = temp.path().join("runtime").join("reviews").join("T-review");
+        std::fs::create_dir_all(&review_dir).unwrap();
+        std::fs::write(
+            review_dir.join("state.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "task_id": "T-review",
+                "status": "collecting",
+                "current_round": 3,
+                "current_review_id": "REV-live",
+                "panel_id": "primary",
+                "panel": ["reviewer-a", "reviewer-b", "reviewer-c"],
+                "submissions_received": ["reviewer-a"],
+                "created_at": "2026-05-23T00:00:00Z",
+                "updated_at": "2026-05-23T00:01:00Z"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut mux = brehon_mux::Mux::new(24, 80);
+        mux.add_pane(make_reviewer_pane("reviewer-a"));
+        mux.add_pane(make_reviewer_pane("reviewer-b"));
+        mux.add_pane(make_reviewer_pane("reviewer-c"));
+        mux.add_pane(make_reviewer_pane("reviewer-idle"));
+
+        let tasks = read_task_files(temp.path());
+        sync_reviewer_review_contexts(&mut mux, temp.path(), &tasks);
+
+        assert!(mux
+            .get("reviewer-a")
+            .expect("reviewer-a")
+            .review_context()
+            .is_none());
+        let reviewer_b = mux
+            .get("reviewer-b")
+            .expect("reviewer-b")
+            .review_context()
+            .expect("pending reviewer context");
+        assert_eq!(reviewer_b.review_id, "REV-live");
+        assert_eq!(reviewer_b.task_id, "T-review");
+        assert_eq!(reviewer_b.round, 3);
+        assert_eq!(reviewer_b.panel_done, 1);
+        assert_eq!(reviewer_b.panel_total, 3);
+        assert!(mux
+            .get("reviewer-c")
+            .expect("reviewer-c")
+            .review_context()
+            .is_some());
+        assert!(mux
+            .get("reviewer-idle")
+            .expect("reviewer-idle")
+            .review_context()
+            .is_none());
+    }
+
+    #[test]
     fn test_collect_dashboard_refresh_collects_runtime_snapshot() {
         let temp = tempfile::tempdir().unwrap();
         init_test_git_repo(temp.path());
@@ -1076,6 +1139,22 @@ mod tests {
             vec!["reviewer-1".to_string()]
         );
         assert_eq!(snapshot.shared_root_issue, None);
+    }
+
+    #[test]
+    fn test_collect_dashboard_refresh_detects_untracked_root_leak() {
+        let temp = tempfile::tempdir().unwrap();
+        init_test_git_repo(temp.path());
+
+        let brehon_root = temp.path().join(".brehon");
+        std::fs::create_dir_all(&brehon_root).unwrap();
+        std::fs::write(temp.path().join("leaked-root-file.txt"), "oops").unwrap();
+
+        let snapshot = collect_dashboard_refresh(&brehon_root, &[], &[]);
+        let issue = snapshot
+            .shared_root_issue
+            .expect("untracked shared-root file should be reported");
+        assert!(issue.contains("leaked-root-file.txt"));
     }
 
     #[test]
@@ -6098,6 +6177,7 @@ mod tests {
             80,
             None,
             None,
+            None,
         )
         .expect("create worker pane");
         pane.append_output(b"[brehon] prompt delivered\r\n")
@@ -7414,6 +7494,7 @@ mod tests {
             80,
             None,
             None,
+            None,
         )
         .expect("create worker pane");
         mux.add_pane(pane);
@@ -7448,6 +7529,7 @@ mod tests {
             None,
             24,
             80,
+            None,
             None,
             None,
         )
@@ -7533,6 +7615,7 @@ T===K.execq():if(!K)return_;let S=Number(K[1]);"#,
             None,
             24,
             80,
+            None,
             None,
             None,
         )

@@ -44,11 +44,19 @@ const GEMINI_METHOD_SESSION_SET_MODEL: &str = "session/set_model";
 const GEMINI_METHOD_SESSION_REQUEST_PERMISSION: &str = "session/request_permission";
 const GEMINI_PERMISSION_CANCELLED: &str = "cancelled";
 const GEMINI_PERMISSION_SELECTED: &str = "selected";
+const BREHON_GEMINI_ALLOW_YOLO_ENV: &str = "BREHON_GEMINI_ALLOW_YOLO";
 const GEMINI_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(30);
 const GEMINI_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const GEMINI_PROMPT_ACCEPT_TIMEOUT: Duration = Duration::from_millis(1500);
-const GEMINI_DEFAULT_MODE_ID: &str = "yolo";
+const GEMINI_YOLO_MODE_ID: &str = "yolo";
 const GEMINI_MAX_CACHED_PROMPT_RESULTS: usize = 64;
+
+/// Returns true if `BREHON_GEMINI_ALLOW_YOLO=1` is in the environment.
+/// Requires an exact value of `"1"` to resist accidental enabling via truthy strings.
+fn gemini_allows_privileged_mode(env: &[(String, String)]) -> bool {
+    env.iter()
+        .any(|(key, value)| key == BREHON_GEMINI_ALLOW_YOLO_ENV && value == "1")
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum GeminiError {
@@ -107,6 +115,7 @@ impl GeminiSession {
     ) -> Result<Self, GeminiError> {
         let session_id = SessionId::new(uuid::Uuid::new_v4().to_string());
         let created_at = chrono::Utc::now();
+        let allow_privileged_mode = gemini_allows_privileged_mode(env);
 
         let process = AgentProcess::spawn_with_env(command, args, &spec.worktree_path, env)
             .await
@@ -151,10 +160,12 @@ impl GeminiSession {
             })?
             .to_string();
 
-        if supports_mode(new_session_response.result.as_ref(), GEMINI_DEFAULT_MODE_ID) {
+        if allow_privileged_mode
+            && supports_mode(new_session_response.result.as_ref(), GEMINI_YOLO_MODE_ID)
+        {
             let mode_response = send_request_sync(
                 &process,
-                build_set_mode_request(&gemini_session_id, GEMINI_DEFAULT_MODE_ID),
+                build_set_mode_request(&gemini_session_id, GEMINI_YOLO_MODE_ID),
                 GEMINI_BOOTSTRAP_TIMEOUT,
             )
             .await?;
@@ -672,7 +683,7 @@ async fn send_request_sync(
         }
         match parse_message(&line) {
             Ok(JsonRpcMessage::Response(response)) if response.id == request_id => {
-                return Ok(response)
+                return Ok(response);
             }
             Ok(JsonRpcMessage::Notification(_)) => continue,
             Ok(JsonRpcMessage::Response(_)) => continue,
@@ -1281,6 +1292,7 @@ mod tests {
     use std::time::Duration;
 
     const TEST_HELPER_ENV: &str = "BREHON_GEMINI_TEST_HELPER";
+    const TEST_SET_MODE_MARKER_ENV: &str = "BREHON_GEMINI_TEST_SET_MODE_MARKER_PATH";
 
     #[test]
     #[ignore = "Spawned by integration tests as a mock Gemini ACP subprocess helper"]
@@ -1318,8 +1330,20 @@ mod tests {
                     }
                 }),
                 GEMINI_METHOD_SESSION_NEW => serde_json::json!({
-                    "sessionId": "mock-session"
+                    "sessionId": "mock-session",
+                    "modes": {
+                        "availableModes": [
+                            { "id": "default" },
+                            { "id": "yolo" }
+                        ]
+                    }
                 }),
+                GEMINI_METHOD_SESSION_SET_MODE => {
+                    if let Some(marker_path) = std::env::var_os(TEST_SET_MODE_MARKER_ENV) {
+                        let _ = std::fs::write(marker_path, "");
+                    }
+                    serde_json::json!({})
+                }
                 GEMINI_METHOD_SESSION_PROMPT => {
                     // Delay long enough so wait_for_response registers a waiter,
                     // but short enough to keep this integration test fast.
@@ -1344,7 +1368,13 @@ mod tests {
     }
 
     async fn spawn_mock_gemini_session() -> GeminiSession {
+        spawn_mock_gemini_session_with_env(&[]).await
+    }
+
+    async fn spawn_mock_gemini_session_with_env(extra_env: &[(String, String)]) -> GeminiSession {
         let current_exe = std::env::current_exe().expect("test binary path");
+        let mut env = vec![(TEST_HELPER_ENV.to_string(), "1".to_string())];
+        env.extend(extra_env.iter().cloned());
         GeminiSession::spawn_with_env(
             SessionSpec::new(
                 brehon_types::AgentId::new("gemini-test"),
@@ -1357,11 +1387,45 @@ mod tests {
                 "--ignored".to_string(),
                 "--nocapture".to_string(),
             ],
-            &[(TEST_HELPER_ENV.to_string(), "1".to_string())],
+            &env,
             None,
         )
         .await
         .expect("spawn mock gemini session")
+    }
+
+    #[tokio::test]
+    async fn test_spawn_with_env_yolo_contract_sends_set_mode() {
+        let marker = std::env::temp_dir().join(format!("gemini-set-mode-{}", uuid::Uuid::new_v4()));
+        let session = spawn_mock_gemini_session_with_env(&[
+            (BREHON_GEMINI_ALLOW_YOLO_ENV.to_string(), "1".to_string()),
+            (
+                TEST_SET_MODE_MARKER_ENV.to_string(),
+                marker.to_string_lossy().to_string(),
+            ),
+        ])
+        .await;
+        assert!(
+            marker.exists(),
+            "session/set_mode should be sent when BREHON_GEMINI_ALLOW_YOLO=1"
+        );
+        session.kill().await.expect("kill mock session");
+        let _ = std::fs::remove_file(&marker);
+    }
+
+    #[tokio::test]
+    async fn test_spawn_with_env_without_yolo_contract_skips_set_mode() {
+        let marker = std::env::temp_dir().join(format!("gemini-set-mode-{}", uuid::Uuid::new_v4()));
+        let session = spawn_mock_gemini_session_with_env(&[(
+            TEST_SET_MODE_MARKER_ENV.to_string(),
+            marker.to_string_lossy().to_string(),
+        )])
+        .await;
+        assert!(
+            !marker.exists(),
+            "session/set_mode should NOT be sent when BREHON_GEMINI_ALLOW_YOLO is absent"
+        );
+        session.kill().await.expect("kill mock session");
     }
 
     #[tokio::test]
@@ -1568,6 +1632,19 @@ mod tests {
 
         assert!(supports_mode(Some(&result), "yolo"));
         assert!(!supports_mode(Some(&result), "plan"));
+    }
+
+    #[test]
+    fn test_gemini_privileged_mode_requires_explicit_env_contract() {
+        assert!(!gemini_allows_privileged_mode(&[]));
+        assert!(!gemini_allows_privileged_mode(&[(
+            BREHON_GEMINI_ALLOW_YOLO_ENV.to_string(),
+            "0".to_string(),
+        )]));
+        assert!(gemini_allows_privileged_mode(&[(
+            BREHON_GEMINI_ALLOW_YOLO_ENV.to_string(),
+            "1".to_string(),
+        )]));
     }
 
     #[test]

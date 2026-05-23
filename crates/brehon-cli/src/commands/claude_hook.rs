@@ -123,6 +123,12 @@ enum Decision {
 struct PolicyContext {
     /// Absolute path to the worker's worktree (BREHON_WORKSPACE_ROOT).
     worktree_root: Option<PathBuf>,
+    /// Current directory of the hook process. Relative tool paths are unsafe
+    /// unless this is inside the assigned worktree.
+    current_dir: Option<PathBuf>,
+    /// Shared repository root. Used to produce precise denial messages when
+    /// a file tool tries to mutate the protected checkout.
+    project_root: Option<PathBuf>,
     /// Agent role for role-specific exceptions, such as supervisor repairs.
     agent_role: Option<String>,
     /// Brehon runtime root. Used to identify Brehon-owned integration worktrees.
@@ -133,14 +139,26 @@ struct PolicyContext {
 
 impl PolicyContext {
     fn from_env() -> Self {
+        let brehon_root = std::env::var("BREHON_ROOT").ok().map(PathBuf::from);
+        let project_root = std::env::var("BREHON_PROJECT_ROOT")
+            .ok()
+            .map(PathBuf::from)
+            .or_else(|| {
+                brehon_root
+                    .as_deref()
+                    .and_then(Path::parent)
+                    .map(Path::to_path_buf)
+            });
         Self {
             worktree_root: std::env::var("BREHON_WORKSPACE_ROOT")
                 .ok()
                 .map(PathBuf::from),
+            current_dir: std::env::current_dir().ok(),
+            project_root,
             agent_role: std::env::var("BREHON_AGENT_ROLE")
                 .ok()
                 .filter(|s| !s.is_empty()),
-            brehon_root: std::env::var("BREHON_ROOT").ok().map(PathBuf::from),
+            brehon_root,
             merge_target: std::env::var("BREHON_MERGE_TARGET")
                 .ok()
                 .filter(|s| !s.is_empty()),
@@ -159,11 +177,18 @@ impl PolicyContext {
 fn evaluate(tool_name: &str, tool_input: &Value, ctx: &PolicyContext) -> Decision {
     match tool_name {
         "Bash" => evaluate_bash(tool_input, ctx),
+        "Edit" | "MultiEdit" | "Write" | "NotebookEdit" => {
+            evaluate_mutating_file_tool(tool_name, tool_input, ctx)
+        }
         _ => Decision::Allow,
     }
 }
 
 fn evaluate_bash(tool_input: &Value, ctx: &PolicyContext) -> Decision {
+    if let Decision::Block(reason) = check_hook_cwd_inside_allowed_root(ctx) {
+        return Decision::Block(reason);
+    }
+
     let cmd = match tool_input.get("command").and_then(Value::as_str) {
         Some(c) => c,
         None => return Decision::Allow,
@@ -183,9 +208,144 @@ fn evaluate_bash(tool_input: &Value, ctx: &PolicyContext) -> Decision {
         if let Decision::Block(reason) = check_cd_outside_worktree(trimmed, ctx) {
             return Decision::Block(reason);
         }
+        if let Decision::Block(reason) = check_bash_file_write_outside_worktree(trimmed, ctx) {
+            return Decision::Block(reason);
+        }
     }
 
     Decision::Allow
+}
+
+fn evaluate_mutating_file_tool(
+    tool_name: &str,
+    tool_input: &Value,
+    ctx: &PolicyContext,
+) -> Decision {
+    let paths = mutating_tool_paths(tool_input);
+    if paths.is_empty() {
+        return Decision::Block(format!(
+            "`{tool_name}` did not include a recognized file path. Brehon fails closed for mutating Claude tools during isolated runs."
+        ));
+    }
+
+    for (key, path) in paths {
+        if let Decision::Block(reason) = validate_mutating_path(tool_name, key, &path, ctx) {
+            return Decision::Block(reason);
+        }
+    }
+    Decision::Allow
+}
+
+fn mutating_tool_paths(tool_input: &Value) -> Vec<(&'static str, String)> {
+    ["file_path", "notebook_path", "path"]
+        .into_iter()
+        .filter_map(|key| {
+            tool_input
+                .get(key)
+                .and_then(Value::as_str)
+                .map(|value| (key, value.to_string()))
+        })
+        .collect()
+}
+
+fn validate_mutating_path(
+    tool_name: &str,
+    key: &str,
+    raw_path: &str,
+    ctx: &PolicyContext,
+) -> Decision {
+    let Some(path) = normalize_candidate_path(raw_path, ctx) else {
+        return Decision::Block(format!(
+            "`{tool_name}` cannot mutate `{raw_path}` because Brehon could not resolve `{key}` inside the agent worktree."
+        ));
+    };
+
+    if path_allowed_for_mutation(&path, ctx) {
+        return Decision::Allow;
+    }
+
+    let shared_root = ctx.project_root.as_deref().map(lexical_normalize);
+    if shared_root
+        .as_ref()
+        .is_some_and(|root| path.starts_with(root))
+    {
+        return Decision::Block(format!(
+            "`{tool_name}` attempted to mutate `{}` under the shared repo root `{}`. \
+             Write only inside your assigned worktree.",
+            path.display(),
+            shared_root.unwrap().display()
+        ));
+    }
+
+    let worktree = ctx
+        .worktree_root
+        .as_deref()
+        .map(|path| lexical_normalize(path).display().to_string())
+        .unwrap_or_else(|| "<missing BREHON_WORKSPACE_ROOT>".to_string());
+    Decision::Block(format!(
+        "`{tool_name}` attempted to mutate `{}`, outside the assigned worktree (`{worktree}`).",
+        path.display()
+    ))
+}
+
+fn normalize_candidate_path(raw_path: &str, ctx: &PolicyContext) -> Option<PathBuf> {
+    let cleaned = clean_shell_path_token(raw_path)?;
+    if cleaned.contains('$') || cleaned.contains('`') || cleaned.is_empty() {
+        return None;
+    }
+    let path = Path::new(cleaned);
+    if path.is_absolute() {
+        Some(lexical_normalize(path))
+    } else {
+        let base = ctx
+            .current_dir
+            .as_deref()
+            .or(ctx.worktree_root.as_deref())?;
+        Some(lexical_normalize(&base.join(path)))
+    }
+}
+
+fn clean_shell_path_token(token: &str) -> Option<&str> {
+    let cleaned = token
+        .trim()
+        .trim_start_matches(['"', '\''])
+        .trim_end_matches(['"', '\'']);
+    if cleaned.is_empty()
+        || cleaned == "-"
+        || cleaned == "/dev/null"
+        || cleaned.starts_with('&')
+        || cleaned.contains(">&")
+    {
+        return None;
+    }
+    Some(cleaned)
+}
+
+fn path_allowed_for_mutation(path: &Path, ctx: &PolicyContext) -> bool {
+    if ctx
+        .worktree_root
+        .as_deref()
+        .map(|worktree| path.starts_with(lexical_normalize(worktree)))
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    is_supervisor_integration_worktree(path, ctx)
+}
+
+fn check_hook_cwd_inside_allowed_root(ctx: &PolicyContext) -> Decision {
+    let Some(current_dir) = ctx.current_dir.as_deref() else {
+        return Decision::Allow;
+    };
+    let current_dir = lexical_normalize(current_dir);
+    if path_allowed_for_mutation(&current_dir, ctx) {
+        return Decision::Allow;
+    }
+    Decision::Block(format!(
+        "Claude hook is executing from `{}`, outside the assigned worktree. \
+         This indicates the agent process was launched or moved outside containment; Brehon fails closed.",
+        current_dir.display()
+    ))
 }
 
 /// Block `git checkout <protected>`, `git switch <protected>`,
@@ -242,6 +402,97 @@ fn check_git_branch_change(segment: &str, ctx: &PolicyContext) -> Decision {
     }
 
     Decision::Allow
+}
+
+fn check_bash_file_write_outside_worktree(segment: &str, ctx: &PolicyContext) -> Decision {
+    let tokens: Vec<&str> = segment.split_whitespace().collect();
+    if tokens.is_empty() {
+        return Decision::Allow;
+    }
+
+    for (index, token) in tokens.iter().enumerate() {
+        if let Some(target) = redirection_target(&tokens, index, token) {
+            if let Decision::Block(reason) =
+                validate_mutating_path("Bash redirection", "target", target, ctx)
+            {
+                return Decision::Block(reason);
+            }
+        }
+    }
+
+    let command_index = first_command_token(&tokens);
+    let Some(command_index) = command_index else {
+        return Decision::Allow;
+    };
+    let command = tokens[command_index]
+        .rsplit('/')
+        .next()
+        .unwrap_or(tokens[command_index]);
+    let args = &tokens[command_index + 1..];
+
+    match command {
+        "tee" => validate_all_non_option_paths("Bash tee", args, ctx),
+        "touch" | "mkdir" | "rm" | "rmdir" | "truncate" | "chmod" | "chown" | "chgrp" => {
+            validate_all_non_option_paths(&format!("Bash {command}"), args, ctx)
+        }
+        "cp" | "install" => validate_last_non_option_path(&format!("Bash {command}"), args, ctx),
+        "mv" => validate_all_non_option_paths("Bash mv", args, ctx),
+        _ => Decision::Allow,
+    }
+}
+
+fn redirection_target<'a>(tokens: &'a [&'a str], index: usize, token: &'a str) -> Option<&'a str> {
+    const REDIRECTS: &[&str] = &[">", ">>", ">|", "1>", "1>>", "2>", "2>>", "&>"];
+    let target = if REDIRECTS.contains(&token) {
+        tokens.get(index + 1).copied()
+    } else {
+        REDIRECTS
+            .iter()
+            .find_map(|prefix| token.strip_prefix(prefix).filter(|rest| !rest.is_empty()))
+    };
+    target.filter(|target| clean_shell_path_token(target).is_some())
+}
+
+fn first_command_token(tokens: &[&str]) -> Option<usize> {
+    let mut index = 0usize;
+    while index < tokens.len() {
+        let token = tokens[index];
+        if token == "env" || token == "command" || token == "builtin" || token == "sudo" {
+            index += 1;
+            continue;
+        }
+        if token.contains('=') {
+            index += 1;
+            continue;
+        }
+        return Some(index);
+    }
+    None
+}
+
+fn validate_all_non_option_paths(tool_name: &str, args: &[&str], ctx: &PolicyContext) -> Decision {
+    for arg in non_option_path_args(args) {
+        if let Decision::Block(reason) = validate_mutating_path(tool_name, "path", arg, ctx) {
+            return Decision::Block(reason);
+        }
+    }
+    Decision::Allow
+}
+
+fn validate_last_non_option_path(tool_name: &str, args: &[&str], ctx: &PolicyContext) -> Decision {
+    if let Some(arg) = non_option_path_args(args).last() {
+        validate_mutating_path(tool_name, "path", arg, ctx)
+    } else {
+        Decision::Allow
+    }
+}
+
+fn non_option_path_args<'a>(args: &'a [&'a str]) -> Vec<&'a str> {
+    args.iter()
+        .copied()
+        .filter(|arg| !arg.starts_with('-'))
+        .filter(|arg| !arg.contains('='))
+        .collect()
 }
 
 /// Find the first token that is, or contains a path component matching, a
@@ -412,15 +663,30 @@ mod tests {
     fn ctx_with(worktree: &str, merge_target: Option<&str>) -> PolicyContext {
         PolicyContext {
             worktree_root: Some(PathBuf::from(worktree)),
+            current_dir: Some(PathBuf::from(worktree)),
+            project_root: None,
             agent_role: None,
             brehon_root: None,
             merge_target: merge_target.map(str::to_string),
         }
     }
 
+    fn ctx_with_project(worktree: &str, project_root: &str) -> PolicyContext {
+        PolicyContext {
+            worktree_root: Some(PathBuf::from(worktree)),
+            current_dir: Some(PathBuf::from(worktree)),
+            project_root: Some(PathBuf::from(project_root)),
+            agent_role: None,
+            brehon_root: Some(PathBuf::from(format!("{project_root}/.brehon"))),
+            merge_target: None,
+        }
+    }
+
     fn supervisor_ctx(worktree: &str, brehon_root: &str) -> PolicyContext {
         PolicyContext {
             worktree_root: Some(PathBuf::from(worktree)),
+            current_dir: Some(PathBuf::from(worktree)),
+            project_root: Path::new(brehon_root).parent().map(Path::to_path_buf),
             agent_role: Some("supervisor".to_string()),
             brehon_root: Some(PathBuf::from(brehon_root)),
             merge_target: None,
@@ -549,6 +815,10 @@ mod tests {
             worktree_root: Some(PathBuf::from(
                 "/repo/.brehon/worktrees/runs/session/worker-1",
             )),
+            current_dir: Some(PathBuf::from(
+                "/repo/.brehon/worktrees/runs/session/worker-1",
+            )),
+            project_root: Some(PathBuf::from("/repo")),
             agent_role: Some("worker".to_string()),
             brehon_root: Some(PathBuf::from("/repo/.brehon")),
             merge_target: None,
@@ -576,9 +846,109 @@ mod tests {
     }
 
     #[test]
-    fn ignores_non_bash_tools() {
-        let decision = evaluate("Edit", &bash("git checkout main"), &ctx_with("/work", None));
+    fn allows_file_tool_inside_worktree() {
+        let decision = evaluate(
+            "Edit",
+            &json!({ "file_path": "/work/src/lib.rs", "old_string": "a", "new_string": "b" }),
+            &ctx_with("/work", None),
+        );
         assert_eq!(decision, Decision::Allow);
+    }
+
+    #[test]
+    fn blocks_file_tool_in_shared_root() {
+        let decision = evaluate(
+            "Write",
+            &json!({ "file_path": "/repo/src/lib.rs", "content": "oops" }),
+            &ctx_with_project("/repo/.brehon/worktrees/runs/session/worker-1", "/repo"),
+        );
+        assert!(matches!(decision, Decision::Block(reason) if reason.contains("shared repo root")));
+    }
+
+    #[test]
+    fn blocks_multi_edit_in_shared_root() {
+        let decision = evaluate(
+            "MultiEdit",
+            &json!({ "file_path": "/repo/crates/brehon-types/src/config.rs", "edits": [] }),
+            &ctx_with_project("/repo/.brehon/worktrees/runs/session/worker-1", "/repo"),
+        );
+        assert!(matches!(decision, Decision::Block(_)));
+    }
+
+    #[test]
+    fn blocks_notebook_edit_outside_worktree() {
+        let decision = evaluate(
+            "NotebookEdit",
+            &json!({ "notebook_path": "/tmp/analysis.ipynb", "new_source": "x" }),
+            &ctx_with("/work", None),
+        );
+        assert!(matches!(decision, Decision::Block(_)));
+    }
+
+    #[test]
+    fn blocks_mutating_file_tool_when_worktree_root_missing() {
+        let ctx = PolicyContext {
+            worktree_root: None,
+            current_dir: None,
+            project_root: Some(PathBuf::from("/repo")),
+            agent_role: Some("worker".to_string()),
+            brehon_root: Some(PathBuf::from("/repo/.brehon")),
+            merge_target: None,
+        };
+        let decision = evaluate("Write", &json!({ "file_path": "src/lib.rs" }), &ctx);
+        assert!(matches!(decision, Decision::Block(_)));
+    }
+
+    #[test]
+    fn blocks_relative_file_tool_when_hook_cwd_escaped_worktree() {
+        let mut ctx = ctx_with_project("/repo/.brehon/worktrees/runs/session/worker-1", "/repo");
+        ctx.current_dir = Some(PathBuf::from("/repo"));
+        let decision = evaluate(
+            "Write",
+            &json!({ "file_path": "src/lib.rs", "content": "oops" }),
+            &ctx,
+        );
+        assert!(matches!(decision, Decision::Block(reason) if reason.contains("shared repo root")));
+    }
+
+    #[test]
+    fn blocks_bash_redirection_to_shared_root() {
+        let decision = evaluate(
+            "Bash",
+            &bash("cat <<EOF > /repo/src/lib.rs"),
+            &ctx_with_project("/repo/.brehon/worktrees/runs/session/worker-1", "/repo"),
+        );
+        assert!(matches!(decision, Decision::Block(_)));
+    }
+
+    #[test]
+    fn allows_bash_redirection_to_dev_null() {
+        let decision = evaluate(
+            "Bash",
+            &bash("cargo test 2>/dev/null"),
+            &ctx_with("/work", None),
+        );
+        assert_eq!(decision, Decision::Allow);
+    }
+
+    #[test]
+    fn blocks_bash_tee_to_shared_root() {
+        let decision = evaluate(
+            "Bash",
+            &bash("printf hi | tee /repo/src/lib.rs"),
+            &ctx_with_project("/repo/.brehon/worktrees/runs/session/worker-1", "/repo"),
+        );
+        assert!(matches!(decision, Decision::Block(_)));
+    }
+
+    #[test]
+    fn blocks_bash_when_hook_cwd_escaped_worktree() {
+        let mut ctx = ctx_with_project("/repo/.brehon/worktrees/runs/session/worker-1", "/repo");
+        ctx.current_dir = Some(PathBuf::from("/repo"));
+        let decision = evaluate("Bash", &bash("cargo test"), &ctx);
+        assert!(
+            matches!(decision, Decision::Block(reason) if reason.contains("outside the assigned worktree"))
+        );
     }
 
     #[test]
@@ -588,6 +958,8 @@ mod tests {
         // changes (those don't need the worktree root).
         let ctx = PolicyContext {
             worktree_root: None,
+            current_dir: None,
+            project_root: None,
             agent_role: None,
             brehon_root: None,
             merge_target: None,

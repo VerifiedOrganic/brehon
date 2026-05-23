@@ -73,6 +73,7 @@ fn test_activity_events_drive_pane_state_transitions() {
         None,
         None,
         None,
+        None,
     )
     .expect("create codex reviewer pane");
     pane.register_gateway_session_spawn("seed-session".to_string());
@@ -159,6 +160,7 @@ fn test_dispatch_deliver_prompt_buffers_gateway_prompt_while_tool_executing() {
         None,
         None,
         None,
+        None,
     )
     .expect("create codex reviewer pane");
     pane.register_gateway_session_spawn("reviewer-session".to_string());
@@ -211,6 +213,7 @@ async fn test_reset_reviewer_gateway_session_clears_runtime_state() {
         None,
         None,
         None,
+        None,
     )
     .expect("create codex reviewer pane");
     mux.add_pane(pane);
@@ -248,6 +251,7 @@ async fn test_shutdown_all_clears_gateway_runtime_state() {
         24,
         80,
         &AgentAdapter::BuiltIn(SupervisorCli::Codex),
+        None,
         None,
         None,
         None,
@@ -392,6 +396,7 @@ async fn test_reset_worker_gateway_session_preserves_task_context_and_clears_ses
         80,
         None,
         None,
+        None,
     )
     .expect("create codex worker pane");
     mux.add_pane(pane);
@@ -448,6 +453,7 @@ async fn test_recycle_bumps_generation_and_flushes_worker_runtime_state() {
         80,
         None,
         None,
+        None,
     )
     .expect("create codex worker");
     mux.add_pane(pane);
@@ -499,6 +505,7 @@ async fn test_recycle_is_idempotent_without_intervening_activity() {
         None,
         24,
         80,
+        None,
         None,
         None,
     )
@@ -556,6 +563,7 @@ async fn test_quarantine_transitions_pane_to_dead_and_rejects_prompt_delivery() 
         None,
         24,
         80,
+        None,
         None,
         None,
     )
@@ -805,6 +813,7 @@ async fn test_deliver_prompt_preserves_explicit_sender_for_claude_teams() {
         None,
         24,
         80,
+        None,
         None,
         None,
     )
@@ -1122,6 +1131,7 @@ fn test_gateway_panes_have_activity_buffer() {
         80,
         None,
         None,
+        None,
     )
     .expect("create codex worker");
 
@@ -1149,6 +1159,7 @@ fn test_claude_panes_no_activity_buffer() {
         None,
         24,
         80,
+        None,
         None,
         None,
     )
@@ -1179,6 +1190,7 @@ fn test_activity_event_propagates_to_pane() {
         None,
         24,
         80,
+        None,
         None,
         None,
     )
@@ -1230,6 +1242,7 @@ async fn test_stale_operation_completed_event_is_dropped_after_recycle() {
         None,
         24,
         80,
+        None,
         None,
         None,
     )
@@ -1342,6 +1355,7 @@ async fn test_r7_stale_operation_completed_after_recycle_preserves_ready_state()
         None,
         24,
         80,
+        None,
         None,
         None,
     )
@@ -1464,6 +1478,7 @@ async fn test_acp_event_bridge_tags_activity_with_current_generation() {
         80,
         None,
         None,
+        None,
     )
     .expect("create codex worker");
     pane.register_gateway_session_spawn("session-1".to_string());
@@ -1517,6 +1532,7 @@ fn test_busy_worker_recovers_within_max_turn_duration_after_session_drop() {
         None,
         24,
         80,
+        None,
         None,
         None,
     )

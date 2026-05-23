@@ -22,6 +22,7 @@ fn test_supervisor_idle_filler_output_is_suppressed() {
         None,
         None,
         &HashMap::new(),
+        None,
     )
     .expect("create supervisor pane");
 
@@ -49,6 +50,7 @@ fn test_supervisor_real_output_survives_idle_filler_filter() {
         None,
         None,
         &HashMap::new(),
+        None,
     )
     .expect("create supervisor pane");
 
@@ -79,6 +81,7 @@ fn test_empty_supervisor_prompt_is_ready_for_safe_inbox_nudge() {
         None,
         None,
         &HashMap::new(),
+        None,
     )
     .expect("create supervisor pane");
 
@@ -116,6 +119,7 @@ fn test_nonempty_supervisor_prompt_is_not_ready_for_inbox_nudge() {
         None,
         None,
         &HashMap::new(),
+        None,
     )
     .expect("create supervisor pane");
 
@@ -151,6 +155,7 @@ fn test_empty_supervisor_prompt_manual_enter_can_clear_pending_inbox_nudge() {
         None,
         None,
         &HashMap::new(),
+        None,
     )
     .expect("create supervisor pane");
 
@@ -183,6 +188,7 @@ fn test_render_generation_bumps_on_visible_state_mutations() {
         None,
         None,
         &HashMap::new(),
+        None,
     )
     .expect("create supervisor pane");
 
@@ -235,6 +241,7 @@ fn test_claude_supervisor_viewport_handles_status_redraws() {
         None,
         None,
         &HashMap::new(),
+        None,
     )
     .expect("create supervisor pane");
 
@@ -267,6 +274,7 @@ fn test_claude_supervisor_scrollback_tracks_display_scroll() {
         None,
         None,
         &HashMap::new(),
+        None,
     )
     .expect("create supervisor pane");
 
@@ -308,6 +316,7 @@ fn test_supervisor_empty_task_ready_block_is_suppressed() {
         None,
         None,
         &HashMap::new(),
+        None,
     )
     .expect("create supervisor pane");
 
@@ -341,6 +350,7 @@ fn test_supervisor_non_empty_task_ready_block_survives_filter() {
         None,
         None,
         &HashMap::new(),
+        None,
     )
     .expect("create supervisor pane");
 
@@ -372,6 +382,7 @@ fn test_supervisor_whoami_block_is_suppressed() {
         None,
         None,
         &HashMap::new(),
+        None,
     )
     .expect("create supervisor pane");
 
@@ -404,6 +415,7 @@ fn test_supervisor_split_whoami_block_is_suppressed() {
         None,
         None,
         &HashMap::new(),
+        None,
     )
     .expect("create supervisor pane");
 
@@ -446,6 +458,7 @@ fn test_supervisor_split_empty_task_ready_block_is_suppressed() {
         None,
         None,
         &HashMap::new(),
+        None,
     )
     .expect("create supervisor pane");
 
@@ -486,6 +499,7 @@ fn test_supervisor_split_non_empty_task_ready_block_survives_filter() {
         None,
         None,
         &HashMap::new(),
+        None,
     )
     .expect("create supervisor pane");
 
@@ -523,6 +537,7 @@ fn test_supervisor_colored_empty_task_ready_block_is_suppressed() {
         None,
         None,
         &HashMap::new(),
+        None,
     )
     .expect("create supervisor pane");
 
@@ -556,6 +571,7 @@ fn test_supervisor_empty_epic_list_block_is_suppressed() {
         None,
         None,
         &HashMap::new(),
+        None,
     )
     .expect("create supervisor pane");
 
@@ -589,6 +605,7 @@ fn test_supervisor_non_empty_epic_list_block_survives_filter() {
         None,
         None,
         &HashMap::new(),
+        None,
     )
     .expect("create supervisor pane");
 
@@ -621,6 +638,7 @@ fn test_supervisor_split_empty_epic_list_block_is_suppressed() {
         None,
         None,
         &HashMap::new(),
+        None,
     )
     .expect("create supervisor pane");
 
@@ -663,6 +681,7 @@ fn test_viewport_preserves_claude_inbox_and_footer_chrome() {
         None,
         None,
         &HashMap::new(),
+        None,
     )
     .expect("create supervisor pane");
 
@@ -699,6 +718,7 @@ fn test_viewport_as_lines_preserves_styles_without_compacting_chrome_rows() {
         None,
         None,
         &HashMap::new(),
+        None,
     )
     .expect("create supervisor pane");
 
@@ -738,6 +758,7 @@ fn test_display_cursor_position_preserves_source_rows() {
         None,
         None,
         &HashMap::new(),
+        None,
     )
     .expect("create supervisor pane");
 
@@ -772,6 +793,7 @@ fn test_claude_prompt_marker_detection_requires_visible_prompt() {
         None,
         None,
         &HashMap::new(),
+        None,
     )
     .expect("create supervisor pane");
 
@@ -804,6 +826,7 @@ fn test_claude_prompt_marker_detection_respects_quiet_period() {
         None,
         None,
         &HashMap::new(),
+        None,
     )
     .expect("create supervisor pane");
 
@@ -831,6 +854,7 @@ fn test_claude_inbox_nudge_waits_for_startup_settle_deadline() {
         None,
         None,
         &HashMap::new(),
+        None,
     )
     .expect("create supervisor pane");
 

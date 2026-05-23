@@ -198,6 +198,64 @@ pub(super) fn non_brehon_status_entries(status: &str) -> Vec<&str> {
         .collect()
 }
 
+pub(super) fn dirty_primary_checkout_terminal_blocker(action: &str) -> Option<String> {
+    let project = project_root()?;
+    if !project.join(".git").exists() {
+        return None;
+    }
+
+    let output = match crate::git_exec::run_git(
+        &project,
+        &["status", "--porcelain", "--untracked-files=all"],
+    ) {
+        Ok(output) => output,
+        Err(err) => {
+            return Some(format!(
+                "Cannot {action}: failed to inspect shared repo root '{}' before a terminal task transition: {err}",
+                project.display()
+            ));
+        }
+    };
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Some(format!(
+            "Cannot {action}: failed to inspect shared repo root '{}' before a terminal task transition: {}",
+            project.display(),
+            if stderr.is_empty() {
+                format!("git status exited with {}", output.status)
+            } else {
+                stderr
+            }
+        ));
+    }
+
+    let status = String::from_utf8_lossy(&output.stdout);
+    let entries = non_brehon_status_entries(&status);
+    if entries.is_empty() {
+        return None;
+    }
+
+    let preview_limit = 5;
+    let preview = entries
+        .iter()
+        .take(preview_limit)
+        .copied()
+        .collect::<Vec<_>>()
+        .join(", ");
+    let suffix = if entries.len() > preview_limit {
+        ", ..."
+    } else {
+        ""
+    };
+    Some(format!(
+        "Cannot {action}: shared repo root '{}' is dirty outside .brehon/ ({}{}). \
+         Refusing to record closed/merged task state while run integrity is compromised.",
+        project.display(),
+        preview,
+        suffix
+    ))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct PrimaryCheckoutWarning {
     pub project_root: String,

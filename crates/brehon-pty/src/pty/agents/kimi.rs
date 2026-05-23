@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use crate::pty::config::PtyConfig;
 use crate::pty::prompts::{
     build_reviewer_startup_prompt, build_supervisor_startup_prompt, build_worker_startup_prompt,
-    project_policy_for_role,
+    project_policy_for_role, sandbox_profile_allows_privileged_mode,
 };
 
 impl PtyConfig {
@@ -19,6 +19,7 @@ impl PtyConfig {
         model: Option<&str>,
         reasoning_effort: Option<&str>,
     ) -> Self {
+        let allow_privileged_mode = sandbox_profile_allows_privileged_mode(brehon_root);
         let mut config = brehon_adapter_kimi::build_kimi_spawn_config(
             name,
             role,
@@ -28,6 +29,7 @@ impl PtyConfig {
             factory_worker_cli,
             model,
             reasoning_effort,
+            allow_privileged_mode,
         );
 
         if role == "worker" {
@@ -94,7 +96,9 @@ impl PtyConfig {
         factory_worker_cli: Option<&str>,
         model: Option<&str>,
         reasoning_effort: Option<&str>,
+        launch_policy: Option<&crate::pty::config::LaunchPolicy>,
     ) -> Self {
+        let work_dir = cwd.to_string_lossy().to_string();
         let mut config = Self::kimi(
             name,
             role,
@@ -105,7 +109,17 @@ impl PtyConfig {
             model,
             reasoning_effort,
         );
-        config.args = vec!["acp".to_string()];
+        config.args = vec!["--work-dir".to_string(), work_dir, "acp".to_string()];
+        if let Some(policy) = launch_policy {
+            config.env.push((
+                "BREHON_SANDBOX_PROFILE".to_string(),
+                policy.profile_name().to_string(),
+            ));
+            config.env.push((
+                "BREHON_LAUNCH_POLICY_UNSAFE".to_string(),
+                policy.is_unsafe().to_string(),
+            ));
+        }
         config
     }
 }

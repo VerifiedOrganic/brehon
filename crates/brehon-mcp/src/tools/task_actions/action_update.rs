@@ -26,8 +26,9 @@ use super::epic::{
 use super::followups::resolve_promoted_followups_for_terminal_task;
 use super::git_ops::{
     commit_workspace_checkpoint, current_git_head, current_workspace_root,
-    detect_default_branch_in, ensure_worker_branch_safe_for_task, git_stdout_in,
-    primary_checkout_status_warning, PrimaryCheckoutWarning,
+    detect_default_branch_in, dirty_primary_checkout_terminal_blocker,
+    ensure_worker_branch_safe_for_task, git_stdout_in, primary_checkout_status_warning,
+    PrimaryCheckoutWarning,
 };
 use super::lifecycle::{
     caller_name, caller_role, caller_supervisor, is_container_task, is_valid_subtask,
@@ -1030,6 +1031,13 @@ pub(super) async fn execute_update(
                 "Task {id} has merge-flow state and cannot be set to 'merged' via task action=update. \
                  Use task action=integrate for epic-bound subtasks, or task action=close only for direct-to-main merge flow."
             )));
+        }
+        if is_terminal_task_status(normalized) {
+            if let Some(err) =
+                dirty_primary_checkout_terminal_blocker(&format!("set task {id} to {normalized}"))
+            {
+                return Ok(error_result(err));
+            }
         }
 
         let integration_conflict_review_recovery = caller_role == "supervisor"

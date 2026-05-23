@@ -5,7 +5,7 @@ use crate::pty::config::{PtyConfig, TeamsSpawnConfig};
 use crate::pty::filesystem::{copy_dir_recursive, load_json_config, write_json_config};
 use crate::pty::prompts::{
     build_reviewer_startup_prompt, build_supervisor_startup_prompt, build_worker_startup_prompt,
-    project_policy_for_role,
+    project_policy_for_role, sandbox_profile_allows_privileged_mode,
 };
 
 use super::brehon_skills::builtin_skill_names_for_role;
@@ -214,6 +214,7 @@ impl PtyConfig {
         // Native Agent Teams is Claude Code-only; Gemini CLI does not support it.
         let session_id = uuid::Uuid::new_v4().to_string();
         let brehon_exe = current_brehon_exe();
+        let allow_privileged_mode = sandbox_profile_allows_privileged_mode(brehon_root);
         let (gemini_home, trusted_folders_path) =
             prepare_local_gemini_home(&cwd, &brehon_exe, role, reasoning_effort).unwrap_or_else(
                 |_| {
@@ -233,8 +234,6 @@ impl PtyConfig {
                 "BREHON_CLONE_PATH".to_string(),
                 cwd.to_string_lossy().to_string(),
             ),
-            // Disable sandbox so workers can edit files in worktrees
-            ("GEMINI_SANDBOX".to_string(), "false".to_string()),
             (
                 "HOME".to_string(),
                 gemini_home.to_string_lossy().to_string(),
@@ -244,6 +243,10 @@ impl PtyConfig {
                 trusted_folders_path.to_string_lossy().to_string(),
             ),
         ];
+        if allow_privileged_mode {
+            env.push(("GEMINI_SANDBOX".to_string(), "false".to_string()));
+            env.push(("BREHON_GEMINI_ALLOW_YOLO".to_string(), "1".to_string()));
+        }
         prepend_current_exe_dir_to_path(&mut env);
         push_workspace_root_env(&mut env, &cwd);
 
@@ -271,12 +274,13 @@ impl PtyConfig {
             ));
         }
 
-        let mut args = vec![
-            "--approval-mode".to_string(),
-            "yolo".to_string(),
-            "--sandbox".to_string(),
-            "false".to_string(),
-        ];
+        let mut args = Vec::new();
+        if allow_privileged_mode {
+            args.push("--approval-mode".to_string());
+            args.push("yolo".to_string());
+            args.push("--sandbox".to_string());
+            args.push("false".to_string());
+        }
 
         if let Some(m) = model {
             args.push("--model".to_string());
@@ -338,6 +342,7 @@ impl PtyConfig {
         factory_worker_cli: Option<&str>,
         model: Option<&str>,
         reasoning_effort: Option<&str>,
+        launch_policy: Option<&crate::pty::config::LaunchPolicy>,
     ) -> Self {
         let mut config = Self::gemini(
             name,
@@ -356,6 +361,16 @@ impl PtyConfig {
             args.push(m.to_string());
         }
         config.args = args;
+        if let Some(policy) = launch_policy {
+            config.env.push((
+                "BREHON_SANDBOX_PROFILE".to_string(),
+                policy.profile_name().to_string(),
+            ));
+            config.env.push((
+                "BREHON_LAUNCH_POLICY_UNSAFE".to_string(),
+                policy.is_unsafe().to_string(),
+            ));
+        }
         config
     }
 }

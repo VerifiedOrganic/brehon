@@ -41,6 +41,7 @@ pub fn merge_configs(base: BrehonConfig, overlay: BrehonConfig) -> BrehonConfig 
         escalation: merge_escalation(base.escalation, overlay.escalation),
         context: merge_context(base.context, overlay.context),
         permissions: merge_permissions(base.permissions, overlay.permissions),
+        profiles: merge_profiles(base.profiles, overlay.profiles),
         retention: merge_retention(base.retention, overlay.retention),
         security: merge_security(base.security, overlay.security),
     }
@@ -318,6 +319,21 @@ fn merge_permissions(base: PermissionsConfig, overlay: PermissionsConfig) -> Per
     PermissionsConfig { categories: merged }
 }
 
+fn merge_profiles(
+    base: brehon_types::ProfilesConfig,
+    overlay: brehon_types::ProfilesConfig,
+) -> brehon_types::ProfilesConfig {
+    let mut defaults = base.defaults;
+    for (key, value) in overlay.defaults {
+        defaults.insert(key, value);
+    }
+    let mut specs = base.specs;
+    for (key, value) in overlay.specs {
+        specs.insert(key, value);
+    }
+    brehon_types::ProfilesConfig { defaults, specs }
+}
+
 fn merge_retention(base: RetentionConfig, overlay: RetentionConfig) -> RetentionConfig {
     RetentionConfig {
         max_events: overlay.max_events.or(base.max_events),
@@ -366,9 +382,10 @@ fn merge_security(base: SecurityConfig, overlay: SecurityConfig) -> SecurityConf
 mod tests {
     use super::*;
     use brehon_types::{
-        AdapterKind, AgentsMdMode, AutonomyLevel, BudgetEnforcement, ChunkStrategy, LayoutPreset,
-        NotifyMethod, Permission, RoleDefinition, RoleKind, SandboxProfile, StaleStrategy,
-        TerminalMode, WorkerIdleBehavior,
+        AdapterKind, AgentsMdMode, AutonomyLevel, BudgetEnforcement, ChunkStrategy,
+        CredentialClass, EnvPolicy, LayoutPreset, NetworkClass, NotifyMethod, Permission,
+        PermissionProfile, RoleDefinition, RoleKind, SandboxBackend, SandboxProfile, SandboxSpec,
+        StaleStrategy, TerminalMode, WorkerIdleBehavior,
     };
     use std::collections::HashMap;
 
@@ -473,6 +490,7 @@ mod tests {
             permissions: PermissionsConfig {
                 categories: HashMap::new(),
             },
+            profiles: brehon_types::ProfilesConfig::default(),
             retention: RetentionConfig::default(),
             security: SecurityConfig {
                 sandbox_profile: SandboxProfile::OsDefault,
@@ -523,6 +541,7 @@ mod tests {
                 base_url: None,
                 api_key_env: None,
                 permission_mode: None,
+                profile: None,
                 max_parallel_tool_calls: None,
                 assistant_message_passthrough_fields: Vec::new(),
                 reasoning_effort_param: None,
@@ -663,6 +682,66 @@ mod tests {
             Some(&brehon_types::PermissionCategory::Simple(
                 brehon_types::PermissionValue::Allow
             ))
+        );
+    }
+
+    #[test]
+    fn merge_profiles_overlay_replaces_existing_profile_spec() {
+        let mut base = create_base_config();
+        base.profiles
+            .defaults
+            .insert("worker".into(), PermissionProfile::Workspace);
+        base.profiles.specs.insert(
+            "workspace".into(),
+            SandboxSpec {
+                backend: SandboxBackend::OsDefault,
+                read_roots: Vec::new(),
+                write_roots: Vec::new(),
+                denied_roots: Vec::new(),
+                network_class: NetworkClass::ModelOnly,
+                credential_class: CredentialClass::EnvAllowlist,
+                env_policy: EnvPolicy::Minimal,
+                unsafe_marker: false,
+            },
+        );
+
+        let mut overlay = create_base_config();
+        overlay
+            .profiles
+            .defaults
+            .insert("worker".into(), PermissionProfile::Dependency);
+        overlay.profiles.specs.insert(
+            "workspace".into(),
+            SandboxSpec {
+                backend: SandboxBackend::Bubblewrap,
+                read_roots: Vec::new(),
+                write_roots: Vec::new(),
+                denied_roots: Vec::new(),
+                network_class: NetworkClass::Allowlisted,
+                credential_class: CredentialClass::KeychainRead,
+                env_policy: EnvPolicy::Strict,
+                unsafe_marker: false,
+            },
+        );
+
+        let merged = merge_configs(base, overlay);
+
+        assert_eq!(
+            merged.profiles.defaults.get("worker"),
+            Some(&PermissionProfile::Dependency)
+        );
+        assert_eq!(
+            merged.profiles.specs.get("workspace"),
+            Some(&SandboxSpec {
+                backend: SandboxBackend::Bubblewrap,
+                read_roots: Vec::new(),
+                write_roots: Vec::new(),
+                denied_roots: Vec::new(),
+                network_class: NetworkClass::Allowlisted,
+                credential_class: CredentialClass::KeychainRead,
+                env_policy: EnvPolicy::Strict,
+                unsafe_marker: false,
+            })
         );
     }
 

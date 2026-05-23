@@ -94,6 +94,7 @@ fn test_flush_pending_inbox_nudges_waits_for_empty_claude_prompt() {
         None,
         None,
         &std::collections::HashMap::new(),
+        None,
     )
     .expect("create supervisor pane");
     mux.add_pane(pane);
@@ -528,6 +529,7 @@ fn test_queue_startup_prompt_delays_claude_teams_inbox_delivery() {
         None,
         None,
         &std::collections::HashMap::new(),
+        None,
     )
     .expect("create supervisor pane");
     mux.add_pane(pane);
@@ -765,6 +767,7 @@ fn test_fifo_drains_one_prompt_per_busy_ready_transition_in_order() {
         None,
         None,
         &std::collections::HashMap::new(),
+        None,
     )
     .expect("create supervisor pane");
     mux.add_pane(pane);
@@ -871,6 +874,7 @@ fn test_state_machine_dispatch_drops_stale_waiting_prompts_after_recycle() {
         None,
         None,
         &std::collections::HashMap::new(),
+        None,
     )
     .expect("create supervisor pane");
     mux.add_pane(pane);
@@ -1015,6 +1019,7 @@ fn test_r2_four_back_to_back_worker_prompts_deliver_fifo_without_duplicate_retry
         None,
         24,
         80,
+        None,
         None,
         None,
     )
@@ -1189,6 +1194,7 @@ fn test_deliver_prompt_delays_claude_teams_inbox_until_settle_deadline() {
         None,
         None,
         None,
+        None,
     )
     .expect("create reviewer pane");
     mux.add_pane(pane);
@@ -1306,6 +1312,7 @@ fn test_pending_teams_nudge_cooldown_does_not_block_inbox_writes() {
         None,
         None,
         None,
+        None,
     )
     .expect("create reviewer pane");
     mux.add_pane(pane);
@@ -1410,6 +1417,7 @@ async fn test_manual_enter_clears_pending_inbox_nudge_on_empty_supervisor_prompt
         None,
         None,
         &std::collections::HashMap::new(),
+        None,
     )
     .expect("create supervisor pane");
     mux.add_pane(pane);
@@ -1467,6 +1475,7 @@ fn test_nonblocking_teams_inbox_write_failure_surfaces_to_delivery_state() {
         None,
         None,
         &std::collections::HashMap::new(),
+        None,
     )
     .expect("create supervisor pane");
     mux.add_pane(pane);
@@ -1549,6 +1558,7 @@ async fn test_deliver_prompt_routes_pty_only_agents_via_injection() {
         None,
         None,
         None,
+        None,
     )
     .expect("create junie reviewer pane");
     mux.add_pane(pane);
@@ -1574,6 +1584,7 @@ async fn test_deliver_prompt_clears_stale_gateway_session_before_respawn_attempt
         24,
         80,
         &AgentAdapter::BuiltIn(SupervisorCli::Codex),
+        None,
         None,
         None,
         None,
@@ -1616,6 +1627,7 @@ fn test_begin_async_gateway_prompt_delivery_clears_stale_session_before_respawn_
         24,
         80,
         &AgentAdapter::BuiltIn(SupervisorCli::Codex),
+        None,
         None,
         None,
         None,
@@ -1714,6 +1726,7 @@ async fn test_deliver_prompt_buffers_gateway_prompt_while_tool_executing() {
         None,
         None,
         None,
+        None,
     )
     .expect("create codex reviewer pane");
     pane.set_tool_executing(true);
@@ -1761,6 +1774,7 @@ fn test_fresh_gateway_placeholder_busy_does_not_count_as_live_turn() {
         None,
         None,
         None,
+        None,
     )
     .expect("create codex reviewer pane");
     assert!(
@@ -1804,6 +1818,7 @@ fn test_attempt_prompt_delivery_returns_already_present_for_duplicate_queued_pro
         None,
         24,
         80,
+        None,
         None,
         None,
     )
@@ -1888,6 +1903,7 @@ fn test_finalize_async_gateway_prompt_delivery_clears_session_on_recoverable_err
         None,
         None,
         None,
+        None,
     )
     .expect("create codex reviewer pane");
     mux.add_pane(pane);
@@ -1920,6 +1936,7 @@ fn test_async_gateway_prompt_delivery_completion_appends_notice() {
         24,
         80,
         &AgentAdapter::BuiltIn(SupervisorCli::Codex),
+        None,
         None,
         None,
         None,
@@ -1957,6 +1974,7 @@ async fn test_async_gateway_prompt_delivery_completion_drops_stale_generation_af
         24,
         80,
         &AgentAdapter::BuiltIn(SupervisorCli::Codex),
+        None,
         None,
         None,
         None,
@@ -2021,6 +2039,7 @@ async fn test_async_gateway_prompt_delivery_non_delivered_arms_drop_stale_genera
         24,
         80,
         &AgentAdapter::BuiltIn(SupervisorCli::Codex),
+        None,
         None,
         None,
         None,
@@ -2100,6 +2119,7 @@ fn test_async_gateway_prompt_delivery_busy_error_requeues_prompt() {
         24,
         80,
         &AgentAdapter::BuiltIn(SupervisorCli::Codex),
+        None,
         None,
         None,
         None,
@@ -2213,6 +2233,7 @@ fn test_per_pane_prompt_queue_keeps_single_in_flight_under_random_interleavings(
             24,
             80,
             &AgentAdapter::BuiltIn(SupervisorCli::Codex),
+            None,
             None,
             None,
             None,

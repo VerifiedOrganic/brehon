@@ -17,6 +17,7 @@ impl PtyConfig {
         brehon_root: Option<&PathBuf>,
         supervisor_name: Option<&str>,
         factory_worker_cli: Option<&str>,
+        launch_policy: Option<&crate::pty::config::LaunchPolicy>,
     ) -> Self {
         let session_id = uuid::Uuid::new_v4().to_string();
         let mut env = vec![
@@ -49,6 +50,17 @@ impl PtyConfig {
             ));
         }
 
+        if let Some(policy) = launch_policy {
+            env.push((
+                "BREHON_SANDBOX_PROFILE".to_string(),
+                policy.profile_name().to_string(),
+            ));
+            env.push((
+                "BREHON_LAUNCH_POLICY_UNSAFE".to_string(),
+                policy.is_unsafe().to_string(),
+            ));
+        }
+
         Self {
             command: command.to_string(),
             args: args.to_vec(),
@@ -71,6 +83,7 @@ impl PtyConfig {
         brehon_root: Option<&PathBuf>,
         supervisor_name: Option<&str>,
         factory_worker_cli: Option<&str>,
+        launch_policy: Option<&crate::pty::config::LaunchPolicy>,
     ) -> Self {
         Self::custom_pty(
             name,
@@ -82,6 +95,7 @@ impl PtyConfig {
             brehon_root,
             supervisor_name,
             factory_worker_cli,
+            launch_policy,
         )
     }
 }
