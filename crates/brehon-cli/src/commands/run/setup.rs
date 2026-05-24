@@ -1086,6 +1086,10 @@ const CLAUDE_SETTINGS_RELATIVE: &str = ".claude/settings.local.json";
 /// removed cleanly without disturbing user-added hooks.
 const CLAUDE_HOOK_MARKER: &str = "brehon claude-hook";
 
+/// Claude tools that can mutate repository files and must therefore pass
+/// through the Brehon worktree guard.
+const CLAUDE_HOOK_MATCHERS: &[&str] = &["Bash", "Edit", "MultiEdit", "Write", "NotebookEdit"];
+
 /// Relative path (under cwd) of the runtime marker file the `claude-hook`
 /// binary checks before applying its policy. When this file is absent, the
 /// hook falls through — that's how we keep the hook a no-op outside an
@@ -1148,12 +1152,14 @@ pub(crate) fn ensure_claude_worktree_hook(cwd: &Path) -> Result<()> {
     // different location between runs.
     pretooluse.retain(|entry| !entry_contains_brehon_marker(entry));
 
-    pretooluse.push(serde_json::json!({
-        "matcher": "Bash",
-        "hooks": [
-            { "type": "command", "command": hook_command }
-        ]
-    }));
+    for matcher in CLAUDE_HOOK_MATCHERS {
+        pretooluse.push(serde_json::json!({
+            "matcher": matcher,
+            "hooks": [
+                { "type": "command", "command": hook_command }
+            ]
+        }));
+    }
 
     std::fs::write(&settings_path, serde_json::to_string_pretty(&doc)?).with_context(|| {
         format!(
@@ -1163,6 +1169,7 @@ pub(crate) fn ensure_claude_worktree_hook(cwd: &Path) -> Result<()> {
     })?;
     tracing::info!(
         path = %settings_path.display(),
+        matchers = ?CLAUDE_HOOK_MATCHERS,
         "Installed Brehon Claude PreToolUse hook"
     );
     Ok(())
@@ -1173,13 +1180,18 @@ fn entry_contains_brehon_marker(entry: &serde_json::Value) -> bool {
     if let Some(arr) = inner {
         for h in arr {
             if let Some(cmd) = h.get("command").and_then(|c| c.as_str()) {
-                if cmd.contains(CLAUDE_HOOK_MARKER) {
+                if command_contains_brehon_hook_marker(cmd) {
                     return true;
                 }
             }
         }
     }
     false
+}
+
+fn command_contains_brehon_hook_marker(cmd: &str) -> bool {
+    cmd.contains(CLAUDE_HOOK_MARKER)
+        || (cmd.contains("brehon") && cmd.split_whitespace().last() == Some("claude-hook"))
 }
 
 /// RAII guard that activates the Claude worktree hook by writing the active
@@ -2115,6 +2127,61 @@ mod tests {
         .unwrap();
         run_git(path, &["add", "README.md", ".gitignore"]);
         run_git(path, &["commit", "-m", "seed"]);
+    }
+
+    #[test]
+    fn test_claude_hook_installs_all_mutating_tool_matchers() {
+        let temp = tempfile::tempdir().unwrap();
+        let settings_path = temp.path().join(CLAUDE_SETTINGS_RELATIVE);
+        std::fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &settings_path,
+            serde_json::json!({
+                "hooks": {
+                    "PreToolUse": [
+                        {
+                            "matcher": "Bash",
+                            "hooks": [
+                                { "type": "command", "command": "/old/bin/brehon claude-hook" }
+                            ]
+                        },
+                        {
+                            "matcher": "Read",
+                            "hooks": [
+                                { "type": "command", "command": "/tmp/user-read-hook" }
+                            ]
+                        }
+                    ]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        ensure_claude_worktree_hook(temp.path()).unwrap();
+        ensure_claude_worktree_hook(temp.path()).unwrap();
+
+        let settings: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        let entries = settings["hooks"]["PreToolUse"].as_array().unwrap();
+        let mut installed: Vec<String> = entries
+            .iter()
+            .filter(|entry| entry_contains_brehon_marker(entry))
+            .filter_map(|entry| entry["matcher"].as_str().map(str::to_string))
+            .collect();
+        installed.sort();
+
+        let mut expected: Vec<String> = CLAUDE_HOOK_MATCHERS
+            .iter()
+            .map(|matcher| matcher.to_string())
+            .collect();
+        expected.sort();
+
+        assert_eq!(installed, expected);
+        assert_eq!(entries.len(), CLAUDE_HOOK_MATCHERS.len() + 1);
+        assert!(entries
+            .iter()
+            .any(|entry| entry["matcher"].as_str() == Some("Read")));
     }
 
     #[test]
