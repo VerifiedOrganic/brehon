@@ -38,6 +38,9 @@ const JOB_STATUS_QUEUED: &str = "queued";
 const JOB_STATUS_RUNNING: &str = "running";
 const JOB_STATUS_COMPLETED: &str = "completed";
 const OPERATOR_REQUEST_TEMPLATE: &str = "operator-request";
+const HANDOFF_STATUS_DELIVERED: &str = "delivered";
+const HANDOFF_STATUS_DEAD_LETTERED: &str = "dead_lettered";
+const HANDOFF_STATUS_UNCERTAIN: &str = "uncertain";
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct ResearchJobFile {
@@ -114,6 +117,13 @@ struct ResearchHandoffDeliveryFile {
     #[serde(default)]
     prompt_id: Option<String>,
     #[serde(default)]
+    warning: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedResearchHandoffDelivery {
+    status: String,
+    method: Option<String>,
     warning: Option<String>,
 }
 
@@ -603,7 +613,7 @@ fn research_events(room: &ResearchRoomFile, brehon_root: Option<&Path>) -> Vec<R
             author,
             role: artifact.role.clone(),
             kind: "artifact".to_string(),
-            status: Some(artifact_handoff_status(artifact)),
+            status: Some(artifact_handoff_status(artifact, brehon_root)),
             pool: Some(artifact.pool.clone()),
             title: Some(format!("{} ({})", artifact.title, artifact.artifact_id)),
             content: artifact_content(room, artifact, brehon_root),
@@ -801,7 +811,7 @@ fn wrap_text_lines(value: &str, width: usize, max_lines: usize) -> Vec<String> {
 }
 
 fn artifact_status_color(status: &str) -> Color {
-    if status.contains("warning") || status.contains("failed") {
+    if status.contains("warning") || status.contains("failed") || status.contains("uncertain") {
         crate::theme::status::WARNING
     } else if status.contains("queued") || status.contains("running") {
         crate::theme::brand::PRIMARY
@@ -861,23 +871,37 @@ fn research_request_block_lines(event: &ResearchEvent, width: usize) -> Vec<Line
     lines
 }
 
-fn artifact_handoff_status(artifact: &ResearchArtifactFile) -> String {
+fn artifact_handoff_status(artifact: &ResearchArtifactFile, brehon_root: Option<&Path>) -> String {
     if artifact.handoff_deliveries.is_empty() {
         return "attached".to_string();
     }
-    if artifact
+    let resolved = artifact
         .handoff_deliveries
         .iter()
-        .any(|delivery| delivery.status == "failed")
-    {
+        .map(|delivery| resolve_handoff_delivery(delivery, brehon_root))
+        .collect::<Vec<_>>();
+    if resolved.iter().any(|delivery| {
+        matches!(
+            delivery.status.as_str(),
+            "failed" | HANDOFF_STATUS_DEAD_LETTERED
+        )
+    }) {
         return "handoff warning".to_string();
     }
-    if artifact
-        .handoff_deliveries
+    if resolved
         .iter()
-        .any(|delivery| delivery.status == "queued")
+        .any(|delivery| delivery.status == HANDOFF_STATUS_UNCERTAIN)
     {
+        return "handoff uncertain".to_string();
+    }
+    if resolved.iter().any(|delivery| delivery.status == "queued") {
         return "handoff queued".to_string();
+    }
+    if resolved
+        .iter()
+        .any(|delivery| delivery.status == HANDOFF_STATUS_DELIVERED)
+    {
+        return "handoff delivered".to_string();
     }
     "attached".to_string()
 }
@@ -927,6 +951,7 @@ fn artifact_content(
             .handoff_deliveries
             .iter()
             .map(|delivery| {
+                let resolved = resolve_handoff_delivery(delivery, brehon_root);
                 let target = if delivery.target.trim().is_empty() {
                     "unknown"
                 } else {
@@ -937,7 +962,7 @@ fn artifact_content(
                 } else {
                     delivery.target_role.as_str()
                 };
-                let method = delivery
+                let method = resolved
                     .method
                     .as_deref()
                     .filter(|value| !value.trim().is_empty())
@@ -949,7 +974,7 @@ fn artifact_content(
                     .filter(|value| !value.trim().is_empty())
                     .map(|value| format!(" #{value}"))
                     .unwrap_or_default();
-                format!("{role} {target}: {}{method}{prompt_id}", delivery.status)
+                format!("{role} {target}: {}{method}{prompt_id}", resolved.status)
             })
             .collect::<Vec<_>>()
             .join("; ");
@@ -961,12 +986,171 @@ fn artifact_content(
     } else if let Some(warning) = artifact
         .handoff_deliveries
         .iter()
-        .find_map(|delivery| delivery.warning.as_deref())
+        .find_map(|delivery| resolve_handoff_delivery(delivery, brehon_root).warning)
     {
         content.push_str("\nWarnings: ");
-        content.push_str(warning);
+        content.push_str(&warning);
     }
     content
+}
+
+fn resolve_handoff_delivery(
+    delivery: &ResearchHandoffDeliveryFile,
+    brehon_root: Option<&Path>,
+) -> ResolvedResearchHandoffDelivery {
+    let fallback = || ResolvedResearchHandoffDelivery {
+        status: delivery.status.clone(),
+        method: delivery.method.clone(),
+        warning: delivery.warning.clone(),
+    };
+
+    if delivery.status == "failed" {
+        return fallback();
+    }
+
+    let Some(prompt_id) = delivery
+        .prompt_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return fallback();
+    };
+    let Some(brehon_root) = brehon_root else {
+        return fallback();
+    };
+
+    if let Some(method) = prompt_delivery_ack_method(brehon_root, prompt_id) {
+        return ResolvedResearchHandoffDelivery {
+            status: HANDOFF_STATUS_DELIVERED.to_string(),
+            method: Some(method),
+            warning: None,
+        };
+    }
+
+    if let Some(reason) = prompt_dead_letter_reason(brehon_root, prompt_id) {
+        return ResolvedResearchHandoffDelivery {
+            status: HANDOFF_STATUS_DEAD_LETTERED.to_string(),
+            method: delivery.method.clone(),
+            warning: Some(reason),
+        };
+    }
+
+    if prompt_queue_contains(brehon_root, prompt_id) {
+        return fallback();
+    }
+
+    if prompt_enqueue_ack_exists(brehon_root, prompt_id) {
+        return ResolvedResearchHandoffDelivery {
+            status: HANDOFF_STATUS_UNCERTAIN.to_string(),
+            method: delivery.method.clone(),
+            warning: Some(format!(
+                "handoff prompt {prompt_id} was enqueued but has no delivery ack or dead-letter"
+            )),
+        };
+    }
+
+    fallback()
+}
+
+fn prompt_delivery_ack_method(brehon_root: &Path, prompt_id: &str) -> Option<String> {
+    let path = brehon_root
+        .join("runtime")
+        .join("prompt-delivery-acks")
+        .join(format!("{}.json", sanitize_prompt_id_for_path(prompt_id)));
+    let content = std::fs::read_to_string(path).ok()?;
+    let value = serde_json::from_str::<Value>(&content).ok()?;
+    Some(
+        value
+            .get("method")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(HANDOFF_STATUS_DELIVERED)
+            .to_string(),
+    )
+}
+
+fn prompt_enqueue_ack_exists(brehon_root: &Path, prompt_id: &str) -> bool {
+    brehon_root
+        .join("runtime")
+        .join("prompt-enqueue-acks")
+        .join(format!("{}.json", sanitize_prompt_id_for_path(prompt_id)))
+        .exists()
+}
+
+fn prompt_queue_contains(brehon_root: &Path, prompt_id: &str) -> bool {
+    find_prompt_payload_file(&brehon_root.join("runtime").join("prompt-queue"), prompt_id).is_some()
+}
+
+fn prompt_dead_letter_reason(brehon_root: &Path, prompt_id: &str) -> Option<String> {
+    let path = find_prompt_payload_file(
+        &brehon_root.join("runtime").join("prompt-dead-letter"),
+        prompt_id,
+    )?;
+    let content = std::fs::read_to_string(path).ok()?;
+    let value = serde_json::from_str::<Value>(&content).ok()?;
+    let source = value.get("entry").unwrap_or(&value);
+    Some(
+        source
+            .get("reason")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("reason not recorded")
+            .to_string(),
+    )
+}
+
+fn find_prompt_payload_file(root: &Path, prompt_id: &str) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(root).ok()?;
+    for entry in entries.flatten().take(1024) {
+        let path = entry.path();
+        if path.is_dir() {
+            let Ok(nested) = std::fs::read_dir(path) else {
+                continue;
+            };
+            for inner in nested.flatten().take(1024) {
+                let inner_path = inner.path();
+                if prompt_file_matches_id(&inner_path, prompt_id) {
+                    return Some(inner_path);
+                }
+            }
+        } else if prompt_file_matches_id(&path, prompt_id) {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn prompt_file_matches_id(path: &Path, prompt_id: &str) -> bool {
+    if path.is_dir() {
+        return false;
+    }
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&content) else {
+        return false;
+    };
+    if value.get("prompt_id").and_then(Value::as_str) == Some(prompt_id) {
+        return true;
+    }
+    value
+        .get("entry")
+        .and_then(|entry| entry.get("prompt_id"))
+        .and_then(Value::as_str)
+        == Some(prompt_id)
+}
+
+fn sanitize_prompt_id_for_path(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    out
 }
 
 fn request_preview(job: &ResearchJobFile) -> String {
@@ -1521,6 +1705,22 @@ research:
         .unwrap();
     }
 
+    fn write_prompt_delivery_ack(brehon_root: &Path, prompt_id: &str, target: &str) {
+        let ack_dir = brehon_root.join("runtime/prompt-delivery-acks");
+        std::fs::create_dir_all(&ack_dir).unwrap();
+        std::fs::write(
+            ack_dir.join(format!("{}.json", sanitize_prompt_id_for_path(prompt_id))),
+            serde_json::json!({
+                "prompt_id": prompt_id,
+                "target": target,
+                "method": "daemon_runtime",
+                "injected_at": Utc::now().to_rfc3339()
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn post_operator_request_writes_room_job() {
         let temp = tempfile::tempdir().unwrap();
@@ -1695,6 +1895,7 @@ research:
             .unwrap(),
         )
         .unwrap();
+        write_prompt_delivery_ack(&brehon_root, "prompt-worker-1", "worker-1");
 
         let mut terminal = Terminal::new(TestBackend::new(140, 24)).unwrap();
         let mut state = ResearchRoomViewState::default();
@@ -1720,10 +1921,91 @@ research:
         assert!(rendered.contains("Protocol Requirements"));
         assert!(rendered.contains("The protocol requires strict ordering."));
         assert!(rendered.contains("handoff warning"));
-        assert!(rendered.contains("worker worker-1: queued"));
+        assert!(rendered.contains("worker worker-1: delivered via daemon_runtime"));
         assert!(rendered.contains("supervisor-1"));
         assert!(rendered.contains("failed"));
         assert!(rendered.contains("Warnings: research handoff could not notify supervisor"));
+    }
+
+    #[test]
+    fn render_research_room_marks_acknowledged_handoffs_delivered() {
+        let temp = tempfile::tempdir().unwrap();
+        let brehon_root = temp.path().join(".brehon");
+        std::fs::create_dir_all(brehon_root.join("runtime/research/T-4/jobs")).unwrap();
+        write_task(&brehon_root, "T-4");
+        let now = Utc::now();
+        let job = ResearchJobFile {
+            job_id: "RJOB-T-4-spec-001".to_string(),
+            task_id: "T-4".to_string(),
+            route_id: None,
+            template_id: "spec".to_string(),
+            pool: "spec-research".to_string(),
+            lane: "codex-worker".to_string(),
+            role: "normative_requirements".to_string(),
+            status: JOB_STATUS_COMPLETED.to_string(),
+            origin: "manual_request".to_string(),
+            prompt: "Summarize the protocol requirements.".to_string(),
+            cost_units: 1,
+            requested_by: "operator".to_string(),
+            assigned_to: Some("researcher-1".to_string()),
+            artifact_id: Some("RCH-T-4-spec-001".to_string()),
+            depends_on: Vec::new(),
+            warnings: Vec::new(),
+            created_at: now,
+            updated_at: now,
+        };
+        write_job(
+            &brehon_root.join("runtime/research/T-4/jobs/RJOB-T-4-spec-001.json"),
+            &job,
+        )
+        .unwrap();
+        std::fs::write(
+            brehon_root.join("runtime/research/T-4/manifest.yaml"),
+            serde_yaml::to_string(&serde_json::json!({
+                "task_id": "T-4",
+                "updated_at": now,
+                "artifacts": [{
+                    "artifact_id": "RCH-T-4-spec-001",
+                    "job_id": "RJOB-T-4-spec-001",
+                    "pool": "spec-research",
+                    "role": "normative_requirements",
+                    "title": "Protocol Requirements",
+                    "summary": "The protocol requires strict ordering.",
+                    "artifact_path": ".brehon/runtime/research/T-4/RCH-T-4-spec-001/brief.md",
+                    "structured_path": ".brehon/runtime/research/T-4/RCH-T-4-spec-001/artifact.yaml",
+                    "handoff_deliveries": [{
+                        "target": "worker-4",
+                        "target_role": "worker",
+                        "status": "queued",
+                        "method": "queued",
+                        "prompt_id": "prompt-worker-4"
+                    }],
+                    "created_at": now
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        write_prompt_delivery_ack(&brehon_root, "prompt-worker-4", "worker-4");
+
+        let mut terminal = Terminal::new(TestBackend::new(140, 20)).unwrap();
+        let mut state = ResearchRoomViewState::default();
+        terminal
+            .draw(|frame| {
+                render_research_view(
+                    frame,
+                    frame.area(),
+                    Some(&brehon_root),
+                    &test_loader(),
+                    &mut state,
+                )
+            })
+            .unwrap();
+
+        let rendered = buffer_text(terminal.backend().buffer());
+        assert!(rendered.contains("handoff delivered"));
+        assert!(rendered.contains("worker worker-4: delivered via daemon_runtime"));
+        assert!(!rendered.contains("handoff queued"));
     }
 
     #[test]

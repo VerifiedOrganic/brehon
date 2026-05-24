@@ -13,12 +13,15 @@ use crate::pty::PtyConfig;
 use panesmith::{
     AttachOptions, InputKind, InputOutcome, InputTransaction, OwnedPaneSnapshot,
     OwnedScrollbackSnapshot, PaneAttachOutcome, PaneAttachTerminal, PaneAttachTerminalControl,
-    PaneConfig, PaneEventKind, PaneId as PanesmithPaneId, PaneManager, PaneManagerConfig, Size,
-    TranscriptConfig, TranscriptMode,
+    PaneConfig, PaneEventKind, PaneId as PanesmithPaneId, PaneManager, PaneManagerConfig,
+    ScrollbackConfig, Size, TranscriptConfig, TranscriptMode,
 };
 
 #[cfg(test)]
 pub(crate) const FORCE_PANESMITH_SPAWN_FAILURE_PANE_ID: &str = "__brehon_test_panesmith_spawn_fail";
+
+const BREHON_PANESMITH_SCROLLBACK_LINES: usize = 20_000;
+const BREHON_PANESMITH_SCROLLBACK_BYTES: usize = 8 * 1024 * 1024;
 
 /// Mirrored event data that can be applied to Brehon's pane/runtime state.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,7 +78,10 @@ impl Default for BrehonPanesmithShim {
 impl BrehonPanesmithShim {
     pub(crate) fn new() -> Self {
         Self {
-            manager: PaneManager::new(PaneManagerConfig::default()),
+            manager: PaneManager::new(
+                PaneManagerConfig::default()
+                    .with_default_scrollback(brehon_panesmith_scrollback_config()),
+            ),
             pane_ids: HashMap::new(),
             brehon_ids: HashMap::new(),
             snapshots: HashMap::new(),
@@ -295,6 +301,7 @@ pub(crate) fn to_panesmith_config(
         .with_id(pane_id)
         .with_size(Size::new(config.rows, config.cols))
         .with_title(title.to_string())
+        .with_scrollback(brehon_panesmith_scrollback_config())
         .with_transcript(TranscriptConfig::new(TranscriptMode::Both));
 
     if let Some(cwd) = &config.cwd {
@@ -306,6 +313,14 @@ pub(crate) fn to_panesmith_config(
     }
 
     pane
+}
+
+fn brehon_panesmith_scrollback_config() -> ScrollbackConfig {
+    ScrollbackConfig::new(
+        BREHON_PANESMITH_SCROLLBACK_LINES,
+        BREHON_PANESMITH_SCROLLBACK_BYTES,
+    )
+    .expect("Brehon Panesmith scrollback limits are non-zero")
 }
 
 fn mirror_event_kind(kind: &PaneEventKind) -> BrehonPanesmithEventKind {
@@ -402,6 +417,10 @@ mod tests {
         );
         assert_eq!(pane_config.size, Size::new(9, 31));
         assert_eq!(pane_config.title.as_deref(), Some("supervisor"));
+        assert_eq!(
+            pane_config.scrollback,
+            Some(brehon_panesmith_scrollback_config())
+        );
         assert_eq!(pane_config.transcript.mode, TranscriptMode::Both);
     }
 
