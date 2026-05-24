@@ -169,23 +169,9 @@ impl BrehonPanesmithShim {
             return Ok(false);
         };
 
-        let kill_result = self
-            .manager
-            .kill(panesmith_id, panesmith::KillReason::HostRequested);
-        let remove_result = self.manager.remove(panesmith_id);
-        match (kill_result, remove_result) {
-            (_, Ok(_)) => {}
-            (Err(kill_err), Err(remove_err)) => {
-                return Err(Error::pty(format!(
-                    "Panesmith: failed to kill pane {}: {}; failed to remove pane {}: {}",
-                    panesmith_id.get(),
-                    kill_err,
-                    panesmith_id.get(),
-                    remove_err
-                )));
-            }
-            (Ok(()), Err(remove_err)) => return Err(map_panesmith_error(remove_err)),
-        }
+        self.manager
+            .kill_and_remove(panesmith_id, panesmith::KillReason::HostRequested)
+            .map_err(map_panesmith_error)?;
 
         self.pane_ids.remove(pane_id);
         self.brehon_ids.remove(&panesmith_id);
