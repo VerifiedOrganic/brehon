@@ -165,16 +165,33 @@ impl BrehonPanesmithShim {
     }
 
     pub(crate) fn kill_and_forget(&mut self, pane_id: &str) -> Result<bool> {
-        let Some(panesmith_id) = self.pane_ids.remove(pane_id) else {
+        let Some(panesmith_id) = self.pane_ids.get(pane_id).copied() else {
             return Ok(false);
         };
+
+        let kill_result = self
+            .manager
+            .kill(panesmith_id, panesmith::KillReason::HostRequested);
+        let remove_result = self.manager.remove(panesmith_id);
+        match (kill_result, remove_result) {
+            (_, Ok(_)) => {}
+            (Err(kill_err), Err(remove_err)) => {
+                return Err(Error::pty(format!(
+                    "Panesmith: failed to kill pane {}: {}; failed to remove pane {}: {}",
+                    panesmith_id.get(),
+                    kill_err,
+                    panesmith_id.get(),
+                    remove_err
+                )));
+            }
+            (Ok(()), Err(remove_err)) => return Err(map_panesmith_error(remove_err)),
+        }
+
+        self.pane_ids.remove(pane_id);
         self.brehon_ids.remove(&panesmith_id);
         self.snapshots.remove(pane_id);
         self.scrollbacks.remove(pane_id);
         self.last_seq.remove(&panesmith_id);
-        let _ = self
-            .manager
-            .kill(panesmith_id, panesmith::KillReason::HostRequested);
         Ok(true)
     }
 
@@ -414,6 +431,55 @@ mod tests {
         assert_eq!(shim.panesmith_id_for("supervisor"), Some(panesmith_id));
         assert_eq!(shim.brehon_id_for(panesmith_id), Some("supervisor"));
         assert!(shim.snapshot("supervisor").is_some());
+    }
+
+    #[test]
+    fn kill_and_forget_removes_pane_from_panesmith_manager() {
+        let mut shim = BrehonPanesmithShim::new();
+        let config = test_config("sh", &["-c", "sleep 30"]);
+
+        let panesmith_id = shim
+            .spawn_pane("supervisor", &config, "Supervisor")
+            .expect("spawn Panesmith supervisor");
+
+        assert!(shim.manager.snapshot(panesmith_id).is_ok());
+        assert!(
+            shim.kill_and_forget("supervisor")
+                .expect("kill and remove Panesmith supervisor")
+        );
+
+        assert!(shim.panesmith_id_for("supervisor").is_none());
+        assert!(shim.brehon_id_for(panesmith_id).is_none());
+        assert!(shim.snapshot("supervisor").is_none());
+        assert!(matches!(
+            shim.manager.snapshot(panesmith_id),
+            Err(panesmith::PaneError::NotFound { pane_id }) if pane_id == panesmith_id
+        ));
+    }
+
+    #[test]
+    fn repeated_kill_and_forget_cycles_do_not_retain_old_panes() {
+        let mut shim = BrehonPanesmithShim::new();
+        let config = test_config("sh", &["-c", "sleep 30"]);
+        let mut removed_ids = Vec::new();
+
+        for _ in 0..3 {
+            let panesmith_id = shim
+                .spawn_pane("supervisor", &config, "Supervisor")
+                .expect("spawn Panesmith supervisor");
+            assert!(
+                shim.kill_and_forget("supervisor")
+                    .expect("kill and remove Panesmith supervisor")
+            );
+            removed_ids.push(panesmith_id);
+        }
+
+        for panesmith_id in removed_ids {
+            assert!(matches!(
+                shim.manager.snapshot(panesmith_id),
+                Err(panesmith::PaneError::NotFound { pane_id }) if pane_id == panesmith_id
+            ));
+        }
     }
 
     #[test]
