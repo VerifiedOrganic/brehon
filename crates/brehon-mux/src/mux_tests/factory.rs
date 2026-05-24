@@ -237,47 +237,6 @@ fn test_factory_uses_panesmith_for_all_interactive_pty_roles() {
 }
 
 #[test]
-fn test_factory_uses_panesmith_for_agy_interactive_pty_roles() {
-    let project_root = super::fresh_temp_dir("brehon-mux-panesmith-agy-roles");
-    let config = MuxConfig {
-        cwd: project_root,
-        workers: 1,
-        worker_names: vec!["agy-worker".to_string()],
-        worker_cli: AgentAdapter::BuiltIn(SupervisorCli::Agy),
-        supervisor_name: "agy-supervisor".to_string(),
-        supervisor_cli: AgentAdapter::BuiltIn(SupervisorCli::Agy),
-        reviewer_names: vec!["agy-reviewer".to_string()],
-        reviewer_cli: AgentAdapter::BuiltIn(SupervisorCli::Agy),
-        include_director: false,
-        rows: 24,
-        cols: 140,
-        ..Default::default()
-    };
-
-    let mut mux = Mux::factory(config).expect("create mux");
-
-    for pane_id in ["agy-worker", "agy-supervisor", "agy-reviewer"] {
-        let pane = mux.get(pane_id).expect("pane exists");
-        assert!(
-            pane.is_panesmith_managed(),
-            "{pane_id} should use Panesmith"
-        );
-        assert!(
-            !pane.is_gateway_backed(),
-            "{pane_id} should stay on the interactive PTY path"
-        );
-        assert_eq!(
-            mux.pane_backend_ownership(pane_id),
-            Some(PaneBackendOwnership::Panesmith)
-        );
-    }
-
-    tokio::runtime::Runtime::new()
-        .expect("runtime")
-        .block_on(mux.shutdown_all());
-}
-
-#[test]
 fn test_factory_keeps_acp_roles_gateway_owned_under_panesmith_default() {
     let project_root = super::fresh_temp_dir("brehon-mux-panesmith-gateway-non-regression");
     let config = MuxConfig {

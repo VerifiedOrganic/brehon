@@ -15,8 +15,8 @@ coverage/
 # ─── Compiler crashes ────────────────────────────────────────────
 rustc-ice-*.txt
 
-# ─── Brehon runtime state in nested crate/test workspaces ────────
-**/*/.brehon/
+# ─── Brehon runtime state (created by `brehon run`) ──────────────
+**/.brehon/
 brehon-*.log
 
 # ─── Internal planning / research / scratch (not for OSS) ────────
@@ -98,8 +98,4 @@ logs/
 .pantheon/
 
 # Brehon orchestration data
-!/.brehon/
-/.brehon/*
-!/.brehon/worktrees/
-/.brehon/worktrees/**
-!/.brehon/worktrees/**/
+.brehon/
