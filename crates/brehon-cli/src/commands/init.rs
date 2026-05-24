@@ -18,8 +18,15 @@ const KNOWN_AGENTS: &[(&str, &str, &str)] = &[
 ];
 
 const AGY_PROJECT_MCP_CONFIG_PATH: &str = ".agents/mcp_config.json";
-const INIT_GITIGNORE_PATTERNS: &[&str] =
-    &[".brehon/", ".agents/mcp_config.json", ".antigravitycli"];
+const INIT_GITIGNORE_PATTERNS: &[&str] = &[
+    "!/.brehon/",
+    "/.brehon/*",
+    "!/.brehon/worktrees/",
+    "/.brehon/worktrees/**",
+    "!/.brehon/worktrees/**/",
+    ".agents/mcp_config.json",
+    ".antigravitycli",
+];
 
 /// Agent info for config generation.
 struct DetectedAgent {
@@ -917,11 +924,33 @@ fn generate_config_for_agents(agents: &[DetectedAgent]) -> String {
     )
 }
 
+fn is_legacy_brehon_dir_ignore(line: &str) -> bool {
+    matches!(line.trim(), ".brehon" | ".brehon/")
+}
+
+fn remove_legacy_brehon_dir_ignores(content: &str) -> (String, bool) {
+    let mut removed = false;
+    let retained = content
+        .lines()
+        .filter(|line| {
+            if is_legacy_brehon_dir_ignore(line) {
+                removed = true;
+                false
+            } else {
+                true
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let mut updated = retained.join("\n");
+    if !updated.is_empty() && content.ends_with('\n') {
+        updated.push('\n');
+    }
+    (updated, removed)
+}
+
 fn gitignore_pattern_present(lines: &[&str], pattern: &str) -> bool {
-    lines.iter().any(|line| {
-        let trimmed = line.trim();
-        trimmed == pattern || (pattern == ".brehon/" && trimmed == ".brehon")
-    })
+    lines.iter().any(|line| line.trim() == pattern)
 }
 
 /// Update .gitignore to include Brehon and machine-local agent files.
@@ -932,28 +961,30 @@ fn update_gitignore(project_path: &Path) -> Result<bool> {
     } else {
         String::new()
     };
-    let lines = content.lines().collect::<Vec<_>>();
+    let (mut new_content, removed_legacy) = remove_legacy_brehon_dir_ignores(&content);
+    let lines = new_content.lines().collect::<Vec<_>>();
     let missing = INIT_GITIGNORE_PATTERNS
         .iter()
         .filter(|pattern| !gitignore_pattern_present(&lines, pattern))
         .copied()
         .collect::<Vec<_>>();
 
-    if missing.is_empty() {
+    if missing.is_empty() && !removed_legacy {
         return Ok(false);
     }
 
-    let mut new_content = content;
-    if !new_content.is_empty() && !new_content.ends_with('\n') {
-        new_content.push('\n');
-    }
-    if !new_content.is_empty() {
-        new_content.push('\n');
-    }
-    new_content.push_str("# Brehon orchestration data\n");
-    for pattern in missing {
-        new_content.push_str(pattern);
-        new_content.push('\n');
+    if !missing.is_empty() {
+        if !new_content.is_empty() && !new_content.ends_with('\n') {
+            new_content.push('\n');
+        }
+        if !new_content.is_empty() {
+            new_content.push('\n');
+        }
+        new_content.push_str("# Brehon orchestration data\n");
+        for pattern in missing {
+            new_content.push_str(pattern);
+            new_content.push('\n');
+        }
     }
     std::fs::write(&gitignore_path, new_content)?;
 
@@ -1503,11 +1534,17 @@ mod tests {
         assert!(update_gitignore(temp.path()).expect("update gitignore"));
         let gitignore =
             std::fs::read_to_string(temp.path().join(".gitignore")).expect("read gitignore");
+        let lines = gitignore
+            .lines()
+            .map(str::trim)
+            .collect::<std::collections::HashSet<_>>();
 
         assert!(gitignore.contains("target/"));
-        assert_eq!(gitignore.matches(".brehon").count(), 1, "{gitignore}");
-        assert!(gitignore.contains(".agents/mcp_config.json"));
-        assert!(gitignore.contains(".antigravitycli"));
+        assert!(!lines.contains(".brehon"), "{gitignore}");
+        assert!(!lines.contains(".brehon/"), "{gitignore}");
+        for pattern in INIT_GITIGNORE_PATTERNS {
+            assert!(lines.contains(*pattern), "{pattern} missing: {gitignore}");
+        }
 
         assert!(!update_gitignore(temp.path()).expect("second update"));
     }

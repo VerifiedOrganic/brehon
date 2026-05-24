@@ -724,8 +724,10 @@ pub(crate) fn default_initiative_integration_worktree(
 /// shared repo root. All of these are machine-local — committing them
 /// poisons teammate checkouts:
 ///
-/// * `.brehon/` — entire runtime/state tree (sessions, worktrees, tasks,
-///   factory caches). Per-developer; never portable.
+/// * `/.brehon/*` plus the worktree exceptions below — runtime/state files stay
+///   ignored, while worktree directory paths remain visible to git-aware CLIs
+///   such as Antigravity CLI. Files inside those worktrees are still ignored
+///   from the shared checkout, so the main repo does not become dirty.
 /// * `.mcp.json` — Claude Code MCP discovery file. Written with an
 ///   absolute path to the current machine's brehon binary (see
 ///   [`ensure_mcp_config`]); the path won't resolve on any other host.
@@ -742,12 +744,41 @@ pub(crate) fn default_initiative_integration_worktree(
 /// without requiring a team-wide .gitignore update. This is the same
 /// pattern most tooling uses for auto-generated dev scaffolding.
 const BREHON_LOCAL_GITIGNORE_PATTERNS: &[&str] = &[
-    ".brehon/",
+    "!/.brehon/",
+    "/.brehon/*",
+    "!/.brehon/worktrees/",
+    "/.brehon/worktrees/**",
+    "!/.brehon/worktrees/**/",
     ".mcp.json",
     ".agents/mcp_config.json",
     ".antigravitycli",
     ".claude/settings.local.json",
 ];
+
+fn is_legacy_brehon_dir_ignore(line: &str) -> bool {
+    matches!(line.trim(), ".brehon" | ".brehon/")
+}
+
+fn remove_legacy_brehon_dir_ignores(content: &str) -> (String, bool) {
+    let mut removed = false;
+    let retained = content
+        .lines()
+        .filter(|line| {
+            if is_legacy_brehon_dir_ignore(line) {
+                removed = true;
+                false
+            } else {
+                true
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let mut updated = retained.join("\n");
+    if !updated.is_empty() && content.ends_with('\n') {
+        updated.push('\n');
+    }
+    (updated, removed)
+}
 
 /// Ensure all Brehon-generated machine-local files are git-ignored
 /// via `.git/info/exclude`.
@@ -768,24 +799,24 @@ pub(crate) fn ensure_brehon_ignored_in_repo(repo_root: &Path) -> Result<()> {
     std::fs::create_dir_all(&info_dir)?;
     let exclude_path = info_dir.join("exclude");
     let existing = std::fs::read_to_string(&exclude_path).unwrap_or_default();
+    let (mut updated, removed_legacy) = remove_legacy_brehon_dir_ignores(&existing);
 
     // Collect the trimmed set of lines already present so we only write
     // patterns that are genuinely missing — and preserve anything else
     // the developer has put in their exclude file (custom tool caches,
     // editor scratch files, etc.).
     let already_present: std::collections::HashSet<&str> =
-        existing.lines().map(|line| line.trim()).collect();
+        updated.lines().map(|line| line.trim()).collect();
 
     let missing: Vec<&&str> = BREHON_LOCAL_GITIGNORE_PATTERNS
         .iter()
         .filter(|pattern| !already_present.contains(**pattern))
         .collect();
 
-    if missing.is_empty() {
+    if missing.is_empty() && !removed_legacy {
         return Ok(());
     }
 
-    let mut updated = existing;
     if !updated.is_empty() && !updated.ends_with('\n') {
         updated.push('\n');
     }
@@ -2110,7 +2141,7 @@ mod tests {
         std::fs::write(path.join("README.md"), "seed\n").unwrap();
         std::fs::write(
             path.join(".gitignore"),
-            ".brehon/\n.claude/settings.local.json\n",
+            "!/.brehon/\n/.brehon/*\n!/.brehon/worktrees/\n/.brehon/worktrees/**\n!/.brehon/worktrees/**/\n.claude/settings.local.json\n",
         )
         .unwrap();
         run_git(path, &["add", "README.md", ".gitignore"]);
@@ -3752,10 +3783,12 @@ mod tests {
         ensure_brehon_ignored_in_repo(temp.path()).unwrap();
 
         let lines = exclude_lines(temp.path());
-        assert!(
-            lines.iter().any(|l| l == ".brehon/"),
-            ".brehon/ missing: {lines:?}"
-        );
+        for pattern in &BREHON_LOCAL_GITIGNORE_PATTERNS[..5] {
+            assert!(
+                lines.iter().any(|l| l.as_str() == *pattern),
+                "{pattern} missing: {lines:?}"
+            );
+        }
         assert!(
             lines.iter().any(|l| l == ".mcp.json"),
             ".mcp.json missing: {lines:?}"
@@ -3793,7 +3826,11 @@ mod tests {
         assert!(contents.contains(".my-editor-scratch/"));
         assert!(contents.contains("build-local/"));
         // Brehon patterns get appended.
-        assert!(contents.contains(".brehon/"));
+        assert!(contents.contains("!/.brehon/"));
+        assert!(contents.contains("/.brehon/*"));
+        assert!(contents.contains("!/.brehon/worktrees/"));
+        assert!(contents.contains("/.brehon/worktrees/**"));
+        assert!(contents.contains("!/.brehon/worktrees/**/"));
         assert!(contents.contains(".mcp.json"));
         assert!(contents.contains(".agents/mcp_config.json"));
         assert!(contents.contains(".antigravitycli"));
@@ -3824,20 +3861,25 @@ mod tests {
         init_git_repo(temp.path());
         let exclude = temp.path().join(".git/info/exclude");
         std::fs::create_dir_all(exclude.parent().unwrap()).unwrap();
-        // Pre-populate with only one of the brehon patterns.
-        std::fs::write(&exclude, ".brehon/\n").unwrap();
+        // Pre-populate with a legacy Brehon pattern and one current pattern.
+        std::fs::write(&exclude, ".brehon/\n.mcp.json\n").unwrap();
 
         ensure_brehon_ignored_in_repo(temp.path()).unwrap();
 
         let lines = exclude_lines(temp.path());
-        // .brehon/ should appear exactly once — we don't re-add.
+        assert!(!lines.iter().any(|l| l == ".brehon/"));
+        assert!(!lines.iter().any(|l| l == ".brehon"));
+        for pattern in &BREHON_LOCAL_GITIGNORE_PATTERNS[..5] {
+            assert!(
+                lines.iter().any(|l| l.as_str() == *pattern),
+                "{pattern} missing: {lines:?}"
+            );
+        }
         assert_eq!(
-            lines.iter().filter(|l| **l == ".brehon/").count(),
+            lines.iter().filter(|l| **l == ".mcp.json").count(),
             1,
-            ".brehon/ was duplicated: {lines:?}"
+            ".mcp.json was duplicated: {lines:?}"
         );
-        // The other patterns should have been added.
-        assert!(lines.iter().any(|l| l == ".mcp.json"));
         assert!(lines.iter().any(|l| l == ".agents/mcp_config.json"));
         assert!(lines.iter().any(|l| l == ".antigravitycli"));
         assert!(lines.iter().any(|l| l == ".claude/settings.local.json"));
@@ -3872,10 +3914,65 @@ mod tests {
         // The user's line must survive, and brehon's entries must be on
         // their own lines (no concatenation).
         assert!(contents.contains("existing-no-newline\n"));
-        assert!(contents.contains("\n.brehon/\n"));
+        assert!(contents.contains("\n!/.brehon/\n"));
+        assert!(contents.contains("\n/.brehon/*\n"));
+        assert!(contents.contains("\n!/.brehon/worktrees/\n"));
+        assert!(contents.contains("\n/.brehon/worktrees/**\n"));
+        assert!(contents.contains("\n!/.brehon/worktrees/**/\n"));
         assert!(contents.contains("\n.mcp.json\n"));
         assert!(contents.contains("\n.agents/mcp_config.json\n"));
         assert!(contents.contains("\n.antigravitycli\n"));
+    }
+
+    #[test]
+    fn ensure_brehon_ignored_in_repo_keeps_worktree_dirs_visible_without_dirtying_root() {
+        let temp = tempfile::tempdir().unwrap();
+        init_git_repo(temp.path());
+
+        ensure_brehon_ignored_in_repo(temp.path()).unwrap();
+
+        let worktree_dir = temp
+            .path()
+            .join(".brehon/worktrees/runs/session-a/agy-worker");
+        std::fs::create_dir_all(worktree_dir.join(".agents")).unwrap();
+        std::fs::write(worktree_dir.join(".git"), "gitdir: /tmp/not-used\n").unwrap();
+        std::fs::write(worktree_dir.join(".agents/mcp_config.json"), "{}\n").unwrap();
+        std::fs::write(worktree_dir.join("src.txt"), "work\n").unwrap();
+
+        let visible_dir = run_git(
+            temp.path(),
+            &[
+                "check-ignore",
+                "-v",
+                ".brehon/worktrees/runs/session-a/agy-worker",
+            ],
+        );
+        assert!(
+            visible_dir.contains("!/.brehon/worktrees/**/"),
+            "worktree directory should be unignored for git-aware CLIs: {visible_dir}"
+        );
+
+        let ignored_file = run_git(
+            temp.path(),
+            &[
+                "check-ignore",
+                "-v",
+                ".brehon/worktrees/runs/session-a/agy-worker/src.txt",
+            ],
+        );
+        assert!(
+            ignored_file.contains("/.brehon/worktrees/**"),
+            "worktree files should stay ignored from the shared root: {ignored_file}"
+        );
+
+        let status = run_git(
+            temp.path(),
+            &["status", "--porcelain", "--untracked-files=all"],
+        );
+        assert!(
+            !status.contains(".brehon"),
+            "worktree contents dirtied shared root status:\n{status}"
+        );
     }
 
     #[test]
