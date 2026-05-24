@@ -350,7 +350,7 @@ fn recover_stale_reviewer_obligations(
                     .unwrap_or(std::time::Instant::now()),
             )
             .unwrap_or_default();
-        if !pane_dead && reviewer_idle < ctx.auto_recover_threshold {
+        if !pane_dead && reviewer_idle < ctx.review_obligation_nudge_threshold {
             continue;
         }
 
@@ -361,13 +361,16 @@ fn recover_stale_reviewer_obligations(
             obligation.review_id.clone(),
         );
         if !pane_dead {
-            match ctx.review_obligation_nudges_sent.get(&nudge_key).copied() {
-                Some(sent_at) if now.duration_since(sent_at) >= ctx.auto_recover_threshold => {}
-                Some(_) => continue,
-                None => {
+            let nudge_sent_at = ctx.review_obligation_nudges_sent.get(&nudge_key).copied();
+            let reset_due = reviewer_idle >= ctx.review_obligation_reset_threshold
+                || nudge_sent_at.is_some_and(|sent_at| {
+                    now.duration_since(sent_at) >= ctx.review_obligation_nudge_threshold
+                });
+            if !reset_due {
+                if nudge_sent_at.is_none() {
                     send_review_obligation_nudge(ctx, brehon_root, &reviewer, obligation, now);
-                    continue;
                 }
+                continue;
             }
         }
         queue_reviewer_obligation_reset(

@@ -147,6 +147,8 @@ pub(crate) struct EventLoopCtx {
     // Stall / recovery tracking
     pub last_activity: std::collections::HashMap<String, Instant>,
     pub auto_recover_threshold: Duration,
+    pub review_obligation_nudge_threshold: Duration,
+    pub review_obligation_reset_threshold: Duration,
     pub worker_context_reset_cooldown: Duration,
     pub self_improve_idle_threshold: Duration,
     pub self_improve_retry_cooldown: Duration,
@@ -3734,6 +3736,8 @@ mod tests {
                 structured_mode: std::collections::HashSet::new(),
                 last_activity,
                 auto_recover_threshold: Duration::from_secs(60),
+                review_obligation_nudge_threshold: Duration::from_secs(60),
+                review_obligation_reset_threshold: Duration::from_secs(120),
                 worker_context_reset_cooldown: Duration::from_secs(60),
                 self_improve_idle_threshold: Duration::from_secs(60),
                 self_improve_retry_cooldown: Duration::from_secs(60),
@@ -4283,7 +4287,8 @@ mod tests {
         mux.add_pane(make_reviewer_pane("reviewer-1"));
         let mut harness = harness_with_mux(mux);
         let now = Instant::now();
-        harness.ctx.auto_recover_threshold = Duration::from_secs(1);
+        harness.ctx.review_obligation_nudge_threshold = Duration::from_secs(1);
+        harness.ctx.review_obligation_reset_threshold = Duration::from_secs(60);
         harness.ctx.stall_check_interval = Duration::ZERO;
         harness.ctx.last_stall_check = now - Duration::from_secs(60);
         harness
@@ -4324,7 +4329,8 @@ mod tests {
         mux.add_pane(make_reviewer_pane("reviewer-1"));
         let mut harness = harness_with_mux(mux);
         let now = Instant::now();
-        harness.ctx.auto_recover_threshold = Duration::from_secs(1);
+        harness.ctx.review_obligation_nudge_threshold = Duration::from_secs(1);
+        harness.ctx.review_obligation_reset_threshold = Duration::from_secs(60);
         harness.ctx.stall_check_interval = Duration::ZERO;
         harness.ctx.last_stall_check = now - Duration::from_secs(60);
         harness.ctx.review_obligation_nudges_sent.insert(
@@ -4376,6 +4382,46 @@ mod tests {
         assert!(
             harness.rx.recv_timeout(Duration::from_millis(50)).is_err(),
             "acknowledged reviewer obligation reset must not loop"
+        );
+    }
+
+    #[test]
+    fn stale_reviewer_obligation_resets_when_idle_exceeds_reset_threshold() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let brehon_root = temp.path().join(".brehon");
+        write_review_obligation_fixture(&brehon_root);
+
+        let mut mux = Mux::new(24, 80);
+        mux.add_pane(make_reviewer_pane("reviewer-1"));
+        let mut harness = harness_with_mux(mux);
+        let now = Instant::now();
+        harness.ctx.review_obligation_nudge_threshold = Duration::from_secs(1);
+        harness.ctx.review_obligation_reset_threshold = Duration::from_secs(3);
+        harness.ctx.stall_check_interval = Duration::ZERO;
+        harness.ctx.last_stall_check = now - Duration::from_secs(60);
+        harness
+            .ctx
+            .last_activity
+            .insert("reviewer-1".to_string(), now - Duration::from_secs(5));
+        harness
+            .ctx
+            .dashboard_data
+            .lock()
+            .expect("dashboard")
+            .brehon_root = Some(brehon_root.clone());
+
+        crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
+
+        let routed = recv_route(&harness.rx);
+        assert_eq!(routed.command.target.pane_id.as_deref(), Some("reviewer-1"));
+        assert!(matches!(
+            routed.command.kind,
+            RuntimeCommandKind::ResetPane { ref reason }
+                if reason == "auto-recover idle reviewer pane with pending review obligation"
+        ));
+        assert!(
+            harness.ctx.review_obligation_nudges_sent.is_empty(),
+            "reset threshold should not spend a turn on a nudge first"
         );
     }
 
