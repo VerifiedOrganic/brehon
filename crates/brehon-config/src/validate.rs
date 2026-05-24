@@ -1211,10 +1211,12 @@ fn reviewer_lane_supports_shared_reset(config: &BrehonConfig, lane: &str) -> boo
             }
             true
         }
+        brehon_types::agent::AdapterKind::Agy => launcher
+            .command_str()
+            .is_some_and(|command| !command.trim().is_empty()),
         brehon_types::agent::AdapterKind::Kimi
         | brehon_types::agent::AdapterKind::Junie
-        | brehon_types::agent::AdapterKind::Copilot
-        | brehon_types::agent::AdapterKind::Agy => false,
+        | brehon_types::agent::AdapterKind::Copilot => false,
     }
 }
 
@@ -2358,6 +2360,66 @@ rooms:
         config.review.panels = vec![brehon_types::ReviewPanelConfig {
             id: "primary".into(),
             reviewers: vec!["claude-code".into(), "codex".into()],
+        }];
+
+        let warnings = validate(&config);
+
+        assert!(!warnings.iter().any(|warning| {
+            warning.kind == ValidationWarningKind::ReviewPanelConflict
+                && warning.message.contains("share_after_submit")
+        }));
+    }
+
+    #[test]
+    fn share_after_submit_allows_agy_reviewers() {
+        let mut config = minimal_valid_config();
+        config.launchers.insert(
+            "agy".into(),
+            AgentConnectionConfig {
+                adapter: AdapterKind::Agy,
+                command: Some("agy".into()),
+                args: vec![],
+                provider: None,
+                transport: None,
+                control_plane: None,
+                base_url: None,
+                api_key_env: None,
+                permission_mode: None,
+                profile: None,
+                max_parallel_tool_calls: None,
+                assistant_message_passthrough_fields: Vec::new(),
+                reasoning_effort_param: None,
+                extra_body: None,
+                env: HashMap::new(),
+                headers: HashMap::new(),
+            },
+        );
+        config.lanes.insert(
+            "agy-reviewer".into(),
+            LaneConfig {
+                launcher: "agy".into(),
+                model: None,
+                reasoning_effort: None,
+                system_prompt: None,
+                profile: None,
+            },
+        );
+        config.roles.reviewers = vec![ReviewerPoolConfig {
+            lane: "agy-reviewer".into(),
+            model: Some(ModelConfig {
+                provider: "google".into(),
+                name: "antigravity-2.0".into(),
+            }),
+            reasoning_effort: None,
+            system_prompt: None,
+            min: 1,
+            max: 1,
+        }];
+        config.review.lease_mode = brehon_types::config::ReviewLeaseMode::ShareAfterSubmit;
+        config.review.default_reviewers = vec!["agy-reviewer".into()];
+        config.review.panels = vec![brehon_types::ReviewPanelConfig {
+            id: "primary".into(),
+            reviewers: vec!["agy-reviewer".into()],
         }];
 
         let warnings = validate(&config);
