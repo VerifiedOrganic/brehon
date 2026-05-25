@@ -852,6 +852,201 @@ async fn test_review_changes_requested_then_re_review() {
 }
 
 #[tokio::test]
+async fn test_submit_review_rejects_unsupported_negative_and_allows_same_reviewer_resubmit() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    let env = TestEnv::new();
+    let tool = env.make_tool();
+
+    std::env::set_var("BREHON_AGENT_NAME", "supervisor-1");
+    std::env::set_var("BREHON_AGENT_ROLE", "supervisor");
+    let request = tool
+        .execute(serde_json::json!({
+            "action": "request_review",
+            "task_id": env.task_id,
+            "title": "Reject unsupported negative"
+        }))
+        .await
+        .unwrap();
+    assert!(request.is_error.is_none(), "{}", extract_text(&request));
+    let review_id = parse_result(&request)["review_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    std::env::set_var("BREHON_AGENT_NAME", "reviewer-alpha");
+    std::env::set_var("BREHON_AGENT_ROLE", "reviewer");
+    let rejected = tool
+        .execute(serde_json::json!({
+            "action": "submit_review",
+            "review_id": review_id,
+            "reviewer": "reviewer-alpha",
+            "score": 5,
+            "verdict": "needs_revision",
+            "summary": "This claims work is required but gives no actionable finding"
+        }))
+        .await
+        .unwrap();
+
+    assert_eq!(rejected.is_error, Some(true));
+    let rejected_text = extract_text(&rejected);
+    assert!(rejected_text.contains("Unsupported negative review from reviewer-alpha"));
+    assert!(rejected_text.contains("same review_id"));
+
+    let state_path = env
+        .root
+        .join("runtime")
+        .join("reviews")
+        .join(&env.task_id)
+        .join("state.json");
+    let state: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
+    assert_eq!(state["status"], "collecting");
+    assert!(state["submissions_received"].as_array().unwrap().is_empty());
+
+    let rejected_submission_path = env
+        .root
+        .join("runtime")
+        .join("reviews")
+        .join(&env.task_id)
+        .join("round-1")
+        .join("reviewer-alpha.json");
+    assert!(
+        !rejected_submission_path.exists(),
+        "unsupported negative reviews must not be persisted"
+    );
+
+    let resubmitted = tool
+        .execute(serde_json::json!({
+            "action": "submit_review",
+            "review_id": review_id,
+            "reviewer": "reviewer-alpha",
+            "score": 5,
+            "verdict": "needs_revision",
+            "summary": "Actionable blocking issue",
+            "findings": [{
+                "description": "The retry path can still drop the marker write failure",
+                "file": "crates/brehon-mux/src/mux/stability.rs",
+                "line": 42,
+                "severity": "blocking",
+                "suggestion": "Propagate the marker write failure into task-visible state"
+            }]
+        }))
+        .await
+        .unwrap();
+    assert!(
+        resubmitted.is_error.is_none(),
+        "{}",
+        extract_text(&resubmitted)
+    );
+    assert_eq!(parse_result(&resubmitted)["outcome"], "changes_requested");
+}
+
+#[tokio::test]
+async fn test_persisted_unsupported_negative_review_does_not_block_two_valid_approvals() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    let env = TestEnv::new();
+    env.write_session("reviewer-gamma", "reviewer", Some("opencode"));
+    let tool = VerificationTool::new().with_config(ReviewConfig {
+        policy: ReviewPolicy {
+            min_average_score: 7,
+            min_individual_score: 6,
+            blocking_score: 5,
+            min_approvals: 2,
+            require_blocking_feedback_resolution: true,
+            max_review_rounds: 3,
+        },
+        timeout_minutes: 30,
+        auto_assign: true,
+        default_reviewers: vec![
+            "codex".to_string(),
+            "gemini".to_string(),
+            "opencode".to_string(),
+        ],
+        panel_mode: ReviewPanelMode::FullCouncil,
+        ..ReviewConfig::default()
+    });
+
+    std::env::set_var("BREHON_AGENT_NAME", "supervisor-1");
+    std::env::set_var("BREHON_AGENT_ROLE", "supervisor");
+    let request = tool
+        .execute(serde_json::json!({
+            "action": "request_review",
+            "task_id": env.task_id,
+            "title": "Ignore persisted unsupported negative"
+        }))
+        .await
+        .unwrap();
+    assert!(request.is_error.is_none(), "{}", extract_text(&request));
+    let request_json = parse_result(&request);
+    let review_id = request_json["review_id"].as_str().unwrap().to_string();
+    assert_eq!(request_json["panel"].as_array().unwrap().len(), 3);
+
+    let review_root = env.root.join("runtime").join("reviews").join(&env.task_id);
+    let round_dir = review_root.join("round-1");
+    std::fs::write(
+        round_dir.join("reviewer-gamma.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "review_id": review_id,
+            "reviewer": "reviewer-gamma",
+            "round": 1,
+            "score": 5,
+            "verdict": "needs_revision",
+            "summary": "Claims a blocker but supplies no finding",
+            "findings": [],
+            "submitted_at": chrono::Utc::now().to_rfc3339()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let state_path = review_root.join("state.json");
+    let mut state: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
+    state["submissions_received"] = serde_json::json!(["reviewer-gamma"]);
+    std::fs::write(&state_path, serde_json::to_string_pretty(&state).unwrap()).unwrap();
+
+    for reviewer in ["reviewer-alpha", "reviewer-beta"] {
+        std::env::set_var("BREHON_AGENT_NAME", reviewer);
+        std::env::set_var("BREHON_AGENT_ROLE", "reviewer");
+        let submit = tool
+            .execute(serde_json::json!({
+                "action": "submit_review",
+                "review_id": review_id,
+                "reviewer": reviewer,
+                "score": 8,
+                "verdict": "approved",
+                "summary": "Approved with no blockers"
+            }))
+            .await
+            .unwrap();
+        assert!(submit.is_error.is_none(), "{}", extract_text(&submit));
+    }
+
+    let consolidated_path = round_dir.join("consolidated.json");
+    let consolidated: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(consolidated_path).unwrap()).unwrap();
+    assert_eq!(consolidated["outcome"], "approved");
+    assert_eq!(consolidated["approval_count"], 2);
+    assert_eq!(consolidated["min_score"], 8);
+    assert_eq!(
+        consolidated["scores"]["reviewer-gamma"]["ignored_for_threshold"],
+        true
+    );
+    assert!(consolidated["threshold_reason"]
+        .as_str()
+        .unwrap()
+        .contains("ignoring 1 unsupported negative review"));
+    assert!(consolidated["dissent"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|value| value
+            .as_str()
+            .unwrap()
+            .contains("Ignored unsupported negative review")));
+}
+
+#[tokio::test]
 async fn test_review_round_closes_early_when_blocking_verdict_arrives() {
     let _lock = ENV_LOCK.lock().unwrap();
     let env = TestEnv::new();
@@ -2133,17 +2328,21 @@ async fn test_reset_rounds_allows_fresh_review_cycle_after_max_rounds() {
         ] {
             std::env::set_var("BREHON_AGENT_NAME", reviewer);
             std::env::set_var("BREHON_AGENT_ROLE", "reviewer");
-            let submit = tool
-                .execute(serde_json::json!({
-                    "action": "submit_review",
-                    "review_id": review_id,
-                    "reviewer": reviewer,
-                    "score": score,
-                    "verdict": verdict,
-                    "summary": "needs another pass"
-                }))
-                .await
-                .unwrap();
+            let mut args = serde_json::json!({
+                "action": "submit_review",
+                "review_id": review_id,
+                "reviewer": reviewer,
+                "score": score,
+                "verdict": verdict,
+                "summary": "needs another pass"
+            });
+            if verdict == "needs_revision" {
+                args["findings"] = serde_json::json!([{
+                    "description": "Needs another concrete pass before reset-rounds coverage",
+                    "severity": "blocking"
+                }]);
+            }
+            let submit = tool.execute(args).await.unwrap();
             assert!(submit.is_error.is_none(), "{}", extract_text(&submit));
         }
 
@@ -2883,7 +3082,11 @@ async fn test_request_review_clears_stale_task_review_feedback() {
             "reviewer": "reviewer-alpha",
             "score": 4,
             "verdict": "needs_revision",
-            "summary": "Still failing"
+            "summary": "Still failing",
+            "findings": [{
+                "description": "Existing feedback still needs a concrete rework pass",
+                "severity": "blocking"
+            }]
         }))
         .await
         .unwrap();
@@ -3542,7 +3745,11 @@ async fn test_rereview_resets_round_timeout_clock() {
         "review_id": review_id_1,
         "reviewer": "reviewer-beta",
         "score": 5,
-        "verdict": "needs_revision"
+        "verdict": "needs_revision",
+        "findings": [{
+            "description": "Round one needs a concrete rework pass before timeout coverage",
+            "severity": "blocking"
+        }]
     }))
     .await
     .unwrap();

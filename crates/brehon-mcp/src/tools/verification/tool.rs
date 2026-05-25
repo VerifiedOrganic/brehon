@@ -34,6 +34,7 @@ use super::panel::{
 use super::review_prompt::{build_review_request_prompt, ReviewRequestPromptInput};
 use super::scoring::{
     build_task_review_feedback, build_task_review_followups, task_status_for_review_outcome,
+    unsupported_negative_review_reason,
 };
 use super::state::{
     acquire_review_lock, current_review_cycle_round, delete_review_state, parse_verdict,
@@ -1963,18 +1964,30 @@ impl VerificationTool {
         // Step 1: Score collection using brehon-review
         let mut collector = ScoreCollector::new();
         let mut scores_map = serde_json::Map::new();
+        let mut ignored_negative_reviews = Vec::new();
 
         for sub in submissions {
             let score = ReviewScore::new(sub.score);
             let verdict = parse_verdict(&sub.verdict);
-            collector.add(sub.reviewer.clone(), score, verdict);
-            scores_map.insert(
-                sub.reviewer.clone(),
-                serde_json::json!({
+            let mut score_entry = serde_json::json!({
                     "score": sub.score,
                     "verdict": sub.verdict
-                }),
-            );
+            });
+
+            if let Some(reason) = unsupported_negative_review_reason(
+                &self.config.policy,
+                sub.score,
+                &sub.verdict,
+                &sub.findings,
+            ) {
+                score_entry["ignored_for_threshold"] = Value::Bool(true);
+                score_entry["ignored_reason"] = Value::String(reason.clone());
+                ignored_negative_reviews.push(format!("{}: {reason}", sub.reviewer));
+            } else {
+                collector.add(sub.reviewer.clone(), score, verdict);
+            }
+
+            scores_map.insert(sub.reviewer.clone(), score_entry);
         }
 
         // Step 2: Threshold evaluation using brehon-review
@@ -1983,7 +1996,15 @@ impl VerificationTool {
 
         let (outcome, threshold_reason) = match threshold {
             brehon_review::ThresholdResult::Approved => {
-                ("approved".to_string(), "All thresholds met".to_string())
+                let reason = if ignored_negative_reviews.is_empty() {
+                    "All thresholds met".to_string()
+                } else {
+                    format!(
+                        "All thresholds met after ignoring {} unsupported negative review(s) with no blocking findings",
+                        ignored_negative_reviews.len()
+                    )
+                };
+                ("approved".to_string(), reason)
             }
             brehon_review::ThresholdResult::ChangesRequested => {
                 let reason = if collector.has_blocking_findings() {
@@ -2055,7 +2076,12 @@ impl VerificationTool {
             .collect();
 
         let consolidator = FeedbackConsolidator::new();
-        let consolidated = consolidator.consolidate(&domain_submissions);
+        let mut consolidated = consolidator.consolidate(&domain_submissions);
+        consolidated
+            .dissent
+            .extend(ignored_negative_reviews.into_iter().map(|reason| {
+                format!("Ignored unsupported negative review for threshold evaluation: {reason}")
+            }));
 
         let avg = collector.average_score().unwrap_or(0.0);
         let min = collector.min_score().map_or(0, |s| s.as_u8());

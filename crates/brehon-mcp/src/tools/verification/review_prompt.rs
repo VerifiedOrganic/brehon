@@ -228,6 +228,11 @@ pub(crate) fn build_review_request_prompt(input: &ReviewRequestPromptInput<'_>) 
          7=acceptable with all non-blocking issues captured, 8-9=good with only minor captured issues, \
          10=clean with no findings.",
     );
+    out.push_str(
+        "\nIf you submit verdict=needs_revision or verdict=rejected, or any score at/below the blocking threshold, \
+         you must include at least one structured finding with severity `blocking`. Unsupported negative reviews are rejected; \
+         fix the submit_review call and resubmit the same review_id.",
+    );
 
     out
 }

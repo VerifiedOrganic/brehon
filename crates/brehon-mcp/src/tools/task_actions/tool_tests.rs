@@ -6674,6 +6674,7 @@ async fn test_update_normalizes_pascal_case_status_for_storage() {
     let _env = ScopedEnv::set(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "worker"),
+        ("BREHON_AGENT_NAME", "worker-1"),
     ]);
     let tool = TaskActionsTool::new();
     write_test_task(root.path(), "T-pascal-update", "Assigned", "task");

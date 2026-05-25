@@ -2037,7 +2037,13 @@ fn test_evaluate_round_rejected() {
             score: 3,
             verdict: "rejected".to_string(),
             summary: String::new(),
-            findings: vec![],
+            findings: vec![StoredFinding {
+                description: "Fundamental correctness issue".to_string(),
+                file: Some("main.rs".to_string()),
+                line: Some(10),
+                severity: "blocking".to_string(),
+                suggestion: None,
+            }],
             submitted_at: String::new(),
         },
     ];
@@ -2080,7 +2086,13 @@ fn test_evaluate_round_escalated_at_max_rounds() {
             score: 5,
             verdict: "needs_revision".to_string(),
             summary: String::new(),
-            findings: vec![],
+            findings: vec![StoredFinding {
+                description: "Still requires a concrete rework pass".to_string(),
+                file: Some("main.rs".to_string()),
+                line: Some(10),
+                severity: "blocking".to_string(),
+                suggestion: None,
+            }],
             submitted_at: String::new(),
         },
     ];

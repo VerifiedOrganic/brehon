@@ -26,7 +26,8 @@ use super::panel::{
 use super::review_prompt::{build_review_request_prompt, ReviewRequestPromptInput};
 use super::scoring::{
     build_override_feedback, build_task_review_feedback, build_task_review_followups,
-    format_worker_feedback_message, task_status_for_review_outcome,
+    format_worker_feedback_message, is_supported_review_verdict, task_status_for_review_outcome,
+    unsupported_negative_review_reason,
 };
 use super::state::{
     acquire_review_lock, current_review_cycle_round, delete_review_state,
@@ -76,6 +77,24 @@ fn enqueue_reviewer_reset_with_logging(task_id: &str, review_id: &str, reviewer:
             false
         }
     }
+}
+
+fn parse_review_findings_arg(value: Option<&Value>) -> Result<Vec<StoredFinding>, String> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+
+    if value.is_array() {
+        return serde_json::from_value(value.clone())
+            .map_err(|err| format!("Invalid findings array: {err}"));
+    }
+
+    if let Some(raw) = value.as_str() {
+        return serde_json::from_str(raw)
+            .map_err(|err| format!("Invalid findings JSON string: {err}"));
+    }
+
+    Err("findings must be a JSON array or a JSON string containing an array".to_string())
 }
 
 fn task_str<'a>(task: &'a Value, key: &str) -> Option<&'a str> {
@@ -1042,6 +1061,11 @@ impl VerificationTool {
             Some(v) if !v.is_empty() => v.to_string(),
             _ => return Ok(error_result("Missing required parameter: verdict")),
         };
+        if !is_supported_review_verdict(&verdict_str_arg) {
+            return Ok(error_result(format!(
+                "Unsupported verdict `{verdict_str_arg}`. Use approved, needs_revision, changes_requested, or rejected."
+            )));
+        }
 
         let score_val = match args.get("score").and_then(|v| v.as_u64()) {
             Some(s) if (1..=10).contains(&s) => s as u8,
@@ -1055,21 +1079,10 @@ impl VerificationTool {
             .unwrap_or("")
             .to_string();
 
-        // Parse findings
-        let findings: Vec<StoredFinding> = if let Some(findings_val) = args.get("findings") {
-            // Accept either a JSON array or a JSON string containing an array
-            let parsed: Option<Vec<StoredFinding>> = if findings_val.is_array() {
-                serde_json::from_value(findings_val.clone()).ok()
-            } else if let Some(s) = findings_val.as_str() {
-                serde_json::from_str(s).ok()
-            } else {
-                None
-            };
-            parsed.unwrap_or_default()
-        } else {
-            Vec::new()
+        let findings = match parse_review_findings_arg(args.get("findings")) {
+            Ok(findings) => findings,
+            Err(err) => return Ok(error_result(err)),
         };
-
         // Reviewer identity: prefer explicit parameter, then env var, then
         // session file lookup. The env var often doesn't propagate through
         // agent CLI -> MCP subprocess boundaries.
@@ -1205,6 +1218,17 @@ impl VerificationTool {
             return Ok(error_result(format!(
                 "Reviewer {reviewer} has already submitted for round {}",
                 state.current_round
+            )));
+        }
+
+        if let Some(reason) = unsupported_negative_review_reason(
+            &self.config.policy,
+            score_val,
+            &verdict_str_arg,
+            &findings,
+        ) {
+            return Ok(error_result(format!(
+                "Unsupported negative review from {reviewer}: {reason}. Submit an actionable blocking finding for this same review_id, or submit verdict=approved with non-blocking findings as suggestions/nitpicks."
             )));
         }
 

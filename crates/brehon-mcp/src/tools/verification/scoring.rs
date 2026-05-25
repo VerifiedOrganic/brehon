@@ -1,6 +1,55 @@
 use serde_json::Value;
 
+use brehon_types::ReviewPolicy;
+
 use super::state::{ConsolidatedReport, ReviewState, StoredFinding};
+
+pub(crate) fn is_supported_review_verdict(verdict: &str) -> bool {
+    matches!(
+        verdict.trim(),
+        "approved" | "needs_revision" | "changes_requested" | "rejected"
+    )
+}
+
+pub(crate) fn has_actionable_blocking_finding(findings: &[StoredFinding]) -> bool {
+    findings.iter().any(|finding| {
+        finding.severity.trim() == "blocking" && !finding.description.trim().is_empty()
+    })
+}
+
+pub(crate) fn negative_review_requires_blocking_finding(
+    policy: &ReviewPolicy,
+    score: u8,
+    verdict: &str,
+) -> bool {
+    score <= policy.blocking_score
+        || matches!(
+            verdict.trim(),
+            "needs_revision" | "changes_requested" | "rejected"
+        )
+}
+
+pub(crate) fn unsupported_negative_review_reason(
+    policy: &ReviewPolicy,
+    score: u8,
+    verdict: &str,
+    findings: &[StoredFinding],
+) -> Option<String> {
+    if !is_supported_review_verdict(verdict) {
+        return Some(format!("unsupported verdict `{}`", verdict.trim()));
+    }
+
+    if negative_review_requires_blocking_finding(policy, score, verdict)
+        && !has_actionable_blocking_finding(findings)
+    {
+        Some(format!(
+            "score {score}/10 with verdict `{}` requires at least one `blocking` finding",
+            verdict.trim()
+        ))
+    } else {
+        None
+    }
+}
 
 pub(crate) fn format_stored_finding(finding: &StoredFinding) -> String {
     let location = match (&finding.file, finding.line) {
