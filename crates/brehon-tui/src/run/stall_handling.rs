@@ -16,14 +16,18 @@ use super::helpers::{
     pane_needs_post_spawn_prompt, read_pending_review_obligations, reviewer_reset_ack_exists,
     ReviewerResetEntry,
 };
-use super::prompt_delivery::{dispatch_runtime_prompt, recycle_terminal_host_pane};
+use super::prompt_delivery::{
+    dispatch_runtime_prompt, recycle_terminal_host_pane, reset_terminal_host_pane,
+};
 use super::recovery::{
-    active_worker_task, agent_is_quarantined_for_run, clear_agent_health_marker,
-    push_dashboard_event, quarantined_worker_names, read_prompt_retry_deferral_snapshot,
+    active_worker_task, agent_health_marker_reason, agent_is_quarantined_for_run,
+    clear_agent_health_marker, push_dashboard_event, quarantined_supervisor_names,
+    quarantined_worker_names, read_prompt_retry_deferral_snapshot,
 };
 use super::self_improvement::{
-    build_reviewer_reset_startup_prompt, build_worker_context_reset_startup_prompt,
-    find_review_wait_task_for_worker, next_self_improvement_prompt,
+    build_reviewer_reset_startup_prompt, build_supervisor_reset_startup_prompt,
+    build_worker_context_reset_startup_prompt, find_review_wait_task_for_worker,
+    next_self_improvement_prompt,
 };
 use super::session::read_session_files;
 use super::types::{PendingReviewObligation, TaskInfo};
@@ -505,6 +509,56 @@ fn queue_worker_context_reset(
     true
 }
 
+fn queue_supervisor_context_reset(
+    ctx: &mut EventLoopCtx,
+    pane_id: &str,
+    reason: String,
+    success_message: String,
+    failure_prefix: String,
+    now: std::time::Instant,
+) -> bool {
+    let Some(pane) = ctx.mux.get(pane_id) else {
+        return false;
+    };
+    if pane.kind() != &PaneKind::Supervisor {
+        return false;
+    }
+    let startup_prompt = if pane_needs_post_spawn_prompt(&ctx.mux, pane_id) {
+        build_supervisor_reset_startup_prompt(&ctx.mux, pane_id)
+    } else {
+        None
+    };
+    let command = RuntimeCommand {
+        command_id: format!("supervisor-context-reset-{}", uuid::Uuid::new_v4()),
+        target: runtime_command_target_for_pane(ctx, pane_id),
+        issued_at_ms: runtime_command_timestamp_ms(),
+        kind: RuntimeCommandKind::ResetPane { reason },
+    };
+    let context = runtime_policy_context_for_pane(ctx, pane_id);
+    if queue_runtime_command(
+        ctx,
+        command,
+        context,
+        PendingRuntimeCommandEffect::RecoveryReset {
+            pane_id: pane_id.to_string(),
+            startup_prompt,
+            success_message,
+            failure_prefix,
+            marker: RecoveryResetMarker::Supervisor,
+        },
+    )
+    .is_err()
+    {
+        return false;
+    }
+
+    ctx.last_activity.insert(pane_id.to_string(), now);
+    ctx.last_supervisor_reset.insert(pane_id.to_string(), now);
+    ctx.pending_self_improve_prompt.remove(pane_id);
+    ctx.needs_redraw = true;
+    true
+}
+
 fn active_assigned_task_for_worker<'a>(
     tasks: &'a [TaskInfo],
     worker_id: &str,
@@ -692,6 +746,122 @@ pub(super) fn detect_and_handle_stalls(ctx: &mut EventLoopCtx) {
     };
 
     if let Some(root) = brehon_root.as_ref() {
+        const SUPERVISOR_QUARANTINE_RESET_COOLDOWN: std::time::Duration =
+            std::time::Duration::from_secs(60);
+        for supervisor_id in quarantined_supervisor_names(root, &sessions_snapshot) {
+            let Some(pane) = ctx.mux.get(&supervisor_id) else {
+                continue;
+            };
+            if pane.kind() != &PaneKind::Supervisor {
+                continue;
+            }
+            if agent_health_marker_reason(root, &supervisor_id).as_deref() == Some("prompt_blocked")
+                && matches!(pane.pane_state(), Some(PaneState::Ready { .. }))
+            {
+                clear_agent_health_marker(root, &supervisor_id);
+                push_dashboard_event(
+                    &ctx.dashboard_data,
+                    format!(
+                        "cleared stale prompt-blocked marker for ready supervisor {supervisor_id}"
+                    ),
+                );
+                continue;
+            }
+            if ctx
+                .last_supervisor_reset
+                .get(&supervisor_id)
+                .is_some_and(|last| {
+                    now.duration_since(*last) < SUPERVISOR_QUARANTINE_RESET_COOLDOWN
+                })
+            {
+                continue;
+            }
+            let reset_via = if ctx.runtime_agent_factory_host_owned {
+                "via terminal-host reset"
+            } else {
+                "via authoritative reset"
+            };
+            if queue_supervisor_context_reset(
+                ctx,
+                &supervisor_id,
+                "auto-recover quarantined supervisor pane via daemon reset".to_string(),
+                format!("reset quarantined supervisor {supervisor_id} {reset_via}"),
+                format!("failed to reset quarantined supervisor {supervisor_id}"),
+                now,
+            ) {
+                continue;
+            }
+            let startup_prompt = if pane_needs_post_spawn_prompt(&ctx.mux, &supervisor_id) {
+                build_supervisor_reset_startup_prompt(&ctx.mux, &supervisor_id)
+            } else {
+                None
+            };
+            let reset_summary = if ctx.runtime_agent_factory_host_owned {
+                match reset_terminal_host_pane(
+                    ctx,
+                    &supervisor_id,
+                    "auto-recover quarantined supervisor pane via terminal-host reset",
+                ) {
+                    Ok(()) => {
+                        clear_agent_health_marker(root, &supervisor_id);
+                        if let Some(startup_prompt) = startup_prompt {
+                            if let Err(err) =
+                                super::prompt_delivery::enqueue_terminal_host_startup_prompt(
+                                    ctx,
+                                    &supervisor_id,
+                                    startup_prompt,
+                                    "terminal-host supervisor quarantine reset startup prompt",
+                                )
+                            {
+                                tracing::warn!(
+                                    supervisor = %supervisor_id,
+                                    error = %err,
+                                    "Failed to queue terminal-host supervisor quarantine reset startup prompt"
+                                );
+                            }
+                        }
+                        "via terminal-host reset".to_string()
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            supervisor = %supervisor_id,
+                            error = %err,
+                            "Failed to reset quarantined host-owned supervisor"
+                        );
+                        continue;
+                    }
+                }
+            } else {
+                let reset_result = ctx
+                    .rt
+                    .block_on(ctx.mux.reset_supervisor_session(&supervisor_id));
+                match reset_result {
+                    Ok(()) => {
+                        clear_agent_health_marker(root, &supervisor_id);
+                        if let Some(startup_prompt) = startup_prompt {
+                            ctx.mux.queue_startup_prompt(&supervisor_id, startup_prompt);
+                        }
+                        "via authoritative reset".to_string()
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            supervisor = %supervisor_id,
+                            error = %err,
+                            "Failed to reset quarantined supervisor"
+                        );
+                        continue;
+                    }
+                }
+            };
+            ctx.last_activity.insert(supervisor_id.clone(), now);
+            ctx.last_supervisor_reset.insert(supervisor_id.clone(), now);
+            ctx.pending_self_improve_prompt.remove(&supervisor_id);
+            push_dashboard_event(
+                &ctx.dashboard_data,
+                format!("reset quarantined supervisor {supervisor_id} {reset_summary}"),
+            );
+        }
+
         for worker_id in quarantined_worker_names(root, &tasks_snapshot, &sessions_snapshot) {
             if ctx
                 .mux

@@ -4,7 +4,9 @@
 use std::path::Path;
 use std::time::Instant;
 
-use brehon_mux::{AsyncGatewayPromptDispatch, PromptDeliveryAttempt, SessionScopedQueue};
+use brehon_mux::{
+    AsyncGatewayPromptDispatch, PaneKind, PaneState, PromptDeliveryAttempt, SessionScopedQueue,
+};
 use brehon_types::task::normalize_task_status;
 use brehon_types::{
     PromptDeliveryMode, RuntimeCommand, RuntimeCommandKind, RuntimeCommandStatus,
@@ -20,15 +22,17 @@ use super::helpers::{
     ReviewerResetEntry, WorkerRecycleEntry,
 };
 use super::recovery::{
-    agent_is_quarantined_for_run, clear_prompt_retry_meta, dead_letter_prompt_for_session,
-    extract_consolidated_report_identity, prompt_retry_not_due, push_dashboard_event,
-    queued_prompt_matches_session, queued_prompt_retry_delay, read_queued_prompt,
-    record_prompt_retry_deferral, record_prompt_retry_failure, rewrite_stale_consolidated_report,
+    agent_health_marker_reason, agent_is_quarantined_for_run, clear_agent_health_marker,
+    clear_prompt_retry_meta, dead_letter_prompt_for_session, extract_consolidated_report_identity,
+    prompt_retry_not_due, push_dashboard_event, queued_prompt_matches_session,
+    queued_prompt_retry_delay, read_queued_prompt, record_prompt_retry_deferral,
+    record_prompt_retry_failure, rewrite_stale_consolidated_report,
     runtime_prompt_queue_sweep_dirs, should_dead_letter_prompt_after_failure,
     should_drop_stale_review_prompt, QueuedPromptPayload,
 };
 use super::self_improvement::{
-    build_reviewer_reset_startup_prompt, build_worker_recycle_startup_prompt,
+    build_reviewer_reset_startup_prompt, build_supervisor_reset_startup_prompt,
+    build_worker_recycle_startup_prompt,
 };
 use super::types::task_is_terminal;
 
@@ -747,26 +751,6 @@ pub(super) fn deliver_pending_prompts(ctx: &mut EventLoopCtx, brehon_root: &std:
                     );
                     continue;
                 }
-                if agent_is_quarantined_for_run(brehon_root, &target) {
-                    dead_letter_prompt_for_session(
-                        brehon_root,
-                        ctx.runtime_session_name.as_deref(),
-                        &path,
-                        &target,
-                        from.as_deref(),
-                        &prompt_text,
-                        "target quarantined unavailable for this run",
-                        "target quarantined for current run",
-                    );
-                    push_dashboard_event(
-                        &ctx.dashboard_data,
-                        format!(
-                            "dead-lettered queued prompt for {target} because the agent is quarantined for this run"
-                        ),
-                    );
-                    continue;
-                }
-
                 if should_drop_stale_review_prompt(brehon_root, &prompt_text) {
                     tracing::info!(
                         target = %target,
@@ -819,6 +803,80 @@ pub(super) fn deliver_pending_prompts(ctx: &mut EventLoopCtx, brehon_root: &std:
                 };
                 let prompt_text = rewrite_stale_consolidated_report(brehon_root, &prompt_text)
                     .unwrap_or(prompt_text);
+
+                if agent_is_quarantined_for_run(brehon_root, &target) {
+                    let target_is_supervisor = ctx.mux.get(&target).is_some_and(|pane| {
+                        pane.kind() == &PaneKind::Supervisor
+                            && !matches!(pane.pane_state(), Some(PaneState::Dead { .. }))
+                    });
+                    let mut quarantine_cleared = false;
+                    if target_is_supervisor {
+                        let marker_reason = agent_health_marker_reason(brehon_root, &target);
+                        let supervisor_ready = ctx.mux.get(&target).is_some_and(|pane| {
+                            matches!(pane.pane_state(), Some(PaneState::Ready { .. }))
+                        });
+                        if marker_reason.as_deref() == Some("prompt_blocked") && supervisor_ready {
+                            clear_agent_health_marker(brehon_root, &target);
+                            quarantine_cleared = true;
+                            push_dashboard_event(
+                                &ctx.dashboard_data,
+                                format!(
+                                    "cleared stale prompt-blocked marker for ready supervisor {target}"
+                                ),
+                            );
+                        } else {
+                            let next_retry_at = record_prompt_retry_deferral(
+                                &path,
+                                TERMINAL_HOST_STARTUP_PROMPT_DELAY,
+                                "target supervisor quarantined for current run",
+                            );
+                            if pane_needs_post_spawn_prompt(&ctx.mux, &target) {
+                                if let Some(startup_prompt) =
+                                    build_supervisor_reset_startup_prompt(&ctx.mux, &target)
+                                {
+                                    if ctx.runtime_agent_factory_host_owned {
+                                        let _ = enqueue_terminal_host_startup_prompt(
+                                            ctx,
+                                            &target,
+                                            startup_prompt,
+                                            "terminal-host supervisor quarantine reset startup prompt",
+                                        );
+                                    } else {
+                                        ctx.mux.queue_startup_prompt(&target, startup_prompt);
+                                    }
+                                }
+                            }
+                            push_dashboard_event(
+                                &ctx.dashboard_data,
+                                format!(
+                                    "deferred queued prompt for quarantined supervisor {target}; will retry after {}",
+                                    next_retry_at.to_rfc3339()
+                                ),
+                            );
+                            continue;
+                        }
+                    }
+
+                    if !quarantine_cleared {
+                        dead_letter_prompt_for_session(
+                            brehon_root,
+                            ctx.runtime_session_name.as_deref(),
+                            &path,
+                            &target,
+                            from.as_deref(),
+                            &prompt_text,
+                            "target quarantined unavailable for this run",
+                            "target quarantined for current run",
+                        );
+                        push_dashboard_event(
+                            &ctx.dashboard_data,
+                            format!(
+                                "dead-lettered queued prompt for {target} because the agent is quarantined for this run"
+                            ),
+                        );
+                        continue;
+                    }
+                }
 
                 if deliver_queued_prompt_via_terminal_host(
                     ctx,

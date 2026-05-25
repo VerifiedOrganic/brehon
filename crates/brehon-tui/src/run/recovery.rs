@@ -298,6 +298,19 @@ pub(crate) fn agent_is_quarantined_for_run(brehon_root: &Path, agent_name: &str)
     value.get("status").and_then(|status| status.as_str()) == Some("unavailable")
 }
 
+pub(crate) fn agent_health_marker_reason(brehon_root: &Path, agent_name: &str) -> Option<String> {
+    let path = agent_health_path(brehon_root, agent_name);
+    let content = std::fs::read_to_string(path).ok()?;
+    let value = serde_json::from_str::<serde_json::Value>(&content).ok()?;
+    if value.get("status").and_then(|status| status.as_str()) != Some("unavailable") {
+        return None;
+    }
+    value
+        .get("reason")
+        .and_then(|reason| reason.as_str())
+        .map(str::to_string)
+}
+
 pub(crate) fn clear_agent_health_marker(brehon_root: &Path, agent_name: &str) {
     let _ = std::fs::remove_file(agent_health_path(brehon_root, agent_name));
 }
@@ -1087,6 +1100,21 @@ pub(crate) fn quarantined_worker_names(
         .collect::<Vec<_>>();
     workers.sort();
     workers
+}
+
+pub(crate) fn quarantined_supervisor_names(
+    brehon_root: &std::path::Path,
+    sessions: &std::collections::HashMap<String, (String, String, String)>,
+) -> Vec<String> {
+    let mut supervisors = sessions
+        .iter()
+        .filter_map(|(name, (role, _, _))| {
+            (role == "supervisor" && agent_is_quarantined_for_run(brehon_root, name))
+                .then_some(name.clone())
+        })
+        .collect::<Vec<_>>();
+    supervisors.sort();
+    supervisors
 }
 
 pub(crate) fn attempt_auto_recover_stalled_worker(

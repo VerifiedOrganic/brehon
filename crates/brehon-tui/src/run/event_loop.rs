@@ -4502,6 +4502,236 @@ mod tests {
     }
 
     #[test]
+    fn quarantined_supervisor_routes_context_reset_and_clears_health() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let brehon_root = temp.path().join(".brehon");
+        let runtime_dir = brehon_root.join("runtime");
+        std::fs::create_dir_all(runtime_dir.join("sessions")).expect("sessions dir");
+        std::fs::create_dir_all(runtime_dir.join("agent-health")).expect("health dir");
+
+        std::fs::write(
+            runtime_dir.join("sessions").join("claude-supervisor.json"),
+            serde_json::json!({
+                "name": "claude-supervisor",
+                "role": "supervisor",
+                "session_id": "session-supervisor",
+                "last_seen_at": chrono::Utc::now().to_rfc3339()
+            })
+            .to_string(),
+        )
+        .expect("session file");
+        let health_path = runtime_dir
+            .join("agent-health")
+            .join("claude-supervisor.json");
+        std::fs::write(
+            &health_path,
+            serde_json::json!({
+                "agent": "claude-supervisor",
+                "status": "unavailable",
+                "reason": "prompt_blocked",
+                "blocked": {
+                    "kind": "permission_request",
+                    "summary": "allow bash ls"
+                }
+            })
+            .to_string(),
+        )
+        .expect("health file");
+
+        let mut mux = Mux::new(24, 80);
+        mux.add_pane(make_supervisor_pane("claude-supervisor"));
+        let mut harness = harness_with_mux(mux);
+        harness.ctx.stall_check_interval = Duration::ZERO;
+        harness.ctx.last_stall_check = Instant::now() - Duration::from_secs(60);
+        harness
+            .ctx
+            .dashboard_data
+            .lock()
+            .expect("dashboard")
+            .brehon_root = Some(brehon_root.clone());
+
+        crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
+
+        let routed = recv_route(&harness.rx);
+        assert_eq!(
+            routed.command.target.pane_id.as_deref(),
+            Some("claude-supervisor")
+        );
+        assert!(matches!(
+            routed.command.kind,
+            RuntimeCommandKind::ResetPane { ref reason }
+                if reason == "auto-recover quarantined supervisor pane via daemon reset"
+        ));
+
+        drain_runtime_commands(&mut harness);
+
+        assert!(
+            !health_path.exists(),
+            "successful reset should clear stale supervisor quarantine marker"
+        );
+        assert_eq!(harness.ctx.mux.pending_delayed_prompt_count(), 1);
+    }
+
+    #[test]
+    fn queued_prompt_to_quarantined_supervisor_is_deferred_not_dead_lettered() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let brehon_root = temp.path().join(".brehon");
+        let runtime_dir = brehon_root.join("runtime");
+        let queue_dir = runtime_dir.join("prompt-queue");
+        std::fs::create_dir_all(&queue_dir).expect("queue dir");
+        std::fs::create_dir_all(runtime_dir.join("agent-health")).expect("health dir");
+        let prompt_path = queue_dir.join("000.prompt");
+        std::fs::write(
+            &prompt_path,
+            serde_json::json!({
+                "target": "claude-supervisor",
+                "from": "review-coordinator",
+                "message": "Review complete for task T-approved\nTask approved (awaiting merge-target integration). Run task action=integrate id=T-approved",
+                "prompt_id": "prompt-approved"
+            })
+            .to_string(),
+        )
+        .expect("prompt file");
+        std::fs::write(
+            runtime_dir
+                .join("agent-health")
+                .join("claude-supervisor.json"),
+            serde_json::json!({
+                "agent": "claude-supervisor",
+                "status": "unavailable",
+                "reason": "prompt_blocked"
+            })
+            .to_string(),
+        )
+        .expect("health file");
+
+        let mut mux = Mux::new(24, 80);
+        mux.add_pane(make_supervisor_pane("claude-supervisor"));
+        let mut harness = harness_with_mux(mux);
+        harness
+            .ctx
+            .dashboard_data
+            .lock()
+            .expect("dashboard")
+            .brehon_root = Some(brehon_root.clone());
+
+        crate::run::prompt_delivery::deliver_pending_prompts(&mut harness.ctx, &brehon_root);
+
+        assert!(
+            harness.rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "quarantined supervisor prompt should not be routed until reset succeeds"
+        );
+        assert!(
+            prompt_path.exists(),
+            "critical supervisor prompt must stay durable while supervisor is quarantined"
+        );
+        assert!(
+            crate::run::recovery::prompt_retry_meta_path(&prompt_path).exists(),
+            "deferred supervisor prompt should record retry metadata"
+        );
+        assert_eq!(harness.ctx.mux.pending_delayed_prompt_count(), 1);
+        let dead_letter_count = std::fs::read_dir(runtime_dir.join("prompt-dead-letter"))
+            .map(|entries| entries.count())
+            .unwrap_or(0);
+        assert_eq!(dead_letter_count, 0);
+    }
+
+    #[test]
+    fn queued_prompt_to_ready_supervisor_clears_stale_prompt_blocked_marker() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let brehon_root = temp.path().join(".brehon");
+        let runtime_dir = brehon_root.join("runtime");
+        let queue_dir = runtime_dir.join("prompt-queue");
+        let health_dir = runtime_dir.join("agent-health");
+        std::fs::create_dir_all(&queue_dir).expect("queue dir");
+        std::fs::create_dir_all(&health_dir).expect("health dir");
+        let prompt_path = queue_dir.join("000.prompt");
+        std::fs::write(
+            &prompt_path,
+            serde_json::json!({
+                "target": "claude-supervisor",
+                "from": "review-coordinator",
+                "message": "Review complete for task T-approved\nTask approved (awaiting merge-target integration). Run task action=integrate id=T-approved",
+                "prompt_id": "prompt-approved"
+            })
+            .to_string(),
+        )
+        .expect("prompt file");
+        let health_path = health_dir.join("claude-supervisor.json");
+        std::fs::write(
+            &health_path,
+            serde_json::json!({
+                "agent": "claude-supervisor",
+                "status": "unavailable",
+                "reason": "prompt_blocked"
+            })
+            .to_string(),
+        )
+        .expect("health file");
+
+        let mut mux = Mux::new(24, 80);
+        mux.add_pane(make_supervisor_pane("claude-supervisor"));
+        let ready_event = brehon_types::RuntimeEvent::new(
+            brehon_types::RuntimeEventMeta::new(
+                "session",
+                "claude-supervisor",
+                0,
+                brehon_types::RuntimeSource::Headless,
+                1,
+            ),
+            brehon_types::RuntimeEventKind::PaneStateChanged(brehon_types::PaneStateChangedEvent {
+                previous: None,
+                current: brehon_types::RuntimePaneState::Ready,
+                reason: Some("state machine ready".to_string()),
+            }),
+        );
+        assert!(
+            mux.apply_terminal_host_runtime_event(&ready_event)
+                .expect("apply ready event"),
+            "ready event should mark supervisor pane ready"
+        );
+        let mut harness = harness_with_mux(mux);
+        harness
+            .ctx
+            .dashboard_data
+            .lock()
+            .expect("dashboard")
+            .brehon_root = Some(brehon_root.clone());
+
+        crate::run::prompt_delivery::deliver_pending_prompts(&mut harness.ctx, &brehon_root);
+
+        let routed = recv_route(&harness.rx);
+        assert_eq!(
+            routed.command.target.pane_id.as_deref(),
+            Some("claude-supervisor")
+        );
+        assert!(matches!(
+            routed.command.kind,
+            RuntimeCommandKind::SendPrompt { ref text, .. }
+                if text.contains("task action=integrate id=T-approved")
+        ));
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !harness.ctx.pending_runtime_commands.is_empty() && Instant::now() < deadline {
+            harness
+                ._rt
+                .block_on(async { tokio::time::sleep(Duration::from_millis(10)).await });
+            process_pending_runtime_commands(&mut harness.ctx);
+        }
+
+        assert!(harness.ctx.pending_runtime_commands.is_empty());
+        assert!(
+            !health_path.exists(),
+            "stale ready-supervisor quarantine marker should be cleared"
+        );
+        assert!(
+            !prompt_path.exists(),
+            "successful delivery should remove the queued supervisor prompt"
+        );
+        assert_eq!(harness.ctx.mux.pending_delayed_prompt_count(), 0);
+    }
+
+    #[test]
     fn durable_prompt_delivery_routes_through_runtime_router_and_acks_on_success() {
         let temp = tempfile::tempdir().expect("tempdir");
         let brehon_root = temp.path().join(".brehon");
