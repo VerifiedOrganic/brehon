@@ -180,8 +180,16 @@ fn evaluate(tool_name: &str, tool_input: &Value, ctx: &PolicyContext) -> Decisio
         "Edit" | "MultiEdit" | "Write" | "NotebookEdit" => {
             evaluate_mutating_file_tool(tool_name, tool_input, ctx)
         }
+        "Task" => evaluate_task_tool(tool_input, ctx),
         _ => Decision::Allow,
     }
+}
+
+fn evaluate_task_tool(_tool_input: &Value, _ctx: &PolicyContext) -> Decision {
+    Decision::Block(
+        "Claude Task/subagent execution is disabled inside Brehon runs because it creates unmanaged Claude worktrees outside Brehon's assigned worktree pool. Continue in this pane, or use Brehon task/research/review tools instead."
+            .to_string(),
+    )
 }
 
 fn evaluate_bash(tool_input: &Value, ctx: &PolicyContext) -> Decision {
@@ -843,6 +851,22 @@ mod tests {
             &ctx_with("/work", None),
         );
         assert_eq!(decision, Decision::Allow);
+    }
+
+    #[test]
+    fn blocks_task_tool_to_prevent_unmanaged_claude_worktrees() {
+        let decision = evaluate(
+            "Task",
+            &json!({
+                "description": "review implementation",
+                "prompt": "Inspect the repository and report findings."
+            }),
+            &ctx_with("/work", None),
+        );
+
+        assert!(
+            matches!(decision, Decision::Block(reason) if reason.contains("unmanaged Claude worktrees"))
+        );
     }
 
     #[test]

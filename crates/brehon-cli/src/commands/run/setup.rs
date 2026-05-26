@@ -1086,9 +1086,10 @@ const CLAUDE_SETTINGS_RELATIVE: &str = ".claude/settings.local.json";
 /// removed cleanly without disturbing user-added hooks.
 const CLAUDE_HOOK_MARKER: &str = "brehon claude-hook";
 
-/// Claude tools that can mutate repository files and must therefore pass
-/// through the Brehon worktree guard.
-const CLAUDE_HOOK_MATCHERS: &[&str] = &["Bash", "Edit", "MultiEdit", "Write", "NotebookEdit"];
+/// Claude tools that can mutate repository files or spawn unmanaged
+/// subagent worktrees and must therefore pass through the Brehon guard.
+const CLAUDE_HOOK_MATCHERS: &[&str] =
+    &["Bash", "Edit", "MultiEdit", "Write", "NotebookEdit", "Task"];
 
 /// Relative path (under cwd) of the runtime marker file the `claude-hook`
 /// binary checks before applying its policy. When this file is absent, the
