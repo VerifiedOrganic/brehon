@@ -255,8 +255,8 @@ pub(super) fn validate_status_transition(
         "assigned" => &["in_progress", "pending"],
         "in_progress" => &["review_ready", "in_review", "blocked", "pending"],
         "review_ready" => &["in_review", "changes_requested", "pending"],
-        "in_review" => &["changes_requested", "approved", "pending"],
-        "changes_requested" => &["in_progress", "review_ready"],
+        "in_review" => &["changes_requested", "approved", "pending", "blocked"],
+        "changes_requested" => &["in_progress", "review_ready", "blocked"],
         "approved" => match completion_mode {
             TaskCompletionMode::Merge => &["merged", "changes_requested"],
             TaskCompletionMode::Close => &["closed", "changes_requested"],

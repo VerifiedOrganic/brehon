@@ -119,6 +119,7 @@ fn review_state_fixture(task_id: &str, review_id: &str, status: &str) -> ReviewS
         status: status.to_string(),
         current_round: 1,
         cycle_start_round: 1,
+        review_epoch_start_round: 1,
         current_review_id: review_id.to_string(),
         max_rounds: 3,
         panel_id: "primary".to_string(),
@@ -697,6 +698,310 @@ async fn test_request_review_recovers_blocked_integration_conflict_task() {
     assert_eq!(task["review_owner"], "worker-1");
     assert!(task.get("integration_conflict").is_none());
     assert!(task.get("blockers").is_none());
+}
+
+#[tokio::test]
+async fn test_request_review_rejects_total_review_livelock() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let root = tempfile::tempdir().unwrap();
+    let brehon_root = root.path().join(".brehon");
+    std::fs::create_dir_all(brehon_root.join("runtime").join("tasks")).unwrap();
+    let _env = ScopedEnv::set(&[
+        ("BREHON_ROOT", brehon_root.to_str().unwrap()),
+        ("BREHON_AGENT_NAME", "supervisor-1"),
+        ("BREHON_AGENT_ROLE", "supervisor"),
+    ]);
+    std::fs::write(
+        brehon_root
+            .join("runtime")
+            .join("tasks")
+            .join("T-livelock.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "task_id": "T-livelock",
+            "title": "Runaway review task",
+            "description": "This task has already exhausted review resets.",
+            "status": "changes_requested",
+            "task_type": "task",
+            "completion_mode": "close",
+            "assignee": "worker-1"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    state::write_review_state(
+        "T-livelock",
+        &ReviewState {
+            task_id: "T-livelock".to_string(),
+            status: "changes_requested".to_string(),
+            current_round: 9,
+            cycle_start_round: 9,
+            review_epoch_start_round: 1,
+            current_review_id: "REV-livelock".to_string(),
+            max_rounds: 3,
+            panel_id: "primary".to_string(),
+            panel_mode: "full_council".to_string(),
+            panel: vec!["reviewer-1".to_string()],
+            submissions_received: vec!["reviewer-1".to_string()],
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        },
+    )
+    .unwrap();
+
+    let result = make_tool()
+        .execute(serde_json::json!({
+            "action": "request_review",
+            "task_id": "T-livelock"
+        }))
+        .await
+        .unwrap();
+
+    assert_eq!(result.is_error, Some(true));
+    let text = match &result.content[0] {
+        ContentBlock::Text { text } => text.clone(),
+        _ => String::new(),
+    };
+    assert!(text.contains("review livelock"), "{text}");
+    assert!(
+        text.contains("Refusing to start/reset review round 10"),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn test_reset_rounds_rejects_total_review_livelock() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let root = tempfile::tempdir().unwrap();
+    let brehon_root = root.path().join(".brehon");
+    std::fs::create_dir_all(brehon_root.join("runtime").join("tasks")).unwrap();
+    let _env = ScopedEnv::set(&[
+        ("BREHON_ROOT", brehon_root.to_str().unwrap()),
+        ("BREHON_AGENT_NAME", "supervisor-1"),
+        ("BREHON_AGENT_ROLE", "supervisor"),
+    ]);
+    std::fs::write(
+        brehon_root
+            .join("runtime")
+            .join("tasks")
+            .join("T-reset-livelock.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "task_id": "T-reset-livelock",
+            "title": "Runaway reset task",
+            "description": "This task should not get another reset cycle.",
+            "status": "changes_requested",
+            "task_type": "task",
+            "completion_mode": "close",
+            "assignee": "worker-1"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    state::write_review_state(
+        "T-reset-livelock",
+        &ReviewState {
+            task_id: "T-reset-livelock".to_string(),
+            status: "escalated".to_string(),
+            current_round: 9,
+            cycle_start_round: 7,
+            review_epoch_start_round: 1,
+            current_review_id: "REV-reset-livelock".to_string(),
+            max_rounds: 3,
+            panel_id: "primary".to_string(),
+            panel_mode: "full_council".to_string(),
+            panel: vec!["reviewer-1".to_string()],
+            submissions_received: vec!["reviewer-1".to_string()],
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        },
+    )
+    .unwrap();
+
+    let result = make_tool()
+        .execute(serde_json::json!({
+            "action": "reset_rounds",
+            "task_id": "T-reset-livelock",
+            "reason": "manual retry requested"
+        }))
+        .await
+        .unwrap();
+
+    assert_eq!(result.is_error, Some(true));
+    let text = match &result.content[0] {
+        ContentBlock::Text { text } => text.clone(),
+        _ => String::new(),
+    };
+    assert!(text.contains("review livelock"), "{text}");
+    assert!(
+        text.contains("Refusing to start/reset review round 10"),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn test_reset_rounds_force_new_epoch_allows_manual_recovery() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let root = tempfile::tempdir().unwrap();
+    let brehon_root = root.path().join(".brehon");
+    std::fs::create_dir_all(brehon_root.join("runtime").join("tasks")).unwrap();
+    let _env = ScopedEnv::set(&[
+        ("BREHON_ROOT", brehon_root.to_str().unwrap()),
+        ("BREHON_AGENT_NAME", "supervisor-1"),
+        ("BREHON_AGENT_ROLE", "supervisor"),
+    ]);
+    std::fs::write(
+        brehon_root
+            .join("runtime")
+            .join("tasks")
+            .join("T-force-epoch.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "task_id": "T-force-epoch",
+            "title": "Manual epoch recovery",
+            "description": "Non-commit work may need an explicit supervised epoch reset.",
+            "status": "changes_requested",
+            "task_type": "task",
+            "completion_mode": "close",
+            "assignee": "worker-1"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    state::write_review_state(
+        "T-force-epoch",
+        &ReviewState {
+            task_id: "T-force-epoch".to_string(),
+            status: "escalated".to_string(),
+            current_round: 9,
+            cycle_start_round: 7,
+            review_epoch_start_round: 1,
+            current_review_id: "REV-force-epoch".to_string(),
+            max_rounds: 3,
+            panel_id: "primary".to_string(),
+            panel_mode: "full_council".to_string(),
+            panel: vec!["reviewer-1".to_string()],
+            submissions_received: vec!["reviewer-1".to_string()],
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        },
+    )
+    .unwrap();
+
+    let result = make_tool()
+        .execute(serde_json::json!({
+            "action": "reset_rounds",
+            "task_id": "T-force-epoch",
+            "reason": "Supervisor split the task and manually verified the implementation delta.",
+            "force_new_epoch": true
+        }))
+        .await
+        .unwrap();
+
+    assert!(
+        result.is_error.is_none(),
+        "{}",
+        match &result.content[0] {
+            ContentBlock::Text { text } => text.clone(),
+            _ => String::new(),
+        }
+    );
+    let payload = result_payload(&result);
+    assert_eq!(payload["next_round"], 10);
+    assert_eq!(payload["force_new_epoch"], true);
+    assert_eq!(payload["review_epoch_start_round"], 10);
+    let state = read_review_state("T-force-epoch").expect("reset state");
+    assert_eq!(state.status, "released");
+    assert_eq!(state.review_epoch_start_round, 10);
+}
+
+#[tokio::test]
+async fn test_request_review_starts_new_epoch_after_new_commit() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let workspace = tempfile::tempdir().unwrap();
+    let brehon_root = workspace.path().join(".brehon");
+    std::fs::create_dir_all(brehon_root.join("runtime").join("tasks")).unwrap();
+    init_git_workspace(workspace.path());
+    std::fs::write(workspace.path().join("feature.txt"), "old\n").unwrap();
+    run_git(workspace.path(), &["add", "feature.txt"]);
+    run_git(workspace.path(), &["commit", "-m", "old review payload"]);
+    let old_commit = run_git(workspace.path(), &["rev-parse", "HEAD"]);
+    std::fs::write(workspace.path().join("feature.txt"), "new\n").unwrap();
+    run_git(workspace.path(), &["add", "feature.txt"]);
+    run_git(workspace.path(), &["commit", "-m", "new review payload"]);
+    let new_commit = run_git(workspace.path(), &["rev-parse", "HEAD"]);
+
+    let _env = ScopedEnv::set(&[
+        ("BREHON_ROOT", brehon_root.to_str().unwrap()),
+        ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
+        ("BREHON_AGENT_NAME", "supervisor-1"),
+        ("BREHON_AGENT_ROLE", "supervisor"),
+    ]);
+    crate::tools::agent::write_session_file("reviewer-1", "reviewer", "sess-1", Some("codex"));
+    std::fs::write(
+        brehon_root
+            .join("runtime")
+            .join("tasks")
+            .join("T-new-epoch.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "task_id": "T-new-epoch",
+            "title": "Restart epoch on real change",
+            "description": "A new checkpoint should get a fresh review epoch.",
+            "status": "changes_requested",
+            "task_type": "task",
+            "completion_mode": "merge",
+            "assignee": "worker-1",
+            "review_owner": "worker-1",
+            "latest_commit": new_commit,
+            "merge_target": "main"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut prior_request = review_request_fixture("T-new-epoch", "REV-old");
+    prior_request.commit = old_commit;
+    state::write_round_request("T-new-epoch", 9, &prior_request).unwrap();
+    state::write_review_state(
+        "T-new-epoch",
+        &ReviewState {
+            task_id: "T-new-epoch".to_string(),
+            status: "changes_requested".to_string(),
+            current_round: 9,
+            cycle_start_round: 9,
+            review_epoch_start_round: 1,
+            current_review_id: "REV-old".to_string(),
+            max_rounds: 3,
+            panel_id: "primary".to_string(),
+            panel_mode: "full_council".to_string(),
+            panel: vec!["reviewer-1".to_string()],
+            submissions_received: vec!["reviewer-1".to_string()],
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        },
+    )
+    .unwrap();
+
+    let result = make_tool()
+        .execute(serde_json::json!({
+            "action": "request_review",
+            "task_id": "T-new-epoch"
+        }))
+        .await
+        .unwrap();
+
+    assert!(
+        result.is_error.is_none(),
+        "{}",
+        match &result.content[0] {
+            ContentBlock::Text { text } => text.clone(),
+            _ => String::new(),
+        }
+    );
+    let payload = result_payload(&result);
+    assert_eq!(payload["round"], 10);
+    assert_eq!(payload["cycle_round"], 1);
+    assert_eq!(payload["review_epoch_round"], 1);
+    assert_eq!(payload["new_review_epoch"], true);
+    let state = read_review_state("T-new-epoch").expect("new review state");
+    assert_eq!(state.review_epoch_start_round, 10);
+    assert_eq!(state.cycle_start_round, 10);
 }
 
 #[tokio::test]
@@ -1312,6 +1617,7 @@ async fn test_request_review_conflict_releases_stale_panel_lease() {
             status: "collecting".to_string(),
             current_round: 2,
             cycle_start_round: 1,
+            review_epoch_start_round: 1,
             current_review_id: "REV-stale".to_string(),
             max_rounds: 3,
             panel_id: "tertiary".to_string(),
@@ -1916,6 +2222,7 @@ fn test_evaluate_round_approved() {
         status: "collecting".to_string(),
         current_round: 1,
         cycle_start_round: 1,
+        review_epoch_start_round: 1,
         current_review_id: "REV-001".to_string(),
         max_rounds: 3,
         panel_id: "primary".to_string(),
@@ -1960,6 +2267,7 @@ fn test_evaluate_round_changes_requested_blocking() {
         status: "collecting".to_string(),
         current_round: 1,
         cycle_start_round: 1,
+        review_epoch_start_round: 1,
         current_review_id: "REV-001".to_string(),
         max_rounds: 3,
         panel_id: "primary".to_string(),
@@ -2010,6 +2318,7 @@ fn test_evaluate_round_rejected() {
         status: "collecting".to_string(),
         current_round: 1,
         cycle_start_round: 1,
+        review_epoch_start_round: 1,
         current_review_id: "REV-001".to_string(),
         max_rounds: 3,
         panel_id: "primary".to_string(),
@@ -2059,6 +2368,7 @@ fn test_evaluate_round_escalated_at_max_rounds() {
         status: "collecting".to_string(),
         current_round: 3, // at max
         cycle_start_round: 1,
+        review_epoch_start_round: 1,
         current_review_id: "REV-003".to_string(),
         max_rounds: 3,
         panel_id: "primary".to_string(),
@@ -2099,4 +2409,61 @@ fn test_evaluate_round_escalated_at_max_rounds() {
     let report = tool.evaluate_round("T-001", "REV-003", &state, &submissions);
     assert_eq!(report.outcome, "escalated");
     assert!(report.threshold_reason.contains("Max review rounds"));
+}
+
+#[test]
+fn test_evaluate_round_escalates_at_total_review_livelock_limit() {
+    let tool = make_tool();
+    let state = ReviewState {
+        task_id: "T-livelock".to_string(),
+        status: "collecting".to_string(),
+        current_round: 9,
+        cycle_start_round: 9,
+        review_epoch_start_round: 1,
+        current_review_id: "REV-livelock".to_string(),
+        max_rounds: 3,
+        panel_id: "primary".to_string(),
+        panel_mode: "full_council".to_string(),
+        panel: vec!["r1".to_string(), "r2".to_string()],
+        submissions_received: vec!["r1".to_string(), "r2".to_string()],
+        created_at: String::new(),
+        updated_at: String::new(),
+    };
+    let submissions = vec![
+        StoredSubmission {
+            review_id: "REV-livelock".to_string(),
+            reviewer: "r1".to_string(),
+            round: 9,
+            score: 8,
+            verdict: "approved".to_string(),
+            summary: String::new(),
+            findings: vec![],
+            submitted_at: String::new(),
+        },
+        StoredSubmission {
+            review_id: "REV-livelock".to_string(),
+            reviewer: "r2".to_string(),
+            round: 9,
+            score: 5,
+            verdict: "needs_revision".to_string(),
+            summary: String::new(),
+            findings: vec![StoredFinding {
+                description: "Still requires a concrete rework pass".to_string(),
+                file: Some("main.rs".to_string()),
+                line: Some(10),
+                severity: "blocking".to_string(),
+                suggestion: None,
+            }],
+            submitted_at: String::new(),
+        },
+    ];
+
+    let report = tool.evaluate_round("T-livelock", "REV-livelock", &state, &submissions);
+
+    assert_eq!(report.outcome, "escalated");
+    assert!(
+        report.threshold_reason.contains("Total review round limit"),
+        "{}",
+        report.threshold_reason
+    );
 }

@@ -38,9 +38,10 @@ use super::scoring::{
 };
 use super::state::{
     acquire_review_lock, current_review_cycle_round, delete_review_state, parse_verdict,
-    read_review_state, read_round_submissions, round_dir, write_consolidated, write_review_state,
-    ConsolidatedReport, ReviewRequestFile, ReviewState, StoredCalibration, StoredCalibrationEntry,
-    StoredFinding, StoredSubmission,
+    read_review_state, read_round_submissions, round_dir, total_review_round_limit,
+    total_review_rounds_exhausted, write_consolidated, write_review_state, ConsolidatedReport,
+    ReviewRequestFile, ReviewState, StoredCalibration, StoredCalibrationEntry, StoredFinding,
+    StoredSubmission,
 };
 use super::tasks::{
     detect_default_branch, merge_target_requires_epic_integration, read_task,
@@ -87,6 +88,14 @@ pub struct VerificationTool {
     pub(super) config: ReviewConfig,
     pub(super) event_store: Option<Arc<dyn EventStore + Send + Sync>>,
     pub(super) proof_recorder: super::proof::ReviewProofRecorder,
+}
+
+fn task_status_for_report(state: &ReviewState, report: &ConsolidatedReport) -> &'static str {
+    if report.outcome == "escalated" && total_review_rounds_exhausted(state) {
+        "blocked"
+    } else {
+        task_status_for_review_outcome(&report.outcome).unwrap_or("changes_requested")
+    }
 }
 
 impl Default for VerificationTool {
@@ -1723,7 +1732,13 @@ impl VerificationTool {
             // requested by policy shortcut.
             let submissions = read_round_submissions(task_id, state.current_round);
             if submissions.is_empty() {
-                if let Err(err) = update_task_status_atomic(task_id, "changes_requested").await {
+                let total_rounds_exhausted = total_review_rounds_exhausted(state);
+                let status_to_set = if total_rounds_exhausted {
+                    "blocked"
+                } else {
+                    "changes_requested"
+                };
+                if let Err(err) = update_task_status_atomic(task_id, status_to_set).await {
                     tracing::warn!(task_id, error = %err, "Failed to update task status after timeout");
                     return false;
                 }
@@ -1758,7 +1773,12 @@ impl VerificationTool {
                      {}",
                     state.current_round,
                     timeout_mins,
-                    if current_review_cycle_round(state) >= state.max_rounds as u32 {
+                    if total_rounds_exhausted {
+                        format!(
+                            "Total review round limit ({}) is exhausted. The task was blocked for supervisor/manual intervention.",
+                            total_review_round_limit(state.max_rounds)
+                        )
+                    } else if current_review_cycle_round(state) >= state.max_rounds as u32 {
                         format!(
                             "Current review cycle is exhausted. Reset rounds with: verification action=reset_rounds task_id={task_id} reason=\"...\" \
                              or mark changes requested/rejected with: verification action=override verdict=needs_revision ..."
@@ -1779,6 +1799,13 @@ impl VerificationTool {
                 return true;
             }
             if submissions.len() < state.panel.len() {
+                let total_rounds_exhausted = total_review_rounds_exhausted(state);
+                if total_rounds_exhausted {
+                    if let Err(err) = update_task_status_atomic(task_id, "blocked").await {
+                        tracing::warn!(task_id, error = %err, "Failed to update task status after timeout");
+                        return false;
+                    }
+                }
                 let submitted_reviewers: Vec<String> =
                     submissions.iter().map(|sub| sub.reviewer.clone()).collect();
                 let pending_reviewers: Vec<String> = state
@@ -1835,7 +1862,12 @@ impl VerificationTool {
                     state.current_round,
                     submissions.len(),
                     state.panel.len(),
-                    if current_review_cycle_round(state) >= state.max_rounds as u32 {
+                    if total_rounds_exhausted {
+                        format!(
+                            "Total review round limit ({}) is exhausted. The task was blocked for supervisor/manual intervention.",
+                            total_review_round_limit(state.max_rounds)
+                        )
+                    } else if current_review_cycle_round(state) >= state.max_rounds as u32 {
                         format!(
                             "Current review cycle is exhausted. Reset rounds with: verification action=reset_rounds task_id={task_id} reason=\"...\" \
                              or mark changes requested/rejected with: verification action=override verdict=needs_revision ..."
@@ -1860,8 +1892,7 @@ impl VerificationTool {
             // reviewer file on disk. Normal submit_review normally handles this.
             let report =
                 self.evaluate_round(task_id, &state.current_review_id, state, &submissions);
-            let status_to_set =
-                task_status_for_review_outcome(&report.outcome).unwrap_or("changes_requested");
+            let status_to_set = task_status_for_report(state, &report);
             if let Err(err) = update_task_status_atomic(task_id, status_to_set).await {
                 tracing::warn!(task_id, error = %err, "Failed to update task status after timeout evaluation");
                 return false;
@@ -2030,8 +2061,18 @@ impl VerificationTool {
                     "Changes requested by reviewer".to_string()
                 };
 
-                // Check if max rounds exceeded in the current review cycle
-                if current_review_cycle_round(state) >= state.max_rounds as u32 {
+                // Hard-stop total review churn across reset cycles. A reset
+                // moves `cycle_start_round`, so the per-cycle cap alone cannot
+                // catch livelock like round 44/cycle round 1.
+                if total_review_rounds_exhausted(state) {
+                    let total_limit = total_review_round_limit(state.max_rounds);
+                    (
+                        "escalated".to_string(),
+                        format!(
+                            "{reason}. Total review round limit ({total_limit}) exhausted across reset cycles — blocking task for supervisor/manual intervention."
+                        ),
+                    )
+                } else if current_review_cycle_round(state) >= state.max_rounds as u32 {
                     (
                         "escalated".to_string(),
                         format!(

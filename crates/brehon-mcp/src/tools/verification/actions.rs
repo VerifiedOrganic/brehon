@@ -30,10 +30,12 @@ use super::scoring::{
     unsupported_negative_review_reason,
 };
 use super::state::{
-    acquire_review_lock, current_review_cycle_round, delete_review_state,
-    find_review_request_by_id, highest_round_on_disk, read_review_state, read_round_request,
-    read_round_submissions, review_cycle_round, write_review_state, write_round_request,
-    write_submission, ReviewRequestFile, ReviewState, StoredFinding, StoredSubmission,
+    acquire_review_lock, current_review_cycle_round, current_review_epoch_round,
+    delete_review_state, find_review_request_by_id, highest_round_on_disk,
+    next_review_round_would_exceed_total_limit, read_review_state, read_round_request,
+    read_round_submissions, review_cycle_round, review_epoch_round, total_review_round_limit,
+    total_review_rounds_exhausted, write_review_state, write_round_request, write_submission,
+    ReviewRequestFile, ReviewState, StoredFinding, StoredSubmission,
 };
 use super::tasks::{
     detect_default_branch, merge_target_requires_epic_integration, read_task, read_task_assignee,
@@ -61,6 +63,21 @@ fn task_status_closes_review(status: Option<&str>) -> bool {
     status.is_some_and(|status| {
         is_terminal_task_status(status) || matches!(status.trim(), "archived" | "Archived")
     })
+}
+
+fn review_livelock_guard_message(
+    task_id: &str,
+    consumed_epoch_rounds: u32,
+    attempted_round: u32,
+    max_rounds: u8,
+) -> String {
+    let total_limit = total_review_round_limit(max_rounds);
+    format!(
+        "Task {task_id} has consumed {consumed_epoch_rounds}/{total_limit} review rounds in the current review epoch. \
+         Refusing to start/reset review round {attempted_round}; this is review livelock, not a normal re-review cycle. \
+         Block the task for supervisor/manual intervention and fix the task before requesting another round. \
+         A new worker checkpoint/commit starts a fresh review epoch automatically; for non-commit work, a supervisor may run reset_rounds with force_new_epoch=true and an explicit reason."
+    )
 }
 
 fn enqueue_reviewer_reset_with_logging(task_id: &str, review_id: &str, reviewer: &str) -> bool {
@@ -545,7 +562,7 @@ fn next_action_after_review_outcome(task_id: &str, outcome: &str) -> Value {
                 }
             }),
         },
-        "changes_requested" | "rejected" | "escalated" => serde_json::json!({
+        "changes_requested" | "rejected" => serde_json::json!({
             "kind": "assign_revision_worker",
             "tool": "factory",
             "args": {
@@ -554,10 +571,42 @@ fn next_action_after_review_outcome(task_id: &str, outcome: &str) -> Value {
             },
             "requires": ["workers"]
         }),
+        "escalated" => serde_json::json!({
+            "kind": "supervisor_intervention_required",
+            "tool": "verification",
+            "args": {
+                "action": "review_status",
+                "task_id": task_id
+            },
+            "requires": ["supervisor"]
+        }),
         _ => serde_json::json!({
             "kind": "none"
         }),
     }
+}
+
+fn reviewed_commit_changed_for_new_epoch(
+    task_id: &str,
+    state: &ReviewState,
+    next_commit: &str,
+) -> bool {
+    let next_commit = next_commit.trim();
+    if next_commit.is_empty() {
+        return false;
+    }
+    let last_round = state.current_round.max(highest_round_on_disk(task_id));
+    let previous_request = read_round_request(task_id, state.current_round)
+        .or_else(|| read_round_request(task_id, last_round));
+    let Some(previous_commit) = previous_request
+        .as_ref()
+        .map(|request| request.commit.trim())
+        .filter(|commit| !commit.is_empty())
+    else {
+        return false;
+    };
+
+    !commits_refer_to_same_oid(previous_commit, next_commit)
 }
 
 impl VerificationTool {
@@ -791,7 +840,24 @@ impl VerificationTool {
             .as_ref()
             .map(|state| state.max_rounds)
             .unwrap_or(self.config.policy.max_review_rounds);
-        if next_cycle_round > max_rounds as u32 {
+        let mut starts_new_review_epoch = existing_state.is_none();
+        if let Some(state) = existing_state.as_ref() {
+            if next_review_round_would_exceed_total_limit(state, next_round) {
+                if reviewed_commit_changed_for_new_epoch(task_id, state, &commit) {
+                    starts_new_review_epoch = true;
+                } else {
+                    let consumed_epoch_round =
+                        review_epoch_round(state, next_round.saturating_sub(1));
+                    return Ok(error_result(review_livelock_guard_message(
+                        task_id,
+                        consumed_epoch_round,
+                        next_round,
+                        max_rounds,
+                    )));
+                }
+            }
+        }
+        if !starts_new_review_epoch && next_cycle_round > max_rounds as u32 {
             return Ok(error_result(format!(
                 "Task {task_id} has exhausted its current review cycle ({} round limit reached). \
                  Supervisor must decide whether to reset review rounds or apply a negative override before continuing. \
@@ -833,7 +899,23 @@ impl VerificationTool {
             current_round: next_round,
             cycle_start_round: existing_state
                 .as_ref()
-                .map(|state| state.cycle_start_round.max(1))
+                .map(|state| {
+                    if starts_new_review_epoch {
+                        next_round
+                    } else {
+                        state.cycle_start_round.max(1)
+                    }
+                })
+                .unwrap_or(next_round),
+            review_epoch_start_round: existing_state
+                .as_ref()
+                .map(|state| {
+                    if starts_new_review_epoch {
+                        next_round
+                    } else {
+                        state.review_epoch_start_round.max(1)
+                    }
+                })
                 .unwrap_or(next_round),
             current_review_id: new_review_id.clone(),
             max_rounds,
@@ -1035,7 +1117,10 @@ impl VerificationTool {
             "panel_id": new_state.panel_id,
             "panel": panel,
             "round": round,
-            "cycle_round": next_cycle_round,
+            "cycle_round": review_cycle_round(&new_state, round),
+            "review_epoch_round": current_review_epoch_round(&new_state),
+            "review_epoch_start_round": new_state.review_epoch_start_round,
+            "new_review_epoch": starts_new_review_epoch,
             "review_fingerprint": review_fingerprint,
             "next_action": next_action_review_status(task_id)
         });
@@ -1337,7 +1422,11 @@ impl VerificationTool {
 
         // Update task status BEFORE updating review state
         let status_to_set =
-            task_status_for_review_outcome(&report.outcome).unwrap_or("changes_requested");
+            if report.outcome == "escalated" && total_review_rounds_exhausted(&state) {
+                "blocked"
+            } else {
+                task_status_for_review_outcome(&report.outcome).unwrap_or("changes_requested")
+            };
         if let Err(err) = update_task_status_atomic(&task_id, status_to_set).await {
             return Ok(error_result(format!(
                 "Failed to update task {task_id} status to {status_to_set}: {err}"
@@ -1577,7 +1666,10 @@ impl VerificationTool {
                     "review_status": state.status,
                     "round": state.current_round,
                     "cycle_round": current_review_cycle_round(&state),
+                    "review_epoch_round": current_review_epoch_round(&state),
                     "max_rounds": state.max_rounds,
+                    "total_round_limit": total_review_round_limit(state.max_rounds),
+                    "review_epoch_start_round": state.review_epoch_start_round.max(1),
                     "panel_id": state.panel_id,
                     "panel_mode": state.panel_mode,
                     "panel": state.panel,
@@ -1675,7 +1767,25 @@ impl VerificationTool {
                     ));
                 }
 
-                if state.status == "escalated"
+                if state.status == "escalated" && total_review_rounds_exhausted(&state) {
+                    result["action_needed"] = serde_json::json!("supervisor_intervention_required");
+                    result["next_action"] = serde_json::json!({
+                        "kind": "supervisor_intervention_required",
+                        "tool": "verification",
+                        "args": {
+                            "action": "review_status",
+                            "task_id": resolved_task_id
+                        },
+                        "requires": ["supervisor"]
+                    });
+                    result["message"] = serde_json::json!(format!(
+                        "Task {resolved_task_id} exhausted the total review round limit ({}/{}). \
+                         Do not request another review round for the same reviewed work. Produce a new checkpoint/commit, \
+                         or use reset_rounds force_new_epoch=true with an explicit reason for non-commit work.",
+                        current_review_epoch_round(&state),
+                        total_review_round_limit(state.max_rounds)
+                    ));
+                } else if state.status == "escalated"
                     && current_review_cycle_round(&state) >= state.max_rounds as u32
                 {
                     result["action_needed"] =
@@ -2004,6 +2114,11 @@ impl VerificationTool {
             Some(r) if !r.trim().is_empty() => r.trim(),
             _ => return Ok(error_result("Missing required parameter: reason")),
         };
+        let force_new_epoch = args
+            .get("force_new_epoch")
+            .or_else(|| args.get("force"))
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
 
         let role = args
             .get("role")
@@ -2050,6 +2165,18 @@ impl VerificationTool {
         };
 
         let prior_cycle_rounds = current_review_cycle_round(&state);
+        let consumed_rounds = highest_round_on_disk(task_id).max(state.current_round);
+        let attempted_round = consumed_rounds.saturating_add(1);
+        let mut consumed_state = state.clone();
+        consumed_state.current_round = consumed_rounds;
+        if total_review_rounds_exhausted(&consumed_state) && !force_new_epoch {
+            return Ok(error_result(review_livelock_guard_message(
+                task_id,
+                current_review_epoch_round(&consumed_state),
+                attempted_round,
+                state.max_rounds,
+            )));
+        }
         if state.status != "escalated" && prior_cycle_rounds < state.max_rounds as u32 {
             return Ok(error_result(format!(
                 "Task {task_id} has only consumed {prior_cycle_rounds}/{} review rounds in the current cycle. A reset is not needed yet.",
@@ -2086,9 +2213,12 @@ impl VerificationTool {
             }
         }
 
-        let next_round = highest_round_on_disk(task_id).max(state.current_round) + 1;
+        let next_round = attempted_round;
         state.status = "released".to_string();
         state.cycle_start_round = next_round;
+        if force_new_epoch {
+            state.review_epoch_start_round = next_round;
+        }
         state.updated_at = chrono::Utc::now().to_rfc3339();
         if let Err(err) = write_review_state(task_id, &state) {
             return Ok(error_result(format!(
@@ -2105,6 +2235,8 @@ impl VerificationTool {
             "max_rounds": state.max_rounds,
             "next_round": next_round,
             "next_cycle_round": 1,
+            "force_new_epoch": force_new_epoch,
+            "review_epoch_start_round": state.review_epoch_start_round,
             "released_panel": released_panel,
             "pending_reviewers_notified": pending_reviewers,
             "reason": reason,

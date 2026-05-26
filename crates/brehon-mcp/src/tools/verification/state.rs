@@ -24,6 +24,8 @@ pub struct ReviewState {
     pub current_round: u32,
     #[serde(default = "default_cycle_start_round")]
     pub cycle_start_round: u32,
+    #[serde(default = "default_review_epoch_start_round")]
+    pub review_epoch_start_round: u32,
     pub current_review_id: String,
     pub max_rounds: u8,
     #[serde(default = "default_panel_id")]
@@ -48,6 +50,10 @@ pub(super) fn default_cycle_start_round() -> u32 {
     1
 }
 
+pub(super) fn default_review_epoch_start_round() -> u32 {
+    1
+}
+
 pub(crate) fn review_cycle_round(state: &ReviewState, absolute_round: u32) -> u32 {
     let cycle_start = state.cycle_start_round.max(1);
     if absolute_round >= cycle_start {
@@ -59,6 +65,36 @@ pub(crate) fn review_cycle_round(state: &ReviewState, absolute_round: u32) -> u3
 
 pub(crate) fn current_review_cycle_round(state: &ReviewState) -> u32 {
     review_cycle_round(state, state.current_round)
+}
+
+pub(crate) const MAX_REVIEW_RESET_CYCLES_PER_TASK: u32 = 3;
+
+pub(crate) fn total_review_round_limit(max_rounds: u8) -> u32 {
+    u32::from(max_rounds.max(1)) * MAX_REVIEW_RESET_CYCLES_PER_TASK
+}
+
+pub(crate) fn review_epoch_round(state: &ReviewState, absolute_round: u32) -> u32 {
+    let epoch_start = state.review_epoch_start_round.max(1);
+    if absolute_round >= epoch_start {
+        absolute_round - epoch_start + 1
+    } else {
+        absolute_round
+    }
+}
+
+pub(crate) fn current_review_epoch_round(state: &ReviewState) -> u32 {
+    review_epoch_round(state, state.current_round)
+}
+
+pub(crate) fn total_review_rounds_exhausted(state: &ReviewState) -> bool {
+    current_review_epoch_round(state) >= total_review_round_limit(state.max_rounds)
+}
+
+pub(crate) fn next_review_round_would_exceed_total_limit(
+    state: &ReviewState,
+    next_round: u32,
+) -> bool {
+    review_epoch_round(state, next_round) > total_review_round_limit(state.max_rounds)
 }
 
 /// Per-round request metadata in `.brehon/runtime/reviews/{task_id}/round-N/request.json`.

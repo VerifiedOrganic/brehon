@@ -216,10 +216,10 @@ pub async fn update_task_status_atomic(task_id: &str, new_status: &str) -> Resul
     }
 
     let valid: &[&str] = match current_normalized {
-        "in_review" => &["changes_requested", "approved"],
+        "in_review" => &["changes_requested", "approved", "blocked"],
         "review_ready" => &["in_review", "changes_requested"],
         "in_progress" => &["in_review", "review_ready"],
-        "changes_requested" => &["in_review", "approved", "review_ready"],
+        "changes_requested" => &["in_review", "approved", "review_ready", "blocked"],
         "blocked" => &["review_ready"],
         "approved" => &["changes_requested"],
         _ => &[],
