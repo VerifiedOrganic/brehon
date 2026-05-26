@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -156,6 +157,7 @@ struct CodexLaunchConfig {
     approval_policy: String,
     thread_sandbox: String,
     turn_sandbox_policy: serde_json::Value,
+    extra_writable_roots: Vec<String>,
     config: serde_json::Map<String, serde_json::Value>,
 }
 
@@ -240,6 +242,7 @@ impl CodexLaunchConfig {
             approval_policy: "never".to_string(),
             turn_sandbox_policy: sandbox_policy_for_mode(&thread_sandbox),
             thread_sandbox,
+            extra_writable_roots: Vec::new(),
             config: serde_json::Map::new(),
         }
     }
@@ -1274,7 +1277,11 @@ fn build_turn_start_params(
     );
     params.insert(
         "sandboxPolicy".to_string(),
-        sandbox_policy_for_worktree(&launch_config.turn_sandbox_policy, worktree_path),
+        sandbox_policy_for_worktree(
+            &launch_config.turn_sandbox_policy,
+            worktree_path,
+            &launch_config.extra_writable_roots,
+        ),
     );
     if let Some(model) = launch_config.model.as_ref() {
         params.insert(
@@ -1297,15 +1304,27 @@ fn build_turn_start_params(
 fn sandbox_policy_for_worktree(
     policy: &serde_json::Value,
     worktree_path: &str,
+    extra_writable_roots: &[String],
 ) -> serde_json::Value {
     let mut policy = policy.clone();
     if policy.get("type").and_then(serde_json::Value::as_str) == Some("workspaceWrite") {
         if let serde_json::Value::Object(map) = &mut policy {
+            let mut writable_roots = Vec::new();
+            push_unique_writable_root(&mut writable_roots, worktree_path);
+            for root in extra_writable_roots {
+                push_unique_writable_root(&mut writable_roots, root);
+            }
+            for root in git_writable_roots_for_worktree(worktree_path) {
+                push_unique_writable_root(&mut writable_roots, &root);
+            }
             map.insert(
                 "writableRoots".to_string(),
-                serde_json::Value::Array(vec![serde_json::Value::String(
-                    worktree_path.to_string(),
-                )]),
+                serde_json::Value::Array(
+                    writable_roots
+                        .into_iter()
+                        .map(serde_json::Value::String)
+                        .collect(),
+                ),
             );
             map.entry("networkAccess".to_string())
                 .or_insert(serde_json::Value::Bool(false));
@@ -1316,6 +1335,7 @@ fn sandbox_policy_for_worktree(
 
 fn extract_codex_launch_config(args: &[String], env: &[(String, String)]) -> CodexLaunchConfig {
     let mut config = CodexLaunchConfig::from_profile(CodexPermissionProfile::from_env_or_role(env));
+    config.extra_writable_roots = extra_writable_roots_from_env(env);
     let mut idx = 0;
 
     while idx < args.len() {
@@ -1363,6 +1383,70 @@ fn extract_codex_launch_config(args: &[String], env: &[(String, String)]) -> Cod
     }
 
     config
+}
+
+fn extra_writable_roots_from_env(env: &[(String, String)]) -> Vec<String> {
+    let mut roots = Vec::new();
+    for key in ["BREHON_ROOT"] {
+        if let Some((_, value)) = env.iter().rev().find(|(env_key, _)| env_key == key) {
+            push_unique_writable_root(&mut roots, value);
+        }
+    }
+    roots
+}
+
+fn git_writable_roots_for_worktree(worktree_path: &str) -> Vec<String> {
+    let worktree = Path::new(worktree_path);
+    let git_file = worktree.join(".git");
+    let Ok(git_contents) = std::fs::read_to_string(&git_file) else {
+        return Vec::new();
+    };
+
+    let Some(raw_gitdir) = git_contents
+        .trim()
+        .strip_prefix("gitdir:")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Vec::new();
+    };
+
+    let gitdir = resolve_path(worktree, raw_gitdir);
+    let mut roots = Vec::new();
+    push_unique_writable_root(&mut roots, &path_to_string(&gitdir));
+
+    let commondir_file = gitdir.join("commondir");
+    if let Ok(commondir_contents) = std::fs::read_to_string(commondir_file) {
+        let raw_commondir = commondir_contents.trim();
+        if !raw_commondir.is_empty() {
+            let common_gitdir = resolve_path(&gitdir, raw_commondir);
+            push_unique_writable_root(&mut roots, &path_to_string(&common_gitdir));
+        }
+    }
+
+    roots
+}
+
+fn resolve_path(base: &Path, raw: &str) -> PathBuf {
+    let raw_path = Path::new(raw);
+    let path = if raw_path.is_absolute() {
+        raw_path.to_path_buf()
+    } else {
+        base.join(raw_path)
+    };
+    path.canonicalize().unwrap_or(path)
+}
+
+fn path_to_string(path: &Path) -> String {
+    path.to_string_lossy().to_string()
+}
+
+fn push_unique_writable_root(roots: &mut Vec<String>, raw_root: &str) {
+    let root = raw_root.trim();
+    if root.is_empty() || roots.iter().any(|existing| existing == root) {
+        return;
+    }
+    roots.push(root.to_string());
 }
 
 fn apply_sandbox_mode(config: &mut CodexLaunchConfig, mode: &str) {
@@ -2182,6 +2266,58 @@ mod tests {
         assert_eq!(params["sandboxPolicy"]["networkAccess"], false);
         assert_eq!(params["input"][0]["type"], "text");
         assert_eq!(params["input"][0]["text"], "hello");
+    }
+
+    #[test]
+    fn test_build_turn_start_params_adds_brehon_root_to_workspace_write() {
+        let env = vec![(
+            "BREHON_ROOT".to_string(),
+            "/tmp/brehon-control-plane".to_string(),
+        )];
+        let launch = extract_codex_launch_config(&[], &env);
+
+        let params = build_turn_start_params("thread-1", "/tmp/worktree", "hello", &launch);
+        let roots = params["sandboxPolicy"]["writableRoots"]
+            .as_array()
+            .expect("writable roots");
+
+        assert!(roots.iter().any(|root| root == "/tmp/worktree"));
+        assert!(roots.iter().any(|root| root == "/tmp/brehon-control-plane"));
+    }
+
+    #[test]
+    fn test_build_turn_start_params_adds_linked_worktree_git_dirs() {
+        let test_root =
+            std::env::temp_dir().join(format!("brehon-codex-gitdirs-{}", uuid::Uuid::new_v4()));
+        let worktree = test_root.join("worktree");
+        let common_gitdir = test_root.join("repo").join(".git");
+        let worktree_gitdir = common_gitdir.join("worktrees").join("worker");
+
+        std::fs::create_dir_all(&worktree).expect("create worktree");
+        std::fs::create_dir_all(&worktree_gitdir).expect("create linked gitdir");
+        std::fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", worktree_gitdir.display()),
+        )
+        .expect("write gitdir file");
+        std::fs::write(worktree_gitdir.join("commondir"), "../..\n").expect("write commondir");
+
+        let launch = CodexLaunchConfig::default();
+        let worktree_arg = worktree.to_string_lossy().to_string();
+        let params = build_turn_start_params("thread-1", &worktree_arg, "hello", &launch);
+        let roots = params["sandboxPolicy"]["writableRoots"]
+            .as_array()
+            .expect("writable roots");
+
+        assert!(roots.iter().any(|root| root == &worktree_arg));
+        assert!(roots.iter().any(|root| {
+            root == &path_to_string(&worktree_gitdir.canonicalize().expect("canonical gitdir"))
+        }));
+        assert!(roots.iter().any(|root| {
+            root == &path_to_string(&common_gitdir.canonicalize().expect("canonical common dir"))
+        }));
+
+        let _ = std::fs::remove_dir_all(test_root);
     }
 
     #[test]
