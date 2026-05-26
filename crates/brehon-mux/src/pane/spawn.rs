@@ -255,6 +255,16 @@ fn validate_codex_gateway_bootstrap(
                 .to_string(),
         ));
     }
+    if !config
+        .args
+        .windows(2)
+        .any(|window| window == ["--disable", "apps"])
+    {
+        return Err(Error::pty(
+            "Codex app-server launch is missing '--disable apps'. Refusing to start with Codex Apps MCP enabled."
+                .to_string(),
+        ));
+    }
 
     let has_bypass = config
         .args

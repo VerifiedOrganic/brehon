@@ -2792,6 +2792,18 @@ key = "oauth/kimi-code"
                 .any(|window| window == ["--sandbox", "workspace-write"])
         );
         assert!(
+            config
+                .args
+                .windows(2)
+                .any(|window| window == ["--disable", "personality"])
+        );
+        assert!(
+            config
+                .args
+                .windows(2)
+                .any(|window| window == ["--disable", "apps"])
+        );
+        assert!(
             !config
                 .args
                 .contains(&"shell_environment_policy.inherit=all".to_string())
@@ -2973,6 +2985,9 @@ key = "oauth/kimi-code"
         let codex_config = std::fs::read_to_string(codex_home.join("config.toml")).unwrap();
         assert!(codex_config.contains(workdir.to_string_lossy().as_ref()));
         assert!(codex_config.contains(gitdir.to_string_lossy().as_ref()));
+        assert!(codex_config.contains("[features]"));
+        assert!(codex_config.contains("personality = false"));
+        assert!(codex_config.contains("apps = false"));
         assert!(
             config
                 .args
@@ -3081,6 +3096,12 @@ key = "oauth/kimi-code"
                 .args
                 .windows(2)
                 .any(|window| window == ["--sandbox", "workspace-write"])
+        );
+        assert!(
+            config
+                .args
+                .windows(2)
+                .any(|window| window == ["--disable", "apps"])
         );
         assert!(
             !config

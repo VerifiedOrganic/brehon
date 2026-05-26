@@ -36,6 +36,7 @@ pub(crate) fn toml_basic_string(value: &str) -> String {
 }
 
 pub(crate) const CODEX_PERMISSION_PROFILE_ENV: &str = "CODEX_PERMISSION_PROFILE";
+const CODEX_DISABLED_FACTORY_FEATURES: &[&str] = &["personality", "apps"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CodexPermissionProfile {
@@ -216,6 +217,10 @@ pub(crate) fn prepare_local_codex_home(
             config.push_str(&format!("{key} = \"{}\"\n", toml_basic_string(value)));
         }
     }
+    config.push_str("\n[features]\n");
+    for feature in CODEX_DISABLED_FACTORY_FEATURES {
+        config.push_str(&format!("{feature} = false\n"));
+    }
     for skill_name in skill_names {
         let skill_path = home_root.join("skills").join(skill_name).join("SKILL.md");
         config.push_str(&format!(
@@ -284,10 +289,14 @@ fn push_codex_common_args(
     if role != "supervisor" {
         args.push("--no-alt-screen".to_string());
     }
-    // Disable personality while leaving explicit Brehon skills available from
-    // the isolated CODEX_HOME written by `prepare_local_codex_home`.
-    args.push("--disable".to_string());
-    args.push("personality".to_string());
+    // Keep Brehon factory sessions limited to the explicit local tool surface.
+    // In particular, Codex Apps starts its own `codex_apps` MCP server and may
+    // phone home during startup, which is noisy and irrelevant for unattended
+    // agent panes.
+    for feature in CODEX_DISABLED_FACTORY_FEATURES {
+        args.push("--disable".to_string());
+        args.push((*feature).to_string());
+    }
 
     // Auto-trust the working directory so Codex doesn't prompt for trust
     // on worktree paths it hasn't seen before.
