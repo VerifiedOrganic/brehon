@@ -4,6 +4,7 @@ mod pane;
 
 pub(crate) use pane::pane_needs_post_spawn_prompt;
 
+pub(crate) use brehon_types::sanitize_runtime_key;
 use brehon_types::task::normalize_task_status;
 use serde::{Deserialize, Serialize};
 
@@ -28,16 +29,103 @@ pub(crate) struct QueuedWorkerRecycle {
 
 pub(crate) type WorkerRecycleEntry = QueuedWorkerRecycle;
 
-fn sanitize_runtime_key(value: &str) -> String {
-    let mut sanitized = String::new();
-    for ch in value.chars() {
-        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
-            sanitized.push(ch);
-        } else {
-            sanitized.push('_');
-        }
+fn prompt_file_matches_id(path: &std::path::Path, prompt_id: &str) -> bool {
+    if path.is_dir() {
+        return false;
     }
-    sanitized
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return false;
+    };
+    if value.get("prompt_id").and_then(|v| v.as_str()) == Some(prompt_id) {
+        return true;
+    }
+    value
+        .get("entry")
+        .and_then(|entry| entry.get("prompt_id"))
+        .and_then(|v| v.as_str())
+        == Some(prompt_id)
+}
+
+/// Find an ack file in `dir` whose JSON payload contains the given `prompt_id`.
+/// This avoids the collision risk of filename-based sanitization by matching on
+/// file content, consistent with how queue and dead-letter directories work.
+///
+/// Performance: O(n) in directory entries. Ack directories are expected to
+/// remain small (single-digit file counts per session), so this scan is cheap
+/// in practice and eliminates the collision risk of the old O(1) filename-
+/// based lookup.
+///
+/// NOTE: Keep in sync with `find_prompt_ack_in_dir` in
+/// `crates/brehon-mcp/src/tools/agent.rs`.
+fn prompt_ack_file_for_id(dir: &std::path::Path, prompt_id: &str) -> Option<std::path::PathBuf> {
+    brehon_types::find_prompt_ack_in_dir(dir, prompt_id).map(|(path, _value)| path)
+}
+
+/// Runtime prompt directories are session-scoped and only contain the queue
+/// layout Brehon writes today (root/session/file). Keep the search recursive so
+/// orphaned legacy entries are still found, but guard depth to avoid unbounded
+/// traversal if the directory layout ever changes.
+fn prompt_id_exists_in_dir_tree(dir: &std::path::Path, prompt_id: &str, max_depth: usize) -> bool {
+    if max_depth == 0 {
+        return false;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let path = entry.path();
+        if path.is_dir() {
+            prompt_id_exists_in_dir_tree(&path, prompt_id, max_depth.saturating_sub(1))
+        } else {
+            prompt_file_matches_id(&path, prompt_id)
+        }
+    })
+}
+
+fn resolve_prompt_delivery_state(brehon_root: &std::path::Path, prompt_id: &str) -> Option<String> {
+    let prompt_id = prompt_id.trim();
+    if prompt_id.is_empty() {
+        return None;
+    }
+
+    let enqueued = prompt_ack_file_for_id(
+        &brehon_root.join("runtime").join("prompt-enqueue-acks"),
+        prompt_id,
+    )
+    .is_some();
+    let injected = prompt_ack_file_for_id(
+        &brehon_root.join("runtime").join("prompt-delivery-acks"),
+        prompt_id,
+    )
+    .is_some();
+    let queued = prompt_id_exists_in_dir_tree(
+        &brehon_root.join("runtime").join("prompt-queue"),
+        prompt_id,
+        3,
+    );
+    let dead_lettered = prompt_id_exists_in_dir_tree(
+        &brehon_root.join("runtime").join("prompt-dead-letter"),
+        prompt_id,
+        3,
+    );
+
+    Some(
+        if dead_lettered {
+            "dead_lettered"
+        } else if injected {
+            "injected"
+        } else if queued {
+            "queued"
+        } else if enqueued {
+            "drained_without_ack"
+        } else {
+            "unknown"
+        }
+        .to_string(),
+    )
 }
 
 #[allow(dead_code)]
@@ -419,8 +507,25 @@ pub(crate) fn read_pending_review_obligations(
         let panel_id = read_optional_string(&value, "panel_id");
         let round = read_optional_u64(&value, "current_round");
         let pending_reviewers = pending.len();
+        let reviewer_assignments = value
+            .get("reviewer_assignments")
+            .and_then(|value| value.as_object());
 
         for reviewer in pending {
+            let assignment =
+                reviewer_assignments.and_then(|assignments| assignments.get(&reviewer));
+            let assignment_delivery_state = assignment
+                .and_then(|value| value.get("prompt_id"))
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .and_then(|prompt_id| resolve_prompt_delivery_state(brehon_root, prompt_id));
+            let assignment_acknowledged_at = assignment
+                .and_then(|value| value.get("acknowledged_at"))
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
             obligations
                 .entry(reviewer)
                 .or_default()
@@ -431,6 +536,8 @@ pub(crate) fn read_pending_review_obligations(
                     panel_id: panel_id.clone(),
                     round,
                     pending_reviewers,
+                    assignment_delivery_state,
+                    assignment_acknowledged_at,
                 });
         }
     }
@@ -635,6 +742,7 @@ pub(crate) fn compute_supervisor_dispatch_frontier(
 
 pub(crate) fn build_supervisor_dispatch_nudge_message(
     frontier: &SupervisorDispatchFrontier,
+    host_owned: bool,
 ) -> String {
     let idle_workers = if frontier.idle_workers.is_empty() {
         "none".to_string()
@@ -667,7 +775,13 @@ pub(crate) fn build_supervisor_dispatch_nudge_message(
         queues.push(format!("approved={}", frontier.approved_tasks.join(", ")));
     }
 
-    let next_step = if frontier.integration_conflict_tasks.is_empty() {
+    let next_step = if host_owned {
+        if frontier.integration_conflict_tasks.is_empty() {
+            "Use `task action=ready` directly to get full state, then request review, integrate approved work, or assign idle workers before ending your turn. Do not wait for operator confirmation."
+        } else {
+            "Use `task action=ready` and `task action=conflicts` directly to get full state, then resolve or explicitly triage supervisor-owned integration conflicts before requesting review, integrating approved work, or assigning idle workers. Do not wait for operator confirmation."
+        }
+    } else if frontier.integration_conflict_tasks.is_empty() {
         "Re-run `task action=ready` now, then request review, integrate approved work, or assign idle workers before ending your turn."
     } else {
         "Re-run `task action=ready` and `task action=conflicts` now, then resolve or explicitly triage supervisor-owned integration conflicts before requesting review, integrating approved work, or assigning idle workers."
@@ -720,4 +834,124 @@ pub(crate) fn has_nonterminal_container_ancestor(tasks: &[TaskInfo], task: &Task
         current_parent = parent.parent_id.as_deref();
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_prompt_record(path: &std::path::Path, prompt_id: &str) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(
+            path,
+            serde_json::json!({
+                "prompt_id": prompt_id
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn resolve_prompt_delivery_state_prioritizes_all_known_variants() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let prompt_id = "prompt:1";
+        let runtime = root.join("runtime");
+
+        assert_eq!(
+            resolve_prompt_delivery_state(root, prompt_id).as_deref(),
+            Some("unknown")
+        );
+
+        // Use arbitrary filenames for ack files to prove content-based
+        // matching (not filename lookup) drives correctness.
+        let enqueue_ack = runtime.join("prompt-enqueue-acks").join("ack1.json");
+        write_prompt_record(&enqueue_ack, prompt_id);
+        assert_eq!(
+            resolve_prompt_delivery_state(root, prompt_id).as_deref(),
+            Some("drained_without_ack")
+        );
+
+        let queued_entry = runtime
+            .join("prompt-queue")
+            .join("session-a")
+            .join("001.prompt");
+        write_prompt_record(&queued_entry, prompt_id);
+        assert_eq!(
+            resolve_prompt_delivery_state(root, prompt_id).as_deref(),
+            Some("queued")
+        );
+
+        let delivery_ack = runtime.join("prompt-delivery-acks").join("ack2.json");
+        write_prompt_record(&delivery_ack, prompt_id);
+        assert_eq!(
+            resolve_prompt_delivery_state(root, prompt_id).as_deref(),
+            Some("injected")
+        );
+
+        let dead_letter = runtime
+            .join("prompt-dead-letter")
+            .join("session-a")
+            .join("001.entry");
+        write_prompt_record(&dead_letter, prompt_id);
+        assert_eq!(
+            resolve_prompt_delivery_state(root, prompt_id).as_deref(),
+            Some("dead_lettered")
+        );
+    }
+
+    #[test]
+    fn prompt_ack_file_for_id_edge_cases() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("acks");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Empty dir → None
+        assert_eq!(prompt_ack_file_for_id(&dir, "p1"), None);
+
+        // Dir with only non-JSON files → None
+        std::fs::write(dir.join("foo.txt"), "not json").unwrap();
+        assert_eq!(prompt_ack_file_for_id(&dir, "p1"), None);
+
+        // Dir with unrelated JSON files → None
+        std::fs::write(
+            dir.join("bar.json"),
+            serde_json::json!({ "prompt_id": "p2" }).to_string(),
+        )
+        .unwrap();
+        assert_eq!(prompt_ack_file_for_id(&dir, "p1"), None);
+
+        // Dir with matching file → Some(path)
+        std::fs::write(
+            dir.join("baz.json"),
+            serde_json::json!({ "prompt_id": "p1", "extra": 42 }).to_string(),
+        )
+        .unwrap();
+        let path = prompt_ack_file_for_id(&dir, "p1").expect("should find matching ack");
+        assert_eq!(path.file_name().unwrap().to_str().unwrap(), "baz.json");
+    }
+
+    #[test]
+    fn prompt_id_exists_in_dir_tree_respects_max_depth_zero() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("queue");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("entry.prompt"),
+            serde_json::json!({ "prompt_id": "p1" }).to_string(),
+        )
+        .unwrap();
+
+        assert!(
+            !prompt_id_exists_in_dir_tree(&dir, "p1", 0),
+            "max_depth=0 should return false even when a matching file exists"
+        );
+        assert!(
+            prompt_id_exists_in_dir_tree(&dir, "p1", 1),
+            "max_depth=1 should find the matching file"
+        );
+    }
 }

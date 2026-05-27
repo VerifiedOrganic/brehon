@@ -3,13 +3,12 @@
 //! This module contains the authoritative pane lifecycle state machine.
 
 use crate::mux::{MAX_TURN_DURATION, PromptQueuePosition, QUIET_THRESHOLD};
-use brehon_types::PromptId;
+use brehon_types::{PromptId, RuntimePaneBlockInfo, RuntimePaneBlockKind};
 use std::collections::VecDeque;
-#[cfg(test)]
 use std::time::Duration;
 use std::time::Instant;
 
-use super::types::Pane;
+use super::types::{BlockedResumeState, Pane};
 
 /// Monotonic pane generation identifier.
 ///
@@ -158,6 +157,11 @@ pub enum PaneState {
         delivered_at: Instant,
         last_activity_at: Instant,
     },
+    /// Pane is blocked on a prompt Brehon cannot answer automatically.
+    Blocked {
+        info: RuntimePaneBlockInfo,
+        at: Instant,
+    },
     /// Pane is terminally dead until replaced.
     Dead { reason: DeathReason, at: Instant },
 }
@@ -178,6 +182,38 @@ impl BusyReadyFastPath {
 }
 
 impl Pane {
+    const PERMISSION_RESOLUTION_FALLBACK_WINDOW: Duration = Duration::from_secs(30);
+
+    fn blocked_permission_resolution_fallback_pending(info: &RuntimePaneBlockInfo) -> bool {
+        matches!(info.kind, RuntimePaneBlockKind::TerminalPrompt)
+            || matches!(
+                info.kind,
+                RuntimePaneBlockKind::PermissionRequest if info.request_id.is_none()
+            )
+    }
+
+    fn blocked_permission_resolution_fallback_until(
+        info: &RuntimePaneBlockInfo,
+        now: Instant,
+    ) -> Option<Instant> {
+        Self::blocked_permission_resolution_fallback_pending(info)
+            .then_some(now + Self::PERMISSION_RESOLUTION_FALLBACK_WINDOW)
+    }
+
+    fn clear_blocked_resume_state(&mut self) {
+        self.blocked_resume_state = None;
+    }
+
+    fn capture_blocked_resume_state(&mut self) {
+        if self.blocked_resume_state.is_some() {
+            return;
+        }
+        self.blocked_resume_state = Some(BlockedResumeState {
+            pane_state: self.pane_state.clone(),
+            tool_executing: self.is_tool_executing,
+        });
+    }
+
     pub(crate) fn delayed_prompt_count(&self) -> usize {
         self.prompt_queue.total_len()
     }
@@ -257,6 +293,7 @@ impl Pane {
                     None
                 }
             }
+            Some(PaneState::Blocked { .. }) => None,
             _ => None,
         };
 
@@ -298,11 +335,44 @@ impl Pane {
     /// Prefer `set_pane_ready()` and `set_pane_busy()` for ordinary activity
     /// updates so dead panes cannot be revived accidentally.
     pub(crate) fn set_pane_state(&mut self, state: PaneState) {
+        if matches!(self.pane_state.as_ref(), Some(PaneState::Blocked { .. }))
+            && !matches!(state, PaneState::Blocked { .. })
+        {
+            self.terminal_prompt_prefilter_tail.clear();
+            self.permission_resolution_fallback_until = None;
+        }
+        if !matches!(state, PaneState::Blocked { .. }) {
+            self.clear_blocked_resume_state();
+        }
         self.pane_state = Some(state);
     }
 
     pub(crate) fn set_pane_ready(&mut self, now: Instant) {
+        if matches!(
+            self.pane_state.as_ref(),
+            Some(PaneState::Dead { .. } | PaneState::Blocked { .. })
+        ) {
+            return;
+        }
+        self.clear_blocked_resume_state();
+        self.permission_resolution_fallback_until = None;
+        self.pane_state = Some(PaneState::Ready { since: now });
+    }
+
+    fn begin_external_ready_or_busy_transition(&mut self) -> bool {
         if matches!(self.pane_state.as_ref(), Some(PaneState::Dead { .. })) {
+            return false;
+        }
+        if matches!(self.pane_state.as_ref(), Some(PaneState::Blocked { .. })) {
+            self.terminal_prompt_prefilter_tail.clear();
+        }
+        self.clear_blocked_resume_state();
+        self.permission_resolution_fallback_until = None;
+        true
+    }
+
+    pub(crate) fn set_external_pane_ready(&mut self, now: Instant) {
+        if !self.begin_external_ready_or_busy_transition() {
             return;
         }
         self.pane_state = Some(PaneState::Ready { since: now });
@@ -314,7 +384,29 @@ impl Pane {
         generation: Generation,
         now: Instant,
     ) {
-        if matches!(self.pane_state.as_ref(), Some(PaneState::Dead { .. })) {
+        if matches!(
+            self.pane_state.as_ref(),
+            Some(PaneState::Dead { .. } | PaneState::Blocked { .. })
+        ) {
+            return;
+        }
+        self.clear_blocked_resume_state();
+        self.permission_resolution_fallback_until = None;
+        self.pane_state = Some(PaneState::Busy {
+            prompt_id,
+            generation,
+            delivered_at: now,
+            last_activity_at: now,
+        });
+    }
+
+    pub(crate) fn set_external_pane_busy(
+        &mut self,
+        prompt_id: PromptId,
+        generation: Generation,
+        now: Instant,
+    ) {
+        if !self.begin_external_ready_or_busy_transition() {
             return;
         }
         self.pane_state = Some(PaneState::Busy {
@@ -323,6 +415,86 @@ impl Pane {
             delivered_at: now,
             last_activity_at: now,
         });
+    }
+
+    pub(crate) fn set_pane_blocked(&mut self, info: RuntimePaneBlockInfo, now: Instant) {
+        if matches!(self.pane_state.as_ref(), Some(PaneState::Dead { .. })) {
+            return;
+        }
+        if !matches!(self.pane_state.as_ref(), Some(PaneState::Blocked { .. })) {
+            self.capture_blocked_resume_state();
+        }
+        if let Some(PaneState::Blocked { info: existing, .. }) = self.pane_state.as_ref() {
+            tracing::warn!(
+                pane_id = %self.id,
+                previous = ?existing,
+                replacement = ?info,
+                "Overwriting existing blocked pane state"
+            );
+        }
+        self.permission_resolution_fallback_until =
+            Self::blocked_permission_resolution_fallback_until(&info, now);
+        self.pane_state = Some(PaneState::Blocked { info, at: now });
+    }
+
+    pub(crate) fn refresh_blocked_info(&mut self, info: RuntimePaneBlockInfo, now: Instant) {
+        if matches!(self.pane_state.as_ref(), Some(PaneState::Blocked { .. })) {
+            self.permission_resolution_fallback_until =
+                Self::blocked_permission_resolution_fallback_until(&info, now);
+            self.pane_state = Some(PaneState::Blocked { info, at: now });
+        }
+    }
+
+    pub(crate) fn restore_after_blocked_permission_resolution(
+        &mut self,
+        fallback_prompt_id: PromptId,
+        fallback_generation: Generation,
+        now: Instant,
+    ) {
+        let resume = self.blocked_resume_state.take();
+        self.terminal_prompt_prefilter_tail.clear();
+        let tool_executing = resume.as_ref().map_or(true, |snapshot| {
+            snapshot.tool_executing || matches!(snapshot.pane_state, Some(PaneState::Busy { .. }))
+        });
+        let (prompt_id, generation) = match resume.as_ref() {
+            Some(BlockedResumeState {
+                pane_state:
+                    Some(PaneState::Busy {
+                        prompt_id,
+                        generation,
+                        ..
+                    }),
+                ..
+            }) => (prompt_id.clone(), *generation),
+            Some(BlockedResumeState { .. }) | None => (fallback_prompt_id, fallback_generation),
+        };
+        self.is_tool_executing = tool_executing;
+        self.permission_resolution_fallback_until = None;
+        self.pane_state = Some(PaneState::Busy {
+            prompt_id,
+            generation,
+            delivered_at: now,
+            last_activity_at: now,
+        });
+    }
+
+    pub(crate) fn clear_permission_resolution_fallback(&mut self) {
+        self.permission_resolution_fallback_until = None;
+    }
+
+    pub(crate) fn permission_resolution_fallback_pending(&self, now: Instant) -> bool {
+        self.permission_resolution_fallback_until
+            .is_some_and(|deadline| now <= deadline)
+    }
+
+    pub(crate) fn permission_resolution_fallback_expired(&self, now: Instant) -> bool {
+        self.permission_resolution_fallback_until
+            .is_some_and(|deadline| now > deadline)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn expire_permission_resolution_fallback_for_test(&mut self) {
+        self.permission_resolution_fallback_until = Some(Instant::now() - Duration::from_secs(1));
     }
 
     pub(crate) fn touch_busy_activity(&mut self, now: Instant) {
@@ -482,5 +654,50 @@ mod tests {
             pane.pane_state(),
             Some(&PaneState::Dead { reason, at: now })
         );
+    }
+
+    #[test]
+    fn external_ready_and_busy_recovery_allow_blocked_but_preserve_dead() {
+        let now = Instant::now();
+        let blocked = RuntimePaneBlockInfo {
+            kind: RuntimePaneBlockKind::PermissionRequest,
+            summary: "permission request blocked automatic recovery".to_string(),
+            command_or_tool: Some("allow bash ls".to_string()),
+            request_id: Some("perm-1".to_string()),
+            task_id: Some("T-1".to_string()),
+            excerpt: Some("Permission request: allow bash ls".to_string()),
+        };
+
+        let mut blocked_ready = make_test_pane();
+        blocked_ready.set_pane_blocked(blocked.clone(), now);
+        blocked_ready.set_external_pane_ready(now + Duration::from_secs(1));
+        assert!(matches!(
+            blocked_ready.pane_state(),
+            Some(PaneState::Ready { .. })
+        ));
+
+        let mut blocked_busy = make_test_pane();
+        blocked_busy.set_pane_blocked(blocked, now);
+        blocked_busy.set_external_pane_busy(
+            PromptId::new("blocked-busy".to_string()),
+            Generation(2),
+            now + Duration::from_secs(1),
+        );
+        assert!(matches!(
+            blocked_busy.pane_state(),
+            Some(PaneState::Busy { generation, .. }) if *generation == Generation(2)
+        ));
+
+        let mut dead = make_test_pane();
+        let reason = DeathReason::SessionDropped;
+        dead.set_pane_state(PaneState::Dead { reason, at: now });
+        dead.set_external_pane_ready(now + Duration::from_secs(1));
+        assert!(matches!(dead.pane_state(), Some(PaneState::Dead { .. })));
+        dead.set_external_pane_busy(
+            PromptId::new("dead-busy".to_string()),
+            Generation(3),
+            now + Duration::from_secs(2),
+        );
+        assert!(matches!(dead.pane_state(), Some(PaneState::Dead { .. })));
     }
 }

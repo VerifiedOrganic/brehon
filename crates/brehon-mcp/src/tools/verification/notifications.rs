@@ -3,6 +3,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use brehon_mux::SessionScopedQueue;
+use brehon_types::sanitize_runtime_key;
 use serde::{Deserialize, Serialize};
 
 use super::helpers::brehon_root;
@@ -23,18 +24,6 @@ pub(crate) struct ReviewerResetRequest {
 pub(crate) type ReviewerResetEntry = ReviewerResetRequest;
 
 const DEFAULT_REVIEWER_RESET_SESSION: &str = "_legacy";
-
-fn sanitize_runtime_key(value: &str) -> String {
-    let mut sanitized = String::new();
-    for ch in value.chars() {
-        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
-            sanitized.push(ch);
-        } else {
-            sanitized.push('_');
-        }
-    }
-    sanitized
-}
 
 pub(crate) fn reviewer_reset_queue_dir_from_root(root: &Path) -> PathBuf {
     root.join("runtime").join("reviewer-reset-queue")

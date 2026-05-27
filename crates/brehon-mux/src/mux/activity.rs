@@ -6,7 +6,12 @@ use crate::error::{Error, Result};
 use crate::mux::MuxEvent;
 use crate::pane::{DeathReason, Generation, PaneState, ReviewContextSnapshot, TaskContextSnapshot};
 use brehon_protocol::ServerMessage;
-use brehon_types::{PromptId, RuntimeEvent, RuntimeEventKind, RuntimePaneState, RuntimeSource};
+use brehon_types::PaneAssignmentContext;
+use brehon_types::{
+    PromptId, RuntimeEvent, RuntimeEventKind, RuntimePaneState, RuntimeSource,
+    pane_assignment_context_dir, pane_assignment_context_path,
+};
+use std::path::PathBuf;
 use std::time::Instant;
 
 fn runtime_source_is_terminal_host(source: &RuntimeSource) -> bool {
@@ -14,6 +19,57 @@ fn runtime_source_is_terminal_host(source: &RuntimeSource) -> bool {
         source,
         RuntimeSource::Headless | RuntimeSource::Web | RuntimeSource::NativeGui
     )
+}
+
+fn brehon_root_dir() -> Option<PathBuf> {
+    std::env::var("BREHON_ROOT").ok().and_then(|root| {
+        let root = root.trim();
+        if root.is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(root))
+        }
+    })
+}
+
+fn write_pane_assignment_context_snapshot(context: &PaneAssignmentContext) {
+    let Some(root) = brehon_root_dir() else {
+        return;
+    };
+    let dir = pane_assignment_context_dir(&root);
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let path = pane_assignment_context_path(&root, context.pane_id.as_str());
+    let tmp = path.with_extension("tmp");
+    let Ok(json) = serde_json::to_string_pretty(context) else {
+        return;
+    };
+    if std::fs::write(&tmp, json).is_err() {
+        return;
+    }
+    let _ = std::fs::rename(tmp, path);
+}
+
+fn clear_pane_assignment_context_snapshot(pane_id: &str) {
+    let Some(root) = brehon_root_dir() else {
+        return;
+    };
+    let path = pane_assignment_context_path(&root, pane_id);
+    let _ = std::fs::remove_file(path);
+}
+
+fn task_status_label(status: brehon_types::task::TaskStatus) -> &'static str {
+    match status {
+        brehon_types::task::TaskStatus::Pending => "pending",
+        brehon_types::task::TaskStatus::Assigned => "assigned",
+        brehon_types::task::TaskStatus::InProgress => "in_progress",
+        brehon_types::task::TaskStatus::InReview => "in_review",
+        brehon_types::task::TaskStatus::ChangesRequested => "changes_requested",
+        brehon_types::task::TaskStatus::Approved => "approved",
+        brehon_types::task::TaskStatus::Merged => "merged",
+        brehon_types::task::TaskStatus::Blocked => "blocked",
+    }
 }
 
 impl crate::mux::Mux {
@@ -67,13 +123,74 @@ impl crate::mux::Mux {
                 }
             }
             RuntimeEventKind::PaneStateChanged(changed) => {
+                let pane_id = pane.id().to_string();
+                let clear_prompt_blocked_health =
+                    matches!(pane.pane_state(), Some(PaneState::Blocked { .. }))
+                        && !matches!(changed.current, RuntimePaneState::Blocked);
                 match changed.current {
-                    RuntimePaneState::Ready => pane.set_pane_ready(now),
+                    RuntimePaneState::Ready => pane.set_external_pane_ready(now),
                     RuntimePaneState::Busy => {
                         let prompt_id = event.meta.correlation_id.clone().unwrap_or_else(|| {
                             format!("terminal-host-{}", event.meta.timestamp_ms)
                         });
-                        pane.set_pane_busy(PromptId::new(prompt_id), event_generation, now);
+                        pane.set_external_pane_busy(
+                            PromptId::new(prompt_id),
+                            event_generation,
+                            now,
+                        );
+                    }
+                    RuntimePaneState::Blocked => {
+                        let info = changed.blocked.clone().unwrap_or_else(|| {
+                            brehon_types::RuntimePaneBlockInfo {
+                                kind: brehon_types::RuntimePaneBlockKind::TerminalPrompt,
+                                summary: changed
+                                    .reason
+                                    .clone()
+                                    .unwrap_or_else(|| "runtime pane blocked".to_string()),
+                                command_or_tool: None,
+                                request_id: event.meta.correlation_id.clone(),
+                                task_id: pane.assignment_task_id(),
+                                excerpt: None,
+                            }
+                        });
+                        match pane.pane_state() {
+                            Some(PaneState::Dead { .. }) => {
+                                tracing::debug!(
+                                    pane = %pane_id,
+                                    "Skipping external blocked pane state update for dead pane"
+                                );
+                            }
+                            Some(PaneState::Blocked { info: existing, .. }) => {
+                                let existing = existing.clone();
+                                let marker_info = if existing != info {
+                                    tracing::warn!(
+                                        pane = %pane_id,
+                                        existing = ?existing,
+                                        duplicate = ?info,
+                                        "Refreshing blocked pane details after duplicate external blocked event"
+                                    );
+                                    pane.refresh_blocked_info(info.clone(), now);
+                                    info.clone()
+                                } else {
+                                    existing
+                                };
+                                super::stability::write_agent_prompt_blocked_marker(
+                                    &pane_id,
+                                    &marker_info,
+                                );
+                                tracing::debug!(
+                                    pane = %pane_id,
+                                    blocked = ?marker_info,
+                                    "Skipping duplicate external blocked pane state update"
+                                );
+                            }
+                            _ => {
+                                pane.set_pane_blocked(info.clone(), now);
+                                super::stability::write_agent_prompt_blocked_marker(
+                                    &pane_id, &info,
+                                );
+                            }
+                        }
                     }
                     RuntimePaneState::Dead => {
                         pane.set_tool_executing(false);
@@ -84,6 +201,9 @@ impl crate::mux::Mux {
                         });
                     }
                     RuntimePaneState::Unknown => {}
+                }
+                if clear_prompt_blocked_health {
+                    super::stability::clear_agent_health_marker(&pane_id);
                 }
                 Ok(true)
             }
@@ -105,6 +225,15 @@ impl crate::mux::Mux {
         if let Some(pane) = self.panes.get_mut(pane_id) {
             let ctx_clone = context.clone();
             pane.set_task_context(context);
+            write_pane_assignment_context_snapshot(&PaneAssignmentContext {
+                pane_id: pane_id.to_string(),
+                assignment_kind: "task".to_string(),
+                task_id: ctx_clone.task_id.clone(),
+                review_id: None,
+                round: None,
+                status: task_status_label(ctx_clone.status).to_string(),
+                updated_at: chrono::Utc::now().to_rfc3339(),
+            });
             let _ = self.event_tx.try_send(MuxEvent::TaskContextChanged {
                 pane_id: pane_id.to_string(),
                 context: Some(ctx_clone),
@@ -117,6 +246,7 @@ impl crate::mux::Mux {
     pub fn clear_pane_task_context(&mut self, pane_id: &str) {
         if let Some(pane) = self.panes.get_mut(pane_id) {
             pane.clear_task_context();
+            clear_pane_assignment_context_snapshot(pane_id);
             let _ = self.event_tx.try_send(MuxEvent::TaskContextChanged {
                 pane_id: pane_id.to_string(),
                 context: None,
@@ -135,6 +265,15 @@ impl crate::mux::Mux {
             if pane.agent_session_id() == Some(session_id) {
                 let ctx_clone = context.clone();
                 pane.set_task_context(context);
+                write_pane_assignment_context_snapshot(&PaneAssignmentContext {
+                    pane_id: pane_id.clone(),
+                    assignment_kind: "task".to_string(),
+                    task_id: ctx_clone.task_id.clone(),
+                    review_id: None,
+                    round: None,
+                    status: task_status_label(ctx_clone.status).to_string(),
+                    updated_at: chrono::Utc::now().to_rfc3339(),
+                });
                 let _ = self.event_tx.try_send(MuxEvent::TaskContextChanged {
                     pane_id: pane_id.clone(),
                     context: Some(ctx_clone),
@@ -150,6 +289,7 @@ impl crate::mux::Mux {
         for (pane_id, pane) in self.panes.iter_mut() {
             if pane.agent_session_id() == Some(session_id) {
                 pane.clear_task_context();
+                clear_pane_assignment_context_snapshot(pane_id);
                 let _ = self.event_tx.try_send(MuxEvent::TaskContextChanged {
                     pane_id: pane_id.clone(),
                     context: None,
@@ -165,6 +305,18 @@ impl crate::mux::Mux {
         if let Some(pane) = self.panes.get_mut(pane_id) {
             let ctx_clone = context.clone();
             pane.set_review_context(context);
+            write_pane_assignment_context_snapshot(&PaneAssignmentContext {
+                pane_id: pane_id.to_string(),
+                assignment_kind: "review".to_string(),
+                task_id: ctx_clone.task_id.clone(),
+                review_id: Some(ctx_clone.review_id.clone()),
+                round: Some(ctx_clone.round),
+                status: ctx_clone
+                    .verdict
+                    .clone()
+                    .unwrap_or_else(|| "collecting".to_string()),
+                updated_at: chrono::Utc::now().to_rfc3339(),
+            });
             let _ = self.event_tx.try_send(MuxEvent::ReviewContextChanged {
                 pane_id: pane_id.to_string(),
                 context: Some(ctx_clone),
@@ -177,6 +329,7 @@ impl crate::mux::Mux {
     pub fn clear_pane_review_context(&mut self, pane_id: &str) {
         if let Some(pane) = self.panes.get_mut(pane_id) {
             pane.clear_review_context();
+            clear_pane_assignment_context_snapshot(pane_id);
             let _ = self.event_tx.try_send(MuxEvent::ReviewContextChanged {
                 pane_id: pane_id.to_string(),
                 context: None,
@@ -195,6 +348,18 @@ impl crate::mux::Mux {
             if pane.agent_session_id() == Some(session_id) {
                 let ctx_clone = context.clone();
                 pane.set_review_context(context);
+                write_pane_assignment_context_snapshot(&PaneAssignmentContext {
+                    pane_id: pane_id.clone(),
+                    assignment_kind: "review".to_string(),
+                    task_id: ctx_clone.task_id.clone(),
+                    review_id: Some(ctx_clone.review_id.clone()),
+                    round: Some(ctx_clone.round),
+                    status: ctx_clone
+                        .verdict
+                        .clone()
+                        .unwrap_or_else(|| "collecting".to_string()),
+                    updated_at: chrono::Utc::now().to_rfc3339(),
+                });
                 let _ = self.event_tx.try_send(MuxEvent::ReviewContextChanged {
                     pane_id: pane_id.clone(),
                     context: Some(ctx_clone),
@@ -210,6 +375,7 @@ impl crate::mux::Mux {
         for (pane_id, pane) in self.panes.iter_mut() {
             if pane.agent_session_id() == Some(session_id) {
                 pane.clear_review_context();
+                clear_pane_assignment_context_snapshot(pane_id);
                 let _ = self.event_tx.try_send(MuxEvent::ReviewContextChanged {
                     pane_id: pane_id.clone(),
                     context: None,

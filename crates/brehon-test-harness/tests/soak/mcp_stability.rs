@@ -15,9 +15,9 @@ async fn soak_mcp_tool_calls_no_in_flight_leak() {
     server.register_tool(std::sync::Arc::new(MockEchoTool {
         name: "counting_tool".to_string(),
     }));
-    const CALLS: usize = 500;
+    let calls = crate::soak_cycles_locked(500);
 
-    for i in 0..CALLS {
+    for i in 0..calls {
         let result = server
             .call_tool("counting_tool", serde_json::json!({"payload": i}))
             .await;
@@ -39,12 +39,12 @@ async fn soak_mcp_panic_boundary_holds() {
         call_count: Arc::new(AtomicUsize::new(0)),
         panic_on_call: Some(5),
     }));
-    const CALLS: usize = 100;
+    let calls = crate::soak_cycles_locked(100);
 
     let mut panics_caught = 0;
     let mut oks = 0;
 
-    for i in 0..CALLS {
+    for i in 0..calls {
         let tool_name = if i % 5 == 0 {
             "panic_tool"
         } else {
@@ -87,16 +87,16 @@ async fn soak_mcp_concurrent_calls_safe() {
     server.register_tool(std::sync::Arc::new(MockEchoTool {
         name: "counting_tool".to_string(),
     }));
-    const TASKS: usize = 20;
-    const CALLS_PER_TASK: usize = 50;
+    let tasks = crate::soak_cycles_locked(20);
+    let calls_per_task = crate::soak_cycles_locked(50);
 
     let mut handles = vec![];
 
-    for task_id in 0..TASKS {
+    for task_id in 0..tasks {
         let server = Arc::clone(&server);
         handles.push(tokio::spawn(async move {
             let mut successes = 0;
-            for i in 0..CALLS_PER_TASK {
+            for i in 0..calls_per_task {
                 let result = server
                     .call_tool(
                         "counting_tool",
@@ -116,7 +116,7 @@ async fn soak_mcp_concurrent_calls_safe() {
 
     assert_eq!(
         total_successes,
-        TASKS * CALLS_PER_TASK,
+        tasks * calls_per_task,
         "All concurrent calls should succeed"
     );
 }
@@ -128,10 +128,11 @@ async fn soak_mcp_slow_tool_drain_completes() {
         name: "slow_tool".to_string(),
         delay_ms: 50,
     }));
+    let calls = crate::soak_cycles_locked(10);
 
     // Launch several slow calls
     let mut handles = vec![];
-    for i in 0..10 {
+    for i in 0..calls {
         let server = Arc::clone(&server);
         handles.push(tokio::spawn(async move {
             server

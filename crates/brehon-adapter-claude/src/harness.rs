@@ -6,7 +6,8 @@
 //! adapter crate instead of hard-coding Claude-specific constants.
 
 pub use brehon_adapter_sdk::{
-    HarnessCapabilities, HarnessControlPlane, HarnessTransport, SupervisorCli,
+    HarnessCapabilities, HarnessControlPlane, HarnessTransport, PromptInjectionStrategy,
+    SupervisorCli,
 };
 
 use std::borrow::Cow;
@@ -31,6 +32,7 @@ pub fn claude_capabilities() -> HarnessCapabilities {
         supports_teams: true,
         one_shot: false,
         uses_ink_prompt: false,
+        prompt_injection_strategy: PromptInjectionStrategy::ImmediateSubmit,
         tool_prefix: Cow::Borrowed(CLAUDE_TOOL_PREFIX),
         transport: HarnessTransport::NativeHooks,
         preferred_control_plane: HarnessControlPlane::NativeHooks,
@@ -63,6 +65,10 @@ mod tests {
         assert_eq!(from_sdk.supports_teams, from_adapter.supports_teams);
         assert_eq!(from_sdk.one_shot, from_adapter.one_shot);
         assert_eq!(from_sdk.uses_ink_prompt, from_adapter.uses_ink_prompt);
+        assert_eq!(
+            from_sdk.prompt_injection_strategy,
+            from_adapter.prompt_injection_strategy
+        );
         assert_eq!(
             from_sdk.preferred_control_plane,
             from_adapter.preferred_control_plane

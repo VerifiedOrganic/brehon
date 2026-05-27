@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::io::ErrorKind;
 use std::path::PathBuf;
@@ -9,6 +10,7 @@ use serde_json::Value;
 use brehon_types::ReviewVerdict;
 
 use super::helpers::reviews_dir;
+use crate::tools::assignment_observability::AssignmentPropagation;
 use crate::tools::stability::refresh_runtime_stability_counters;
 
 // ── Storage wrapper types ────────────────────────────────────────────────────
@@ -34,6 +36,8 @@ pub struct ReviewState {
     pub panel_mode: String, // "full_council" | "fixed_size"
     pub panel: Vec<String>,
     pub submissions_received: Vec<String>,
+    #[serde(default)]
+    pub(crate) reviewer_assignments: BTreeMap<String, AssignmentPropagation>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -117,6 +121,8 @@ pub struct ReviewRequestFile {
     pub resolved_empty_commit_set: bool,
     #[serde(default)]
     pub review_fingerprint: Value,
+    #[serde(default)]
+    pub reviewer_prompts: BTreeMap<String, String>,
     pub context: String,
 }
 
@@ -432,6 +438,57 @@ pub(crate) fn write_submission(
     std::fs::rename(&tmp, &path)
 }
 
+pub(crate) fn delete_submission(task_id: &str, round: u32, reviewer: &str) -> std::io::Result<()> {
+    let dir = round_dir(task_id, round)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "No round dir"))?;
+    let path = dir.join(format!("{reviewer}.json"));
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+/// Roll back a persisted submission and its in-memory state entry.
+/// Deletes the on-disk submission file, removes the reviewer from the
+/// `submissions_received` list, drops their assignment propagation record, and
+/// re-persists the updated review state.
+///
+/// This is a best-effort multi-step cleanup, not a transactional guarantee.
+/// If the process crashes between `delete_submission` and `write_review_state`,
+/// the on-disk state may be inconsistent until the next operation.
+///
+/// Returns `Ok(())` when both the file deletion and state re-write succeed.
+/// Returns `Err` with a description if either step fails so callers can surface
+/// a distinct rollback-failed warning alongside the original error.
+pub(crate) fn rollback_review_submission(
+    task_id: &str,
+    round: u32,
+    reviewer: &str,
+    state: &mut ReviewState,
+) -> Result<(), String> {
+    let mut errors = Vec::new();
+
+    if let Err(err) = delete_submission(task_id, round, reviewer) {
+        errors.push(format!("failed to delete submission file: {err}"));
+    }
+    state.submissions_received.retain(|r| r != reviewer);
+    state.reviewer_assignments.remove(reviewer);
+
+    if let Err(err) = write_review_state(task_id, state) {
+        errors.push(format!("failed to rewrite review state: {err}"));
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Rollback for reviewer {reviewer} on task {task_id} round {round} partially failed: {}",
+            errors.join("; ")
+        ))
+    }
+}
+
 pub(crate) fn read_round_request(task_id: &str, round: u32) -> Option<ReviewRequestFile> {
     let dir = round_dir(task_id, round)?;
     let path = dir.join("request.json");
@@ -518,4 +575,19 @@ pub(crate) fn write_consolidated(
     let path = dir.join("consolidated.json");
     let json = serde_json::to_string_pretty(report).map_err(std::io::Error::other)?;
     std::fs::write(&path, &json)
+}
+
+/// Best-effort delete of a consolidated report for a round.
+///
+/// Returns `Ok(())` when the file is removed or already absent.
+/// Returns `Err` only for unexpected I/O failures.
+pub(crate) fn delete_consolidated(task_id: &str, round: u32) -> std::io::Result<()> {
+    let dir = round_dir(task_id, round)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "No round dir"))?;
+    let path = dir.join("consolidated.json");
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
 }

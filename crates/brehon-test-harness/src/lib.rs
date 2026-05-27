@@ -28,6 +28,7 @@ pub mod mock_store;
 pub mod run_store_contract;
 pub mod scenario;
 pub mod stress;
+pub mod test_env;
 
 pub use assertions::*;
 pub use chaos::ChaosConfig;
@@ -46,3 +47,4 @@ pub use mock_notifications::RecordingNotificationSink;
 pub use mock_run_store::InMemoryRunStore;
 pub use mock_store::InMemoryEventStore;
 pub use scenario::{Scenario, ScenarioRunner};
+pub use test_env::{ScopedEnv, TEST_ENV_LOCK};

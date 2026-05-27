@@ -9,6 +9,10 @@ use brehon_types::{
 
 use crate::error::McpError;
 use crate::server::{ContentBlock, ToolResult};
+use crate::tools::assignment_observability::{
+    acknowledge_propagation, mark_progress_started, read_task_assignment_propagation,
+    write_task_assignment_propagation,
+};
 use crate::tools::verification::{
     clear_obsolete_review_state_for_resumed_work, release_panel_lease_for_task,
 };
@@ -207,6 +211,7 @@ async fn execute_checkpoint_inner(
         "updated_at".into(),
         Value::String(chrono::Utc::now().to_rfc3339()),
     );
+    mark_task_assignment_progress_started(&mut task, &caller_name, "task action=checkpoint");
     if !write_task(id, &task) {
         return Ok(error_result(format!(
             "Checkpoint created for task {id}, but failed to persist latest_commit."
@@ -248,6 +253,24 @@ fn tool_result_text(result: &ToolResult) -> String {
         })
         .collect::<Vec<_>>()
         .join("")
+}
+
+fn mark_task_assignment_progress_started(
+    task: &mut serde_json::Map<String, Value>,
+    actor: &str,
+    via: &str,
+) {
+    let Some(mut propagation) = read_task_assignment_propagation(task) else {
+        return;
+    };
+    if propagation.owner.trim() != actor.trim() {
+        return;
+    }
+    let acknowledged = acknowledge_propagation(&mut propagation, actor, via);
+    let progressed = mark_progress_started(&mut propagation, actor, via);
+    if acknowledged || progressed {
+        write_task_assignment_propagation(task, &propagation);
+    }
 }
 
 fn parse_tool_result_json(action: &str, result: &ToolResult) -> Result<Value, String> {
@@ -471,6 +494,10 @@ pub(super) async fn execute_complete(
         return Ok(error_result(
             "Only workers can complete tasks. Use task action=complete from the assigned worker pane.",
         ));
+    }
+
+    if let Some(err) = dirty_primary_checkout_terminal_blocker(&format!("complete task {id}")) {
+        return Ok(error_result(err));
     }
 
     let checkpoint_message = complete_checkpoint_message(args, id);
@@ -809,6 +836,9 @@ pub(super) async fn execute_progress(
     };
     if let Some(ref commit) = current_commit {
         task.insert("latest_commit".into(), Value::String(commit.clone()));
+    }
+    if let Some(worker) = worker_caller_name.as_deref() {
+        mark_task_assignment_progress_started(&mut task, worker, "task action=progress");
     }
 
     // Auto-transition: a worker reporting 100% from an active work gate

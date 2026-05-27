@@ -26,6 +26,9 @@ nix = { version = "0.29", features = ["signal"] }
 tokio = { workspace = true, features = ["test-util", "macros"] }
 tempfile = "3"
 brehon-pty = { path = "../brehon-pty" }
+brehon-mcp = { path = "../brehon-mcp" }
+brehon-mux = { path = "../brehon-mux" }
+brehon-tui = { path = "../brehon-tui" }
 
 [[test]]
 name = "chaos_tests"

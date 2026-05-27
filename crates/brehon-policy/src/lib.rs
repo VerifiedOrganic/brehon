@@ -64,6 +64,13 @@ impl BasicPolicyGate {
                 reason: "operation requires a live pane".to_string(),
             };
         }
+        if matches!(request.context.pane_state, Some(RuntimePaneState::Blocked))
+            && command_requires_unblocked_pane(&request.command.kind)
+        {
+            return RuntimePolicyDecision::Deny {
+                reason: "operation requires a pane that is not prompt-blocked".to_string(),
+            };
+        }
 
         if let Some(recent_failures) = request.context.recent_failures
             && recent_failures >= self.config.max_recent_failures
@@ -121,6 +128,15 @@ impl BasicPolicyGate {
             | RuntimeCommandKind::ResolveApproval { .. } => RuntimePolicyDecision::Allow,
         }
     }
+}
+
+fn command_requires_unblocked_pane(kind: &RuntimeCommandKind) -> bool {
+    matches!(
+        kind,
+        RuntimeCommandKind::SendPrompt { .. }
+            | RuntimeCommandKind::SendTerminalInput { .. }
+            | RuntimeCommandKind::Interrupt { .. }
+    )
 }
 
 #[async_trait]
@@ -293,6 +309,28 @@ mod tests {
                 RuntimeCommandKind::SendTerminalInput { bytes: vec![b'x'] },
                 RuntimePolicyContext {
                     pane_state: Some(RuntimePaneState::Dead),
+                    ..RuntimePolicyContext::default()
+                },
+            ))
+            .await
+            .expect("policy");
+
+        assert!(matches!(decision, RuntimePolicyDecision::Deny { .. }));
+    }
+
+    #[tokio::test]
+    async fn denies_direct_prompt_to_blocked_pane() {
+        let gate = BasicPolicyGate::default();
+        let decision = gate
+            .evaluate(request(
+                RuntimeCommandKind::SendPrompt {
+                    prompt_id: "p".to_string(),
+                    text: "resume".to_string(),
+                    from: None,
+                    delivery: PromptDeliveryMode::Direct,
+                },
+                RuntimePolicyContext {
+                    pane_state: Some(RuntimePaneState::Blocked),
                     ..RuntimePolicyContext::default()
                 },
             ))

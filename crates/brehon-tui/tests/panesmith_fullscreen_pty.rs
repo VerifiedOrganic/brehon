@@ -309,6 +309,7 @@ fn custom_interactive_agent(name: &str, command: &str, args: &[&str]) -> AgentAd
             supports_teams: false,
             one_shot: false,
             uses_ink_prompt: false,
+            prompt_injection_strategy: brehon_mux::PromptInjectionStrategy::ImmediateSubmit,
             tool_prefix: Cow::Borrowed("mcp_brehon_"),
             transport: HarnessTransport::InteractivePty,
             preferred_control_plane: HarnessControlPlane::PtyInjection,

@@ -28,6 +28,7 @@ futures-util = "0.3"
 tokio-util = { version = "0.7", features = ["codec"] }
 
 [dev-dependencies]
+brehon-test-harness = { path = "../brehon-test-harness" }
 brehon-store-fjall = { path = "../brehon-store-fjall" }
 tempfile = "3"
 uuid = { workspace = true }

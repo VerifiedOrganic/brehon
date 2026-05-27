@@ -285,6 +285,7 @@ pub(crate) fn parse_document(path: &Path) -> Result<PlanDocument> {
         stack,
         target,
         path: path.to_path_buf(),
+        already_landed_commit: None,
         phases,
     })
 }

@@ -3,39 +3,13 @@
 use super::paths::read_task;
 use super::tool::FactoryTool;
 use crate::server::ContentBlock;
-use crate::tools::Tool;
-use crate::tools::TEST_ENV_LOCK;
+use crate::tools::{ScopedEnv, Tool, TEST_ENV_LOCK};
+use brehon_mux::PromptQueueEntry;
 use serde_json::Value;
-use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::{fs, os::unix::fs::PermissionsExt};
 use tempfile::TempDir;
-
-struct ScopedEnv {
-    saved: Vec<(&'static str, Option<OsString>)>,
-}
-
-impl ScopedEnv {
-    fn set(vars: &[(&'static str, &str)]) -> Self {
-        let mut saved = Vec::with_capacity(vars.len());
-        for (key, value) in vars {
-            saved.push((*key, std::env::var_os(key)));
-            std::env::set_var(key, value);
-        }
-        Self { saved }
-    }
-}
-
-impl Drop for ScopedEnv {
-    fn drop(&mut self) {
-        for (key, value) in self.saved.iter().rev() {
-            if let Some(value) = value {
-                std::env::set_var(key, value);
-            } else {
-                std::env::remove_var(key);
-            }
-        }
-    }
-}
 
 struct ScopedCurrentDir {
     saved: PathBuf,
@@ -1392,6 +1366,348 @@ async fn test_assign_workers_allows_live_changes_requested_same_worker() {
     assert_eq!(task["assignee"], "worker-1");
 }
 
+#[test]
+fn test_stage_task_assignment_propagation_clears_stale_same_worker_metadata() {
+    let mut task = serde_json::Map::new();
+    task.insert(
+        "task_id".into(),
+        Value::String("T-same-revision".to_string()),
+    );
+    task.insert(
+        "status".into(),
+        Value::String("changes_requested".to_string()),
+    );
+    task.insert("assignee".into(), Value::String("worker-1".to_string()));
+    task.insert(
+        "assignment_propagation".into(),
+        serde_json::json!({
+            "owner": "worker-1",
+            "assignment_kind": "task",
+            "assigned_at": "2026-05-24T01:00:00Z",
+            "prompt_id": "prompt-worker-1",
+            "delivery_method": "queued",
+            "acknowledged_at": "2026-05-24T01:00:05Z",
+            "acknowledged_by": "worker-1",
+            "acknowledged_via": "task action=mine",
+            "progress_started_at": "2026-05-24T01:00:10Z",
+            "progress_started_by": "worker-1",
+            "progress_started_via": "task action=progress"
+        }),
+    );
+
+    let propagation = super::tool::stage_task_assignment_propagation(&mut task, "worker-1", "task");
+
+    assert_eq!(task["assignment_propagation"]["owner"], "worker-1");
+    assert!(task["assignment_propagation"]["prompt_id"].is_null());
+    assert!(task["assignment_propagation"]["acknowledged_at"].is_null());
+    assert!(task["assignment_propagation"]["progress_started_at"].is_null());
+
+    let observability = crate::tools::assignment_observability::build_assignment_observability(
+        "worker-1",
+        "task",
+        "T-same-revision",
+        None,
+        None,
+        Some(&propagation),
+        false,
+    );
+    assert_eq!(observability["overall"], "assigned_without_delivery");
+}
+
+#[tokio::test]
+async fn test_merge_assignment_delivery_metadata_preserves_concurrent_ack_and_progress() {
+    let mut task = serde_json::Map::new();
+    task.insert(
+        "task_id".into(),
+        Value::String("T-concurrent-delivery".to_string()),
+    );
+    task.insert("status".into(), Value::String("assigned".to_string()));
+    task.insert("assignee".into(), Value::String("worker-1".to_string()));
+
+    let staged = super::tool::stage_task_assignment_propagation(&mut task, "worker-1", "task");
+    task.insert(
+        "assignment_propagation".into(),
+        serde_json::json!({
+            "owner": "worker-1",
+            "assignment_kind": "task",
+            "assigned_at": staged.assigned_at,
+            "prompt_id": null,
+            "delivery_method": null,
+            "acknowledged_at": "2026-05-24T01:00:05Z",
+            "acknowledged_by": "worker-1",
+            "acknowledged_via": "task action=mine",
+            "progress_started_at": "2026-05-24T01:00:10Z",
+            "progress_started_by": "worker-1",
+            "progress_started_via": "task action=progress"
+        }),
+    );
+
+    super::tool::merge_assignment_delivery_metadata(
+        &mut task,
+        "worker-1",
+        "prompt-worker-1",
+        "queued",
+        Some(&staged),
+    );
+
+    assert_eq!(
+        task["assignment_propagation"]["prompt_id"],
+        Value::String("prompt-worker-1".to_string())
+    );
+    assert_eq!(
+        task["assignment_propagation"]["delivery_method"],
+        Value::String("queued".to_string())
+    );
+    assert_eq!(
+        task["assignment_propagation"]["acknowledged_via"],
+        Value::String("task action=mine".to_string())
+    );
+    assert_eq!(
+        task["assignment_propagation"]["progress_started_via"],
+        Value::String("task action=progress".to_string())
+    );
+}
+
+#[test]
+fn test_persist_assignment_delivery_metadata_writes_prompt_id_before_dispatch() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let root = make_test_root();
+    let _env = ScopedEnv::set(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
+
+    let mut task = serde_json::Map::new();
+    task.insert(
+        "task_id".into(),
+        Value::String("T-persist-before-delivery".to_string()),
+    );
+    task.insert("status".into(), Value::String("assigned".to_string()));
+    task.insert("assignee".into(), Value::String("worker-1".to_string()));
+    let staged = super::tool::stage_task_assignment_propagation(&mut task, "worker-1", "task");
+    assert!(super::paths::write_task("T-persist-before-delivery", &task));
+
+    super::tool::persist_assignment_delivery_metadata(
+        "T-persist-before-delivery",
+        "worker-1",
+        "prompt-before-dispatch",
+        crate::tools::agent::PROMPT_QUEUE_DELIVERY_METHOD,
+        Some(&staged),
+    )
+    .expect("persist delivery metadata");
+
+    let stored = read_test_task(root.path(), "T-persist-before-delivery");
+    assert_eq!(
+        stored["assignment_propagation"]["prompt_id"],
+        Value::String("prompt-before-dispatch".to_string())
+    );
+    assert_eq!(
+        stored["assignment_propagation"]["delivery_method"],
+        Value::String(crate::tools::agent::PROMPT_QUEUE_DELIVERY_METHOD.to_string())
+    );
+}
+
+#[test]
+fn test_persist_assignment_delivery_metadata_rejects_stale_assignee() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let root = make_test_root();
+    let _env = ScopedEnv::set(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
+
+    let mut task = serde_json::Map::new();
+    task.insert(
+        "task_id".into(),
+        Value::String("T-stale-delivery-owner".to_string()),
+    );
+    task.insert("status".into(), Value::String("assigned".to_string()));
+    task.insert("assignee".into(), Value::String("worker-2".to_string()));
+    assert!(super::paths::write_task("T-stale-delivery-owner", &task));
+
+    let err = super::tool::persist_assignment_delivery_metadata(
+        "T-stale-delivery-owner",
+        "worker-1",
+        "prompt-stale-owner",
+        crate::tools::agent::PROMPT_QUEUE_DELIVERY_METHOD,
+        None,
+    )
+    .expect_err("stale assignee should fail");
+
+    assert!(
+        err.contains("task assignee changed to 'worker-2'"),
+        "unexpected error: {err}"
+    );
+    let stored = read_test_task(root.path(), "T-stale-delivery-owner");
+    assert!(stored.get("assignment_propagation").is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn test_persist_assignment_delivery_metadata_errors_when_task_write_fails() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let root = make_test_root();
+    let _env = ScopedEnv::set(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
+
+    let mut task = serde_json::Map::new();
+    task.insert(
+        "task_id".into(),
+        Value::String("T-delivery-write-failure".to_string()),
+    );
+    task.insert("status".into(), Value::String("assigned".to_string()));
+    task.insert("assignee".into(), Value::String("worker-1".to_string()));
+    let staged = super::tool::stage_task_assignment_propagation(&mut task, "worker-1", "task");
+    assert!(super::paths::write_task("T-delivery-write-failure", &task));
+
+    let tasks_dir = root.path().join("runtime").join("tasks");
+    let original_mode = fs::metadata(&tasks_dir).unwrap().permissions().mode();
+    fs::set_permissions(&tasks_dir, fs::Permissions::from_mode(0o555)).unwrap();
+
+    struct RestorePerms<'a> {
+        path: &'a std::path::Path,
+        mode: u32,
+    }
+    impl<'a> Drop for RestorePerms<'a> {
+        fn drop(&mut self) {
+            let _ = fs::set_permissions(self.path, fs::Permissions::from_mode(self.mode));
+        }
+    }
+    let _restore = RestorePerms {
+        path: &tasks_dir,
+        mode: original_mode,
+    };
+
+    let err = super::tool::persist_assignment_delivery_metadata(
+        "T-delivery-write-failure",
+        "worker-1",
+        "prompt-write-failure",
+        crate::tools::agent::PROMPT_QUEUE_DELIVERY_METHOD,
+        Some(&staged),
+    )
+    .expect_err("read-only tasks dir should fail");
+
+    assert_eq!(err, "write failed for task T-delivery-write-failure");
+    let stored = read_test_task(root.path(), "T-delivery-write-failure");
+    assert!(stored["assignment_propagation"]["prompt_id"].is_null());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_assign_workers_rewrites_propagation_when_delivery_fails() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let root = make_test_root();
+    let _env = ScopedEnv::set(&[
+        ("BREHON_ROOT", root.path().to_str().unwrap()),
+        ("BREHON_AGENT_ROLE", "supervisor"),
+        ("BREHON_SESSION_NAME", "test-session"),
+    ]);
+    crate::tools::agent::write_session_file(
+        "worker-1",
+        "worker",
+        "worker-1-session",
+        Some("opencode"),
+    );
+    write_test_task(root.path(), "T-delivery-fail", "pending", "task");
+
+    // Block enqueue by placing a file where the queue expects a directory.
+    let queue_dir = root.path().join("runtime").join("prompt-queue");
+    std::fs::create_dir_all(queue_dir.parent().unwrap()).unwrap();
+    std::fs::write(&queue_dir, b"").unwrap();
+
+    let tool = FactoryTool::new();
+    let result = tool
+        .execute(serde_json::json!({
+            "action": "assign_workers",
+            "task_id": "T-delivery-fail",
+            "worker": "worker-1"
+        }))
+        .await
+        .unwrap();
+
+    assert!(result.is_error.is_none(), "{}", extract_text(&result));
+    let payload: Value = serde_json::from_str(&extract_text(&result)).unwrap();
+    assert_eq!(payload["inbox_delivered"], false);
+
+    let task = read_test_task(root.path(), "T-delivery-fail");
+    assert_eq!(
+        task["assignment_propagation"]["delivery_method"],
+        "persisted_not_enqueued"
+    );
+}
+
+#[test]
+fn test_validate_assignment_delivery_entry_rejects_empty_prompt_id() {
+    let entry = PromptQueueEntry::new("worker-1", Some("supervisor"), "test").with_prompt_id("");
+    let result = super::tool::validate_assignment_delivery_entry(&entry, "T-123", "worker-1");
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert!(
+        err.contains("assigned_without_delivery"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn test_validate_assignment_delivery_entry_accepts_valid_prompt_id() {
+    let entry = PromptQueueEntry::new("worker-1", Some("supervisor"), "test")
+        .with_prompt_id("prompt-abc-123");
+    let result = super::tool::validate_assignment_delivery_entry(&entry, "T-123", "worker-1");
+    assert_eq!(result.unwrap(), "prompt-abc-123");
+}
+
+#[test]
+fn test_validate_assignment_delivery_entry_rejects_missing_prompt_id() {
+    let mut entry = PromptQueueEntry::new("worker-1", Some("supervisor"), "test");
+    entry.prompt_id = None;
+    let result = super::tool::validate_assignment_delivery_entry(&entry, "T-123", "worker-1");
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert!(
+        err.contains("assigned_without_delivery"),
+        "unexpected error: {err}"
+    );
+}
+
+#[tokio::test]
+async fn test_assign_workers_persists_prompt_id_before_delivery() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let root = make_test_root();
+    let _env = ScopedEnv::set(&[
+        ("BREHON_ROOT", root.path().to_str().unwrap()),
+        ("BREHON_AGENT_ROLE", "supervisor"),
+        ("BREHON_AGENT_NAME", "supervisor-1"),
+    ]);
+    write_test_task(root.path(), "T-persisted-prompt", "pending", "task");
+    crate::tools::agent::write_session_file(
+        "worker-1",
+        "worker",
+        "worker-1-session",
+        Some("opencode"),
+    );
+    let tool = FactoryTool::new();
+
+    let result = tool
+        .execute(serde_json::json!({
+            "action": "assign_workers",
+            "task_id": "T-persisted-prompt",
+            "worker": "worker-1"
+        }))
+        .await
+        .unwrap();
+
+    assert!(result.is_error.is_none(), "{}", extract_text(&result));
+    let payload: Value = serde_json::from_str(&extract_text(&result)).unwrap();
+    let prompt_id = payload["prompt_id"]
+        .as_str()
+        .expect("assign_workers should surface prompt_id");
+    assert_eq!(payload["inbox_delivered"], true);
+
+    let stored = read_test_task(root.path(), "T-persisted-prompt");
+    assert_eq!(stored["assignment_propagation"]["owner"], "worker-1");
+    assert_eq!(
+        stored["assignment_propagation"]["prompt_id"],
+        Value::String(prompt_id.to_string())
+    );
+    assert_eq!(
+        stored["assignment_propagation"]["delivery_method"],
+        Value::String(crate::tools::agent::PROMPT_QUEUE_DELIVERY_METHOD.to_string())
+    );
+}
+
 #[tokio::test]
 async fn test_assign_workers_reseeds_changes_requested_task_from_latest_commit() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -2167,6 +2483,56 @@ async fn test_set_ownership_requires_supervisor_and_rejects_terminal_tasks() {
         .unwrap();
     assert_eq!(supervisor_result.is_error, Some(true));
     assert!(extract_text(&supervisor_result).contains("is terminal"));
+}
+
+#[tokio::test]
+async fn test_set_ownership_replaces_stale_assignment_propagation() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let root = make_test_root();
+    let _env = ScopedEnv::set(&[
+        ("BREHON_ROOT", root.path().to_str().unwrap()),
+        ("BREHON_AGENT_ROLE", "supervisor"),
+    ]);
+    let tool = FactoryTool::new();
+    write_test_task_with_assignee(
+        root.path(),
+        "T-reassign",
+        "assigned",
+        "task",
+        Value::String("worker-1".to_string()),
+    );
+    let mut task = read_test_task(root.path(), "T-reassign");
+    task["assignment_propagation"] = serde_json::json!({
+        "owner": "worker-1",
+        "assignment_kind": "task",
+        "assigned_at": "2026-05-24T01:00:00Z",
+        "prompt_id": "prompt-worker-1",
+        "delivery_method": "queued",
+        "acknowledged_at": "2026-05-24T01:00:05Z",
+        "acknowledged_by": "worker-1",
+        "acknowledged_via": "task action=mine",
+        "progress_started_at": "2026-05-24T01:00:10Z",
+        "progress_started_by": "worker-1",
+        "progress_started_via": "task action=progress"
+    });
+    write_test_task_json(root.path(), "T-reassign", &task);
+
+    let result = tool
+        .execute(serde_json::json!({
+            "action": "set_ownership",
+            "task_id": "T-reassign",
+            "worker": "worker-2"
+        }))
+        .await
+        .unwrap();
+
+    assert!(result.is_error.is_none(), "{}", extract_text(&result));
+    let stored = read_test_task(root.path(), "T-reassign");
+    assert_eq!(stored["assignee"], "worker-2");
+    assert_eq!(stored["assignment_propagation"]["owner"], "worker-2");
+    assert!(stored["assignment_propagation"]["prompt_id"].is_null());
+    assert!(stored["assignment_propagation"]["acknowledged_at"].is_null());
+    assert!(stored["assignment_propagation"]["progress_started_at"].is_null());
 }
 
 #[tokio::test]

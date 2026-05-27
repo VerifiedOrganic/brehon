@@ -11,8 +11,8 @@
 use async_trait::async_trait;
 use brehon_mux::{PromptQueueEntry, SessionScopedQueue};
 use brehon_types::{
-    build_advisor_startup_prompt, build_worker_protocol, infer_task_completion_mode,
-    parse_task_completion_mode, WorkerBootstrapMode,
+    build_advisor_startup_prompt, build_worker_protocol, find_prompt_ack_in_dir,
+    infer_task_completion_mode, parse_task_completion_mode, WorkerBootstrapMode,
 };
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -28,13 +28,72 @@ use crate::tools::{error_result, text_result, Tool};
 ///
 /// `prompt_id` is always populated when `queued == true` and is the key
 /// callers use to poll `agent action=delivery_status` for downstream delivery
-/// state (`queued`, `injected`, `dead_lettered`, `drained_without_ack`). When
-/// enqueue itself fails, `prompt_id` is empty and the caller has nothing to poll.
+/// state (`queued`, `injected`, `dead_lettered`, `drained_without_ack`).
 #[derive(Debug, Clone)]
 pub struct DeliveryOutcome {
     pub queued: bool,
     pub method: String,
     pub prompt_id: String,
+}
+
+pub(crate) const PROMPT_QUEUE_DELIVERY_METHOD: &str = "queued";
+
+pub(crate) fn prepare_delivery_message(
+    target: &str,
+    from: &str,
+    message: &str,
+) -> PromptQueueEntry {
+    PromptQueueEntry::new(target, Some(from), message)
+}
+
+fn try_deliver_entry(
+    entry: PromptQueueEntry,
+    preserve_prompt_id_on_failure: bool,
+) -> DeliveryOutcome {
+    let prompt_id = entry.prompt_id.clone().unwrap_or_default();
+    let prompt_id_on_failure = if preserve_prompt_id_on_failure {
+        prompt_id.clone()
+    } else {
+        String::new()
+    };
+
+    let Some(root) = brehon_root() else {
+        return DeliveryOutcome {
+            queued: false,
+            method: "no BREHON_ROOT available".to_string(),
+            prompt_id: prompt_id_on_failure,
+        };
+    };
+
+    let session_name = resolved_runtime_session_name_for_prompt_queue(&root);
+    let prompt_queue = SessionScopedQueue::new(&session_name, prompt_queue_root(&root));
+    let target = entry.target.clone();
+    let from = entry.from.clone().unwrap_or_default();
+
+    match prompt_queue.enqueue(entry) {
+        Ok(_) => {
+            if let Err(err) =
+                write_prompt_enqueue_ack(&root, &prompt_id, &target, &from, &session_name)
+            {
+                tracing::warn!(
+                    prompt_id = %prompt_id,
+                    target = %target,
+                    error = %err,
+                    "failed to write prompt enqueue ack"
+                );
+            }
+            DeliveryOutcome {
+                queued: true,
+                method: PROMPT_QUEUE_DELIVERY_METHOD.to_string(),
+                prompt_id,
+            }
+        }
+        Err(e) => DeliveryOutcome {
+            queued: false,
+            method: format!("prompt-queue write failed: {e}"),
+            prompt_id: prompt_id_on_failure,
+        },
+    }
 }
 
 /// Deliver a message to a target agent via the prompt-queue gateway.
@@ -50,43 +109,11 @@ pub struct DeliveryOutcome {
 /// onto a delivery-ack file (`runtime/prompt-delivery-acks/<prompt_id>.json`)
 /// once it successfully injects the prompt into the target pane.
 pub fn try_deliver_message(target: &str, from: &str, message: &str) -> DeliveryOutcome {
-    let Some(root) = brehon_root() else {
-        return DeliveryOutcome {
-            queued: false,
-            method: "no BREHON_ROOT available".to_string(),
-            prompt_id: String::new(),
-        };
-    };
+    try_deliver_entry(prepare_delivery_message(target, from, message), false)
+}
 
-    let session_name = resolved_runtime_session_name_for_prompt_queue(&root);
-    let prompt_queue = SessionScopedQueue::new(&session_name, prompt_queue_root(&root));
-
-    let entry = PromptQueueEntry::new(target, Some(from), message);
-    let prompt_id = entry.prompt_id.clone().unwrap_or_default();
-    match prompt_queue.enqueue(entry) {
-        Ok(_) => {
-            if let Err(err) =
-                write_prompt_enqueue_ack(&root, &prompt_id, target, from, &session_name)
-            {
-                tracing::warn!(
-                    prompt_id = %prompt_id,
-                    target = %target,
-                    error = %err,
-                    "failed to write prompt enqueue ack"
-                );
-            }
-            DeliveryOutcome {
-                queued: true,
-                method: "queued".to_string(),
-                prompt_id,
-            }
-        }
-        Err(e) => DeliveryOutcome {
-            queued: false,
-            method: format!("prompt-queue write failed: {e}"),
-            prompt_id: String::new(),
-        },
-    }
+pub(crate) fn try_deliver_prepared_message(entry: PromptQueueEntry) -> DeliveryOutcome {
+    try_deliver_entry(entry, true)
 }
 
 pub(crate) const DEFAULT_SESSION_STALE_AFTER: Duration = Duration::from_secs(15 * 60);
@@ -346,8 +373,12 @@ pub(crate) fn prompt_queue_root(root: &Path) -> PathBuf {
     root.join("runtime").join("prompt-queue")
 }
 
-fn prompt_enqueue_ack_dir(root: &Path) -> PathBuf {
+pub(crate) fn prompt_enqueue_ack_dir(root: &Path) -> PathBuf {
     root.join("runtime").join("prompt-enqueue-acks")
+}
+
+pub(crate) fn prompt_delivery_ack_dir(root: &Path) -> PathBuf {
+    root.join("runtime").join("prompt-delivery-acks")
 }
 
 fn write_prompt_enqueue_ack(
@@ -1412,21 +1443,21 @@ impl Tool for AgentTool {
 /// from "the TUI injected and the worker went silent" from "the TUI failed
 /// and dead-lettered the prompt".
 #[derive(Debug, Default)]
-struct DeliveryStatus {
-    enqueued: bool,
-    enqueued_at: Option<String>,
-    queued: bool,
-    injected: bool,
-    injected_at: Option<String>,
-    injected_method: Option<String>,
-    target: Option<String>,
-    dead_lettered: bool,
-    dead_letter_reason: Option<String>,
-    overall: &'static str,
-    human_summary: String,
+pub(crate) struct DeliveryStatus {
+    pub(crate) enqueued: bool,
+    pub(crate) enqueued_at: Option<String>,
+    pub(crate) queued: bool,
+    pub(crate) injected: bool,
+    pub(crate) injected_at: Option<String>,
+    pub(crate) injected_method: Option<String>,
+    pub(crate) target: Option<String>,
+    pub(crate) dead_lettered: bool,
+    pub(crate) dead_letter_reason: Option<String>,
+    pub(crate) overall: &'static str,
+    pub(crate) human_summary: String,
 }
 
-fn resolve_delivery_status(prompt_id: &str) -> DeliveryStatus {
+pub(crate) fn resolve_delivery_status(prompt_id: &str) -> DeliveryStatus {
     let mut status = DeliveryStatus::default();
     let Some(root) = brehon_root() else {
         status.overall = "unknown_no_brehon_root";
@@ -1439,43 +1470,35 @@ fn resolve_delivery_status(prompt_id: &str) -> DeliveryStatus {
     //    prompt-queue write succeeds. If the queue file later disappears without
     //    an injection ack or dead-letter, this lets the supervisor distinguish
     //    "drained without ack" from "never enqueued".
-    let enqueue_path = prompt_enqueue_ack_dir(&root)
-        .join(format!("{}.json", sanitize_prompt_id_for_path(prompt_id)));
-    if let Ok(content) = std::fs::read_to_string(&enqueue_path) {
-        if let Ok(value) = serde_json::from_str::<Value>(&content) {
-            status.enqueued = true;
-            status.enqueued_at = value
-                .get("queued_at")
-                .and_then(|v| v.as_str())
-                .map(str::to_string);
-            status.target = value
-                .get("target")
-                .and_then(|v| v.as_str())
-                .map(str::to_string);
-        }
+    let enqueue_dir = prompt_enqueue_ack_dir(&root);
+    if let Some((_, value)) = find_prompt_ack_in_dir(&enqueue_dir, prompt_id) {
+        status.enqueued = true;
+        status.enqueued_at = value
+            .get("queued_at")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        status.target = value
+            .get("target")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
     }
 
     // 2. Injection ack — the TUI writes this after a successful pane inject.
-    let ack_path = root
-        .join("runtime")
-        .join("prompt-delivery-acks")
-        .join(format!("{}.json", sanitize_prompt_id_for_path(prompt_id)));
-    if let Ok(content) = std::fs::read_to_string(&ack_path) {
-        if let Ok(value) = serde_json::from_str::<Value>(&content) {
-            status.injected = true;
-            status.injected_at = value
-                .get("injected_at")
-                .and_then(|v| v.as_str())
-                .map(str::to_string);
-            status.injected_method = value
-                .get("method")
-                .and_then(|v| v.as_str())
-                .map(str::to_string);
-            status.target = value
-                .get("target")
-                .and_then(|v| v.as_str())
-                .map(str::to_string);
-        }
+    let delivery_acks_dir = root.join("runtime").join("prompt-delivery-acks");
+    if let Some((_, value)) = find_prompt_ack_in_dir(&delivery_acks_dir, prompt_id) {
+        status.injected = true;
+        status.injected_at = value
+            .get("injected_at")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        status.injected_method = value
+            .get("method")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        status.target = value
+            .get("target")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
     }
 
     // 3. Queue presence — if the prompt file still exists in the prompt-queue,
@@ -1596,9 +1619,11 @@ fn prompt_file_matches_id(path: &std::path::Path, prompt_id: &str) -> bool {
         == Some(prompt_id)
 }
 
-fn sanitize_prompt_id_for_path(prompt_id: &str) -> String {
+pub(crate) fn sanitize_prompt_id_for_path(prompt_id: &str) -> String {
     // Mirrors `sanitize_runtime_key` in the TUI helpers — same character set
-    // so the MCP can reconstruct the ack filename the TUI writes.
+    // for writing ack filenames in a format consistent with the TUI.
+    // The read path uses `find_prompt_ack_in_dir` for content-based matching,
+    // so this sanitizer is only needed for the write path.
     let mut out = String::with_capacity(prompt_id.len());
     for ch in prompt_id.chars() {
         if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
@@ -2232,5 +2257,97 @@ mod tests {
         let args = serde_json::json!({ "action": "bogus" });
         let result = tool.execute(args).await.unwrap();
         assert_eq!(result.is_error, Some(true));
+    }
+
+    #[test]
+    fn test_resolve_delivery_status_ignores_malformed_ack_files() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        let _env = ScopedEnv::set(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
+        write_current_session(root.path(), "brehon-malformed-test");
+
+        let outcome = try_deliver_message("supervisor", "worker-1", "hello");
+        assert!(outcome.queued);
+
+        // Overwrite the enqueue ack with malformed JSON
+        let enqueue_dir = prompt_enqueue_ack_dir(root.path());
+        for entry in std::fs::read_dir(&enqueue_dir).unwrap().flatten() {
+            std::fs::write(entry.path(), "not json").unwrap();
+        }
+
+        let status = resolve_delivery_status(&outcome.prompt_id);
+        assert!(
+            !status.enqueued,
+            "malformed ack should not be treated as enqueued"
+        );
+        assert!(status.queued, "prompt should still be in queue");
+    }
+
+    #[test]
+    fn test_resolve_delivery_status_distinguishes_colliding_filenames() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        let _env = ScopedEnv::set(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
+        write_current_session(root.path(), "brehon-collision-test");
+
+        // Manually create two ack files whose sanitized filenames collide:
+        // both "prompt!abc" and "prompt@abc" sanitize to "prompt_abc.json"
+        let enqueue_dir = prompt_enqueue_ack_dir(root.path());
+        std::fs::create_dir_all(&enqueue_dir).unwrap();
+        std::fs::write(
+            enqueue_dir.join("prompt_abc.json"),
+            serde_json::json!({
+                "prompt_id": "prompt!abc",
+                "target": "worker-1",
+                "queued_at": "2026-01-01T00:00:00Z"
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let status = resolve_delivery_status("prompt@abc");
+        assert!(
+            !status.enqueued,
+            "ack for prompt!abc should not count as enqueued for prompt@abc"
+        );
+
+        let status_match = resolve_delivery_status("prompt!abc");
+        assert!(
+            status_match.enqueued,
+            "ack for prompt!abc should count as enqueued for prompt!abc"
+        );
+        assert_eq!(status_match.target.as_deref(), Some("worker-1"));
+    }
+
+    #[test]
+    fn test_find_prompt_ack_in_dir_edge_cases() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("acks");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Empty dir → None
+        assert_eq!(find_prompt_ack_in_dir(&dir, "p1"), None);
+
+        // Dir with only non-JSON files → None
+        std::fs::write(dir.join("foo.txt"), "not json").unwrap();
+        assert_eq!(find_prompt_ack_in_dir(&dir, "p1"), None);
+
+        // Dir with unrelated JSON files → None
+        std::fs::write(
+            dir.join("bar.json"),
+            serde_json::json!({ "prompt_id": "p2" }).to_string(),
+        )
+        .unwrap();
+        assert_eq!(find_prompt_ack_in_dir(&dir, "p1"), None);
+
+        // Dir with matching file → Some(path, value)
+        std::fs::write(
+            dir.join("baz.json"),
+            serde_json::json!({ "prompt_id": "p1", "extra": 42 }).to_string(),
+        )
+        .unwrap();
+        let (path, value) = find_prompt_ack_in_dir(&dir, "p1").expect("should find matching ack");
+        assert_eq!(path.file_name().unwrap().to_str().unwrap(), "baz.json");
+        assert_eq!(value.get("prompt_id").and_then(|v| v.as_str()), Some("p1"));
     }
 }

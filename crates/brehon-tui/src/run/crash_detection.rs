@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use brehon_mux::{ActivityEntry, ActivityKind, Mux, PaneKind, SupervisorCli};
+use brehon_mux::{ActivityEntry, ActivityKind, Mux, PaneKind};
 
 use super::recovery::push_dashboard_event;
 use super::types::*;
@@ -61,6 +61,7 @@ pub(crate) fn perform_manual_pane_reset(
     dashboard_data: &Arc<std::sync::Mutex<DashboardData>>,
     last_activity: &mut HashMap<String, Instant>,
     pending_self_improve_prompt: &mut HashMap<String, Instant>,
+    host_owned: bool,
 ) -> bool {
     let Some(pane) = mux.get(pane_id) else {
         return false;
@@ -154,7 +155,7 @@ pub(crate) fn perform_manual_pane_reset(
         PaneKind::Supervisor => {
             let startup_prompt = if super::helpers::pane_needs_post_spawn_prompt(mux, pane_id) {
                 let Some(startup_prompt) =
-                    super::build_supervisor_reset_startup_prompt(mux, pane_id)
+                    super::build_supervisor_reset_startup_prompt(mux, pane_id, host_owned)
                 else {
                     return false;
                 };
@@ -210,10 +211,7 @@ pub(crate) fn is_worker_context_reset_candidate(
     let Some(message) = entry.message.as_deref() else {
         return false;
     };
-    if !message.starts_with("Codex error: ")
-        || !(is_context_length_error_message(message)
-            || is_stream_disconnect_error_message(message))
-    {
+    if !(is_context_length_error_message(message) || is_stream_disconnect_error_message(message)) {
         return false;
     }
     let Some(pane) = mux.get(pane_id) else {
@@ -221,5 +219,5 @@ pub(crate) fn is_worker_context_reset_candidate(
     };
     pane.kind() == &PaneKind::Worker
         && pane.is_gateway_backed()
-        && pane.cli_type().as_builtin() == Some(SupervisorCli::Codex)
+        && pane.cli_type().needs_post_spawn_prompt()
 }

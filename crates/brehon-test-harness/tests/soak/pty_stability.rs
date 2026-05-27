@@ -10,11 +10,11 @@ mod unix_tests {
     use brehon_pty::{Pty, PtyConfig};
     use std::time::Duration;
 
-    const CYCLES: usize = 50;
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn soak_pty_spawn_kill_cycles_no_leak() {
-        for cycle in 0..CYCLES {
+        let cycles = crate::soak_cycles_locked(50);
+
+        for cycle in 0..cycles {
             let config = PtyConfig {
                 command: "sh".to_string(),
                 args: vec!["-c".to_string(), "sleep 0.1".to_string()],
@@ -39,7 +39,9 @@ mod unix_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn soak_pty_drop_cycles_no_leak() {
-        for cycle in 0..CYCLES {
+        let cycles = crate::soak_cycles_locked(50);
+
+        for cycle in 0..cycles {
             let config = PtyConfig {
                 command: "sh".to_string(),
                 args: vec!["-c".to_string(), "echo hello".to_string()],
@@ -61,7 +63,9 @@ mod unix_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn soak_pty_write_and_kill_cycles() {
-        for cycle in 0..CYCLES {
+        let cycles = crate::soak_cycles_locked(50);
+
+        for cycle in 0..cycles {
             let config = PtyConfig {
                 command: "sh".to_string(),
                 args: vec!["-c".to_string(), "read line; echo $line".to_string()],
@@ -84,7 +88,9 @@ mod unix_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn soak_pty_resize_during_lifecycle() {
-        for cycle in 0..CYCLES {
+        let cycles = crate::soak_cycles_locked(50);
+
+        for cycle in 0..cycles {
             let config = PtyConfig {
                 command: "sh".to_string(),
                 args: vec!["-c".to_string(), "sleep 0.05".to_string()],

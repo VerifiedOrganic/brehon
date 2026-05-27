@@ -11,7 +11,17 @@ use std::path::Path;
 use std::process::Command;
 
 fn run_git(workspace: &Path, args: &[&str]) -> String {
-    let output = Command::new("git")
+    let mut command = Command::new("git");
+    match args.first().copied() {
+        Some("commit" | "merge") => {
+            command.args(["-c", "commit.gpgsign=false"]);
+        }
+        Some("tag") => {
+            command.args(["-c", "tag.gpgsign=false"]);
+        }
+        _ => {}
+    }
+    let output = command
         .args(args)
         .current_dir(workspace)
         .output()

@@ -18,8 +18,8 @@ const KNOWN_AGENTS: &[(&str, &str, &str)] = &[
 ];
 
 const AGY_PROJECT_MCP_CONFIG_PATH: &str = ".agents/mcp_config.json";
-const INIT_GITIGNORE_PATTERNS: &[&str] =
-    &[".brehon/", ".agents/mcp_config.json", ".antigravitycli"];
+const BREHON_INIT_EXTRA_GITIGNORE_PATTERNS: &[&str] =
+    &[".agents/mcp_config.json", ".antigravitycli"];
 
 /// Agent info for config generation.
 struct DetectedAgent {
@@ -918,10 +918,7 @@ fn generate_config_for_agents(agents: &[DetectedAgent]) -> String {
 }
 
 fn gitignore_pattern_present(lines: &[&str], pattern: &str) -> bool {
-    lines.iter().any(|line| {
-        let trimmed = line.trim();
-        trimmed == pattern || (pattern == ".brehon/" && trimmed == ".brehon")
-    })
+    lines.iter().any(|line| line.trim() == pattern)
 }
 
 /// Update .gitignore to include Brehon and machine-local agent files.
@@ -932,28 +929,37 @@ fn update_gitignore(project_path: &Path) -> Result<bool> {
     } else {
         String::new()
     };
-    let lines = content.lines().collect::<Vec<_>>();
-    let missing = INIT_GITIGNORE_PATTERNS
+    let (mut new_content, removed_legacy) = brehon_git::remove_legacy_brehon_dir_ignores(&content);
+    let lines = new_content.lines().collect::<Vec<_>>();
+    let missing = brehon_git::WORKTREE_AWARE_BREHON_IGNORE_PATTERNS
         .iter()
+        .chain(BREHON_INIT_EXTRA_GITIGNORE_PATTERNS.iter())
         .filter(|pattern| !gitignore_pattern_present(&lines, pattern))
         .copied()
         .collect::<Vec<_>>();
 
-    if missing.is_empty() {
+    if missing.is_empty() && !removed_legacy {
         return Ok(false);
     }
 
-    let mut new_content = content;
-    if !new_content.is_empty() && !new_content.ends_with('\n') {
-        new_content.push('\n');
-    }
-    if !new_content.is_empty() {
-        new_content.push('\n');
-    }
-    new_content.push_str("# Brehon orchestration data\n");
-    for pattern in missing {
-        new_content.push_str(pattern);
-        new_content.push('\n');
+    if !missing.is_empty() {
+        let header_present = new_content
+            .lines()
+            .any(|l| l.trim() == "# Brehon orchestration data");
+
+        if !new_content.is_empty() && !new_content.ends_with('\n') {
+            new_content.push('\n');
+        }
+        if !header_present {
+            if !new_content.is_empty() {
+                new_content.push('\n');
+            }
+            new_content.push_str("# Brehon orchestration data\n");
+        }
+        for pattern in missing {
+            new_content.push_str(pattern);
+            new_content.push('\n');
+        }
     }
     std::fs::write(&gitignore_path, new_content)?;
 
@@ -1503,13 +1509,68 @@ mod tests {
         assert!(update_gitignore(temp.path()).expect("update gitignore"));
         let gitignore =
             std::fs::read_to_string(temp.path().join(".gitignore")).expect("read gitignore");
+        let lines = gitignore
+            .lines()
+            .map(str::trim)
+            .collect::<std::collections::HashSet<_>>();
 
         assert!(gitignore.contains("target/"));
-        assert_eq!(gitignore.matches(".brehon").count(), 1, "{gitignore}");
-        assert!(gitignore.contains(".agents/mcp_config.json"));
-        assert!(gitignore.contains(".antigravitycli"));
+        assert!(!lines.contains(".brehon"), "{gitignore}");
+        assert!(!lines.contains(".brehon/"), "{gitignore}");
+        for pattern in brehon_git::WORKTREE_AWARE_BREHON_IGNORE_PATTERNS {
+            assert!(lines.contains(*pattern), "{pattern} missing: {gitignore}");
+        }
+        for pattern in BREHON_INIT_EXTRA_GITIGNORE_PATTERNS {
+            assert!(lines.contains(*pattern), "{pattern} missing: {gitignore}");
+        }
 
         assert!(!update_gitignore(temp.path()).expect("second update"));
+    }
+
+    #[test]
+    fn init_gitignore_no_duplicate_header_when_partially_present() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        // Pre-populate with one worktree-aware pattern and the header already present.
+        std::fs::write(
+            temp.path().join(".gitignore"),
+            "target/\n# Brehon orchestration data\n!/.brehon/\n",
+        )
+        .expect("write gitignore");
+
+        assert!(update_gitignore(temp.path()).expect("update gitignore"));
+        let gitignore =
+            std::fs::read_to_string(temp.path().join(".gitignore")).expect("read gitignore");
+
+        let header_count = gitignore
+            .lines()
+            .filter(|l| l.trim() == "# Brehon orchestration data")
+            .count();
+        assert_eq!(header_count, 1, "duplicate header found:\n{gitignore}");
+
+        // Patterns should land contiguously under the existing header — no blank
+        // line gap between the already-present `!/.brehon/` and newly appended lines.
+        let all_lines: Vec<_> = gitignore.lines().collect();
+        let header_idx = all_lines
+            .iter()
+            .position(|l| l.trim() == "# Brehon orchestration data")
+            .expect("header exists");
+        let brehon_block = &all_lines[header_idx..];
+        let blank_inside_block = brehon_block
+            .windows(2)
+            .any(|w| w[0].trim().starts_with("!/.brehon/") && w[1].trim().is_empty());
+        assert!(
+            !blank_inside_block,
+            "blank line inside Brehon block:\n{gitignore}"
+        );
+
+        // All patterns should now be present.
+        let lines: std::collections::HashSet<_> = gitignore.lines().map(str::trim).collect();
+        for pattern in brehon_git::WORKTREE_AWARE_BREHON_IGNORE_PATTERNS {
+            assert!(lines.contains(*pattern), "{pattern} missing: {gitignore}");
+        }
+        for pattern in BREHON_INIT_EXTRA_GITIGNORE_PATTERNS {
+            assert!(lines.contains(*pattern), "{pattern} missing: {gitignore}");
+        }
     }
 
     #[test]

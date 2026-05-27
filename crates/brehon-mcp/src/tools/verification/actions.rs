@@ -11,6 +11,11 @@ use brehon_types::{is_terminal_task_status, normalize_task_status, EventKind, Ta
 
 use crate::error::McpError;
 use crate::server::ToolResult;
+use crate::tools::agent::try_deliver_message;
+use crate::tools::assignment_observability::{
+    acknowledge_propagation, build_assignment_observability, mark_progress_started,
+    AssignmentPropagation,
+};
 use crate::tools::{error_result, text_result};
 
 use super::commits::{preview_commit_integration_conflicts, resolve_review_commit_set};
@@ -31,11 +36,12 @@ use super::scoring::{
 };
 use super::state::{
     acquire_review_lock, current_review_cycle_round, current_review_epoch_round,
-    delete_review_state, find_review_request_by_id, highest_round_on_disk,
+    delete_consolidated, delete_review_state, find_review_request_by_id, highest_round_on_disk,
     next_review_round_would_exceed_total_limit, read_review_state, read_round_request,
-    read_round_submissions, review_cycle_round, review_epoch_round, total_review_round_limit,
-    total_review_rounds_exhausted, write_review_state, write_round_request, write_submission,
-    ReviewRequestFile, ReviewState, StoredFinding, StoredSubmission,
+    read_round_submissions, review_cycle_round, review_epoch_round, rollback_review_submission,
+    total_review_round_limit, total_review_rounds_exhausted, write_review_state,
+    write_round_request, write_submission, ReviewRequestFile, ReviewState, StoredFinding,
+    StoredSubmission,
 };
 use super::tasks::{
     detect_default_branch, merge_target_requires_epic_integration, read_task, read_task_assignee,
@@ -45,8 +51,8 @@ use super::tool::{RejectionReason, VerificationTool};
 
 use crate::tools::task_actions::{
     append_task_review_followups, clear_task_supervisor_integration_conflict,
-    mark_task_supervisor_integration_conflict, release_task_worker_to_review,
-    restore_task_worker_from_review_owner, set_task_review_feedback,
+    dirty_primary_checkout_terminal_blocker, mark_task_supervisor_integration_conflict,
+    release_task_worker_to_review, restore_task_worker_from_review_owner, set_task_review_feedback,
     task_has_integration_conflict_recovery_marker, update_task_status_atomic,
 };
 
@@ -923,6 +929,7 @@ impl VerificationTool {
             panel_mode: self.panel_mode_str().to_string(),
             panel: panel.clone(),
             submissions_received: Vec::new(),
+            reviewer_assignments: std::collections::BTreeMap::new(),
             created_at: now.clone(),
             updated_at: now.clone(),
         };
@@ -1000,32 +1007,6 @@ impl VerificationTool {
             &reviewed_commit_set,
             resolved_empty_commit_set,
         );
-        let req = ReviewRequestFile {
-            task_id: task_id.to_string(),
-            review_id: review_id.clone(),
-            requested_by: requested_by.clone(),
-            requested_at: chrono::Utc::now().to_rfc3339(),
-            title: title.to_string(),
-            description: description.to_string(),
-            commit: commit.clone(),
-            base_commit: reviewed_commit_set.base_commit,
-            merge_target_head: reviewed_commit_set.merge_target_head,
-            commits: reviewed_commit_set.commits,
-            resolved_empty_commit_set,
-            review_fingerprint: review_fingerprint.clone(),
-            context: context.clone(),
-        };
-        if let Err(err) = write_round_request(task_id, round, &req) {
-            return Ok(error_result(format!(
-                "Failed to persist review request metadata for task {task_id}: {err}"
-            )));
-        }
-
-        if let Err(err) = self.emit_review_requested(&task, task_id, &review_id).await {
-            return Ok(error_result(format!(
-                "Failed to persist review request for task {task_id}: {err}"
-            )));
-        }
 
         // Resolve fields the reviewer needs but the task-state lookup paths
         // above did not load. These are stable across the panel loop.
@@ -1088,7 +1069,8 @@ impl VerificationTool {
             String::new()
         };
 
-        // Send review prompt to each panel reviewer -- personalized with their name
+        let mut rendered_review_prompts = Vec::new();
+        let mut reviewer_prompt_map = std::collections::BTreeMap::new();
         for reviewer in &panel {
             let review_prompt = build_review_request_prompt(&ReviewRequestPromptInput {
                 review_id: &review_id,
@@ -1107,7 +1089,59 @@ impl VerificationTool {
                 proof_summary: proof_summary.as_ref(),
                 research_context: Some(&research_context),
             });
-            notify_agent(reviewer, &requested_by, &review_prompt);
+            reviewer_prompt_map.insert(reviewer.clone(), review_prompt.clone());
+            rendered_review_prompts.push((reviewer.clone(), review_prompt));
+        }
+
+        let req = ReviewRequestFile {
+            task_id: task_id.to_string(),
+            review_id: review_id.clone(),
+            requested_by: requested_by.clone(),
+            requested_at: chrono::Utc::now().to_rfc3339(),
+            title: title.to_string(),
+            description: description.to_string(),
+            commit: commit.clone(),
+            base_commit: reviewed_commit_set.base_commit,
+            merge_target_head: reviewed_commit_set.merge_target_head,
+            commits: reviewed_commit_set.commits,
+            resolved_empty_commit_set,
+            review_fingerprint: review_fingerprint.clone(),
+            reviewer_prompts: reviewer_prompt_map,
+            context: context.clone(),
+        };
+        if let Err(err) = write_round_request(task_id, round, &req) {
+            return Ok(error_result(format!(
+                "Failed to persist review request metadata for task {task_id}: {err}"
+            )));
+        }
+
+        if let Err(err) = self.emit_review_requested(&task, task_id, &review_id).await {
+            return Ok(error_result(format!(
+                "Failed to persist review request for task {task_id}: {err}"
+            )));
+        }
+
+        let mut reviewer_assignments = std::collections::BTreeMap::new();
+        // Send review prompt to each panel reviewer -- personalized with their name
+        for (reviewer, review_prompt) in rendered_review_prompts {
+            let delivery = try_deliver_message(&reviewer, &requested_by, &review_prompt);
+            reviewer_assignments.insert(
+                reviewer.clone(),
+                AssignmentPropagation::new(
+                    &reviewer,
+                    "review",
+                    (!delivery.prompt_id.trim().is_empty()).then(|| delivery.prompt_id.clone()),
+                    Some(delivery.method.clone()),
+                ),
+            );
+        }
+        if let Some(mut refreshed_state) = read_review_state(task_id) {
+            refreshed_state.reviewer_assignments = reviewer_assignments;
+            if let Err(err) = write_review_state(task_id, &refreshed_state) {
+                return Ok(error_result(format!(
+                    "Failed to persist reviewer assignment propagation for task {task_id}: {err}"
+                )));
+            }
         }
 
         let mut result = serde_json::json!({
@@ -1306,6 +1340,21 @@ impl VerificationTool {
             )));
         }
 
+        // Preflight: if this would be the final submission and the verdict is
+        // approved, check dirty root before persisting so the reviewer can
+        // retry after cleanup.
+        let would_complete_panel = state
+            .panel
+            .iter()
+            .all(|r| state.submissions_received.contains(r) || r == &reviewer);
+        if would_complete_panel && verdict_str_arg == "approved" {
+            if let Some(err) =
+                dirty_primary_checkout_terminal_blocker(&format!("approve task {task_id}"))
+            {
+                return Ok(error_result(err));
+            }
+        }
+
         if let Some(reason) = unsupported_negative_review_reason(
             &self.config.policy,
             score_val,
@@ -1335,6 +1384,23 @@ impl VerificationTool {
         }
 
         // Update state
+        let mut propagation = state
+            .reviewer_assignments
+            .remove(&reviewer)
+            .unwrap_or_else(|| AssignmentPropagation::new(&reviewer, "review", None, None));
+        acknowledge_propagation(
+            &mut propagation,
+            &reviewer,
+            "verification action=submit_review",
+        );
+        mark_progress_started(
+            &mut propagation,
+            &reviewer,
+            "verification action=submit_review",
+        );
+        state
+            .reviewer_assignments
+            .insert(reviewer.clone(), propagation);
         state.submissions_received.push(reviewer.clone());
         state.updated_at = chrono::Utc::now().to_rfc3339();
         if let Err(err) = write_review_state(&task_id, &state) {
@@ -1343,16 +1409,28 @@ impl VerificationTool {
             )));
         }
 
-        // Emit ReviewScoreReceived
-        self.emit_event(
-            EventKind::ReviewScoreReceived {
-                review_id: review_id.clone(),
-                reviewer_id: reviewer.clone(),
-                score: score_val,
-            },
-            &review_id,
-        )
-        .await;
+        // Second dirty-root check immediately after persistence: if the repo
+        // became dirty between the preflight and now, roll back so the reviewer
+        // can retry after cleanup.
+        if would_complete_panel && verdict_str_arg == "approved" {
+            if let Some(err) =
+                dirty_primary_checkout_terminal_blocker(&format!("approve task {task_id}"))
+            {
+                let rollback_warn = match rollback_review_submission(
+                    &task_id,
+                    state.current_round,
+                    &reviewer,
+                    &mut state,
+                ) {
+                    Ok(()) => String::new(),
+                    Err(rb_err) => {
+                        tracing::error!(%rb_err, "Rollback after post-persist dirty-root check failed");
+                        format!(" (WARNING: rollback did not complete cleanly: {rb_err})")
+                    }
+                };
+                return Ok(error_result(format!("{err}{rollback_warn}")));
+            }
+        }
 
         // Check if panel is complete
         let all_submitted = state
@@ -1375,6 +1453,17 @@ impl VerificationTool {
             );
 
         if !all_submitted && !completed_early {
+            // Emit ReviewScoreReceived for incomplete panels before returning.
+            self.emit_event(
+                EventKind::ReviewScoreReceived {
+                    review_id: review_id.clone(),
+                    reviewer_id: reviewer.clone(),
+                    score: score_val,
+                },
+                &review_id,
+            )
+            .await;
+
             let progress = format!("{}/{}", state.submissions_received.len(), state.panel.len());
             let result = serde_json::json!({
                 "status": "ok",
@@ -1412,14 +1501,6 @@ impl VerificationTool {
             )));
         }
 
-        // Best-effort: record consolidated review evidence into the durable
-        // proof bundle. Failure surfaces as `proof_status`/`proof_warning`
-        // on the response but never blocks consolidation.
-        let proof_outcome = self
-            .proof_recorder
-            .record_consolidation(&task_id, &review_id, &report, &submissions)
-            .await;
-
         // Update task status BEFORE updating review state
         let status_to_set =
             if report.outcome == "escalated" && total_review_rounds_exhausted(&state) {
@@ -1428,10 +1509,51 @@ impl VerificationTool {
                 task_status_for_review_outcome(&report.outcome).unwrap_or("changes_requested")
             };
         if let Err(err) = update_task_status_atomic(&task_id, status_to_set).await {
+            // Roll back the submission so the reviewer can retry after cleanup.
+            // This prevents the round from getting stuck when the dirty-root
+            // check fails after the submission has already been persisted.
+            let rollback_warn = match rollback_review_submission(
+                &task_id,
+                state.current_round,
+                &reviewer,
+                &mut state,
+            ) {
+                Ok(()) => String::new(),
+                Err(rb_err) => {
+                    tracing::error!(%rb_err, "Rollback after update_task_status_atomic failure failed");
+                    format!(" (WARNING: rollback did not complete cleanly: {rb_err})")
+                }
+            };
+            // Best-effort: remove the consolidated report written above so retry
+            // does not leave a stale artifact on disk.
+            if let Err(del_err) = delete_consolidated(&task_id, state.current_round) {
+                tracing::warn!(%del_err, "Failed to clean up consolidated report after rollback");
+            }
             return Ok(error_result(format!(
-                "Failed to update task {task_id} status to {status_to_set}: {err}"
+                "Failed to update task {task_id} status to {status_to_set}: {err}{rollback_warn}"
             )));
         }
+
+        // Emit ReviewScoreReceived only after the submission can no longer be
+        // rolled back, preventing duplicate events in the event log on retry.
+        self.emit_event(
+            EventKind::ReviewScoreReceived {
+                review_id: review_id.clone(),
+                reviewer_id: reviewer.clone(),
+                score: score_val,
+            },
+            &review_id,
+        )
+        .await;
+
+        // Best-effort: record consolidated review evidence into the durable
+        // proof bundle. Moved after update_task_status_atomic so retry cannot
+        // duplicate proof entries when a rollback occurs.
+        let proof_outcome = self
+            .proof_recorder
+            .record_consolidation(&task_id, &review_id, &report, &submissions)
+            .await;
+
         let task_feedback = Some(build_task_review_feedback(&state, &report));
         if let Err(err) = set_task_review_feedback(&task_id, task_feedback).await {
             return Ok(error_result(format!(
@@ -1677,6 +1799,32 @@ impl VerificationTool {
                     "pending": pending,
                     "progress": format!("{}/{}", state.submissions_received.len(), state.panel.len())
                 });
+                let reviewer_assignments: Vec<Value> = state
+                    .panel
+                    .iter()
+                    .map(|reviewer| {
+                        let propagation = state.reviewer_assignments.get(reviewer);
+                        let progress_started = propagation
+                            .and_then(|propagation| propagation.progress_started_at.as_deref())
+                            .is_some();
+                        let mut value = serde_json::json!({
+                            "reviewer": reviewer,
+                            "assignment_observability": build_assignment_observability(
+                                reviewer,
+                                "review",
+                                &resolved_task_id,
+                                Some(state.current_review_id.as_str()),
+                                Some(state.current_round),
+                                propagation,
+                                progress_started,
+                            )
+                        });
+                        value["submitted"] =
+                            Value::Bool(state.submissions_received.contains(reviewer));
+                        value
+                    })
+                    .collect();
+                result["reviewer_assignments"] = Value::Array(reviewer_assignments);
                 if let Some(task_status) = task_status.as_deref() {
                     result["task_status"] = serde_json::json!(task_status);
                 }

@@ -101,6 +101,7 @@ fn test_config() -> BrehonConfig {
             self_improve_tasks: Vec::new(),
             spawn_workers: None,
             drain_timeout_secs: None,
+            worktree_root: None,
         },
         runtime: RuntimeConfig::default(),
         budget: BudgetConfig {

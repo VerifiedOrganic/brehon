@@ -1098,6 +1098,7 @@ pub(crate) async fn extract_document_with_supervisor(
                 stack: chunked.stack,
                 target: chunked.target,
                 path: plan_path.to_path_buf(),
+                already_landed_commit: None,
                 phases,
             },
             plan_path,

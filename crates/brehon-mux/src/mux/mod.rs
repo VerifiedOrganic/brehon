@@ -31,6 +31,7 @@ mod types;
 
 pub use command::{MuxRuntimeCommandPort, MuxRuntimeCommandReceiver};
 pub use config::{AgentPaneMaterialization, MuxConfig};
+pub use stability::suppress_pending_agent_health_marker_writes;
 pub use types::{
     AsyncGatewayPromptDeliveryError, AsyncGatewayPromptDispatch, MuxEvent, PaneBackendOwnership,
     PromptDeliveryAttempt, PromptQueuePosition, QuarantineOutcome,

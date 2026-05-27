@@ -1499,13 +1499,14 @@ impl Mux {
                     state_change =
                         Self::runtime_state_change(previous, pane.pane_state(), "prompt delivered");
                 }
-                if let Some((previous, current, reason)) = state_change {
+                if let Some((previous, current, reason, blocked)) = state_change {
                     self.publish_runtime_pane_state_changed(
                         pane_id,
                         generation,
                         previous,
                         current,
                         Some(reason),
+                        blocked,
                     );
                 }
                 tracing::info!(
@@ -1521,7 +1522,12 @@ impl Mux {
             Err(err) => {
                 let err_text = err.to_string();
                 if Self::is_busy_gateway_delivery_error(&err_text) {
-                    self.mark_gateway_delivery_busy(pane_id, prompt_id.clone(), generation);
+                    self.mark_gateway_delivery_busy(
+                        pane_id,
+                        prompt_id.clone(),
+                        generation,
+                        Instant::now(),
+                    );
                     return Ok(PromptDeliveryAttempt::Queued {
                         prompt_id,
                         ahead_of: self.pane_prompt_backlog_with_live_turn(pane_id),
@@ -1727,8 +1733,7 @@ impl Mux {
                     brehon_ports::AgentGateway::kill_session(gateway, &session_id).await
             {
                 let err_text = err.to_string();
-                let lower = err_text.to_ascii_lowercase();
-                if !(lower.contains("not found") || lower.contains("unknown session")) {
+                if !Self::is_missing_gateway_session_error(&err_text) {
                     tracing::warn!(
                         pane = %pane_id,
                         session = %session_id,

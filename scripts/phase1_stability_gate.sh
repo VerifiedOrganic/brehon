@@ -39,10 +39,10 @@ esac
 checks=(
   "permission requests wait for explicit decisions|cargo test -p brehon-acp session::tests::test_permission_request_waits_for_explicit_decision -- --exact --nocapture"
   "permission timeout policy is enforced when unresolved|cargo test -p brehon-acp session::tests::test_permission_request_uses_timeout_policy_when_unresolved -- --exact --nocapture"
-  "timed-out ACP waits clean pending request/prompt maps|cargo test -p brehon-acp session::tests::test_wait_for_response_timeout_cleans_up_pending_maps -- --exact --nocapture"
-  "ACP kill wakes outstanding waiters to avoid orphaned requests|cargo test -p brehon-acp session::tests::test_kill_wakes_outstanding_prompt_and_request_waiters -- --exact --nocapture"
-  "ACP kill awaits reader ownership shutdown|cargo test -p brehon-acp session::tests::test_kill_awaits_reader_task -- --exact --nocapture"
-  "worker pool death handling clears dead-worker assignment|cargo test -p brehon-orchestrator worker_pool::tests::handle_worker_death_clears_dead_worker_assignment -- --exact --nocapture"
+  "timed-out ACP waits clean pending request/prompt maps|cargo test -p brehon-acp session::tests::runtime_safety_tests::test_wait_for_response_timeout_cleans_up_pending_maps -- --exact --nocapture"
+  "ACP kill wakes outstanding waiters to avoid orphaned requests|cargo test -p brehon-acp session::tests::runtime_safety_tests::test_kill_wakes_outstanding_prompt_and_request_waiters -- --exact --nocapture"
+  "ACP kill awaits reader ownership shutdown|cargo test -p brehon-acp session::tests::runtime_safety_tests::test_kill_awaits_reader_task -- --exact --nocapture"
+  "worker pool death handling clears dead-worker assignment|cargo test -p brehon-orchestrator worker_pool_tests::handle_worker_death_clears_dead_worker_assignment -- --exact --nocapture"
   "orchestrator reconciles missing-worker task ownership|cargo test -p brehon-orchestrator orchestrator::tests::tick_unassigns_tasks_owned_by_missing_workers -- --exact --nocapture"
   "review-owned dead-worker tasks are preserved for review flow|cargo test -p brehon-orchestrator orchestrator::tests::tick_respawns_dead_worker_with_review_owned_task_without_unassigning_task -- --exact --nocapture"
   "drain tracker reports immediate completion with no in-flight work|cargo test -p brehon-types drain::tests::drain_sync_returns_zero_when_no_work -- --exact --nocapture"
@@ -52,10 +52,10 @@ checks=(
 required_symbols=(
   "crates/brehon-acp/src/session.rs|test_permission_request_waits_for_explicit_decision"
   "crates/brehon-acp/src/session.rs|test_permission_request_uses_timeout_policy_when_unresolved"
-  "crates/brehon-acp/src/session.rs|test_wait_for_response_timeout_cleans_up_pending_maps"
-  "crates/brehon-acp/src/session.rs|test_kill_wakes_outstanding_prompt_and_request_waiters"
-  "crates/brehon-acp/src/session.rs|test_kill_awaits_reader_task"
-  "crates/brehon-orchestrator/src/worker_pool.rs|handle_worker_death_clears_dead_worker_assignment"
+  "crates/brehon-acp/src/session_runtime_safety_tests.rs|test_wait_for_response_timeout_cleans_up_pending_maps"
+  "crates/brehon-acp/src/session_runtime_safety_tests.rs|test_kill_wakes_outstanding_prompt_and_request_waiters"
+  "crates/brehon-acp/src/session_runtime_safety_tests.rs|test_kill_awaits_reader_task"
+  "crates/brehon-orchestrator/src/worker_pool_tests.rs|handle_worker_death_clears_dead_worker_assignment"
   "crates/brehon-orchestrator/src/orchestrator.rs|tick_respawns_dead_worker_with_review_owned_task_without_unassigning_task"
 )
 

@@ -11,15 +11,14 @@ use brehon_test_harness::InMemoryEventStore;
 use brehon_types::{Event, EventFilter, EventKind, ViewOperation, ViewType, ViewUpdate};
 use chrono::Utc;
 
-const CYCLES: usize = 200;
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn soak_crash_recovery_no_sequence_reuse() {
     let store = InMemoryEventStore::new();
+    let cycles = crate::soak_cycles_locked(200);
 
     let mut all_ids: HashSet<u64> = HashSet::new();
 
-    for cycle in 0..CYCLES {
+    for cycle in 0..cycles {
         // Write some events
         let mut cycle_ids = Vec::new();
         for i in 0..5 {
@@ -84,8 +83,9 @@ async fn soak_crash_recovery_no_sequence_reuse() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn soak_crash_recovery_views_consistent() {
     let store = InMemoryEventStore::new();
+    let cycles = crate::soak_cycles_locked(200);
 
-    for cycle in 0..CYCLES {
+    for cycle in 0..cycles {
         let task_id = format!("T-{}", cycle);
 
         // Append baseline event and persist
@@ -155,8 +155,9 @@ async fn soak_crash_recovery_views_consistent() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn soak_crash_recovery_atomic_batch_integrity() {
     let store = InMemoryEventStore::new();
+    let cycles = crate::soak_cycles_locked(200);
 
-    for cycle in 0..CYCLES {
+    for cycle in 0..cycles {
         let task_id = format!("batch-{}", cycle);
 
         // Persist a baseline

@@ -515,6 +515,79 @@ impl WorkerPool {
         &self.assignment_history
     }
 
+    /// Mark workers dead by their session IDs without planning respawns.
+    ///
+    /// This is a low-level state update helper used by the orchestrator's
+    /// production shutdown path so it can record incremental kill successes
+    /// without duplicating the pool's internal bookkeeping.
+    pub(crate) fn mark_workers_dead_by_sessions(&mut self, sessions: &[SessionId]) {
+        for session_id in sessions {
+            if let Some(worker_id) = self.session_to_worker.get(session_id).cloned() {
+                if let Some(worker) = self.workers.get_mut(&worker_id) {
+                    worker.is_alive = false;
+                    worker.assigned_task = None;
+                }
+            }
+        }
+        self.session_to_worker.retain(|_, worker_id| {
+            self.workers
+                .get(worker_id)
+                .map(|w| w.is_alive)
+                .unwrap_or(false)
+        });
+    }
+
+    /// Best-effort shutdown of all alive worker sessions.
+    ///
+    /// This is an **internal-only** helper. It marks every worker dead
+    /// regardless of whether `kill_session` succeeds and always returns
+    /// `Ok(())` so that partial gateway failures do not prevent the pool
+    /// from reaching a clean stopped state.  This method is only available
+    /// in test builds; `Orchestrator::shutdown()` is the production entry
+    /// point that propagates real kill failures so callers know whether
+    /// live sessions remain.
+    #[cfg(test)]
+    pub(crate) async fn shutdown(&mut self) -> Result<()> {
+        let alive_workers: Vec<WorkerInfo> = self
+            .workers
+            .values()
+            .filter(|w| w.is_alive)
+            .cloned()
+            .collect();
+
+        for worker in &alive_workers {
+            if let Err(e) = self.gateway.kill_session(&worker.session_id).await {
+                warn!(
+                    worker_id = %worker.id,
+                    session_id = %worker.session_id,
+                    error = %e,
+                    "Failed to kill worker session during shutdown"
+                );
+            } else {
+                info!(
+                    worker_id = %worker.id,
+                    session_id = %worker.session_id,
+                    "Killed worker session during shutdown"
+                );
+            }
+            // Mark as dead regardless of gateway result so the pool state
+            // is consistent.
+            if let Some(w) = self.workers.get_mut(&worker.id) {
+                w.is_alive = false;
+                w.assigned_task = None;
+            }
+        }
+
+        self.session_to_worker.retain(|_, worker_id| {
+            self.workers
+                .get(worker_id)
+                .map(|w| w.is_alive)
+                .unwrap_or(false)
+        });
+
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) fn set_worker_alive_for_test(
         &mut self,

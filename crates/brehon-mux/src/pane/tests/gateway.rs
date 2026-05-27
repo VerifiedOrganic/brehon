@@ -1,6 +1,6 @@
 use crate::harness::{
     AgentAdapter, CustomAgentConfig, HarnessCapabilities, HarnessControlPlane, HarnessTransport,
-    SupervisorCli,
+    PromptInjectionStrategy, SupervisorCli,
 };
 use crate::mux::AgentPaneMaterialization;
 use crate::pane::{AgentTerminalLaunchPlan, Generation, Pane, PaneKind};
@@ -581,6 +581,417 @@ fn test_claude_advisor_unsafe_profile_includes_skip_permissions() {
     );
 }
 
+fn assert_gateway_sandbox_env(
+    config: &crate::pane::types::GatewaySpawnConfig,
+    expected_profile: &str,
+    expected_unsafe: &str,
+) {
+    let sandbox_profile = config
+        .env
+        .iter()
+        .find_map(|(k, v)| (k == "BREHON_SANDBOX_PROFILE").then_some(v.as_str()))
+        .expect("BREHON_SANDBOX_PROFILE should be present");
+    let launch_policy_unsafe = config
+        .env
+        .iter()
+        .find_map(|(k, v)| (k == "BREHON_LAUNCH_POLICY_UNSAFE").then_some(v.as_str()))
+        .expect("BREHON_LAUNCH_POLICY_UNSAFE should be present");
+    assert_eq!(
+        sandbox_profile, expected_profile,
+        "BREHON_SANDBOX_PROFILE mismatch"
+    );
+    assert_eq!(
+        launch_policy_unsafe, expected_unsafe,
+        "BREHON_LAUNCH_POLICY_UNSAFE mismatch"
+    );
+}
+
+fn grok_adapter(name: &str) -> AgentAdapter {
+    AgentAdapter::Custom(CustomAgentConfig {
+        name: name.to_string(),
+        command: Some("grok".to_string()),
+        args: vec![
+            "agent".to_string(),
+            "--always-approve".to_string(),
+            "stdio".to_string(),
+        ],
+        base_url: None,
+        api_key_env: None,
+        headers: Vec::new(),
+        capabilities: HarnessCapabilities {
+            supports_hooks: false,
+            supports_subagents: false,
+            supports_textbox_submit: true,
+            supports_teams: false,
+            one_shot: false,
+            uses_ink_prompt: false,
+            prompt_injection_strategy: PromptInjectionStrategy::ImmediateSubmit,
+            tool_prefix: std::borrow::Cow::Borrowed("brehon__"),
+            transport: HarnessTransport::AppServer,
+            preferred_control_plane: HarnessControlPlane::Acp,
+        },
+    })
+}
+
+fn custom_acp_adapter(name: &str) -> AgentAdapter {
+    AgentAdapter::Custom(CustomAgentConfig {
+        name: name.to_string(),
+        command: Some("my-agent".to_string()),
+        args: vec!["--stdio".to_string()],
+        base_url: None,
+        api_key_env: None,
+        headers: Vec::new(),
+        capabilities: HarnessCapabilities {
+            supports_hooks: false,
+            supports_subagents: false,
+            supports_textbox_submit: true,
+            supports_teams: false,
+            one_shot: false,
+            uses_ink_prompt: false,
+            prompt_injection_strategy: PromptInjectionStrategy::ImmediateSubmit,
+            tool_prefix: std::borrow::Cow::Borrowed("mcp_brehon_"),
+            transport: HarnessTransport::AppServer,
+            preferred_control_plane: HarnessControlPlane::Acp,
+        },
+    })
+}
+
+#[test]
+fn test_kimi_worker_safe_profile_propagates_sandbox_env() {
+    let pane = Pane::worker(
+        "worker-1",
+        PathBuf::from("/tmp"),
+        None,
+        "supervisor",
+        &AgentAdapter::BuiltIn(SupervisorCli::Kimi),
+        Some("kimi-for-coding"),
+        None,
+        24,
+        80,
+        None,
+        Some("high"),
+        Some(SandboxProfile::OsDefault),
+    )
+    .expect("create kimi worker pane");
+    let config = pane.gateway_spawn_config().expect("gateway config");
+    assert_gateway_sandbox_env(&config, "os_default", "false");
+}
+
+#[test]
+fn test_kimi_worker_unsafe_profile_propagates_sandbox_env() {
+    let pane = Pane::worker(
+        "worker-1",
+        PathBuf::from("/tmp"),
+        None,
+        "supervisor",
+        &AgentAdapter::BuiltIn(SupervisorCli::Kimi),
+        Some("kimi-for-coding"),
+        None,
+        24,
+        80,
+        None,
+        Some("high"),
+        Some(SandboxProfile::None),
+    )
+    .expect("create kimi worker pane");
+    let config = pane.gateway_spawn_config().expect("gateway config");
+    assert_gateway_sandbox_env(&config, "unsafe", "true");
+}
+
+#[test]
+fn test_opencode_worker_safe_profile_propagates_sandbox_env() {
+    let pane = Pane::worker(
+        "worker-1",
+        PathBuf::from("/tmp"),
+        None,
+        "supervisor",
+        &AgentAdapter::BuiltIn(SupervisorCli::OpenCode),
+        None,
+        None,
+        24,
+        80,
+        None,
+        None,
+        Some(SandboxProfile::OsDefault),
+    )
+    .expect("create opencode worker pane");
+    let config = pane.gateway_spawn_config().expect("gateway config");
+    assert_gateway_sandbox_env(&config, "os_default", "false");
+}
+
+#[test]
+fn test_opencode_worker_unsafe_profile_propagates_sandbox_env() {
+    let pane = Pane::worker(
+        "worker-1",
+        PathBuf::from("/tmp"),
+        None,
+        "supervisor",
+        &AgentAdapter::BuiltIn(SupervisorCli::OpenCode),
+        None,
+        None,
+        24,
+        80,
+        None,
+        None,
+        Some(SandboxProfile::None),
+    )
+    .expect("create opencode worker pane");
+    let config = pane.gateway_spawn_config().expect("gateway config");
+    assert_gateway_sandbox_env(&config, "unsafe", "true");
+}
+
+#[test]
+fn test_grok_worker_safe_profile_propagates_sandbox_env() {
+    let pane = Pane::worker(
+        "worker-1",
+        PathBuf::from("/tmp"),
+        None,
+        "supervisor",
+        &grok_adapter("grok-worker"),
+        None,
+        None,
+        24,
+        80,
+        None,
+        None,
+        Some(SandboxProfile::OsDefault),
+    )
+    .expect("create grok worker pane");
+    let config = pane.gateway_spawn_config().expect("gateway config");
+    assert_gateway_sandbox_env(&config, "os_default", "false");
+}
+
+#[test]
+fn test_grok_worker_unsafe_profile_propagates_sandbox_env() {
+    let pane = Pane::worker(
+        "worker-1",
+        PathBuf::from("/tmp"),
+        None,
+        "supervisor",
+        &grok_adapter("grok-worker"),
+        None,
+        None,
+        24,
+        80,
+        None,
+        None,
+        Some(SandboxProfile::None),
+    )
+    .expect("create grok worker pane");
+    let config = pane.gateway_spawn_config().expect("gateway config");
+    assert_gateway_sandbox_env(&config, "unsafe", "true");
+}
+
+#[test]
+fn test_custom_acp_worker_safe_profile_propagates_sandbox_env() {
+    let pane = Pane::worker(
+        "worker-1",
+        PathBuf::from("/tmp"),
+        None,
+        "supervisor",
+        &custom_acp_adapter("custom-worker"),
+        None,
+        None,
+        24,
+        80,
+        None,
+        None,
+        Some(SandboxProfile::OsDefault),
+    )
+    .expect("create custom acp worker pane");
+    let config = pane.gateway_spawn_config().expect("gateway config");
+    assert_gateway_sandbox_env(&config, "os_default", "false");
+}
+
+#[test]
+fn test_custom_acp_worker_unsafe_profile_propagates_sandbox_env() {
+    let pane = Pane::worker(
+        "worker-1",
+        PathBuf::from("/tmp"),
+        None,
+        "supervisor",
+        &custom_acp_adapter("custom-worker"),
+        None,
+        None,
+        24,
+        80,
+        None,
+        None,
+        Some(SandboxProfile::None),
+    )
+    .expect("create custom acp worker pane");
+    let config = pane.gateway_spawn_config().expect("gateway config");
+    assert_gateway_sandbox_env(&config, "unsafe", "true");
+}
+
+#[test]
+fn test_kimi_reviewer_safe_profile_propagates_sandbox_env() {
+    let pane = Pane::reviewer_with_agent_type(
+        "reviewer-1",
+        PathBuf::from("/tmp"),
+        None,
+        None,
+        24,
+        80,
+        &AgentAdapter::BuiltIn(SupervisorCli::Kimi),
+        Some("kimi-for-coding"),
+        None,
+        None,
+        None,
+        Some("off"),
+        &[],
+        Some(SandboxProfile::OsDefault),
+    )
+    .expect("create kimi reviewer pane");
+    let config = pane.gateway_spawn_config().expect("gateway config");
+    assert_gateway_sandbox_env(&config, "os_default", "false");
+}
+
+#[test]
+fn test_kimi_reviewer_unsafe_profile_propagates_sandbox_env() {
+    let pane = Pane::reviewer_with_agent_type(
+        "reviewer-1",
+        PathBuf::from("/tmp"),
+        None,
+        None,
+        24,
+        80,
+        &AgentAdapter::BuiltIn(SupervisorCli::Kimi),
+        Some("kimi-for-coding"),
+        None,
+        None,
+        None,
+        Some("off"),
+        &[],
+        Some(SandboxProfile::None),
+    )
+    .expect("create kimi reviewer pane");
+    let config = pane.gateway_spawn_config().expect("gateway config");
+    assert_gateway_sandbox_env(&config, "unsafe", "true");
+}
+
+#[test]
+fn test_opencode_reviewer_safe_profile_propagates_sandbox_env() {
+    let pane = Pane::reviewer(
+        "reviewer-1",
+        PathBuf::from("/tmp"),
+        None,
+        24,
+        80,
+        &AgentAdapter::BuiltIn(SupervisorCli::OpenCode),
+        None,
+        None,
+        None,
+        Some(SandboxProfile::OsDefault),
+    )
+    .expect("create opencode reviewer pane");
+    let config = pane.gateway_spawn_config().expect("gateway config");
+    assert_gateway_sandbox_env(&config, "os_default", "false");
+}
+
+#[test]
+fn test_opencode_reviewer_unsafe_profile_propagates_sandbox_env() {
+    let pane = Pane::reviewer(
+        "reviewer-1",
+        PathBuf::from("/tmp"),
+        None,
+        24,
+        80,
+        &AgentAdapter::BuiltIn(SupervisorCli::OpenCode),
+        None,
+        None,
+        None,
+        Some(SandboxProfile::None),
+    )
+    .expect("create opencode reviewer pane");
+    let config = pane.gateway_spawn_config().expect("gateway config");
+    assert_gateway_sandbox_env(&config, "unsafe", "true");
+}
+
+#[test]
+fn test_grok_reviewer_safe_profile_propagates_sandbox_env() {
+    let pane = Pane::reviewer_with_agent_type(
+        "reviewer-1",
+        PathBuf::from("/tmp"),
+        None,
+        None,
+        24,
+        80,
+        &grok_adapter("grok-reviewer"),
+        None,
+        None,
+        None,
+        None,
+        None,
+        &[],
+        Some(SandboxProfile::OsDefault),
+    )
+    .expect("create grok reviewer pane");
+    let config = pane.gateway_spawn_config().expect("gateway config");
+    assert_gateway_sandbox_env(&config, "os_default", "false");
+}
+
+#[test]
+fn test_grok_reviewer_unsafe_profile_propagates_sandbox_env() {
+    let pane = Pane::reviewer_with_agent_type(
+        "reviewer-1",
+        PathBuf::from("/tmp"),
+        None,
+        None,
+        24,
+        80,
+        &grok_adapter("grok-reviewer"),
+        None,
+        None,
+        None,
+        None,
+        None,
+        &[],
+        Some(SandboxProfile::None),
+    )
+    .expect("create grok reviewer pane");
+    let config = pane.gateway_spawn_config().expect("gateway config");
+    assert_gateway_sandbox_env(&config, "unsafe", "true");
+}
+
+#[test]
+fn test_custom_acp_reviewer_safe_profile_propagates_sandbox_env() {
+    let pane = Pane::reviewer(
+        "reviewer-1",
+        PathBuf::from("/tmp"),
+        None,
+        24,
+        80,
+        &custom_acp_adapter("custom-reviewer"),
+        None,
+        None,
+        None,
+        Some(SandboxProfile::OsDefault),
+    )
+    .expect("create custom acp reviewer pane");
+    let config = pane.gateway_spawn_config().expect("gateway config");
+    assert_gateway_sandbox_env(&config, "os_default", "false");
+}
+
+#[test]
+fn test_custom_acp_reviewer_unsafe_profile_propagates_sandbox_env() {
+    let pane = Pane::reviewer(
+        "reviewer-1",
+        PathBuf::from("/tmp"),
+        None,
+        24,
+        80,
+        &custom_acp_adapter("custom-reviewer"),
+        None,
+        None,
+        None,
+        Some(SandboxProfile::None),
+    )
+    .expect("create custom acp reviewer pane");
+    let config = pane.gateway_spawn_config().expect("gateway config");
+    assert_gateway_sandbox_env(&config, "unsafe", "true");
+}
+
 #[test]
 fn test_gateway_reviewer_preserves_configured_agent_type_alias() {
     let pane = Pane::reviewer_with_agent_type(
@@ -639,6 +1050,38 @@ fn test_gemini_worker_uses_stdio_gateway_protocol() {
 }
 
 #[test]
+fn test_built_in_override_gemini_worker_uses_built_in_pty_contract() {
+    let mut capabilities = SupervisorCli::Gemini.capabilities();
+    capabilities.transport = HarnessTransport::InteractivePty;
+    capabilities.preferred_control_plane = HarnessControlPlane::PtyInjection;
+    let adapter = AgentAdapter::built_in_with_capabilities(SupervisorCli::Gemini, capabilities);
+
+    let pane = Pane::worker(
+        "worker-1",
+        PathBuf::from("/tmp"),
+        None,
+        "supervisor",
+        &adapter,
+        None,
+        None,
+        24,
+        80,
+        None,
+        None,
+        None,
+    )
+    .expect("create gemini worker pane with PTY override");
+
+    assert!(!pane.is_gateway_backed());
+    let config = pane
+        .pty_spawn_config
+        .as_ref()
+        .expect("PTY config should exist");
+    assert_eq!(config.command, "gemini");
+    assert!(config.args.iter().any(|arg| arg == "-i"));
+}
+
+#[test]
 fn test_opencode_worker_uses_server_gateway_protocol() {
     let pane = Pane::worker(
         "worker-1",
@@ -669,6 +1112,158 @@ fn test_opencode_worker_uses_server_gateway_protocol() {
             .env
             .iter()
             .any(|(k, _)| k == "BREHON_OPENCODE_SERVER_URL")
+    );
+}
+
+#[test]
+fn test_built_in_override_codex_worker_keeps_gateway_protocol() {
+    let mut capabilities = SupervisorCli::Codex.capabilities();
+    capabilities.supports_subagents = true;
+    let adapter = AgentAdapter::built_in_with_capabilities(SupervisorCli::Codex, capabilities);
+
+    let pane = Pane::worker(
+        "worker-1",
+        PathBuf::from("/tmp"),
+        None,
+        "supervisor",
+        &adapter,
+        None,
+        None,
+        24,
+        80,
+        None,
+        None,
+        None,
+    )
+    .expect("create codex worker pane with built-in override");
+
+    assert!(pane.is_gateway_backed());
+    let config = pane
+        .gateway_spawn_config()
+        .expect("gateway config should exist");
+    assert_eq!(config.protocol, GatewayProtocol::CodexAppServerWs);
+    assert_eq!(config.command.as_deref(), Some("codex"));
+    assert!(config.args.iter().any(|arg| arg == "app-server"));
+}
+
+#[test]
+fn test_unsupported_built_in_override_claude_reviewer_falls_back_to_builtin_contract() {
+    let mut capabilities = SupervisorCli::Claude.capabilities();
+    capabilities.transport = HarnessTransport::AppServer;
+    capabilities.preferred_control_plane = HarnessControlPlane::Acp;
+    let adapter = AgentAdapter::built_in_with_capabilities(SupervisorCli::Claude, capabilities);
+
+    let pane = Pane::reviewer(
+        "reviewer-1",
+        PathBuf::from("/tmp"),
+        None,
+        24,
+        80,
+        &adapter,
+        None,
+        None,
+        None,
+        None,
+    )
+    .expect("create claude reviewer pane with unsupported override normalized away");
+
+    assert!(!pane.is_gateway_backed());
+    let config = pane
+        .pty_spawn_config
+        .as_ref()
+        .expect("PTY config should exist");
+    assert_eq!(config.command, "claude");
+}
+
+#[test]
+fn test_unsupported_built_in_override_gemini_worker_falls_back_to_builtin_gateway_protocol() {
+    let mut capabilities = SupervisorCli::Gemini.capabilities();
+    capabilities.transport = HarnessTransport::ManagedApi;
+    capabilities.preferred_control_plane = HarnessControlPlane::OpenAiCompatible;
+    let adapter = AgentAdapter::built_in_with_capabilities(SupervisorCli::Gemini, capabilities);
+
+    let pane = Pane::worker(
+        "worker-1",
+        PathBuf::from("/tmp"),
+        None,
+        "supervisor",
+        &adapter,
+        None,
+        None,
+        24,
+        80,
+        None,
+        None,
+        None,
+    )
+    .expect("create gemini worker pane with unsupported override normalized away");
+
+    assert!(pane.is_gateway_backed());
+    let config = pane
+        .gateway_spawn_config()
+        .expect("gateway config should exist");
+    assert_eq!(config.protocol, GatewayProtocol::GeminiAcpStdio);
+}
+
+#[test]
+fn test_built_in_override_codex_worker_rejects_unsupported_one_shot_contract() {
+    let mut capabilities = SupervisorCli::Codex.capabilities();
+    capabilities.transport = HarnessTransport::OneShotPty;
+    capabilities.preferred_control_plane = HarnessControlPlane::OneShot;
+    capabilities.one_shot = true;
+    let adapter = AgentAdapter::built_in_with_capabilities(SupervisorCli::Codex, capabilities);
+
+    let err = Pane::worker(
+        "worker-1",
+        PathBuf::from("/tmp"),
+        None,
+        "supervisor",
+        &adapter,
+        None,
+        None,
+        24,
+        80,
+        None,
+        None,
+        None,
+    )
+    .err()
+    .expect("unsupported one-shot built-in worker override should fail");
+
+    assert!(
+        err.to_string()
+            .contains("does not support one-shot overrides"),
+        "{err}"
+    );
+}
+
+#[test]
+fn test_built_in_override_codex_reviewer_rejects_unsupported_one_shot_contract() {
+    let mut capabilities = SupervisorCli::Codex.capabilities();
+    capabilities.transport = HarnessTransport::OneShotPty;
+    capabilities.preferred_control_plane = HarnessControlPlane::OneShot;
+    capabilities.one_shot = true;
+    let adapter = AgentAdapter::built_in_with_capabilities(SupervisorCli::Codex, capabilities);
+
+    let err = Pane::reviewer(
+        "reviewer-1",
+        PathBuf::from("/tmp"),
+        None,
+        24,
+        80,
+        &adapter,
+        None,
+        None,
+        None,
+        None,
+    )
+    .err()
+    .expect("unsupported one-shot built-in reviewer override should fail");
+
+    assert!(
+        err.to_string()
+            .contains("does not support one-shot overrides"),
+        "{err}"
     );
 }
 
@@ -931,6 +1526,7 @@ fn test_custom_acp_worker_uses_stdio_gateway_protocol() {
             supports_teams: false,
             one_shot: false,
             uses_ink_prompt: false,
+            prompt_injection_strategy: PromptInjectionStrategy::ImmediateSubmit,
             tool_prefix: std::borrow::Cow::Borrowed("mcp_brehon_"),
             transport: HarnessTransport::AppServer,
             preferred_control_plane: HarnessControlPlane::Acp,
@@ -982,30 +1578,6 @@ fn test_custom_acp_worker_uses_stdio_gateway_protocol() {
 
 #[test]
 fn test_grok_acp_worker_receives_brehon_mcp_server() {
-    let adapter = AgentAdapter::Custom(CustomAgentConfig {
-        name: "grok-worker".to_string(),
-        command: Some("grok".to_string()),
-        args: vec![
-            "agent".to_string(),
-            "--always-approve".to_string(),
-            "stdio".to_string(),
-        ],
-        base_url: None,
-        api_key_env: None,
-        headers: Vec::new(),
-        capabilities: HarnessCapabilities {
-            supports_hooks: false,
-            supports_subagents: false,
-            supports_textbox_submit: true,
-            supports_teams: false,
-            one_shot: false,
-            uses_ink_prompt: false,
-            tool_prefix: std::borrow::Cow::Borrowed("brehon__"),
-            transport: HarnessTransport::AppServer,
-            preferred_control_plane: HarnessControlPlane::Acp,
-        },
-    });
-
     let brehon_root = PathBuf::from("/tmp/.brehon");
     let pane = Pane::worker_with_agent_type(
         "worker-1",
@@ -1013,7 +1585,7 @@ fn test_grok_acp_worker_receives_brehon_mcp_server() {
         Some("session-a"),
         Some(&brehon_root),
         "supervisor",
-        &adapter,
+        &grok_adapter("grok-worker"),
         None,
         None,
         24,
@@ -1077,6 +1649,53 @@ fn test_grok_acp_worker_receives_brehon_mcp_server() {
 }
 
 #[test]
+fn test_grok_reviewer_uses_acp_stdio_gateway_protocol() {
+    let pane = Pane::reviewer_with_agent_type(
+        "reviewer-1",
+        PathBuf::from("/tmp"),
+        None,
+        None,
+        24,
+        80,
+        &grok_adapter("grok-reviewer"),
+        None,
+        None,
+        None,
+        None,
+        None,
+        &[],
+        None,
+    )
+    .expect("create grok reviewer pane");
+
+    assert!(pane.is_gateway_backed());
+    let config = pane
+        .gateway_spawn_config()
+        .expect("gateway config should exist");
+    assert_eq!(config.protocol, GatewayProtocol::AcpStdio);
+    assert_eq!(config.command.as_deref(), Some("grok"));
+    assert!(
+        config
+            .args
+            .windows(2)
+            .any(|window| window == ["--cwd", "/tmp"])
+    );
+    assert!(
+        config
+            .args
+            .windows(2)
+            .any(|window| window == ["--sandbox", "workspace"])
+    );
+    let mcp_servers = config
+        .env
+        .iter()
+        .find_map(|(key, value)| (key == "BREHON_ACP_MCP_SERVERS_JSON").then_some(value))
+        .expect("grok acp mcp servers env");
+    let parsed: serde_json::Value = serde_json::from_str(mcp_servers).unwrap();
+    assert_eq!(parsed[0]["name"], "brehon");
+}
+
+#[test]
 fn test_custom_codex_app_server_worker_uses_codex_ws_gateway_protocol() {
     let cwd =
         std::env::temp_dir().join(format!("brehon-custom-codex-pane-{}", uuid::Uuid::new_v4()));
@@ -1107,6 +1726,7 @@ fn test_custom_codex_app_server_worker_uses_codex_ws_gateway_protocol() {
             supports_teams: false,
             one_shot: false,
             uses_ink_prompt: false,
+            prompt_injection_strategy: PromptInjectionStrategy::ImmediateSubmit,
             tool_prefix: std::borrow::Cow::Borrowed("mcp__brehon__"),
             transport: HarnessTransport::AppServer,
             preferred_control_plane: HarnessControlPlane::Acp,
@@ -1197,6 +1817,7 @@ fn test_custom_codex_app_server_worker_accepts_long_form_safe_bootstrap() {
             supports_teams: false,
             one_shot: false,
             uses_ink_prompt: false,
+            prompt_injection_strategy: PromptInjectionStrategy::ImmediateSubmit,
             tool_prefix: std::borrow::Cow::Borrowed("mcp__brehon__"),
             transport: HarnessTransport::AppServer,
             preferred_control_plane: HarnessControlPlane::Acp,
@@ -1273,6 +1894,7 @@ fn test_custom_codex_app_server_worker_accepts_short_form_safe_bootstrap() {
             supports_teams: false,
             one_shot: false,
             uses_ink_prompt: false,
+            prompt_injection_strategy: PromptInjectionStrategy::ImmediateSubmit,
             tool_prefix: std::borrow::Cow::Borrowed("mcp__brehon__"),
             transport: HarnessTransport::AppServer,
             preferred_control_plane: HarnessControlPlane::Acp,
@@ -1341,6 +1963,7 @@ fn test_custom_codex_app_server_worker_requires_instructions_bootstrap() {
             supports_teams: false,
             one_shot: false,
             uses_ink_prompt: false,
+            prompt_injection_strategy: PromptInjectionStrategy::ImmediateSubmit,
             tool_prefix: std::borrow::Cow::Borrowed("mcp__brehon__"),
             transport: HarnessTransport::AppServer,
             preferred_control_plane: HarnessControlPlane::Acp,
@@ -1388,6 +2011,7 @@ fn test_custom_acp_reviewer_uses_stdio_gateway_protocol() {
             supports_teams: false,
             one_shot: false,
             uses_ink_prompt: false,
+            prompt_injection_strategy: PromptInjectionStrategy::ImmediateSubmit,
             tool_prefix: std::borrow::Cow::Borrowed("mcp_brehon_"),
             transport: HarnessTransport::AppServer,
             preferred_control_plane: HarnessControlPlane::Acp,
@@ -1451,6 +2075,7 @@ fn test_custom_acp_supervisor_is_rejected_without_pty_contract() {
             supports_teams: false,
             one_shot: false,
             uses_ink_prompt: false,
+            prompt_injection_strategy: PromptInjectionStrategy::ImmediateSubmit,
             tool_prefix: std::borrow::Cow::Borrowed("mcp_brehon_"),
             transport: HarnessTransport::AppServer,
             preferred_control_plane: HarnessControlPlane::Acp,
@@ -1502,6 +2127,7 @@ fn test_custom_pty_supervisor_uses_pty_launch_contract() {
             supports_teams: false,
             one_shot: false,
             uses_ink_prompt: false,
+            prompt_injection_strategy: PromptInjectionStrategy::ImmediateSubmit,
             tool_prefix: std::borrow::Cow::Borrowed("mcp_brehon_"),
             transport: HarnessTransport::InteractivePty,
             preferred_control_plane: HarnessControlPlane::PtyInjection,
@@ -1586,6 +2212,7 @@ fn test_custom_acp_sidecar_supervisor_has_pty_and_gateway_contract() {
             supports_teams: false,
             one_shot: false,
             uses_ink_prompt: false,
+            prompt_injection_strategy: PromptInjectionStrategy::ImmediateSubmit,
             tool_prefix: std::borrow::Cow::Borrowed("mcp_brehon_"),
             transport: HarnessTransport::InteractivePty,
             preferred_control_plane: HarnessControlPlane::AcpSidecar,
@@ -1679,6 +2306,7 @@ fn test_custom_acp_sidecar_supervisor_rejects_non_interactive_transport() {
             supports_teams: false,
             one_shot: false,
             uses_ink_prompt: false,
+            prompt_injection_strategy: PromptInjectionStrategy::ImmediateSubmit,
             tool_prefix: std::borrow::Cow::Borrowed("mcp_brehon_"),
             transport: HarnessTransport::AppServer,
             preferred_control_plane: HarnessControlPlane::AcpSidecar,
@@ -1736,6 +2364,7 @@ fn test_custom_openai_worker_uses_managed_api_gateway_protocol() {
             supports_teams: false,
             one_shot: false,
             uses_ink_prompt: false,
+            prompt_injection_strategy: PromptInjectionStrategy::ImmediateSubmit,
             tool_prefix: std::borrow::Cow::Borrowed("mcp_brehon_"),
             transport: HarnessTransport::ManagedApi,
             preferred_control_plane: HarnessControlPlane::OpenAiCompatible,
@@ -1792,6 +2421,7 @@ fn test_custom_openai_supervisor_is_rejected_without_pty_command() {
             supports_teams: false,
             one_shot: false,
             uses_ink_prompt: false,
+            prompt_injection_strategy: PromptInjectionStrategy::ImmediateSubmit,
             tool_prefix: std::borrow::Cow::Borrowed("mcp_brehon_"),
             transport: HarnessTransport::ManagedApi,
             preferred_control_plane: HarnessControlPlane::OpenAiCompatible,

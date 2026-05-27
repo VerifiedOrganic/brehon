@@ -78,6 +78,8 @@ pub(crate) struct PlanDocument {
     pub target: Option<String>,
     #[serde(default)]
     pub path: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub already_landed_commit: Option<String>,
     #[serde(default)]
     pub phases: Vec<PlanPhase>,
 }

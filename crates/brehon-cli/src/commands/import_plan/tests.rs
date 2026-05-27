@@ -143,7 +143,7 @@ fn init_git_repo(root: &Path) -> Result<()> {
         .context("git add failed")?;
     let mut commit = std::process::Command::new("git");
     commit
-        .args(["commit", "-m", "init"])
+        .args(["-c", "commit.gpgsign=false", "commit", "-m", "init"])
         .env("GIT_AUTHOR_NAME", "Test")
         .env("GIT_AUTHOR_EMAIL", "test@example.com")
         .env("GIT_COMMITTER_NAME", "Test")
@@ -798,7 +798,7 @@ async fn import_plan_creates_initiative_epic_and_dependency_blocked_tasks() {
         .unwrap();
     let mut commit_plan = std::process::Command::new("git");
     commit_plan
-        .args(["commit", "-m", "plan"])
+        .args(["-c", "commit.gpgsign=false", "commit", "-m", "plan"])
         .env("GIT_AUTHOR_NAME", "Test")
         .env("GIT_AUTHOR_EMAIL", "test@example.com")
         .env("GIT_COMMITTER_NAME", "Test")
@@ -899,7 +899,13 @@ async fn import_normalized_plan_json_creates_records() {
         .unwrap();
     let mut commit_plan = std::process::Command::new("git");
     commit_plan
-        .args(["commit", "-m", "normalized plan"])
+        .args([
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-m",
+            "normalized plan",
+        ])
         .env("GIT_AUTHOR_NAME", "Test")
         .env("GIT_AUTHOR_EMAIL", "test@example.com")
         .env("GIT_COMMITTER_NAME", "Test")
@@ -945,7 +951,13 @@ async fn import_normalized_plan_persists_task_packet_fields() {
         .unwrap();
     let mut commit_plan = std::process::Command::new("git");
     commit_plan
-        .args(["commit", "-m", "normalized plan with task packet fields"])
+        .args([
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-m",
+            "normalized plan with task packet fields",
+        ])
         .env("GIT_AUTHOR_NAME", "Test")
         .env("GIT_AUTHOR_EMAIL", "test@example.com")
         .env("GIT_COMMITTER_NAME", "Test")
@@ -1019,7 +1031,13 @@ async fn import_normalized_plan_with_done_task_seeds_terminal_state() {
         .unwrap();
     let mut commit_plan = std::process::Command::new("git");
     commit_plan
-        .args(["commit", "-m", "normalized plan with done task"])
+        .args([
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-m",
+            "normalized plan with done task",
+        ])
         .env("GIT_AUTHOR_NAME", "Test")
         .env("GIT_AUTHOR_EMAIL", "test@example.com")
         .env("GIT_COMMITTER_NAME", "Test")
@@ -1079,7 +1097,13 @@ async fn import_normalized_plan_allows_source_titles_that_mention_dot_brehon() {
         .unwrap();
     let mut commit_plan = std::process::Command::new("git");
     commit_plan
-        .args(["commit", "-m", "normalized plan with dot brehon title"])
+        .args([
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-m",
+            "normalized plan with dot brehon title",
+        ])
         .env("GIT_AUTHOR_NAME", "Test")
         .env("GIT_AUTHOR_EMAIL", "test@example.com")
         .env("GIT_COMMITTER_NAME", "Test")
@@ -1181,6 +1205,8 @@ async fn import_normalized_plan_always_assigns_phase_epic_branch() {
     let mut commit_plan = std::process::Command::new("git");
     commit_plan
         .args([
+            "-c",
+            "commit.gpgsign=false",
             "commit",
             "-m",
             "normalized plan with phase epic branch case",
@@ -1224,6 +1250,34 @@ async fn import_normalized_plan_always_assigns_phase_epic_branch() {
     assert!(branch.ends_with(&initiative_suffix));
 }
 
+fn git_branches(cwd: &std::path::Path) -> Vec<String> {
+    let output = std::process::Command::new("git")
+        .args(["branch", "--format=%(refname:short)"])
+        .current_dir(cwd)
+        .output()
+        .unwrap();
+    let mut branches: Vec<String> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|s| s.to_string())
+        .collect();
+    branches.sort();
+    branches
+}
+
+fn git_worktrees(cwd: &std::path::Path) -> Vec<String> {
+    let output = std::process::Command::new("git")
+        .args(["worktree", "list", "--porcelain"])
+        .current_dir(cwd)
+        .output()
+        .unwrap();
+    let mut worktrees: Vec<String> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|s| s.to_string())
+        .collect();
+    worktrees.sort();
+    worktrees
+}
+
 #[tokio::test]
 async fn import_normalized_plan_can_be_rerun_without_epic_branch_conflicts() {
     let _lock = IMPORT_PLAN_TEST_LOCK
@@ -1240,7 +1294,13 @@ async fn import_normalized_plan_can_be_rerun_without_epic_branch_conflicts() {
         .unwrap();
     let mut commit_plan = std::process::Command::new("git");
     commit_plan
-        .args(["commit", "-m", "normalized plan"])
+        .args([
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-m",
+            "normalized plan",
+        ])
         .env("GIT_AUTHOR_NAME", "Test")
         .env("GIT_AUTHOR_EMAIL", "test@example.com")
         .env("GIT_COMMITTER_NAME", "Test")
@@ -1251,28 +1311,449 @@ async fn import_normalized_plan_can_be_rerun_without_epic_branch_conflicts() {
     execute(dir.path(), &plan_path, false, ExtractMode::Auto)
         .await
         .unwrap();
+
+    let tasks_dir = dir.path().join(".brehon").join("runtime").join("tasks");
+    let initial_task_count = fs::read_dir(&tasks_dir)
+        .unwrap()
+        .flatten()
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+        .count();
+    let initial_branches = git_branches(dir.path());
+    let initial_worktrees = git_worktrees(dir.path());
+
+    let err = execute(dir.path(), &plan_path, false, ExtractMode::Auto)
+        .await
+        .unwrap_err();
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("already imported"),
+        "expected duplicate import refusal, got: {message}"
+    );
+    assert!(
+        message.contains("residual follow-up plan is required"),
+        "expected residual follow-up guidance, got: {message}"
+    );
+
+    let final_task_count = fs::read_dir(&tasks_dir)
+        .unwrap()
+        .flatten()
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+        .count();
+    assert_eq!(
+        final_task_count, initial_task_count,
+        "duplicate import must not create additional tasks"
+    );
+    assert_eq!(
+        git_branches(dir.path()),
+        initial_branches,
+        "duplicate import must not create branches"
+    );
+    assert_eq!(
+        git_worktrees(dir.path()),
+        initial_worktrees,
+        "duplicate import must not create worktrees"
+    );
+}
+
+#[tokio::test]
+async fn import_plan_fails_from_different_relative_path_spelling() {
+    let _lock = IMPORT_PLAN_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let dir = TempDir::new().unwrap();
+    init_git_repo(dir.path()).unwrap();
+    let plan_path = dir.path().join("plan.json");
+    fs::write(&plan_path, normalized_plan_json()).unwrap();
+    std::process::Command::new("git")
+        .args(["add", "plan.json"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    let mut commit_plan = std::process::Command::new("git");
+    commit_plan
+        .args([
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-m",
+            "normalized plan",
+        ])
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .current_dir(dir.path());
+    commit_plan.output().unwrap();
+
+    // First import via absolute path
+    execute(dir.path(), &plan_path, false, ExtractMode::Auto)
+        .await
+        .unwrap();
+
+    // Second import via differently-spelled absolute path should still be detected as duplicate
+    let alternate_spelling = dir.path().join("./plan.json");
+    let err = execute(dir.path(), &alternate_spelling, false, ExtractMode::Auto)
+        .await
+        .unwrap_err();
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("already imported"),
+        "expected duplicate import refusal for different path spelling, got: {message}"
+    );
+}
+
+#[tokio::test]
+async fn import_plan_fails_when_commit_31f95d9_is_ancestor() {
+    let _lock = IMPORT_PLAN_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let dir = TempDir::new().unwrap();
+    init_git_repo(dir.path()).unwrap();
+
+    // Create a second commit so we can tag the first one as 31f95d9
+    fs::write(dir.path().join("second.md"), "second\n").unwrap();
+    std::process::Command::new("git")
+        .args(["add", "second.md"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    let mut commit = std::process::Command::new("git");
+    commit
+        .args(["-c", "commit.gpgsign=false", "commit", "-m", "second"])
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .current_dir(dir.path());
+    commit.output().unwrap();
+
+    // Tag the first commit as 31f95d9 so git merge-base resolves it
+    std::process::Command::new("git")
+        .args(["tag", "31f95d9", "HEAD~1"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    let plan_path = dir.path().join("plan.json");
+    let mut plan_value: Value = serde_json::from_str(&normalized_plan_json()).unwrap();
+    plan_value["already_landed_commit"] = json!("31f95d9");
+    fs::write(&plan_path, serde_json::to_string(&plan_value).unwrap()).unwrap();
+
+    let initial_branches = git_branches(dir.path());
+    let initial_worktrees = git_worktrees(dir.path());
+
+    let err = execute(dir.path(), &plan_path, false, ExtractMode::Auto)
+        .await
+        .unwrap_err();
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("31f95d9"),
+        "expected 31f95d9 ancestor refusal, got: {message}"
+    );
+    assert!(
+        message.contains("residual follow-up plan is required"),
+        "expected residual follow-up guidance, got: {message}"
+    );
+
+    // Must fail before creating any tasks, branches, or worktrees
+    let tasks_dir = dir.path().join(".brehon").join("runtime").join("tasks");
+    assert!(
+        !tasks_dir.exists() || fs::read_dir(&tasks_dir).unwrap().flatten().next().is_none(),
+        "import must fail before creating tasks"
+    );
+    assert_eq!(
+        git_branches(dir.path()),
+        initial_branches,
+        "import must fail before creating branches"
+    );
+    assert_eq!(
+        git_worktrees(dir.path()),
+        initial_worktrees,
+        "import must fail before creating worktrees"
+    );
+}
+
+#[tokio::test]
+async fn import_plan_succeeds_when_landed_commit_is_not_ancestor() {
+    let _lock = IMPORT_PLAN_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let dir = TempDir::new().unwrap();
+    init_git_repo(dir.path()).unwrap();
+
+    // Create a second commit on main so we can branch from the first.
+    fs::write(dir.path().join("second.md"), "second\n").unwrap();
+    std::process::Command::new("git")
+        .args(["add", "second.md"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    let mut commit = std::process::Command::new("git");
+    commit
+        .args(["-c", "commit.gpgsign=false", "commit", "-m", "second"])
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .current_dir(dir.path());
+    commit.output().unwrap();
+
+    // Create a side branch from the first commit and add a commit to it.
+    // This side-branch commit is NOT an ancestor of main's HEAD.
+    std::process::Command::new("git")
+        .args(["checkout", "-b", "side", "HEAD~1"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    fs::write(dir.path().join("side.md"), "side\n").unwrap();
+    std::process::Command::new("git")
+        .args(["add", "side.md"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    let mut side_commit = std::process::Command::new("git");
+    side_commit
+        .args(["-c", "commit.gpgsign=false", "commit", "-m", "side"])
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .current_dir(dir.path());
+    side_commit.output().unwrap();
+    let side_hash = String::from_utf8_lossy(
+        &std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .trim()
+    .to_string();
+
+    // Back to main for the import.
+    std::process::Command::new("git")
+        .args(["checkout", "main"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    let plan_path = dir.path().join("plan.json");
+    let mut plan_value: Value = serde_json::from_str(&normalized_plan_json()).unwrap();
+    plan_value["already_landed_commit"] = json!(side_hash);
+    fs::write(&plan_path, serde_json::to_string(&plan_value).unwrap()).unwrap();
+    std::process::Command::new("git")
+        .args(["add", "plan.json"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    let mut commit_plan = std::process::Command::new("git");
+    commit_plan
+        .args([
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-m",
+            "normalized plan with landed commit",
+        ])
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .current_dir(dir.path());
+    commit_plan.output().unwrap();
+
+    // Should succeed because the side-branch commit is not an ancestor of main's HEAD.
     execute(dir.path(), &plan_path, false, ExtractMode::Auto)
         .await
         .unwrap();
 
     let tasks_dir = dir.path().join(".brehon").join("runtime").join("tasks");
-    let tasks = fs::read_dir(&tasks_dir)
+    let entries = fs::read_dir(&tasks_dir)
         .unwrap()
         .flatten()
         .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
-        .map(|entry| {
-            serde_json::from_str::<Value>(&fs::read_to_string(entry.path()).unwrap()).unwrap()
-        })
-        .collect::<Vec<_>>();
+        .count();
+    assert_eq!(
+        entries, 9,
+        "plan with non-ancestor landed_commit should import normally"
+    );
+}
 
-    let phase_branches = tasks
-        .iter()
-        .filter(|task| task["plan_import"]["kind"] == "phase_epic")
-        .map(|task| task["integration_branch"].as_str().unwrap().to_string())
-        .collect::<Vec<_>>();
-    assert_eq!(phase_branches.len(), 2);
-    assert_ne!(phase_branches[0], phase_branches[1]);
-    assert!(phase_branches
-        .iter()
-        .all(|branch| branch.starts_with("epic/")));
+#[tokio::test]
+async fn import_plan_fails_for_invalid_landed_commit_ref() {
+    let _lock = IMPORT_PLAN_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let dir = TempDir::new().unwrap();
+    init_git_repo(dir.path()).unwrap();
+
+    let plan_path = dir.path().join("plan.json");
+    let mut plan_value: Value = serde_json::from_str(&normalized_plan_json()).unwrap();
+    plan_value["already_landed_commit"] = json!("deadbeef");
+    fs::write(&plan_path, serde_json::to_string(&plan_value).unwrap()).unwrap();
+    std::process::Command::new("git")
+        .args(["add", "plan.json"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    let mut commit_plan = std::process::Command::new("git");
+    commit_plan
+        .args([
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-m",
+            "normalized plan with invalid landed commit",
+        ])
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .current_dir(dir.path());
+    commit_plan.output().unwrap();
+
+    let err = execute(dir.path(), &plan_path, false, ExtractMode::Auto)
+        .await
+        .unwrap_err();
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("deadbeef"),
+        "expected deadbeef error in message, got: {message}"
+    );
+
+    // Must fail before creating any tasks
+    let tasks_dir = dir.path().join(".brehon").join("runtime").join("tasks");
+    assert!(
+        !tasks_dir.exists() || fs::read_dir(&tasks_dir).unwrap().flatten().next().is_none(),
+        "import must fail before creating tasks"
+    );
+}
+
+#[tokio::test]
+async fn import_plan_fails_from_subdirectory_path() {
+    let _lock = IMPORT_PLAN_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let dir = TempDir::new().unwrap();
+    init_git_repo(dir.path()).unwrap();
+    let plan_path = dir.path().join("plan.json");
+    fs::write(&plan_path, normalized_plan_json()).unwrap();
+    std::process::Command::new("git")
+        .args(["add", "plan.json"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    let mut commit_plan = std::process::Command::new("git");
+    commit_plan
+        .args([
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-m",
+            "normalized plan",
+        ])
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .current_dir(dir.path());
+    commit_plan.output().unwrap();
+
+    // First import from a subdirectory via ../plan.json.
+    // We construct the path explicitly rather than mutating process-global CWD
+    // so that unrelated concurrent tests are never exposed to a temporary CWD.
+    let subdir = dir.path().join("subdir");
+    fs::create_dir_all(&subdir).unwrap();
+    let subdir_plan_path = subdir.join("..").join("plan.json");
+    execute(dir.path(), &subdir_plan_path, false, ExtractMode::Auto)
+        .await
+        .unwrap();
+
+    // Second import from repo root via plan.json should be detected as duplicate
+    let err = execute(dir.path(), &plan_path, false, ExtractMode::Auto)
+        .await
+        .unwrap_err();
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("already imported"),
+        "expected duplicate import refusal for subdirectory path, got: {message}"
+    );
+}
+
+#[tokio::test]
+async fn import_plan_succeeds_for_ambiguous_legacy_external_path() {
+    let _lock = IMPORT_PLAN_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let dir = TempDir::new().unwrap();
+    init_git_repo(dir.path()).unwrap();
+
+    // Create the in-repo plan at outside/plan.json
+    let outside_dir = dir.path().join("outside");
+    fs::create_dir_all(&outside_dir).unwrap();
+    let plan_path = outside_dir.join("plan.json");
+    fs::write(&plan_path, normalized_plan_json()).unwrap();
+    std::process::Command::new("git")
+        .args(["add", "outside/plan.json"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    let mut commit_plan = std::process::Command::new("git");
+    commit_plan
+        .args([
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-m",
+            "normalized plan",
+        ])
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .current_dir(dir.path());
+    commit_plan.output().unwrap();
+
+    // Seed a legacy task file with a genuinely external-looking relative
+    // path. Because the basename (plan-a.json) differs from the plan we are
+    // about to import (plan.json), Detection A should skip the unrelated
+    // entry and let the import proceed.
+    let tasks_dir = dir.path().join(".brehon").join("runtime").join("tasks");
+    fs::create_dir_all(&tasks_dir).unwrap();
+    fs::write(
+        tasks_dir.join("T-external.json"),
+        r#"{"task_id":"T-external","plan_import":{"source_file":"../outside/plan-a.json"}}"#,
+    )
+    .unwrap();
+
+    let initial_branches = git_branches(dir.path());
+    let initial_worktrees = git_worktrees(dir.path());
+
+    // Import of the in-repo file should succeed — the ambiguous legacy
+    // path is skipped by Detection A, and there is no already_landed_commit
+    // for Detection B to catch.
+    execute(dir.path(), &plan_path, false, ExtractMode::Auto)
+        .await
+        .unwrap();
+
+    // Should have created the full set of imported tasks (9 total: 1 legacy +
+    // 8 new, or if the tool counts differently, at least more than 1).
+    let final_task_count = fs::read_dir(&tasks_dir)
+        .unwrap()
+        .flatten()
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+        .count();
+    assert!(
+        final_task_count > 1,
+        "import should have created new tasks, but only found {final_task_count}"
+    );
+    assert!(
+        git_branches(dir.path()).len() > initial_branches.len(),
+        "import should have created new branches"
+    );
+    assert!(
+        git_worktrees(dir.path()).len() > initial_worktrees.len(),
+        "import should have created new worktrees"
+    );
 }

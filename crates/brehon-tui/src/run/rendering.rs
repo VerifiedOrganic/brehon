@@ -1466,6 +1466,24 @@ fn host_owned_pane_lines(
                     Style::default().fg(crate::theme::status::ERROR),
                 )));
             }
+            if let Some(blocked) = runtime_pane.blocked.as_ref() {
+                lines.push(Line::from(Span::styled(
+                    format!("blocked {}", blocked.summary),
+                    Style::default().fg(crate::theme::status::WARNING),
+                )));
+                if let Some(task_id) = blocked.task_id.as_deref() {
+                    lines.push(Line::from(Span::styled(
+                        format!("blocked_task {task_id}"),
+                        Style::default().fg(TEXT_DIM),
+                    )));
+                }
+                if let Some(command) = blocked.command_or_tool.as_deref() {
+                    lines.push(Line::from(Span::styled(
+                        format!("blocked_command {command}"),
+                        Style::default().fg(TEXT_DIM),
+                    )));
+                }
+            }
         }
         None => {
             lines.push(Line::from(Span::styled(
@@ -1523,6 +1541,7 @@ fn runtime_pane_state_label(state: &RuntimePaneState) -> &'static str {
     match state {
         RuntimePaneState::Ready => "ready",
         RuntimePaneState::Busy => "busy",
+        RuntimePaneState::Blocked => "blocked",
         RuntimePaneState::Dead => "dead",
         RuntimePaneState::Unknown => "unknown",
     }
@@ -1532,6 +1551,7 @@ fn runtime_pane_state_style(state: &RuntimePaneState) -> Style {
     match state {
         RuntimePaneState::Ready => Style::default().fg(crate::theme::status::SUCCESS),
         RuntimePaneState::Busy => Style::default().fg(crate::theme::status::PENDING),
+        RuntimePaneState::Blocked => Style::default().fg(crate::theme::status::WARNING),
         RuntimePaneState::Dead => Style::default().fg(crate::theme::status::ERROR),
         RuntimePaneState::Unknown => Style::default().fg(TEXT_DIM),
     }

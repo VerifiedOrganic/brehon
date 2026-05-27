@@ -97,6 +97,8 @@ pub(crate) struct RuntimePaneDashboardInfo {
     pub exit_code: Option<i32>,
     #[serde(default)]
     pub exit_reason: Option<String>,
+    #[serde(default)]
+    pub blocked: Option<brehon_types::RuntimePaneBlockInfo>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -760,6 +762,7 @@ fn runtime_dashboard_state_style(state: &RuntimePaneState) -> Style {
     match state {
         RuntimePaneState::Ready => Style::default().fg(crate::theme::status::SUCCESS),
         RuntimePaneState::Busy => Style::default().fg(crate::theme::status::RUNNING),
+        RuntimePaneState::Blocked => Style::default().fg(crate::theme::status::WARNING),
         RuntimePaneState::Dead => Style::default().fg(crate::theme::status::ERROR),
         RuntimePaneState::Unknown => Style::default().fg(TEXT_DIM),
     }
@@ -1575,6 +1578,12 @@ pub(super) fn runtime_registry_summary(
         .iter()
         .filter(|pane| pane.state == RuntimePaneState::Busy)
         .count();
+    let blocked = status
+        .registry
+        .panes
+        .iter()
+        .filter(|pane| pane.state == RuntimePaneState::Blocked)
+        .count();
     let dead = status
         .registry
         .panes
@@ -1588,8 +1597,9 @@ pub(super) fn runtime_registry_summary(
         .filter(|pane| pane.state == RuntimePaneState::Unknown)
         .count();
     let total = status.registry_count.max(status.registry.panes.len());
-    let mut summary =
-        format!("panes={total} ready={ready} busy={busy} dead={dead} unknown={unknown}");
+    let mut summary = format!(
+        "panes={total} ready={ready} busy={busy} blocked={blocked} dead={dead} unknown={unknown}"
+    );
     let source_summary = runtime_registry_source_summary(status);
     if !source_summary.is_empty() {
         summary.push_str(" sources=");
@@ -1815,6 +1825,16 @@ fn runtime_pane_summary(pane: &RuntimePaneDashboardInfo, mux: Option<&Mux>) -> S
     if let Some(reason) = pane.exit_reason.as_deref() {
         summary.push_str(&format!(" reason={reason:?}"));
     }
+    if let Some(blocked) = pane.blocked.as_ref() {
+        summary.push_str(&format!(" blocked={:?}", blocked.kind));
+        summary.push_str(&format!(" blocked_summary={:?}", blocked.summary));
+        if let Some(task_id) = blocked.task_id.as_deref() {
+            summary.push_str(&format!(" blocked_task={task_id}"));
+        }
+        if let Some(command) = blocked.command_or_tool.as_deref() {
+            summary.push_str(&format!(" blocked_command={command:?}"));
+        }
+    }
     summary
 }
 
@@ -2000,6 +2020,7 @@ fn runtime_pane_state_label(state: &RuntimePaneState) -> &'static str {
     match state {
         RuntimePaneState::Ready => "ready",
         RuntimePaneState::Busy => "busy",
+        RuntimePaneState::Blocked => "blocked",
         RuntimePaneState::Dead => "dead",
         RuntimePaneState::Unknown => "unknown",
     }
@@ -2071,6 +2092,7 @@ pub(crate) fn dashboard_agent_status_for_state(
             format!("{} running", crate::theme::glyph::spinner(tick)),
             StatusKind::Running,
         ),
+        Some(PaneState::Blocked { .. }) => ("⛔", "blocked".to_string(), StatusKind::Warning),
         Some(PaneState::Dead { .. }) => ("✗", "error".to_string(), StatusKind::Error),
         Some(PaneState::Ready { .. }) => ("○", "idle".to_string(), StatusKind::Idle),
         None if registered => ("◐", "starting".to_string(), StatusKind::Info),
@@ -2078,16 +2100,22 @@ pub(crate) fn dashboard_agent_status_for_state(
     }
 }
 
+fn builtin_dashboard_agent_identity(
+    cli: brehon_mux::SupervisorCli,
+    pane: &Pane,
+) -> (String, String) {
+    let cli_name = cli.as_str().to_string();
+    let provider_name = pane
+        .configured_agent_type()
+        .unwrap_or(cli.as_str())
+        .to_string();
+    (cli_name, provider_name)
+}
+
 fn dashboard_agent_identity(pane: &Pane) -> (String, String) {
     match pane.cli_type() {
-        AgentAdapter::BuiltIn(cli) => {
-            let cli_name = cli.as_str().to_string();
-            let provider_name = pane
-                .configured_agent_type()
-                .unwrap_or(cli.as_str())
-                .to_string();
-            (cli_name, provider_name)
-        }
+        AgentAdapter::BuiltIn(cli) => builtin_dashboard_agent_identity(*cli, pane),
+        AgentAdapter::BuiltInOverride(cfg) => builtin_dashboard_agent_identity(cfg.cli, pane),
         AgentAdapter::Custom(custom) => {
             let cli_name = custom
                 .command
@@ -2814,4 +2842,43 @@ pub(crate) fn filter_dashboard_tasks(tasks: Vec<TaskInfo>) -> Vec<TaskInfo> {
             !task_is_terminal(task)
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dashboard_agent_identity;
+    use brehon_mux::{AgentAdapter, HarnessControlPlane, HarnessTransport, Pane, SupervisorCli};
+    use std::path::PathBuf;
+
+    #[test]
+    fn dashboard_agent_identity_handles_built_in_overrides_explicitly() {
+        let mut capabilities = SupervisorCli::Gemini.capabilities();
+        capabilities.transport = HarnessTransport::InteractivePty;
+        capabilities.preferred_control_plane = HarnessControlPlane::PtyInjection;
+        let adapter = AgentAdapter::built_in_with_capabilities(SupervisorCli::Gemini, capabilities);
+
+        let pane = Pane::worker_with_agent_type(
+            "worker-1",
+            PathBuf::from("/tmp"),
+            None,
+            None,
+            "supervisor",
+            &adapter,
+            None,
+            None,
+            24,
+            80,
+            None,
+            None,
+            Some("gemini-worker"),
+            &[],
+            None,
+        )
+        .expect("create worker pane");
+
+        assert_eq!(
+            dashboard_agent_identity(&pane),
+            ("gemini".to_string(), "gemini-worker".to_string())
+        );
+    }
 }

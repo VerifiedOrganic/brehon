@@ -9,13 +9,12 @@ use std::collections::HashMap;
 use brehon_ports::GitOperations;
 use brehon_test_harness::FakeGitOperations;
 
-const CYCLES: usize = 200;
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn soak_git_create_branch_rebase_merge_cycles() {
     let git = FakeGitOperations::new();
+    let cycles = crate::soak_cycles_locked(200);
 
-    for cycle in 0..CYCLES {
+    for cycle in 0..cycles {
         let branch = format!("feature/soak-{}", cycle);
         git.create_branch(&branch);
 
@@ -49,8 +48,9 @@ async fn soak_git_create_branch_rebase_merge_cycles() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn soak_git_conflict_recovery_clean_state() {
     let git = FakeGitOperations::new();
+    let cycles = crate::soak_cycles_locked(200);
 
-    for cycle in 0..CYCLES {
+    for cycle in 0..cycles {
         let branch = format!("feature/conflict-{}", cycle);
         git.create_branch(&branch);
 
@@ -88,8 +88,9 @@ async fn soak_git_conflict_recovery_clean_state() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn soak_git_worktree_create_remove_cycles() {
     let git = FakeGitOperations::new();
+    let cycles = crate::soak_cycles_locked(200);
 
-    for cycle in 0..CYCLES {
+    for cycle in 0..cycles {
         let branch = format!("feature/wt-{}", cycle);
         git.create_branch(&branch);
 
@@ -102,8 +103,9 @@ async fn soak_git_worktree_create_remove_cycles() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn soak_git_checkout_cycles_remain_consistent() {
     let git = FakeGitOperations::new();
+    let cycles = crate::soak_cycles_locked(200);
 
-    for cycle in 0..CYCLES {
+    for cycle in 0..cycles {
         let branch = format!("feature/checkout-{}", cycle);
         git.create_branch(&branch);
 

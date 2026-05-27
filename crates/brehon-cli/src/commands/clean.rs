@@ -66,7 +66,12 @@ pub(crate) fn list_branches_with_prefix(project_path: &Path, prefix: &str) -> Ve
     match output {
         Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
             .lines()
-            .map(|l| l.trim().trim_start_matches("* ").to_string())
+            .map(|l| {
+                l.trim()
+                    .trim_start_matches("* ")
+                    .trim_start_matches("+ ")
+                    .to_string()
+            })
             .filter(|l| !l.is_empty())
             .collect(),
         _ => vec![],
@@ -214,6 +219,64 @@ pub(crate) fn is_git_repo(project_path: &Path) -> bool {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn list_branches_with_prefix_strips_linked_worktree_marker() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_path = temp.path();
+
+        let run_git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(project_path)
+                .status()
+                .expect("git command failed");
+            assert!(status.success(), "git {:?} failed", args);
+        };
+
+        run_git(&["init", "--quiet"]);
+        run_git(&["config", "user.email", "test@example.com"]);
+        run_git(&["config", "user.name", "Test"]);
+        // Disable commit signing so the test is hermetic in environments that
+        // enable GPG signing by default.
+        run_git(&["config", "commit.gpgsign", "false"]);
+
+        // Create an initial commit so branches and worktrees can be created.
+        std::fs::write(project_path.join("file.txt"), "hello").unwrap();
+        run_git(&["add", "file.txt"]);
+        run_git(&["commit", "--quiet", "-m", "initial"]);
+
+        // Create a branch and check it out in a linked worktree.
+        // When a branch is checked out in another worktree, `git branch --list`
+        // prefixes it with "+ " instead of "* ".
+        run_git(&["branch", "brehon/runs/session-a/agent-1"]);
+        let wt_path = project_path.join("wt");
+        run_git(&[
+            "worktree",
+            "add",
+            "--quiet",
+            wt_path.to_str().unwrap(),
+            "brehon/runs/session-a/agent-1",
+        ]);
+
+        // list_branches_with_prefix should strip the "+ " marker.
+        let branches = list_branches_with_prefix(project_path, "brehon/");
+        assert!(
+            branches.contains(&"brehon/runs/session-a/agent-1".to_string()),
+            "branch should appear without '+ ' marker, got: {:?}",
+            branches
+        );
+        assert!(
+            !branches.iter().any(|b| b.starts_with("+")),
+            "no branch should still carry the '+ ' marker, got: {:?}",
+            branches
+        );
+    }
 }
 
 pub fn execute(project_path: &Path, force: bool) -> Result<()> {

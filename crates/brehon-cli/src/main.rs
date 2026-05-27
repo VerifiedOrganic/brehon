@@ -15,8 +15,8 @@ use clap::{Parser, Subcommand};
 use tracing::info;
 
 use crate::commands::{
-    claude_hook, clean, config, doctor, epic_truth, factory, import_plan, init, process, reset,
-    run, runtime, serve, task, test as test_cmd,
+    claude_hook, clean, config, doctor, epic_truth, factory, import_plan, init, maintenance,
+    process, reset, run, runtime, serve, task, test as test_cmd,
 };
 
 fn absolutize_project_root(path: &Path) -> Option<PathBuf> {
@@ -210,6 +210,22 @@ enum Commands {
         /// Skip confirmation prompt
         #[arg(long)]
         force: bool,
+    },
+
+    /// Report stale/prunable Brehon worktrees, run branches, and failed-import
+    /// branches. Distinguishes active runtime state from leftovers. Use --prune
+    /// to remove stale items after explicit confirmation.
+    #[command(name = "maintenance")]
+    Maintenance {
+        /// Actually remove stale branches and worktrees (requires confirmation)
+        #[arg(long)]
+        prune: bool,
+        /// Skip confirmation prompt when pruning
+        #[arg(long, requires = "prune")]
+        force: bool,
+        /// Output report as JSON
+        #[arg(long, conflicts_with = "prune")]
+        json: bool,
     },
 
     #[command(name = "factory")]
@@ -575,6 +591,16 @@ async fn main() -> ExitCode {
         Some(Commands::Reset { force }) => {
             let path = project_path.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
             match reset::execute(&path, force) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("\n  {} {}", ui::red("Error:"), e);
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Some(Commands::Maintenance { prune, force, json }) => {
+            let path = project_path.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+            match maintenance::execute(&path, prune, force, json) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("\n  {} {}", ui::red("Error:"), e);

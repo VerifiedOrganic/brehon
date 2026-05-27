@@ -1270,6 +1270,10 @@ pub struct OrchestrationConfig {
     /// an omitted field is `None` and falls through to the base config.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub drain_timeout_secs: Option<u64>,
+    /// Explicit external worktree root. When unset, Brehon computes a cross-platform
+    /// default under the user's data directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_root: Option<String>,
 }
 
 impl OrchestrationConfig {
@@ -1278,6 +1282,71 @@ impl OrchestrationConfig {
     /// Falls back to 30 if no config layer set the value.
     pub fn effective_drain_timeout_secs(&self) -> u64 {
         self.drain_timeout_secs.unwrap_or(30)
+    }
+
+    /// Resolve the effective worktree root directory.
+    ///
+    /// If `worktree_root` is explicitly configured, returns that path
+    ///
+    /// The explicit override, when set, must be an absolute path.
+    /// Validation rejects relative overrides.
+    ///
+    /// Otherwise computes a platform-appropriate default under the user's
+    /// data directory, scoped by `repo_identity` to avoid collisions
+    /// across different repositories.
+    pub fn resolve_worktree_root(&self, _project_root: &std::path::Path, repo_identity: &str) -> std::path::PathBuf {
+        if let Some(root) = &self.worktree_root {
+            std::path::PathBuf::from(root)
+        } else {
+            default_worktree_root(repo_identity)
+        }
+    }
+
+    /// Returns the legacy in-repo worktree root for reading existing runtime records.
+    pub fn legacy_worktree_root(project_root: &std::path::Path) -> std::path::PathBuf {
+        project_root.join(".brehon").join("worktrees")
+    }
+}
+
+/// Returns the platform-specific data directory for Brehon, if available.
+fn platform_data_dir() -> Option<std::path::PathBuf> {
+    directories::ProjectDirs::from("", "", "brehon").map(|d| d.data_dir().to_path_buf())
+}
+
+/// Compute the platform-default external worktree root.
+///
+/// macOS: `~/Library/Application Support/brehon/worktrees/<identity>/`
+/// Linux: `$XDG_DATA_HOME/brehon/worktrees/<identity>/` or `~/.local/share/brehon/worktrees/<identity>/`
+/// Fallback (no home dir): `<temp_dir>/brehon/worktrees/<identity>/`
+pub fn default_worktree_root(repo_identity: &str) -> std::path::PathBuf {
+    default_worktree_root_with_base(platform_data_dir(), repo_identity)
+}
+
+fn default_worktree_root_with_base(
+    base: Option<std::path::PathBuf>,
+    repo_identity: &str,
+) -> std::path::PathBuf {
+    let base = base.unwrap_or_else(|| std::env::temp_dir().join("brehon"));
+    base.join("worktrees").join(sanitize_repo_identity(repo_identity))
+}
+
+/// Sanitize a repo identity string for use as a filesystem path component.
+fn sanitize_repo_identity(identity: &str) -> String {
+    let sanitized: String = identity
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let sanitized = sanitized.trim_matches('-');
+    if sanitized.is_empty() {
+        "unknown".to_string()
+    } else {
+        sanitized.to_string()
     }
 }
 
@@ -2315,6 +2384,7 @@ mod tests {
                 self_improve_tasks: Vec::new(),
                 spawn_workers: None,
                 drain_timeout_secs: None,
+                worktree_root: None,
             },
             runtime: RuntimeConfig::default(),
             budget: BudgetConfig {
@@ -2567,4 +2637,101 @@ security:
         let json = serde_json::to_value(&parsed).unwrap();
         assert!(json.get("profiles").is_none());
     }
+
+    #[test]
+    fn resolve_worktree_root_uses_explicit_absolute_override() {
+        let config = OrchestrationConfig {
+            worktree_root: Some("/tmp/custom-worktrees".to_string()),
+            ..OrchestrationConfig {
+                max_active_workers: 1,
+                worktree_isolation: true,
+                branch_prefix: "brehon/".into(),
+                auto_cleanup_worktrees: true,
+                worker_idle_behavior: WorkerIdleBehavior::Wait,
+                allow_mutating_idle_work: false,
+                self_improve_tasks: Vec::new(),
+                spawn_workers: None,
+                drain_timeout_secs: None,
+                worktree_root: None,
+            }
+        };
+        let resolved = config.resolve_worktree_root(std::path::Path::new("/project"), "repo-abc12345");
+        assert_eq!(resolved, std::path::PathBuf::from("/tmp/custom-worktrees"));
+    }
+
+    #[test]
+    fn default_worktree_root_contains_brehon_and_identity() {
+        let path = default_worktree_root("my-repo-abc12345");
+        assert!(path.is_absolute(), "default worktree root must be absolute: {path:?}");
+        let components: Vec<_> = path.components().map(|c| c.as_os_str().to_string_lossy()).collect();
+        assert!(components.iter().any(|c| c == "brehon"), "path should contain 'brehon': {path:?}");
+        assert!(components.iter().any(|c| c == "worktrees"), "path should contain 'worktrees': {path:?}");
+        assert!(components.iter().any(|c| c == "my-repo-abc12345"), "path should contain identity: {path:?}");
+    }
+
+    #[test]
+    fn default_worktree_root_sanitizes_identity() {
+        let path = default_worktree_root("My Repo!!!");
+        let file_name = path.file_name().unwrap().to_string_lossy();
+        assert_eq!(file_name, "my-repo");
+    }
+
+    #[test]
+    fn default_worktree_root_sanitizes_all_special_chars_to_unknown() {
+        let path = default_worktree_root("!!!");
+        let file_name = path.file_name().unwrap().to_string_lossy();
+        assert_eq!(file_name, "unknown");
+    }
+
+    #[test]
+    fn default_worktree_root_with_base_uses_injected_macos_path() {
+        let base = Some(std::path::PathBuf::from("/Users/test/Library/Application Support/brehon"));
+        let path = default_worktree_root_with_base(base, "my-repo-abc12345");
+        assert_eq!(path, std::path::PathBuf::from("/Users/test/Library/Application Support/brehon/worktrees/my-repo-abc12345"));
+    }
+
+    #[test]
+    fn default_worktree_root_with_base_uses_injected_linux_xdg_path() {
+        let base = Some(std::path::PathBuf::from("/home/test/.local/share/brehon"));
+        let path = default_worktree_root_with_base(base, "my-repo-abc12345");
+        assert_eq!(path, std::path::PathBuf::from("/home/test/.local/share/brehon/worktrees/my-repo-abc12345"));
+    }
+
+    #[test]
+    fn default_worktree_root_with_base_falls_back_to_temp_when_none() {
+        let path = default_worktree_root_with_base(None, "my-repo-abc12345");
+        assert!(path.is_absolute(), "fallback path must be absolute: {path:?}");
+        assert!(path.to_string_lossy().contains("worktrees"), "path should contain 'worktrees': {path:?}");
+        assert!(path.to_string_lossy().contains("my-repo-abc12345"), "path should contain identity: {path:?}");
+    }
+
+    #[test]
+    fn legacy_worktree_root_returns_in_repo_path() {
+        let path = OrchestrationConfig::legacy_worktree_root(std::path::Path::new("/project"));
+        assert_eq!(path, std::path::PathBuf::from("/project/.brehon/worktrees"));
+    }
+
+    #[test]
+    fn resolve_worktree_root_is_always_absolute() {
+        // resolve_worktree_root must always return an absolute path,
+        // whether from an explicit override, a platform default, or a fallback.
+        let config = OrchestrationConfig {
+            worktree_root: None,
+            ..OrchestrationConfig {
+                max_active_workers: 1,
+                worktree_isolation: true,
+                branch_prefix: "brehon/".into(),
+                auto_cleanup_worktrees: true,
+                worker_idle_behavior: WorkerIdleBehavior::Wait,
+                allow_mutating_idle_work: false,
+                self_improve_tasks: Vec::new(),
+                spawn_workers: None,
+                drain_timeout_secs: None,
+                worktree_root: None,
+            }
+        };
+        let resolved = config.resolve_worktree_root(std::path::Path::new("/project"), "repo-123");
+        assert!(resolved.is_absolute(), "resolved worktree root must be absolute: {resolved:?}");
+    }
 }
+

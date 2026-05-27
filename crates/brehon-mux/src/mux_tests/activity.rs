@@ -1,9 +1,11 @@
+use super::{ScopedEnv, TEST_ENV_LOCK};
 use crate::mux::*;
 use crate::teams::{TeamsManager, TeamsPaths};
 use crate::{
     ActivityEntry, ActivityKind, AgentAdapter, DeathReason, Generation, Pane, PaneState,
     SupervisorCli,
 };
+use brehon_ports::RuntimeEventStream;
 use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
@@ -286,6 +288,60 @@ async fn test_shutdown_all_clears_gateway_runtime_state() {
 }
 
 #[tokio::test]
+async fn test_reset_reviewer_session_clears_assignment_snapshot_file() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let brehon_root = temp.path().join(".brehon");
+    std::fs::create_dir_all(&brehon_root).expect("create brehon root");
+    let _env = ScopedEnv::set(&[("BREHON_ROOT", brehon_root.to_str().unwrap())]);
+
+    let mut mux = Mux::new(24, 80);
+    let pane = Pane::reviewer(
+        "codex-reviewer",
+        temp.path().to_path_buf(),
+        None,
+        24,
+        80,
+        &AgentAdapter::BuiltIn(SupervisorCli::Codex),
+        None,
+        None,
+        None,
+        None,
+    )
+    .expect("create codex reviewer pane");
+    mux.add_pane(pane);
+    mux.set_pane_review_context(
+        "codex-reviewer",
+        crate::ReviewContextSnapshot {
+            review_id: "REV-ctx".to_string(),
+            task_id: "T-ctx".to_string(),
+            round: 2,
+            panel_total: 3,
+            panel_done: 1,
+            verdict: None,
+            score: None,
+            findings_summary: Some("pending".to_string()),
+            updated_at: std::time::Instant::now(),
+        },
+    );
+
+    let path = brehon_root
+        .join("runtime")
+        .join("pane-assignment-context")
+        .join("codex-reviewer.json");
+    assert!(path.exists(), "set review context should create snapshot");
+
+    mux.reset_reviewer_session("codex-reviewer")
+        .await
+        .expect("reset reviewer session");
+
+    assert!(
+        !path.exists(),
+        "reset reviewer session should clear persisted assignment snapshot"
+    );
+}
+
+#[tokio::test]
 async fn test_reset_reviewer_session_restarts_claude_pty_reviewer() {
     use brehon_pty::{Pty, PtyConfig};
 
@@ -436,6 +492,1710 @@ async fn test_reset_worker_gateway_session_preserves_task_context_and_clears_ses
     assert!(matches!(pane.pane_state(), Some(PaneState::Ready { .. })));
     let context = pane.task_context().expect("task context preserved");
     assert_eq!(context.task_id, "T-42");
+}
+
+#[test]
+fn test_permission_request_activity_marks_worker_blocked_with_task_context() {
+    let mut mux = Mux::new(24, 80);
+    let pane = Pane::worker(
+        "codex-worker",
+        PathBuf::from("/tmp"),
+        None,
+        "supervisor",
+        &AgentAdapter::BuiltIn(SupervisorCli::Codex),
+        None,
+        None,
+        24,
+        80,
+        None,
+        None,
+        None,
+    )
+    .expect("create codex worker pane");
+    mux.add_pane(pane);
+
+    let generation = mux
+        .get("codex-worker")
+        .expect("worker pane exists")
+        .current_generation();
+    mux.get_mut("codex-worker")
+        .expect("worker pane exists")
+        .set_task_context(crate::TaskContextSnapshot {
+            task_id: "T-owned".to_string(),
+            title: "Owned task".to_string(),
+            status: brehon_types::task::TaskStatus::InProgress,
+            completion_mode: None,
+            merge_target: None,
+            parent_id: None,
+            epic_branch: None,
+            epic_worktree: None,
+            blocked_reason: None,
+            updated_at: std::time::Instant::now(),
+        });
+
+    mux.event_tx
+        .try_send(MuxEvent::ActivityEvent {
+            pane_id: "codex-worker".to_string(),
+            entry: ActivityEntry {
+                kind: ActivityKind::Permission,
+                ingested_at: std::time::Instant::now(),
+                tool_id: Some("perm-1".to_string()),
+                tool_name: None,
+                status: None,
+                message: Some("allow bash ls".to_string()),
+                output_chunks: None,
+                duration: None,
+            },
+            generation,
+        })
+        .expect("queue permission request activity");
+
+    let (_bytes, _events) = mux.poll_batch();
+
+    let pane = mux.get("codex-worker").expect("worker pane exists");
+    match pane.pane_state() {
+        Some(PaneState::Blocked { info, .. }) => {
+            assert_eq!(
+                info.kind,
+                brehon_types::RuntimePaneBlockKind::PermissionRequest
+            );
+            assert_eq!(info.task_id.as_deref(), Some("T-owned"));
+            assert_eq!(info.request_id.as_deref(), Some("perm-1"));
+            assert_eq!(info.command_or_tool.as_deref(), Some("allow bash ls"));
+        }
+        other => panic!("expected blocked pane state, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_terminal_prompt_output_marks_reviewer_blocked_with_review_task_context() {
+    let mut mux = Mux::new(24, 80);
+    let pane = Pane::reviewer(
+        "codex-reviewer",
+        PathBuf::from("/tmp"),
+        None,
+        24,
+        80,
+        &AgentAdapter::BuiltIn(SupervisorCli::Codex),
+        None,
+        None,
+        None,
+        None,
+    )
+    .expect("create codex reviewer pane");
+    mux.add_pane(pane);
+
+    let generation = mux
+        .get("codex-reviewer")
+        .expect("reviewer pane exists")
+        .current_generation();
+    let now = std::time::Instant::now();
+    let pane = mux.get_mut("codex-reviewer").expect("reviewer pane exists");
+    pane.set_pane_state(PaneState::Busy {
+        prompt_id: brehon_types::PromptId::new("review-prompt".to_string()),
+        generation,
+        delivered_at: now,
+        last_activity_at: now,
+    });
+    pane.set_review_context(crate::ReviewContextSnapshot {
+        review_id: "REV-1".to_string(),
+        task_id: "T-review".to_string(),
+        round: 1,
+        panel_total: 3,
+        panel_done: 1,
+        verdict: None,
+        score: None,
+        findings_summary: None,
+        updated_at: std::time::Instant::now(),
+    });
+
+    mux.event_tx
+        .try_send(MuxEvent::PaneOutput {
+            pane_id: "codex-reviewer".to_string(),
+            data: b"Do you want to allow this command? git show HEAD\r\n".to_vec(),
+            generation,
+        })
+        .expect("queue reviewer pane output");
+
+    let (_bytes, _events) = mux.poll_batch();
+
+    let pane = mux.get("codex-reviewer").expect("reviewer pane exists");
+    match pane.pane_state() {
+        Some(PaneState::Blocked { info, .. }) => {
+            assert_eq!(
+                info.kind,
+                brehon_types::RuntimePaneBlockKind::TerminalPrompt
+            );
+            assert_eq!(info.task_id.as_deref(), Some("T-review"));
+            assert_eq!(info.request_id.as_deref(), Some("review-prompt"));
+        }
+        other => panic!("expected blocked pane state, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_terminal_prompt_output_marks_worker_blocked_with_prompt_context() {
+    let mut mux = Mux::new(24, 80);
+    let pane = Pane::worker(
+        "codex-worker",
+        PathBuf::from("/tmp"),
+        None,
+        "supervisor",
+        &AgentAdapter::BuiltIn(SupervisorCli::Codex),
+        None,
+        None,
+        24,
+        80,
+        None,
+        None,
+        None,
+    )
+    .expect("create codex worker pane");
+    mux.add_pane(pane);
+
+    let generation = mux
+        .get("codex-worker")
+        .expect("worker pane exists")
+        .current_generation();
+    let now = std::time::Instant::now();
+    let pane = mux.get_mut("codex-worker").expect("worker pane exists");
+    pane.set_pane_state(PaneState::Busy {
+        prompt_id: brehon_types::PromptId::new("busy-prompt".to_string()),
+        generation,
+        delivered_at: now,
+        last_activity_at: now,
+    });
+    pane.set_task_context(crate::TaskContextSnapshot {
+        task_id: "T-output".to_string(),
+        title: "Output task".to_string(),
+        status: brehon_types::task::TaskStatus::InProgress,
+        completion_mode: None,
+        merge_target: None,
+        parent_id: None,
+        epic_branch: None,
+        epic_worktree: None,
+        blocked_reason: None,
+        updated_at: std::time::Instant::now(),
+    });
+
+    mux.event_tx
+        .try_send(MuxEvent::PaneOutput {
+            pane_id: "codex-worker".to_string(),
+            data: b"Do you want to allow this command? cargo test\r\n".to_vec(),
+            generation,
+        })
+        .expect("queue pane output");
+
+    let (_bytes, _events) = mux.poll_batch();
+
+    let pane = mux.get("codex-worker").expect("worker pane exists");
+    match pane.pane_state() {
+        Some(PaneState::Blocked { info, .. }) => {
+            assert_eq!(
+                info.kind,
+                brehon_types::RuntimePaneBlockKind::TerminalPrompt
+            );
+            assert_eq!(info.task_id.as_deref(), Some("T-output"));
+            assert_eq!(info.request_id.as_deref(), Some("busy-prompt"));
+            assert_eq!(
+                info.command_or_tool.as_deref(),
+                Some("Do you want to allow this command? cargo test")
+            );
+            assert!(
+                info.excerpt
+                    .as_deref()
+                    .is_some_and(|excerpt| excerpt.contains("Do you want to allow"))
+            );
+        }
+        other => panic!("expected blocked pane state, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_terminal_prompt_excerpt_strips_ansi_escape_sequences() {
+    let mut mux = Mux::new(24, 80);
+    let pane = Pane::worker(
+        "codex-worker",
+        PathBuf::from("/tmp"),
+        None,
+        "supervisor",
+        &AgentAdapter::BuiltIn(SupervisorCli::Codex),
+        None,
+        None,
+        24,
+        80,
+        None,
+        None,
+        None,
+    )
+    .expect("create codex worker pane");
+    mux.add_pane(pane);
+
+    let generation = mux
+        .get("codex-worker")
+        .expect("worker pane exists")
+        .current_generation();
+    let now = std::time::Instant::now();
+    let pane = mux.get_mut("codex-worker").expect("worker pane exists");
+    pane.set_pane_state(PaneState::Busy {
+        prompt_id: brehon_types::PromptId::new("busy-prompt".to_string()),
+        generation,
+        delivered_at: now,
+        last_activity_at: now,
+    });
+
+    mux.event_tx
+        .try_send(MuxEvent::PaneOutput {
+            pane_id: "codex-worker".to_string(),
+            data:
+                b"\x1b[31mred context\x1b[0m\r\nDo you want to allow this command? cargo test\r\n"
+                    .to_vec(),
+            generation,
+        })
+        .expect("queue pane output");
+
+    let (_bytes, _events) = mux.poll_batch();
+
+    let pane = mux.get("codex-worker").expect("worker pane exists");
+    match pane.pane_state() {
+        Some(PaneState::Blocked { info, .. }) => {
+            let excerpt = info.excerpt.as_deref().expect("excerpt");
+            assert!(excerpt.contains("red context"));
+            assert!(!excerpt.contains('\u{1b}'));
+        }
+        other => panic!("expected blocked pane state, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_unrelated_output_does_not_reblock_after_terminal_prompt_recovery() {
+    let mut mux = Mux::new(24, 80);
+    let pane = Pane::worker(
+        "codex-worker",
+        PathBuf::from("/tmp"),
+        None,
+        "supervisor",
+        &AgentAdapter::BuiltIn(SupervisorCli::Codex),
+        None,
+        None,
+        24,
+        80,
+        None,
+        None,
+        None,
+    )
+    .expect("create codex worker pane");
+    mux.add_pane(pane);
+
+    let generation = mux
+        .get("codex-worker")
+        .expect("worker pane exists")
+        .current_generation();
+    let now = std::time::Instant::now();
+    let pane = mux.get_mut("codex-worker").expect("worker pane exists");
+    pane.set_pane_state(PaneState::Busy {
+        prompt_id: brehon_types::PromptId::new("busy-prompt".to_string()),
+        generation,
+        delivered_at: now,
+        last_activity_at: now,
+    });
+    pane.set_task_context(crate::TaskContextSnapshot {
+        task_id: "T-output".to_string(),
+        title: "Output task".to_string(),
+        status: brehon_types::task::TaskStatus::InProgress,
+        completion_mode: None,
+        merge_target: None,
+        parent_id: None,
+        epic_branch: None,
+        epic_worktree: None,
+        blocked_reason: None,
+        updated_at: std::time::Instant::now(),
+    });
+    pane.append_output(b"permission request: allow bash ls\r\n")
+        .expect("append historical permission prompt output");
+
+    mux.event_tx
+        .try_send(MuxEvent::ActivityEvent {
+            pane_id: "codex-worker".to_string(),
+            entry: ActivityEntry {
+                kind: ActivityKind::Permission,
+                ingested_at: std::time::Instant::now(),
+                tool_id: Some("perm-1".to_string()),
+                tool_name: None,
+                status: None,
+                message: Some("allow bash ls".to_string()),
+                output_chunks: None,
+                duration: None,
+            },
+            generation,
+        })
+        .expect("queue permission request activity");
+    let (_bytes, _events) = mux.poll_batch();
+    assert!(matches!(
+        mux.get("codex-worker")
+            .expect("worker pane exists")
+            .pane_state(),
+        Some(PaneState::Blocked { .. })
+    ));
+
+    mux.event_tx
+        .try_send(MuxEvent::ActivityEvent {
+            pane_id: "codex-worker".to_string(),
+            entry: ActivityEntry {
+                kind: ActivityKind::Permission,
+                ingested_at: std::time::Instant::now(),
+                tool_id: Some("perm-1".to_string()),
+                tool_name: None,
+                status: Some("approved".to_string()),
+                message: None,
+                output_chunks: None,
+                duration: None,
+            },
+            generation,
+        })
+        .expect("queue permission resolution activity");
+    let (_bytes, _events) = mux.poll_batch();
+    assert!(matches!(
+        mux.get("codex-worker")
+            .expect("worker pane exists")
+            .pane_state(),
+        Some(PaneState::Busy { .. })
+    ));
+
+    mux.event_tx
+        .try_send(MuxEvent::PaneOutput {
+            pane_id: "codex-worker".to_string(),
+            data: b"Running tests...\r\n".to_vec(),
+            generation,
+        })
+        .expect("queue unrelated pane output");
+    let (_bytes, _events) = mux.poll_batch();
+
+    match mux
+        .get("codex-worker")
+        .expect("worker pane exists")
+        .pane_state()
+    {
+        Some(PaneState::Busy { prompt_id, .. }) => {
+            assert_eq!(prompt_id.to_string(), "busy-prompt");
+        }
+        other => panic!("expected busy pane state, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_permission_request_output_upgrades_to_structured_request_and_restores_on_approval() {
+    let mut mux = Mux::new(24, 80);
+    let pane = Pane::worker(
+        "codex-worker",
+        PathBuf::from("/tmp"),
+        None,
+        "supervisor",
+        &AgentAdapter::BuiltIn(SupervisorCli::Codex),
+        None,
+        None,
+        24,
+        80,
+        None,
+        None,
+        None,
+    )
+    .expect("create codex worker pane");
+    mux.add_pane(pane);
+
+    let generation = mux
+        .get("codex-worker")
+        .expect("worker pane exists")
+        .current_generation();
+    let now = std::time::Instant::now();
+    let pane = mux.get_mut("codex-worker").expect("worker pane exists");
+    pane.set_pane_state(PaneState::Busy {
+        prompt_id: brehon_types::PromptId::new("busy-prompt".to_string()),
+        generation,
+        delivered_at: now,
+        last_activity_at: now,
+    });
+    pane.set_task_context(crate::TaskContextSnapshot {
+        task_id: "T-output".to_string(),
+        title: "Output task".to_string(),
+        status: brehon_types::task::TaskStatus::InProgress,
+        completion_mode: None,
+        merge_target: None,
+        parent_id: None,
+        epic_branch: None,
+        epic_worktree: None,
+        blocked_reason: None,
+        updated_at: std::time::Instant::now(),
+    });
+
+    mux.event_tx
+        .try_send(MuxEvent::PaneOutput {
+            pane_id: "codex-worker".to_string(),
+            data: b"permission request: allow bash ls\r\n".to_vec(),
+            generation,
+        })
+        .expect("queue permission request output");
+    let (_bytes, _events) = mux.poll_batch();
+
+    match mux
+        .get("codex-worker")
+        .expect("worker pane exists")
+        .pane_state()
+    {
+        Some(PaneState::Blocked { info, .. }) => {
+            assert_eq!(
+                info.kind,
+                brehon_types::RuntimePaneBlockKind::PermissionRequest
+            );
+            assert_eq!(info.command_or_tool.as_deref(), Some("allow bash ls"));
+            assert_eq!(info.request_id, None);
+        }
+        other => panic!("expected blocked pane state, got {other:?}"),
+    }
+
+    mux.event_tx
+        .try_send(MuxEvent::ActivityEvent {
+            pane_id: "codex-worker".to_string(),
+            entry: ActivityEntry {
+                kind: ActivityKind::Permission,
+                ingested_at: std::time::Instant::now(),
+                tool_id: Some("perm-1".to_string()),
+                tool_name: None,
+                status: None,
+                message: Some("allow bash ls".to_string()),
+                output_chunks: None,
+                duration: None,
+            },
+            generation,
+        })
+        .expect("queue permission request activity");
+    let (_bytes, _events) = mux.poll_batch();
+
+    match mux
+        .get("codex-worker")
+        .expect("worker pane exists")
+        .pane_state()
+    {
+        Some(PaneState::Blocked { info, .. }) => {
+            assert_eq!(
+                info.kind,
+                brehon_types::RuntimePaneBlockKind::PermissionRequest
+            );
+            assert_eq!(info.request_id.as_deref(), Some("perm-1"));
+            assert_eq!(info.command_or_tool.as_deref(), Some("allow bash ls"));
+        }
+        other => panic!("expected blocked pane state, got {other:?}"),
+    }
+
+    mux.event_tx
+        .try_send(MuxEvent::ActivityEvent {
+            pane_id: "codex-worker".to_string(),
+            entry: ActivityEntry {
+                kind: ActivityKind::Permission,
+                ingested_at: std::time::Instant::now(),
+                tool_id: Some("perm-1".to_string()),
+                tool_name: None,
+                status: Some("approved".to_string()),
+                message: None,
+                output_chunks: None,
+                duration: None,
+            },
+            generation,
+        })
+        .expect("queue permission approval activity");
+    let (_bytes, _events) = mux.poll_batch();
+
+    match mux
+        .get("codex-worker")
+        .expect("worker pane exists")
+        .pane_state()
+    {
+        Some(PaneState::Busy { prompt_id, .. }) => {
+            assert_eq!(prompt_id.to_string(), "busy-prompt");
+        }
+        other => panic!("expected busy pane state after approval, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_pty_only_permission_request_restores_on_approval_without_structured_request() {
+    let mut mux = Mux::new(24, 80);
+    let pane = Pane::worker(
+        "codex-worker",
+        PathBuf::from("/tmp"),
+        None,
+        "supervisor",
+        &AgentAdapter::BuiltIn(SupervisorCli::Codex),
+        None,
+        None,
+        24,
+        80,
+        None,
+        None,
+        None,
+    )
+    .expect("create codex worker pane");
+    mux.add_pane(pane);
+
+    let generation = mux
+        .get("codex-worker")
+        .expect("worker pane exists")
+        .current_generation();
+    let now = std::time::Instant::now();
+    let pane = mux.get_mut("codex-worker").expect("worker pane exists");
+    pane.set_pane_state(PaneState::Busy {
+        prompt_id: brehon_types::PromptId::new("busy-prompt".to_string()),
+        generation,
+        delivered_at: now,
+        last_activity_at: now,
+    });
+
+    mux.event_tx
+        .try_send(MuxEvent::PaneOutput {
+            pane_id: "codex-worker".to_string(),
+            data: b"permission request: allow bash ls\r\n".to_vec(),
+            generation,
+        })
+        .expect("queue permission request output");
+    let (_bytes, _events) = mux.poll_batch();
+    assert!(matches!(
+        mux.get("codex-worker")
+            .expect("worker pane exists")
+            .pane_state(),
+        Some(PaneState::Blocked { .. })
+    ));
+
+    mux.event_tx
+        .try_send(MuxEvent::ActivityEvent {
+            pane_id: "codex-worker".to_string(),
+            entry: ActivityEntry {
+                kind: ActivityKind::Permission,
+                ingested_at: std::time::Instant::now(),
+                tool_id: Some("perm-1".to_string()),
+                tool_name: None,
+                status: Some("approved".to_string()),
+                message: None,
+                output_chunks: None,
+                duration: None,
+            },
+            generation,
+        })
+        .expect("queue permission approval activity");
+    let (_bytes, _events) = mux.poll_batch();
+
+    match mux
+        .get("codex-worker")
+        .expect("worker pane exists")
+        .pane_state()
+    {
+        Some(PaneState::Busy { prompt_id, .. }) => {
+            assert_eq!(prompt_id.to_string(), "busy-prompt");
+        }
+        other => panic!("expected busy pane state after approval, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_pty_only_permission_request_fallback_survives_unrelated_activity_until_resolution() {
+    let mut mux = Mux::new(24, 80);
+    let pane = Pane::worker(
+        "codex-worker",
+        PathBuf::from("/tmp"),
+        None,
+        "supervisor",
+        &AgentAdapter::BuiltIn(SupervisorCli::Codex),
+        None,
+        None,
+        24,
+        80,
+        None,
+        None,
+        None,
+    )
+    .expect("create codex worker pane");
+    mux.add_pane(pane);
+
+    let generation = mux
+        .get("codex-worker")
+        .expect("worker pane exists")
+        .current_generation();
+    let now = std::time::Instant::now();
+    let pane = mux.get_mut("codex-worker").expect("worker pane exists");
+    pane.set_pane_state(PaneState::Busy {
+        prompt_id: brehon_types::PromptId::new("busy-prompt".to_string()),
+        generation,
+        delivered_at: now,
+        last_activity_at: now,
+    });
+
+    mux.event_tx
+        .try_send(MuxEvent::PaneOutput {
+            pane_id: "codex-worker".to_string(),
+            data: b"permission request: allow bash ls\r\n".to_vec(),
+            generation,
+        })
+        .expect("queue permission request output");
+    let (_bytes, _events) = mux.poll_batch();
+    assert!(matches!(
+        mux.get("codex-worker")
+            .expect("worker pane exists")
+            .pane_state(),
+        Some(PaneState::Blocked { .. })
+    ));
+
+    mux.event_tx
+        .try_send(MuxEvent::ActivityEvent {
+            pane_id: "codex-worker".to_string(),
+            entry: ActivityEntry {
+                kind: ActivityKind::Operation,
+                ingested_at: std::time::Instant::now(),
+                tool_id: None,
+                tool_name: None,
+                status: Some("started".to_string()),
+                message: Some("unrelated operation".to_string()),
+                output_chunks: None,
+                duration: None,
+            },
+            generation,
+        })
+        .expect("queue unrelated activity");
+    let (_bytes, _events) = mux.poll_batch();
+
+    mux.event_tx
+        .try_send(MuxEvent::ActivityEvent {
+            pane_id: "codex-worker".to_string(),
+            entry: ActivityEntry {
+                kind: ActivityKind::Permission,
+                ingested_at: std::time::Instant::now(),
+                tool_id: Some("perm-1".to_string()),
+                tool_name: None,
+                status: Some("approved".to_string()),
+                message: None,
+                output_chunks: None,
+                duration: None,
+            },
+            generation,
+        })
+        .expect("queue late permission approval activity");
+    let (_bytes, _events) = mux.poll_batch();
+
+    match mux
+        .get("codex-worker")
+        .expect("worker pane exists")
+        .pane_state()
+    {
+        Some(PaneState::Busy { prompt_id, .. }) => {
+            assert_eq!(prompt_id.to_string(), "busy-prompt");
+        }
+        other => panic!("expected busy pane state after late approval, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_pty_only_permission_request_fallback_expires_without_resolution() {
+    let mut mux = Mux::new(24, 80);
+    let pane = Pane::worker(
+        "codex-worker",
+        PathBuf::from("/tmp"),
+        None,
+        "supervisor",
+        &AgentAdapter::BuiltIn(SupervisorCli::Codex),
+        None,
+        None,
+        24,
+        80,
+        None,
+        None,
+        None,
+    )
+    .expect("create codex worker pane");
+    mux.add_pane(pane);
+
+    let generation = mux
+        .get("codex-worker")
+        .expect("worker pane exists")
+        .current_generation();
+    let now = std::time::Instant::now();
+    let pane = mux.get_mut("codex-worker").expect("worker pane exists");
+    pane.set_pane_state(PaneState::Busy {
+        prompt_id: brehon_types::PromptId::new("busy-prompt".to_string()),
+        generation,
+        delivered_at: now,
+        last_activity_at: now,
+    });
+
+    mux.event_tx
+        .try_send(MuxEvent::PaneOutput {
+            pane_id: "codex-worker".to_string(),
+            data: b"permission request: allow bash ls\r\n".to_vec(),
+            generation,
+        })
+        .expect("queue permission request output");
+    let (_bytes, _events) = mux.poll_batch();
+    mux.get_mut("codex-worker")
+        .expect("worker pane exists")
+        .expire_permission_resolution_fallback_for_test();
+
+    mux.event_tx
+        .try_send(MuxEvent::ActivityEvent {
+            pane_id: "codex-worker".to_string(),
+            entry: ActivityEntry {
+                kind: ActivityKind::Permission,
+                ingested_at: std::time::Instant::now(),
+                tool_id: Some("perm-1".to_string()),
+                tool_name: None,
+                status: Some("approved".to_string()),
+                message: None,
+                output_chunks: None,
+                duration: None,
+            },
+            generation,
+        })
+        .expect("queue expired permission approval activity");
+    let (_bytes, _events) = mux.poll_batch();
+
+    assert!(matches!(
+        mux.get("codex-worker")
+            .expect("worker pane exists")
+            .pane_state(),
+        Some(PaneState::Blocked { .. })
+    ));
+}
+
+#[test]
+fn test_terminal_prompt_permission_resolution_restores_busy_turn_without_structured_request() {
+    let mut mux = Mux::new(24, 80);
+    let pane = Pane::worker(
+        "codex-worker",
+        PathBuf::from("/tmp"),
+        None,
+        "supervisor",
+        &AgentAdapter::BuiltIn(SupervisorCli::Codex),
+        None,
+        None,
+        24,
+        80,
+        None,
+        None,
+        None,
+    )
+    .expect("create codex worker pane");
+    mux.add_pane(pane);
+
+    let generation = mux
+        .get("codex-worker")
+        .expect("worker pane exists")
+        .current_generation();
+    let now = std::time::Instant::now();
+    let pane = mux.get_mut("codex-worker").expect("worker pane exists");
+    pane.set_pane_state(PaneState::Busy {
+        prompt_id: brehon_types::PromptId::new("busy-prompt".to_string()),
+        generation,
+        delivered_at: now,
+        last_activity_at: now,
+    });
+
+    mux.event_tx
+        .try_send(MuxEvent::PaneOutput {
+            pane_id: "codex-worker".to_string(),
+            data: b"Do you want to allow this command? cargo test\r\n".to_vec(),
+            generation,
+        })
+        .expect("queue terminal prompt output");
+    let (_bytes, _events) = mux.poll_batch();
+    assert!(matches!(
+        mux.get("codex-worker")
+            .expect("worker pane exists")
+            .pane_state(),
+        Some(PaneState::Blocked { .. })
+    ));
+
+    mux.event_tx
+        .try_send(MuxEvent::ActivityEvent {
+            pane_id: "codex-worker".to_string(),
+            entry: ActivityEntry {
+                kind: ActivityKind::Permission,
+                ingested_at: std::time::Instant::now(),
+                tool_id: Some("perm-allow".to_string()),
+                tool_name: None,
+                status: Some("approved".to_string()),
+                message: None,
+                output_chunks: None,
+                duration: None,
+            },
+            generation,
+        })
+        .expect("queue permission resolution activity");
+    let (_bytes, _events) = mux.poll_batch();
+
+    match mux
+        .get("codex-worker")
+        .expect("worker pane exists")
+        .pane_state()
+    {
+        Some(PaneState::Busy { prompt_id, .. }) => {
+            assert_eq!(prompt_id.to_string(), "busy-prompt");
+        }
+        other => panic!("expected busy pane state after approval, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_generic_terminal_prompt_upgrades_to_structured_request_and_restores_on_approval() {
+    let mut mux = Mux::new(24, 80);
+    let pane = Pane::worker(
+        "codex-worker",
+        PathBuf::from("/tmp"),
+        None,
+        "supervisor",
+        &AgentAdapter::BuiltIn(SupervisorCli::Codex),
+        None,
+        None,
+        24,
+        80,
+        None,
+        None,
+        None,
+    )
+    .expect("create codex worker pane");
+    mux.add_pane(pane);
+
+    let generation = mux
+        .get("codex-worker")
+        .expect("worker pane exists")
+        .current_generation();
+    let now = std::time::Instant::now();
+    let pane = mux.get_mut("codex-worker").expect("worker pane exists");
+    pane.set_pane_state(PaneState::Busy {
+        prompt_id: brehon_types::PromptId::new("busy-prompt".to_string()),
+        generation,
+        delivered_at: now,
+        last_activity_at: now,
+    });
+
+    mux.event_tx
+        .try_send(MuxEvent::PaneOutput {
+            pane_id: "codex-worker".to_string(),
+            data: b"This command requires approval\r\n".to_vec(),
+            generation,
+        })
+        .expect("queue generic terminal prompt output");
+    let (_bytes, _events) = mux.poll_batch();
+
+    match mux
+        .get("codex-worker")
+        .expect("worker pane exists")
+        .pane_state()
+    {
+        Some(PaneState::Blocked { info, .. }) => {
+            assert_eq!(
+                info.kind,
+                brehon_types::RuntimePaneBlockKind::TerminalPrompt
+            );
+            assert_eq!(
+                info.command_or_tool.as_deref(),
+                Some("This command requires approval")
+            );
+        }
+        other => panic!("expected blocked pane state, got {other:?}"),
+    }
+
+    mux.event_tx
+        .try_send(MuxEvent::ActivityEvent {
+            pane_id: "codex-worker".to_string(),
+            entry: ActivityEntry {
+                kind: ActivityKind::Permission,
+                ingested_at: std::time::Instant::now(),
+                tool_id: Some("perm-1".to_string()),
+                tool_name: None,
+                status: None,
+                message: Some("allow bash ls".to_string()),
+                output_chunks: None,
+                duration: None,
+            },
+            generation,
+        })
+        .expect("queue structured permission request activity");
+    let (_bytes, _events) = mux.poll_batch();
+
+    match mux
+        .get("codex-worker")
+        .expect("worker pane exists")
+        .pane_state()
+    {
+        Some(PaneState::Blocked { info, .. }) => {
+            assert_eq!(
+                info.kind,
+                brehon_types::RuntimePaneBlockKind::PermissionRequest
+            );
+            assert_eq!(info.request_id.as_deref(), Some("perm-1"));
+            assert_eq!(info.command_or_tool.as_deref(), Some("allow bash ls"));
+        }
+        other => panic!("expected upgraded blocked pane state, got {other:?}"),
+    }
+
+    mux.event_tx
+        .try_send(MuxEvent::ActivityEvent {
+            pane_id: "codex-worker".to_string(),
+            entry: ActivityEntry {
+                kind: ActivityKind::Permission,
+                ingested_at: std::time::Instant::now(),
+                tool_id: Some("perm-1".to_string()),
+                tool_name: None,
+                status: Some("approved".to_string()),
+                message: None,
+                output_chunks: None,
+                duration: None,
+            },
+            generation,
+        })
+        .expect("queue permission approval activity");
+    let (_bytes, _events) = mux.poll_batch();
+
+    match mux
+        .get("codex-worker")
+        .expect("worker pane exists")
+        .pane_state()
+    {
+        Some(PaneState::Busy { prompt_id, .. }) => {
+            assert_eq!(prompt_id.to_string(), "busy-prompt");
+        }
+        other => panic!("expected busy pane state after approval, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_permission_request_upgrade_publishes_blocked_state_refresh_event() {
+    let bus = std::sync::Arc::new(brehon_runtime::RuntimeEventBus::new(8));
+    let mut rx = bus.subscribe();
+    let mut mux = Mux::new(24, 80);
+    mux.set_runtime_event_sink(bus);
+    let pane = Pane::worker(
+        "codex-worker",
+        PathBuf::from("/tmp"),
+        None,
+        "supervisor",
+        &AgentAdapter::BuiltIn(SupervisorCli::Codex),
+        None,
+        None,
+        24,
+        80,
+        None,
+        None,
+        None,
+    )
+    .expect("create codex worker pane");
+    mux.add_pane(pane);
+
+    let generation = mux
+        .get("codex-worker")
+        .expect("worker pane exists")
+        .current_generation();
+    let now = std::time::Instant::now();
+    let pane = mux.get_mut("codex-worker").expect("worker pane exists");
+    pane.set_pane_state(PaneState::Busy {
+        prompt_id: brehon_types::PromptId::new("busy-prompt".to_string()),
+        generation,
+        delivered_at: now,
+        last_activity_at: now,
+    });
+
+    mux.event_tx
+        .try_send(MuxEvent::PaneOutput {
+            pane_id: "codex-worker".to_string(),
+            data: b"permission request: allow bash ls\r\n".to_vec(),
+            generation,
+        })
+        .expect("queue permission request output");
+    let (_bytes, _events) = mux.poll_batch();
+
+    for _ in 0..4 {
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(50), rx.next_event()).await;
+    }
+
+    mux.event_tx
+        .try_send(MuxEvent::ActivityEvent {
+            pane_id: "codex-worker".to_string(),
+            entry: ActivityEntry {
+                kind: ActivityKind::Permission,
+                ingested_at: std::time::Instant::now(),
+                tool_id: Some("perm-1".to_string()),
+                tool_name: None,
+                status: None,
+                message: Some("allow bash ls".to_string()),
+                output_chunks: None,
+                duration: None,
+            },
+            generation,
+        })
+        .expect("queue permission request activity");
+    let (_bytes, _events) = mux.poll_batch();
+
+    let mut saw_refresh = false;
+    for _ in 0..8 {
+        let Ok(Ok(Some(runtime_event))) =
+            tokio::time::timeout(std::time::Duration::from_millis(200), rx.next_event()).await
+        else {
+            continue;
+        };
+
+        if matches!(
+            runtime_event.kind,
+            brehon_types::RuntimeEventKind::PaneStateChanged(ref changed)
+                if runtime_event.meta.pane_id == "codex-worker"
+                    && changed.previous == Some(brehon_types::RuntimePaneState::Blocked)
+                    && changed.current == brehon_types::RuntimePaneState::Blocked
+                    && changed
+                        .blocked
+                        .as_ref()
+                        .is_some_and(|blocked| {
+                            blocked.kind
+                                == brehon_types::RuntimePaneBlockKind::PermissionRequest
+                                && blocked.request_id.as_deref() == Some("perm-1")
+                        })
+        ) {
+            saw_refresh = true;
+            break;
+        }
+    }
+
+    assert!(
+        saw_refresh,
+        "upgrading a PTY-detected permission block should republish blocked details"
+    );
+}
+
+#[test]
+fn test_gateway_delivery_busy_does_not_set_tool_flag_on_blocked_pane() {
+    let mut mux = Mux::new(24, 80);
+    let pane = Pane::worker(
+        "codex-worker",
+        PathBuf::from("/tmp"),
+        None,
+        "supervisor",
+        &AgentAdapter::BuiltIn(SupervisorCli::Codex),
+        None,
+        None,
+        24,
+        80,
+        None,
+        None,
+        None,
+    )
+    .expect("create codex worker pane");
+    mux.add_pane(pane);
+
+    let generation = mux
+        .get("codex-worker")
+        .expect("worker pane exists")
+        .current_generation();
+    mux.get_mut("codex-worker")
+        .expect("worker pane exists")
+        .set_pane_blocked(
+            brehon_types::RuntimePaneBlockInfo {
+                kind: brehon_types::RuntimePaneBlockKind::TerminalPrompt,
+                summary: "terminal prompt blocked automatic recovery: requires approval"
+                    .to_string(),
+                command_or_tool: Some("This command requires approval".to_string()),
+                request_id: Some("busy-prompt".to_string()),
+                task_id: Some("T-output".to_string()),
+                excerpt: None,
+            },
+            std::time::Instant::now(),
+        );
+
+    mux.mark_gateway_delivery_busy(
+        "codex-worker",
+        brehon_types::PromptId::new("gateway-busy"),
+        generation,
+        std::time::Instant::now(),
+    );
+
+    let pane = mux.get("codex-worker").expect("worker pane exists");
+    assert!(!pane.is_tool_executing());
+    assert!(matches!(pane.pane_state(), Some(PaneState::Blocked { .. })));
+}
+
+#[test]
+fn test_terminal_prompt_output_detects_split_keyword_across_chunks() {
+    let mut mux = Mux::new(24, 80);
+    let pane = Pane::worker(
+        "codex-worker",
+        PathBuf::from("/tmp"),
+        None,
+        "supervisor",
+        &AgentAdapter::BuiltIn(SupervisorCli::Codex),
+        None,
+        None,
+        24,
+        80,
+        None,
+        None,
+        None,
+    )
+    .expect("create codex worker pane");
+    mux.add_pane(pane);
+
+    let generation = mux
+        .get("codex-worker")
+        .expect("worker pane exists")
+        .current_generation();
+    let now = std::time::Instant::now();
+    let pane = mux.get_mut("codex-worker").expect("worker pane exists");
+    pane.set_pane_state(PaneState::Busy {
+        prompt_id: brehon_types::PromptId::new("busy-prompt".to_string()),
+        generation,
+        delivered_at: now,
+        last_activity_at: now,
+    });
+    pane.set_task_context(crate::TaskContextSnapshot {
+        task_id: "T-output".to_string(),
+        title: "Output task".to_string(),
+        status: brehon_types::task::TaskStatus::InProgress,
+        completion_mode: None,
+        merge_target: None,
+        parent_id: None,
+        epic_branch: None,
+        epic_worktree: None,
+        blocked_reason: None,
+        updated_at: std::time::Instant::now(),
+    });
+
+    mux.event_tx
+        .try_send(MuxEvent::PaneOutput {
+            pane_id: "codex-worker".to_string(),
+            data: b"This command requires".to_vec(),
+            generation,
+        })
+        .expect("queue first pane output chunk");
+    let (_bytes, _events) = mux.poll_batch();
+    assert!(matches!(
+        mux.get("codex-worker")
+            .expect("worker pane exists")
+            .pane_state(),
+        Some(PaneState::Busy { .. })
+    ));
+
+    mux.event_tx
+        .try_send(MuxEvent::PaneOutput {
+            pane_id: "codex-worker".to_string(),
+            data: b" approval\r\n".to_vec(),
+            generation,
+        })
+        .expect("queue second pane output chunk");
+    let (_bytes, _events) = mux.poll_batch();
+
+    let pane = mux.get("codex-worker").expect("worker pane exists");
+    match pane.pane_state() {
+        Some(PaneState::Blocked { info, .. }) => {
+            assert_eq!(
+                info.kind,
+                brehon_types::RuntimePaneBlockKind::TerminalPrompt
+            );
+            assert_eq!(
+                info.command_or_tool.as_deref(),
+                Some("This command requires approval")
+            );
+            assert_eq!(info.request_id.as_deref(), Some("busy-prompt"));
+        }
+        other => panic!("expected blocked pane state, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_terminal_prompt_output_detects_permission_request_when_only_trailing_line_arrives() {
+    let mut mux = Mux::new(24, 80);
+    let pane = Pane::worker(
+        "codex-worker",
+        PathBuf::from("/tmp"),
+        None,
+        "supervisor",
+        &AgentAdapter::BuiltIn(SupervisorCli::Codex),
+        None,
+        None,
+        24,
+        80,
+        None,
+        None,
+        None,
+    )
+    .expect("create codex worker pane");
+    mux.add_pane(pane);
+
+    let generation = mux
+        .get("codex-worker")
+        .expect("worker pane exists")
+        .current_generation();
+    let now = std::time::Instant::now();
+    let pane = mux.get_mut("codex-worker").expect("worker pane exists");
+    pane.set_pane_state(PaneState::Busy {
+        prompt_id: brehon_types::PromptId::new("busy-prompt".to_string()),
+        generation,
+        delivered_at: now,
+        last_activity_at: now,
+    });
+    pane.set_task_context(crate::TaskContextSnapshot {
+        task_id: "T-output".to_string(),
+        title: "Output task".to_string(),
+        status: brehon_types::task::TaskStatus::InProgress,
+        completion_mode: None,
+        merge_target: None,
+        parent_id: None,
+        epic_branch: None,
+        epic_worktree: None,
+        blocked_reason: None,
+        updated_at: std::time::Instant::now(),
+    });
+    pane.append_output(b"Permission request: cargo test\r\n")
+        .expect("seed prior permission prompt output");
+    pane.terminal_prompt_prefilter_tail = "Permission request: cargo test\r\n".to_string();
+
+    mux.event_tx
+        .try_send(MuxEvent::PaneOutput {
+            pane_id: "codex-worker".to_string(),
+            data: b"[y/N]\r\n".to_vec(),
+            generation,
+        })
+        .expect("queue trailing prompt chunk");
+    let (_bytes, _events) = mux.poll_batch();
+
+    let pane = mux.get("codex-worker").expect("worker pane exists");
+    match pane.pane_state() {
+        Some(PaneState::Blocked { info, .. }) => {
+            assert_eq!(
+                info.kind,
+                brehon_types::RuntimePaneBlockKind::PermissionRequest
+            );
+            assert_eq!(info.command_or_tool.as_deref(), Some("cargo test"));
+            assert_eq!(info.task_id.as_deref(), Some("T-output"));
+            assert_eq!(info.request_id, None);
+        }
+        other => panic!("expected blocked pane state, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_auto_approved_gemini_permission_status_does_not_block_pane() {
+    let mut mux = Mux::new(24, 80);
+    let pane = Pane::worker(
+        "gemini-worker",
+        PathBuf::from("/tmp"),
+        None,
+        "supervisor",
+        &AgentAdapter::BuiltIn(SupervisorCli::Gemini),
+        None,
+        None,
+        24,
+        80,
+        None,
+        None,
+        None,
+    )
+    .expect("create gemini worker pane");
+    mux.add_pane(pane);
+
+    let generation = mux
+        .get("gemini-worker")
+        .expect("worker pane exists")
+        .current_generation();
+    let now = std::time::Instant::now();
+    let pane = mux.get_mut("gemini-worker").expect("worker pane exists");
+    pane.set_pane_state(PaneState::Busy {
+        prompt_id: brehon_types::PromptId::new("busy-prompt".to_string()),
+        generation,
+        delivered_at: now,
+        last_activity_at: now,
+    });
+    pane.set_task_context(crate::TaskContextSnapshot {
+        task_id: "T-output".to_string(),
+        title: "Output task".to_string(),
+        status: brehon_types::task::TaskStatus::InProgress,
+        completion_mode: None,
+        merge_target: None,
+        parent_id: None,
+        epic_branch: None,
+        epic_worktree: None,
+        blocked_reason: None,
+        updated_at: std::time::Instant::now(),
+    });
+
+    mux.event_tx
+        .try_send(MuxEvent::PaneOutput {
+            pane_id: "gemini-worker".to_string(),
+            data: b"\x1b[2mAuto-approved Gemini permission request: allow_once\x1b[0m\r\n".to_vec(),
+            generation,
+        })
+        .expect("queue auto-approved permission status");
+    let (_bytes, _events) = mux.poll_batch();
+
+    assert!(matches!(
+        mux.get("gemini-worker")
+            .expect("worker pane exists")
+            .pane_state(),
+        Some(PaneState::Busy { .. })
+    ));
+}
+
+#[test]
+fn test_rejected_gemini_permission_status_does_not_block_pane() {
+    let mut mux = Mux::new(24, 80);
+    let pane = Pane::worker(
+        "gemini-worker",
+        PathBuf::from("/tmp"),
+        None,
+        "supervisor",
+        &AgentAdapter::BuiltIn(SupervisorCli::Gemini),
+        None,
+        None,
+        24,
+        80,
+        None,
+        None,
+        None,
+    )
+    .expect("create gemini worker pane");
+    mux.add_pane(pane);
+
+    let generation = mux
+        .get("gemini-worker")
+        .expect("worker pane exists")
+        .current_generation();
+    let now = std::time::Instant::now();
+    let pane = mux.get_mut("gemini-worker").expect("worker pane exists");
+    pane.set_pane_state(PaneState::Busy {
+        prompt_id: brehon_types::PromptId::new("busy-prompt".to_string()),
+        generation,
+        delivered_at: now,
+        last_activity_at: now,
+    });
+    pane.set_task_context(crate::TaskContextSnapshot {
+        task_id: "T-output".to_string(),
+        title: "Output task".to_string(),
+        status: brehon_types::task::TaskStatus::InProgress,
+        completion_mode: None,
+        merge_target: None,
+        parent_id: None,
+        epic_branch: None,
+        epic_worktree: None,
+        blocked_reason: None,
+        updated_at: std::time::Instant::now(),
+    });
+
+    mux.event_tx
+        .try_send(MuxEvent::PaneOutput {
+            pane_id: "gemini-worker".to_string(),
+            data: b"\x1b[31mRejected Gemini permission request\x1b[0m\r\n".to_vec(),
+            generation,
+        })
+        .expect("queue rejected permission status");
+    let (_bytes, _events) = mux.poll_batch();
+
+    assert!(matches!(
+        mux.get("gemini-worker")
+            .expect("worker pane exists")
+            .pane_state(),
+        Some(PaneState::Busy { .. })
+    ));
+}
+
+#[test]
+fn test_terminal_prompt_output_detects_split_signal_token_across_chunks() {
+    let mut mux = Mux::new(24, 80);
+    let pane = Pane::worker(
+        "codex-worker",
+        PathBuf::from("/tmp"),
+        None,
+        "supervisor",
+        &AgentAdapter::BuiltIn(SupervisorCli::Codex),
+        None,
+        None,
+        24,
+        80,
+        None,
+        None,
+        None,
+    )
+    .expect("create codex worker pane");
+    mux.add_pane(pane);
+
+    let generation = mux
+        .get("codex-worker")
+        .expect("worker pane exists")
+        .current_generation();
+    let now = std::time::Instant::now();
+    let pane = mux.get_mut("codex-worker").expect("worker pane exists");
+    pane.set_pane_state(PaneState::Busy {
+        prompt_id: brehon_types::PromptId::new("busy-prompt".to_string()),
+        generation,
+        delivered_at: now,
+        last_activity_at: now,
+    });
+    pane.set_task_context(crate::TaskContextSnapshot {
+        task_id: "T-output".to_string(),
+        title: "Output task".to_string(),
+        status: brehon_types::task::TaskStatus::InProgress,
+        completion_mode: None,
+        merge_target: None,
+        parent_id: None,
+        epic_branch: None,
+        epic_worktree: None,
+        blocked_reason: None,
+        updated_at: std::time::Instant::now(),
+    });
+
+    mux.event_tx
+        .try_send(MuxEvent::PaneOutput {
+            pane_id: "codex-worker".to_string(),
+            data: b"Do you want to al".to_vec(),
+            generation,
+        })
+        .expect("queue first pane output chunk");
+    let (_bytes, _events) = mux.poll_batch();
+    assert!(matches!(
+        mux.get("codex-worker")
+            .expect("worker pane exists")
+            .pane_state(),
+        Some(PaneState::Busy { .. })
+    ));
+
+    mux.event_tx
+        .try_send(MuxEvent::PaneOutput {
+            pane_id: "codex-worker".to_string(),
+            data: b"low this command? cargo test\r\n".to_vec(),
+            generation,
+        })
+        .expect("queue second pane output chunk");
+    let (_bytes, _events) = mux.poll_batch();
+
+    let pane = mux.get("codex-worker").expect("worker pane exists");
+    match pane.pane_state() {
+        Some(PaneState::Blocked { info, .. }) => {
+            assert_eq!(
+                info.kind,
+                brehon_types::RuntimePaneBlockKind::TerminalPrompt
+            );
+            assert_eq!(
+                info.command_or_tool.as_deref(),
+                Some("Do you want to allow this command? cargo test")
+            );
+            assert_eq!(info.request_id.as_deref(), Some("busy-prompt"));
+        }
+        other => panic!("expected blocked pane state, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_permission_resolution_with_matching_request_restores_busy_turn() {
+    let mut mux = Mux::new(24, 80);
+    let pane = Pane::worker(
+        "codex-worker",
+        PathBuf::from("/tmp"),
+        None,
+        "supervisor",
+        &AgentAdapter::BuiltIn(SupervisorCli::Codex),
+        None,
+        None,
+        24,
+        80,
+        None,
+        None,
+        None,
+    )
+    .expect("create codex worker pane");
+    mux.add_pane(pane);
+
+    let generation = mux
+        .get("codex-worker")
+        .expect("worker pane exists")
+        .current_generation();
+    let now = std::time::Instant::now();
+    let pane = mux.get_mut("codex-worker").expect("worker pane exists");
+    pane.set_pane_state(PaneState::Busy {
+        prompt_id: brehon_types::PromptId::new("busy-prompt".to_string()),
+        generation,
+        delivered_at: now,
+        last_activity_at: now,
+    });
+    pane.set_tool_executing(true);
+
+    mux.event_tx
+        .try_send(MuxEvent::ActivityEvent {
+            pane_id: "codex-worker".to_string(),
+            entry: ActivityEntry {
+                kind: ActivityKind::Permission,
+                ingested_at: std::time::Instant::now(),
+                tool_id: Some("perm-1".to_string()),
+                tool_name: None,
+                status: None,
+                message: Some("allow bash ls".to_string()),
+                output_chunks: None,
+                duration: None,
+            },
+            generation,
+        })
+        .expect("queue permission request activity");
+    let (_bytes, _events) = mux.poll_batch();
+    assert!(matches!(
+        mux.get("codex-worker")
+            .expect("worker pane exists")
+            .pane_state(),
+        Some(PaneState::Blocked { .. })
+    ));
+
+    mux.event_tx
+        .try_send(MuxEvent::ActivityEvent {
+            pane_id: "codex-worker".to_string(),
+            entry: ActivityEntry {
+                kind: ActivityKind::Permission,
+                ingested_at: std::time::Instant::now(),
+                tool_id: Some("perm-1".to_string()),
+                tool_name: None,
+                status: Some("approved".to_string()),
+                message: None,
+                output_chunks: None,
+                duration: None,
+            },
+            generation,
+        })
+        .expect("queue permission resolution activity");
+    let (_bytes, _events) = mux.poll_batch();
+
+    let pane = mux.get("codex-worker").expect("worker pane exists");
+    assert!(pane.is_tool_executing());
+    match pane.pane_state() {
+        Some(PaneState::Busy {
+            prompt_id,
+            generation: busy_generation,
+            ..
+        }) => {
+            assert_eq!(prompt_id.to_string(), "busy-prompt");
+            assert_eq!(*busy_generation, generation);
+        }
+        other => panic!("expected busy pane state, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_permission_resolution_with_non_matching_request_keeps_blocked_state() {
+    let mut mux = Mux::new(24, 80);
+    let pane = Pane::worker(
+        "codex-worker",
+        PathBuf::from("/tmp"),
+        None,
+        "supervisor",
+        &AgentAdapter::BuiltIn(SupervisorCli::Codex),
+        None,
+        None,
+        24,
+        80,
+        None,
+        None,
+        None,
+    )
+    .expect("create codex worker pane");
+    mux.add_pane(pane);
+
+    let generation = mux
+        .get("codex-worker")
+        .expect("worker pane exists")
+        .current_generation();
+
+    mux.event_tx
+        .try_send(MuxEvent::ActivityEvent {
+            pane_id: "codex-worker".to_string(),
+            entry: ActivityEntry {
+                kind: ActivityKind::Permission,
+                ingested_at: std::time::Instant::now(),
+                tool_id: Some("perm-1".to_string()),
+                tool_name: None,
+                status: None,
+                message: Some("allow bash ls".to_string()),
+                output_chunks: None,
+                duration: None,
+            },
+            generation,
+        })
+        .expect("queue permission request activity");
+    let (_bytes, _events) = mux.poll_batch();
+
+    mux.event_tx
+        .try_send(MuxEvent::ActivityEvent {
+            pane_id: "codex-worker".to_string(),
+            entry: ActivityEntry {
+                kind: ActivityKind::Permission,
+                ingested_at: std::time::Instant::now(),
+                tool_id: Some("perm-2".to_string()),
+                tool_name: None,
+                status: Some("approved".to_string()),
+                message: None,
+                output_chunks: None,
+                duration: None,
+            },
+            generation,
+        })
+        .expect("queue mismatched permission resolution activity");
+    let (_bytes, _events) = mux.poll_batch();
+
+    let pane = mux.get("codex-worker").expect("worker pane exists");
+    match pane.pane_state() {
+        Some(PaneState::Blocked { info, .. }) => {
+            assert_eq!(
+                info.kind,
+                brehon_types::RuntimePaneBlockKind::PermissionRequest
+            );
+            assert_eq!(info.request_id.as_deref(), Some("perm-1"));
+        }
+        other => panic!("expected blocked pane state, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_set_pane_blocked_warns_when_replacing_existing_block_reason() {
+    let mut pane = Pane::worker(
+        "codex-worker",
+        PathBuf::from("/tmp"),
+        None,
+        "supervisor",
+        &AgentAdapter::BuiltIn(SupervisorCli::Codex),
+        None,
+        None,
+        24,
+        80,
+        None,
+        None,
+        None,
+    )
+    .expect("create codex worker pane");
+    pane.set_pane_blocked(
+        brehon_types::RuntimePaneBlockInfo {
+            kind: brehon_types::RuntimePaneBlockKind::PermissionRequest,
+            summary: "first block".to_string(),
+            command_or_tool: Some("first command".to_string()),
+            request_id: Some("perm-1".to_string()),
+            task_id: Some("T-first".to_string()),
+            excerpt: None,
+        },
+        std::time::Instant::now(),
+    );
+
+    let logs = capture_logs(|| {
+        pane.set_pane_blocked(
+            brehon_types::RuntimePaneBlockInfo {
+                kind: brehon_types::RuntimePaneBlockKind::TerminalPrompt,
+                summary: "second block".to_string(),
+                command_or_tool: Some("second command".to_string()),
+                request_id: Some("prompt-2".to_string()),
+                task_id: Some("T-second".to_string()),
+                excerpt: Some("blocked excerpt".to_string()),
+            },
+            std::time::Instant::now(),
+        );
+    });
+
+    assert!(
+        logs.contains("Overwriting existing blocked pane state"),
+        "expected overwrite warning, got logs: {logs}"
+    );
 }
 
 #[tokio::test]
@@ -787,6 +2547,12 @@ async fn test_reset_worker_gateway_session_rejects_missing_isolated_cwd() {
 
 #[tokio::test]
 async fn test_deliver_prompt_preserves_explicit_sender_for_claude_teams() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let brehon_root = temp.path().join(".brehon");
+    std::fs::create_dir_all(&brehon_root).expect("create brehon root");
+    let _env = ScopedEnv::set(&[("BREHON_ROOT", brehon_root.to_str().unwrap())]);
+
     let home = std::env::temp_dir().join(format!("brehon-mux-home-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&home).expect("create fake home");
 

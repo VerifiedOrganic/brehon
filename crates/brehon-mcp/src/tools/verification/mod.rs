@@ -40,5 +40,5 @@ pub(crate) use helpers::commits_refer_to_same_oid;
 pub(crate) use panel::{find_panel_lease_by_task, release_panel_lease_for_task};
 pub(crate) use state::{
     clear_obsolete_review_state_for_resumed_work, delete_review_state, read_review_state,
-    read_round_request, reviewed_commits,
+    read_round_request, reviewed_commits, write_review_state,
 };

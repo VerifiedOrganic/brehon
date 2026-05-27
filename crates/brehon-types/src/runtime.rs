@@ -5,8 +5,10 @@
 //! future daemon, semantic detectors, policy gates, and terminal-host adapters.
 
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 /// Identity attached to every runtime event.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -112,6 +114,90 @@ pub struct TerminalPaneHandle {
     pub source: RuntimeSource,
 }
 
+/// Durable snapshot of the assignment context currently loaded in a pane.
+///
+/// The mux mirrors task/review context changes into runtime files so MCP tools
+/// can authoritatively answer whether a worker or reviewer pane is showing the
+/// expected assignment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneAssignmentContext {
+    pub pane_id: String,
+    pub assignment_kind: String,
+    pub task_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub round: Option<u32>,
+    pub status: String,
+    pub updated_at: String,
+}
+
+const PANE_ASSIGNMENT_CONTEXT_DIRNAME: &str = "pane-assignment-context";
+
+/// Sanitize a runtime identifier for use in filenames.
+pub fn sanitize_runtime_key(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// Scan `dir` for a finalized `.json` ack file whose JSON payload contains the
+/// given `prompt_id`. Returns the matching file path together with the parsed
+/// JSON value so callers can avoid a second parse.
+///
+/// This avoids the collision risk of filename-based sanitization by matching on
+/// file content, consistent with how queue and dead-letter directories work.
+///
+/// Performance: O(n) in directory entries. Ack directories are expected to
+/// remain small (single-digit file counts per session), so this scan is cheap
+/// in practice and eliminates the collision risk of the old O(1) filename-
+/// based lookup.
+pub fn find_prompt_ack_in_dir(dir: &Path, prompt_id: &str) -> Option<(PathBuf, Value)> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return None;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            continue;
+        }
+        if path.extension().is_none_or(|ext| ext != "json") {
+            continue;
+        }
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            if let Ok(value) = serde_json::from_str::<Value>(&content) {
+                if value.get("prompt_id").and_then(|v| v.as_str()) == Some(prompt_id) {
+                    return Some((path, value));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Return the runtime directory used for pane assignment context snapshots.
+pub fn pane_assignment_context_dir(root: &Path) -> PathBuf {
+    root.join("runtime").join(PANE_ASSIGNMENT_CONTEXT_DIRNAME)
+}
+
+/// Return the snapshot path for a pane assignment context file.
+pub fn pane_assignment_context_path(root: &Path, pane_id: &str) -> PathBuf {
+    let pane_key = sanitize_runtime_key(pane_id);
+    let pane_key = if pane_key.is_empty() {
+        "pane"
+    } else {
+        pane_key.as_str()
+    };
+    pane_assignment_context_dir(root).join(format!("{pane_key}.json"))
+}
+
 /// Requested terminal dimensions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TerminalResize {
@@ -168,6 +254,8 @@ pub struct PaneStateChangedEvent {
     pub current: RuntimePaneState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked: Option<RuntimePaneBlockInfo>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -175,8 +263,30 @@ pub struct PaneStateChangedEvent {
 pub enum RuntimePaneState {
     Ready,
     Busy,
+    Blocked,
     Dead,
     Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimePaneBlockKind {
+    PermissionRequest,
+    TerminalPrompt,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimePaneBlockInfo {
+    pub kind: RuntimePaneBlockKind,
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_or_tool: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub excerpt: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -559,5 +669,32 @@ mod tests {
         assert_eq!(decoded_spec, spec);
         assert_eq!(decoded_handle, handle);
         assert_eq!(decoded_resize, resize);
+    }
+
+    #[test]
+    fn sanitize_runtime_key_replaces_non_filename_chars() {
+        assert_eq!(sanitize_runtime_key("pane 1/2:3"), "pane_1_2_3");
+        assert_eq!(sanitize_runtime_key("worker-1_ok"), "worker-1_ok");
+    }
+
+    #[test]
+    fn pane_assignment_context_path_uses_runtime_snapshot_dir() {
+        let path = pane_assignment_context_path(Path::new("/tmp/brehon"), "pane 1/2");
+        assert_eq!(
+            path,
+            Path::new("/tmp/brehon")
+                .join("runtime")
+                .join("pane-assignment-context")
+                .join("pane_1_2.json")
+        );
+    }
+
+    #[test]
+    fn pane_assignment_context_path_falls_back_for_empty_pane_ids() {
+        let path = pane_assignment_context_path(Path::new("/tmp/brehon"), "");
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("pane.json")
+        );
     }
 }

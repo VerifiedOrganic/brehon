@@ -53,6 +53,7 @@ fn host_prompt_policy_context(ctx: &EventLoopCtx, target: &str) -> RuntimePolicy
             .map(|state| match state {
                 brehon_mux::PaneState::Ready { .. } => RuntimePaneState::Ready,
                 brehon_mux::PaneState::Busy { .. } => RuntimePaneState::Busy,
+                brehon_mux::PaneState::Blocked { .. } => RuntimePaneState::Blocked,
                 brehon_mux::PaneState::Dead { .. } => RuntimePaneState::Dead,
             });
     RuntimePolicyContext {
@@ -634,7 +635,11 @@ fn queue_queued_prompt_delivery_via_daemon(
     prompt_text: &str,
     prompt_id: Option<&str>,
 ) -> bool {
-    if ctx.mux.get(target).is_none() {
+    let Some(pane) = ctx.mux.get(target) else {
+        return false;
+    };
+
+    if pane.is_gateway_backed() {
         return false;
     }
 
@@ -832,7 +837,7 @@ pub(super) fn deliver_pending_prompts(ctx: &mut EventLoopCtx, brehon_root: &std:
                             );
                             if pane_needs_post_spawn_prompt(&ctx.mux, &target) {
                                 if let Some(startup_prompt) =
-                                    build_supervisor_reset_startup_prompt(&ctx.mux, &target)
+                                    build_supervisor_reset_startup_prompt(&ctx.mux, &target, ctx.runtime_agent_factory_host_owned)
                                 {
                                     if ctx.runtime_agent_factory_host_owned {
                                         let _ = enqueue_terminal_host_startup_prompt(
@@ -1527,5 +1532,60 @@ mod tests {
             resolve_role_alias_prompt_target(temp.path(), "firm-hen-20", "Ping").unwrap(),
             Some("firm-hen-20".to_string())
         );
+    }
+
+    #[test]
+    fn gateway_backed_targets_bypass_daemon_runtime_prompt_delivery() {
+        let temp = tempfile::tempdir().unwrap();
+        let brehon_root = temp.path().join(".brehon");
+        std::fs::create_dir_all(brehon_root.join("runtime").join("prompt-queue")).unwrap();
+        let prompt_path = brehon_root
+            .join("runtime")
+            .join("prompt-queue")
+            .join("queued.prompt");
+        std::fs::write(&prompt_path, "queued").unwrap();
+
+        let adapter = brehon_mux::AgentAdapter::BuiltIn(brehon_mux::SupervisorCli::Gemini);
+        let pane = brehon_mux::Pane::worker(
+            "worker-gemini",
+            temp.path().to_path_buf(),
+            Some(&brehon_root),
+            "claude-supervisor",
+            &adapter,
+            None,
+            None,
+            24,
+            80,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(pane.is_gateway_backed());
+
+        let mut mux = brehon_mux::Mux::new(24, 80);
+        mux.add_pane(pane);
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut ctx = crate::run::event_loop::new_headless_event_loop_ctx(
+            mux,
+            rt.handle().clone(),
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        ctx.dashboard_data.lock().unwrap().brehon_root = Some(brehon_root.clone());
+
+        assert!(!queue_queued_prompt_delivery_via_daemon(
+            &mut ctx,
+            &brehon_root,
+            &prompt_path,
+            "worker-gemini",
+            None,
+            "assignment",
+            Some("prompt-1"),
+        ));
+        assert!(ctx.pending_runtime_commands.is_empty());
     }
 }

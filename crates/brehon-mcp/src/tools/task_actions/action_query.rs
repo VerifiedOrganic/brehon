@@ -6,8 +6,14 @@ use brehon_types::{is_terminal_task_status, normalize_task_status};
 
 use crate::error::McpError;
 use crate::server::ToolResult;
+use crate::tools::assignment_observability::{
+    acknowledge_propagation, build_assignment_observability, read_task_assignment_propagation,
+    write_task_assignment_propagation, AssignmentPropagation,
+};
 use crate::tools::routing::routing_summary;
-use crate::tools::verification::{find_panel_lease_by_task, read_review_state, read_round_request};
+use crate::tools::verification::{
+    find_panel_lease_by_task, read_review_state, read_round_request, write_review_state,
+};
 use crate::tools::{error_result, text_result};
 
 use super::dependencies::{
@@ -23,8 +29,140 @@ use super::lifecycle::{
     is_epic, is_initiative, reconcile_dependency_states,
 };
 use super::paths::{brehon_root_dir, project_root};
-use super::persistence::{read_all_tasks, read_task};
+use super::persistence::{read_all_tasks, read_task, write_task};
 use super::structured_spec::control_plane_scope_issue_for_task;
+
+fn nonempty_json_string(task: &serde_json::Map<String, Value>, key: &str) -> Option<String> {
+    task.get(key)
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn current_task_assignment(
+    task: &serde_json::Map<String, Value>,
+) -> Option<(String, Option<AssignmentPropagation>)> {
+    let propagation = read_task_assignment_propagation(task);
+    let owner = nonempty_json_string(task, "assignee")
+        .or_else(|| {
+            propagation
+                .as_ref()
+                .map(|propagation| propagation.owner.trim())
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
+        .or_else(|| nonempty_json_string(task, "review_owner"))?;
+    let propagation = propagation.filter(|propagation| propagation.owner.trim() == owner.trim());
+    Some((owner, propagation))
+}
+
+fn task_assignment_progress_started(propagation: Option<&AssignmentPropagation>) -> bool {
+    propagation
+        .and_then(|propagation| propagation.progress_started_at.as_deref())
+        .is_some()
+}
+
+fn annotate_task_assignment_observability(task: &mut serde_json::Map<String, Value>) {
+    let Some((owner, propagation)) = current_task_assignment(task) else {
+        return;
+    };
+    let Some(task_id) = nonempty_json_string(task, "task_id") else {
+        return;
+    };
+    task.insert(
+        "assignment_observability".into(),
+        build_assignment_observability(
+            &owner,
+            "task",
+            &task_id,
+            None,
+            None,
+            propagation.as_ref(),
+            task_assignment_progress_started(propagation.as_ref()),
+        ),
+    );
+}
+
+fn acknowledge_task_assignment(
+    task: &mut serde_json::Map<String, Value>,
+    actor: &str,
+    via: &str,
+) -> bool {
+    let Some((owner, existing_propagation)) = current_task_assignment(task) else {
+        return false;
+    };
+    if owner != actor {
+        return false;
+    }
+    let propagation_missing = existing_propagation.is_none();
+    let mut propagation = existing_propagation
+        .unwrap_or_else(|| AssignmentPropagation::new(&owner, "task", None, None));
+    let changed = acknowledge_propagation(&mut propagation, actor, via);
+    if changed || propagation_missing {
+        write_task_assignment_propagation(task, &propagation);
+        return true;
+    }
+    false
+}
+
+fn acknowledge_review_assignments(reviewer: &str, via: &str) {
+    let Some(reviews_dir) = brehon_root_dir().map(|root| root.join("runtime").join("reviews"))
+    else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(&reviews_dir) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        if !entry.path().is_dir() {
+            continue;
+        }
+        let Some(task_id) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        let Some(mut state) = read_review_state(&task_id) else {
+            continue;
+        };
+        if state.status != "collecting"
+            || !state.panel.iter().any(|member| member == reviewer)
+            || state
+                .submissions_received
+                .iter()
+                .any(|member| member == reviewer)
+        {
+            continue;
+        }
+        if !read_task(&task_id).as_ref().is_some_and(|task| {
+            normalize_task_status(
+                task.get("status")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("pending"),
+            ) == Some("in_review")
+        }) {
+            continue;
+        }
+        let mut propagation = state
+            .reviewer_assignments
+            .remove(reviewer)
+            .unwrap_or_else(|| AssignmentPropagation::new(reviewer, "review", None, None));
+        let changed = acknowledge_propagation(&mut propagation, reviewer, via);
+        state
+            .reviewer_assignments
+            .insert(reviewer.to_string(), propagation);
+        if changed {
+            if let Err(err) = write_review_state(&task_id, &state) {
+                tracing::warn!(
+                    task_id = %task_id,
+                    reviewer = %reviewer,
+                    error = %err,
+                    "Failed to persist review assignment acknowledgment"
+                );
+            }
+        }
+    }
+}
 
 pub(super) fn read_active_review_obligations(reviewer: &str) -> Vec<Value> {
     let Some(reviews_dir) = brehon_root_dir().map(|root| root.join("runtime").join("reviews"))
@@ -142,6 +280,27 @@ pub(super) fn read_active_review_obligations(reviewer: &str) -> Vec<Value> {
                     "reviewer": reviewer
                 }
             }),
+        );
+        let propagation = state.reviewer_assignments.get(reviewer);
+        let progress_started = propagation
+            .and_then(|propagation| propagation.progress_started_at.as_deref())
+            .is_some()
+            || (propagation.is_none()
+                && state
+                    .submissions_received
+                    .iter()
+                    .any(|member| member == reviewer));
+        obligation.insert(
+            "assignment_observability".into(),
+            build_assignment_observability(
+                reviewer,
+                "review",
+                &task_id,
+                Some(state.current_review_id.as_str()),
+                Some(state.current_round),
+                propagation,
+                progress_started,
+            ),
         );
         if let Some(request) = request {
             obligation.insert(
@@ -476,6 +635,10 @@ pub(super) async fn execute_list(args: &Value) -> Result<ToolResult, McpError> {
         .get("include_closed")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let include_assignment_observability = args
+        .get("include_assignment_observability")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     let mut tasks: Vec<Value> = read_all_tasks()
         .into_iter()
@@ -552,6 +715,12 @@ pub(super) async fn execute_list(args: &Value) -> Result<ToolResult, McpError> {
                     v["merge_target"] = Value::String(merge_target.to_string());
                 }
             }
+            if include_assignment_observability {
+                let Some(object) = v.as_object_mut() else {
+                    return v;
+                };
+                annotate_task_assignment_observability(object);
+            }
             v
         })
         .collect();
@@ -569,7 +738,8 @@ pub(super) async fn execute_list(args: &Value) -> Result<ToolResult, McpError> {
         "filter": {
             "task_type": task_type,
             "status": status,
-            "include_closed": include_closed
+            "include_closed": include_closed,
+            "include_assignment_observability": include_assignment_observability
         }
     });
 
@@ -590,12 +760,35 @@ pub(super) async fn execute_mine(args: &Value) -> Result<ToolResult, McpError> {
             t.get("assignee").and_then(|v| v.as_str()) == Some(&agent_name)
                 && task_is_visible_in_mine(t, &role)
         })
-        .map(|task| Value::Object(sanitize_task_for_agent(task, &role)))
+        .map(|mut task| {
+            let original_task = task.clone();
+            let task_id = nonempty_json_string(&task, "task_id");
+            if acknowledge_task_assignment(&mut task, &agent_name, "task action=mine") {
+                if let Some(task_id) = task_id.as_deref() {
+                    if !write_task(task_id, &task) {
+                        tracing::warn!(
+                            task_id = %task_id,
+                            "Failed to persist task assignment acknowledgment"
+                        );
+                        task = original_task;
+                    }
+                }
+            }
+            // Always include assignment observability for mine: the caller is
+            // explicitly requesting their own assignments, and the per-task
+            // delivery/pane-context state is directly useful. Unlike list,
+            // which may return many tasks and gates this behind
+            // include_assignment_observability, mine is bounded to the caller's
+            // assignments so the O(n) I/O is acceptable.
+            annotate_task_assignment_observability(&mut task);
+            Value::Object(sanitize_task_for_agent(task, &role))
+        })
         .collect();
 
     // Do not gate this on BREHON_AGENT_ROLE. Some launchers expose the lane
     // name or lose role env propagation across the CLI -> MCP boundary. Panel
     // membership by agent name is the durable source of truth.
+    acknowledge_review_assignments(&agent_name, "task action=mine");
     let review_obligations = read_active_review_obligations(&agent_name);
 
     let task_count = tasks.len();

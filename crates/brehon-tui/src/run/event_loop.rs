@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
-use ratatui::Terminal;
+use ratatui::{Terminal, TerminalOptions, Viewport};
 
 use brehon_mux::{
     Mux, MuxEvent, MuxRuntimeCommandReceiver, PaneKind, PromptDeliveryAttempt, SessionScopedQueue,
@@ -21,7 +21,7 @@ use brehon_ports::{PortError, RuntimeCommandRouter};
 use brehon_types::config::OrchestrationConfig;
 use brehon_types::{
     RuntimeCommand, RuntimeCommandKind, RuntimeCommandStatus, RuntimeCommandTarget, RuntimeEvent,
-    RuntimePaneKind, RuntimePaneState, RuntimePolicyContext,
+    RuntimePaneBlockInfo, RuntimePaneKind, RuntimePaneState, RuntimePolicyContext,
 };
 
 use super::advisors::{
@@ -62,10 +62,12 @@ use super::layout::{
     SUB_TAB_HEIGHT,
 };
 use super::recovery::{
-    clear_agent_health_marker, clear_prompt_retry_meta, dead_letter_prompt_for_session,
-    promote_active_assigned_task, push_dashboard_event, queued_prompt_retry_delay,
+    block_task_for_prompt_block_recovery_failure, clear_agent_health_marker,
+    clear_prompt_retry_meta, dead_letter_prompt_for_session, promote_active_assigned_task,
+    prompt_blocked_detail, prompt_blocked_info, push_dashboard_event, queued_prompt_retry_delay,
     record_prompt_retry_deferral, record_prompt_retry_failure,
     should_dead_letter_prompt_after_failure, sync_worker_task_contexts,
+    write_prompt_blocked_recovery_failed_marker_or_clear_stale_marker,
 };
 use super::refresh::{
     apply_dashboard_refresh_snapshot, collect_dashboard_refresh, collect_session_refresh_entries,
@@ -147,6 +149,8 @@ pub(crate) struct EventLoopCtx {
     // Stall / recovery tracking
     pub last_activity: std::collections::HashMap<String, Instant>,
     pub auto_recover_threshold: Duration,
+    /// Time elapsed after the last *nudge* before a reviewer is eligible for
+    /// escalation. Resends are tracked separately and do not start this timer.
     pub review_obligation_nudge_threshold: Duration,
     pub review_obligation_reset_threshold: Duration,
     pub worker_context_reset_cooldown: Duration,
@@ -161,6 +165,7 @@ pub(crate) struct EventLoopCtx {
     pub last_worker_context_reset: std::collections::HashMap<String, Instant>,
     pub pending_self_improve_prompt: std::collections::HashMap<String, Instant>,
     pub next_self_improve_index: std::collections::HashMap<String, usize>,
+    pub prompt_blocked_recovery_failed_panes: std::collections::HashSet<String>,
 
     // Post-checkpoint handoff nudge state.
     //
@@ -178,7 +183,11 @@ pub(crate) struct EventLoopCtx {
     pub post_checkpoint_nudge_threshold: Duration,
     pub post_checkpoint_nudge_cooldown: Duration,
     pub post_checkpoint_nudges_sent: std::collections::HashMap<(String, String, String), Instant>,
-    pub review_obligation_nudges_sent: std::collections::HashMap<(String, String, String), Instant>,
+    pub review_obligation_notifications_sent:
+        std::collections::HashMap<(String, String, String), Instant>,
+    pub review_obligation_resends_sent:
+        std::collections::HashMap<(String, String, String), Instant>,
+    pub review_obligation_failures_reported: std::collections::HashSet<(String, String, String)>,
     pub active_worker_recovery_nudges_sent: std::collections::HashMap<(String, String), Instant>,
     pub active_worker_recovery_resets_sent: std::collections::HashMap<(String, String), Instant>,
 
@@ -239,6 +248,14 @@ pub(crate) enum PendingRuntimeCommandEffect {
         success_message: String,
         failure_prefix: String,
         marker: RecoveryResetMarker,
+    },
+    WorkerRecycle {
+        pane_id: String,
+        owning_task_id: Option<String>,
+        blocked: Option<RuntimePaneBlockInfo>,
+        startup_prompt: Option<String>,
+        success_message: String,
+        failure_prefix: String,
     },
     DashboardAction {
         pane_id: Option<String>,
@@ -317,6 +334,7 @@ fn perform_manual_reset_request(ctx: &mut EventLoopCtx, pane_id: &str) -> bool {
             &ctx.dashboard_data,
             &mut ctx.last_activity,
             &mut ctx.pending_self_improve_prompt,
+            ctx.runtime_agent_factory_host_owned,
         )
     } else {
         push_dashboard_event(
@@ -379,7 +397,11 @@ fn manual_reset_plan(ctx: &EventLoopCtx, pane_id: &str) -> Option<(Option<String
         }
         PaneKind::Supervisor => {
             let startup_prompt = if pane_needs_post_spawn_prompt(&ctx.mux, pane_id) {
-                build_supervisor_reset_startup_prompt(&ctx.mux, pane_id)
+                build_supervisor_reset_startup_prompt(
+                    &ctx.mux,
+                    pane_id,
+                    ctx.runtime_agent_factory_host_owned,
+                )
             } else {
                 None
             };
@@ -426,6 +448,42 @@ pub(super) fn queue_runtime_command(
             handle,
         });
     Ok(())
+}
+
+pub(super) fn worker_recycle_command_pending(ctx: &EventLoopCtx, pane_id: &str) -> bool {
+    ctx.pending_runtime_commands.iter().any(|task| {
+        matches!(
+            &task.effect,
+            PendingRuntimeCommandEffect::WorkerRecycle {
+                pane_id: pending_pane_id,
+                ..
+            } if pending_pane_id == pane_id
+        )
+    })
+}
+
+pub(super) fn worker_reset_or_recycle_command_pending(ctx: &EventLoopCtx, pane_id: &str) -> bool {
+    ctx.pending_runtime_commands.iter().any(|task| {
+        matches!(
+            &task.effect,
+            PendingRuntimeCommandEffect::ManualReset {
+                pane_id: pending_pane_id,
+                ..
+            }
+            | PendingRuntimeCommandEffect::RecoveryReset {
+                pane_id: pending_pane_id,
+                ..
+            }
+            | PendingRuntimeCommandEffect::WorkerRecycle {
+                pane_id: pending_pane_id,
+                ..
+            } if pending_pane_id == pane_id
+        ) || matches!(
+            &task.effect,
+            PendingRuntimeCommandEffect::QueuedWorkerRecycle { request, .. }
+                if request.worker == pane_id
+        )
+    })
 }
 
 fn record_runtime_command_pending(ctx: &mut EventLoopCtx, command: &RuntimeCommand) {
@@ -1080,7 +1138,7 @@ fn handle_global_control_key(
     false
 }
 
-fn process_pending_runtime_commands(ctx: &mut EventLoopCtx) {
+pub(super) fn process_pending_runtime_commands(ctx: &mut EventLoopCtx) {
     let mut index = 0usize;
     while index < ctx.pending_runtime_commands.len() {
         if !ctx.pending_runtime_commands[index].handle.is_finished() {
@@ -1119,6 +1177,347 @@ fn process_pending_runtime_commands(ctx: &mut EventLoopCtx) {
             }
         }
         ctx.needs_redraw = true;
+    }
+}
+
+pub(super) fn drain_runtime_command_receiver(ctx: &mut EventLoopCtx) {
+    let mut runtime_command_rx_disconnected = false;
+    if let Some(runtime_command_rx) = ctx.runtime_command_rx.as_mut() {
+        loop {
+            match runtime_command_rx.try_recv() {
+                Ok(request) => {
+                    let result = ctx
+                        .mux
+                        .execute_runtime_command(&ctx.rt, request.command().clone());
+                    request.complete(result);
+                    ctx.needs_redraw = true;
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    runtime_command_rx_disconnected = true;
+                    break;
+                }
+            }
+        }
+    }
+    if runtime_command_rx_disconnected {
+        ctx.runtime_command_rx = None;
+    }
+}
+
+pub(super) fn process_pending_runtime_approval_resolutions(ctx: &mut EventLoopCtx) {
+    let mut approval_resolution_index = 0usize;
+    while approval_resolution_index < ctx.pending_runtime_approval_resolutions.len() {
+        if ctx.pending_runtime_approval_resolutions[approval_resolution_index].is_finished() {
+            let task = ctx
+                .pending_runtime_approval_resolutions
+                .swap_remove(approval_resolution_index);
+            match ctx.rt.block_on(task) {
+                Ok((approval_id, approved, Ok(result))) => {
+                    push_dashboard_event(
+                        &ctx.dashboard_data,
+                        format!(
+                            "{} runtime approval {}: {:?}",
+                            if approved { "approved" } else { "denied" },
+                            approval_id,
+                            result.status
+                        ),
+                    );
+                    if let Some(message) = result.message {
+                        tracing::info!(
+                            approval_id = %approval_id,
+                            approved,
+                            message = %message,
+                            "Resolved runtime approval"
+                        );
+                    }
+                }
+                Ok((approval_id, approved, Err(err))) => {
+                    push_dashboard_event(
+                        &ctx.dashboard_data,
+                        format!(
+                            "failed to {} runtime approval {}: {}",
+                            if approved { "approve" } else { "deny" },
+                            approval_id,
+                            err
+                        ),
+                    );
+                    tracing::warn!(
+                        approval_id = %approval_id,
+                        approved,
+                        error = %err,
+                        "Failed to resolve runtime approval"
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, "Runtime approval resolution task failed");
+                }
+            }
+            ctx.needs_redraw = true;
+        } else {
+            approval_resolution_index += 1;
+        }
+    }
+}
+
+pub(super) fn process_pending_queued_gateway_prompt_deliveries(ctx: &mut EventLoopCtx) {
+    let mut queued_gateway_completion_index = 0usize;
+    while queued_gateway_completion_index < ctx.pending_queued_gateway_prompt_deliveries.len() {
+        if ctx.pending_queued_gateway_prompt_deliveries[queued_gateway_completion_index]
+            .handle
+            .is_finished()
+        {
+            let task = ctx
+                .pending_queued_gateway_prompt_deliveries
+                .swap_remove(queued_gateway_completion_index);
+            let result = match ctx.rt.block_on(task.handle) {
+                Ok(result) => result,
+                Err(err) => Err(brehon_mux::AsyncGatewayPromptDeliveryError {
+                    error: err.to_string(),
+                }),
+            };
+            match result {
+                Ok(PromptDeliveryAttempt::Delivered { .. }) => {
+                    ctx.mux.finalize_async_gateway_prompt_delivery(
+                        &task.target,
+                        &task.prompt_text,
+                        task.from.as_deref(),
+                        Ok(()),
+                    );
+                    ctx.last_activity
+                        .insert(task.target.clone(), Instant::now());
+                    clear_prompt_retry_meta(&task.path);
+                    if let (Some(id), Some(root)) = (
+                        task.prompt_id.as_deref(),
+                        ctx.dashboard_data.lock().unwrap().brehon_root.clone(),
+                    ) {
+                        if let Err(err) = super::helpers::write_prompt_delivery_ack(
+                            &root,
+                            id,
+                            &task.target,
+                            "gateway",
+                        ) {
+                            tracing::warn!(
+                                target = %task.target,
+                                prompt_id = %id,
+                                error = %err,
+                                "Failed to persist prompt delivery ack after gateway delivery"
+                            );
+                        }
+                    }
+                    let _ = std::fs::remove_file(&task.path);
+                    tracing::info!(
+                        target = %task.target,
+                        "Delivered queued gateway prompt via background attempt"
+                    );
+                }
+                Ok(PromptDeliveryAttempt::Queued {
+                    prompt_id,
+                    ahead_of,
+                }) => {
+                    if let Some(generation) = ctx
+                        .mux
+                        .get(&task.target)
+                        .map(|pane| pane.current_generation())
+                    {
+                        ctx.mux.mark_gateway_delivery_busy(
+                            &task.target,
+                            prompt_id.clone(),
+                            generation,
+                            Instant::now(),
+                        );
+                    }
+                    let retry_after = queued_prompt_retry_delay(ahead_of);
+                    let next_retry_at = record_prompt_retry_deferral(
+                        &task.path,
+                        retry_after,
+                        "gateway delivery queued prompt",
+                    );
+                    super::stall_handling::recover_stale_deferred_prompt_delivery(
+                        ctx,
+                        &task.target,
+                        &task.path,
+                        Instant::now(),
+                    );
+                    tracing::info!(
+                        target = %task.target,
+                        prompt_id = %prompt_id,
+                        ahead_of,
+                        next_retry_at = %next_retry_at.to_rfc3339(),
+                        retry_after_ms = %retry_after.as_millis(),
+                        "Queued gateway prompt after background attempt"
+                    );
+                }
+                Ok(PromptDeliveryAttempt::AlreadyPresent {
+                    prompt_id,
+                    position,
+                }) => {
+                    let retry_after = queued_prompt_retry_delay(position.retry_ahead_of());
+                    let next_retry_at = record_prompt_retry_deferral(
+                        &task.path,
+                        retry_after,
+                        "gateway delivery prompt already queued",
+                    );
+                    super::stall_handling::recover_stale_deferred_prompt_delivery(
+                        ctx,
+                        &task.target,
+                        &task.path,
+                        Instant::now(),
+                    );
+                    tracing::info!(
+                        target = %task.target,
+                        prompt_id = %prompt_id,
+                        position = %position,
+                        next_retry_at = %next_retry_at.to_rfc3339(),
+                        retry_after_ms = %retry_after.as_millis(),
+                        "Queued gateway prompt already present after background attempt"
+                    );
+                }
+                Ok(PromptDeliveryAttempt::Rejected { reason }) => {
+                    let err_text = format!("prompt delivery rejected: {reason:?}");
+                    ctx.mux.finalize_async_gateway_prompt_delivery(
+                        &task.target,
+                        &task.prompt_text,
+                        task.from.as_deref(),
+                        Err(brehon_mux::AsyncGatewayPromptDeliveryError {
+                            error: err_text.clone(),
+                        }),
+                    );
+                    let brehon_root = ctx.dashboard_data.lock().unwrap().brehon_root.clone();
+                    let Some(root) = brehon_root.as_ref() else {
+                        tracing::warn!(
+                            target = %task.target,
+                            error = %err_text,
+                            "Queued gateway prompt rejected without BREHON_ROOT available for retry handling"
+                        );
+                        continue;
+                    };
+                    if should_dead_letter_prompt_after_failure(&task.prompt_text, &err_text) {
+                        dead_letter_prompt_for_session(
+                            root,
+                            ctx.runtime_session_name.as_deref(),
+                            &task.path,
+                            &task.target,
+                            task.from.as_deref(),
+                            &task.prompt_text,
+                            &err_text,
+                            "nonrecoverable prompt delivery rejection",
+                        );
+                        push_dashboard_event(
+                            &ctx.dashboard_data,
+                            format!(
+                                "dead-lettered queued prompt for {} after gateway delivery rejection",
+                                task.target
+                            ),
+                        );
+                        tracing::warn!(
+                            target = %task.target,
+                            error = %err_text,
+                            "Dead-lettered queued gateway prompt after delivery rejection"
+                        );
+                    } else {
+                        let (attempts, next_retry_at) =
+                            record_prompt_retry_failure(&task.path, &err_text);
+                        tracing::warn!(
+                            target = %task.target,
+                            error = %err_text,
+                            attempts,
+                            next_retry_at = %next_retry_at.to_rfc3339(),
+                            "Rejected queued gateway prompt delivery; backing off retry"
+                        );
+                    }
+                }
+                Err(err) => {
+                    let err_text = err.error;
+                    ctx.mux.finalize_async_gateway_prompt_delivery(
+                        &task.target,
+                        &task.prompt_text,
+                        task.from.as_deref(),
+                        Err(brehon_mux::AsyncGatewayPromptDeliveryError {
+                            error: err_text.clone(),
+                        }),
+                    );
+                    let brehon_root = ctx.dashboard_data.lock().unwrap().brehon_root.clone();
+                    let Some(root) = brehon_root.as_ref() else {
+                        tracing::warn!(
+                            target = %task.target,
+                            error = %err_text,
+                            "Queued gateway prompt failed without BREHON_ROOT available for retry handling"
+                        );
+                        continue;
+                    };
+                    if should_dead_letter_prompt_after_failure(&task.prompt_text, &err_text) {
+                        dead_letter_prompt_for_session(
+                            root,
+                            ctx.runtime_session_name.as_deref(),
+                            &task.path,
+                            &task.target,
+                            task.from.as_deref(),
+                            &task.prompt_text,
+                            &err_text,
+                            "nonrecoverable prompt delivery failure",
+                        );
+                        push_dashboard_event(
+                            &ctx.dashboard_data,
+                            format!(
+                                "dead-lettered queued prompt for {} after gateway delivery failure",
+                                task.target
+                            ),
+                        );
+                        tracing::warn!(
+                            target = %task.target,
+                            error = %err_text,
+                            "Dead-lettered queued gateway prompt after nonrecoverable failure"
+                        );
+                    } else {
+                        let (attempts, next_retry_at) =
+                            record_prompt_retry_failure(&task.path, &err_text);
+                        tracing::warn!(
+                            target = %task.target,
+                            error = %err_text,
+                            attempts,
+                            next_retry_at = %next_retry_at.to_rfc3339(),
+                            "Failed queued gateway prompt delivery; backing off retry"
+                        );
+                    }
+                }
+            }
+            ctx.needs_redraw = true;
+        } else {
+            let elapsed = ctx.pending_queued_gateway_prompt_deliveries
+                [queued_gateway_completion_index]
+                .started_at
+                .elapsed();
+            if elapsed >= QUEUED_GATEWAY_PROMPT_WATCHDOG {
+                let task = ctx
+                    .pending_queued_gateway_prompt_deliveries
+                    .swap_remove(queued_gateway_completion_index);
+                task.handle.abort();
+                ctx.mux.finalize_async_gateway_prompt_delivery(
+                    &task.target,
+                    &task.prompt_text,
+                    task.from.as_deref(),
+                    Err(brehon_mux::AsyncGatewayPromptDeliveryError {
+                        error: "watchdog aborted stuck queued gateway prompt delivery".to_string(),
+                    }),
+                );
+                let (attempts, next_retry_at) = record_prompt_retry_failure(
+                    &task.path,
+                    "watchdog aborted stuck queued gateway prompt delivery",
+                );
+                tracing::warn!(
+                    target = %task.target,
+                    path = %task.path.display(),
+                    elapsed_ms = %elapsed.as_millis(),
+                    attempts,
+                    next_retry_at = %next_retry_at.to_rfc3339(),
+                    "Watchdog aborted stuck queued gateway prompt delivery; backing off retry"
+                );
+                ctx.needs_redraw = true;
+            } else {
+                queued_gateway_completion_index += 1;
+            }
+        }
     }
 }
 
@@ -1206,6 +1605,15 @@ fn handle_runtime_command_success(ctx: &mut EventLoopCtx, effect: PendingRuntime
                 &success_message,
                 Some(marker),
             );
+        }
+        PendingRuntimeCommandEffect::WorkerRecycle {
+            pane_id,
+            startup_prompt,
+            success_message,
+            ..
+        } => {
+            ctx.mux.clear_pane_task_context(&pane_id);
+            apply_runtime_reset_success(ctx, &pane_id, startup_prompt, &success_message, None);
         }
         PendingRuntimeCommandEffect::DashboardAction {
             pane_id,
@@ -1354,6 +1762,42 @@ fn handle_runtime_command_success(ctx: &mut EventLoopCtx, effect: PendingRuntime
     }
 }
 
+fn prompt_blocked_failure_message(base: String, blocked: Option<&RuntimePaneBlockInfo>) -> String {
+    let Some(blocked) = blocked else {
+        return base;
+    };
+    format!(
+        "{base}; blocked request context: {}",
+        prompt_blocked_detail(blocked)
+    )
+}
+
+fn persist_taskless_prompt_blocked_recovery_failure(
+    ctx: &mut EventLoopCtx,
+    brehon_root: &std::path::Path,
+    pane_id: &str,
+    failure: &str,
+    blocked: Option<&RuntimePaneBlockInfo>,
+) {
+    let blocked = blocked
+        .cloned()
+        .or_else(|| prompt_blocked_info(brehon_root, pane_id, ctx.mux.get(pane_id)));
+    if let Err(marker_err) = write_prompt_blocked_recovery_failed_marker_or_clear_stale_marker(
+        brehon_root,
+        pane_id,
+        failure,
+        blocked.as_ref(),
+    ) {
+        tracing::warn!(
+            pane = %pane_id,
+            error = %marker_err,
+            "Failed to persist prompt-blocked terminal recovery failure marker"
+        );
+        ctx.prompt_blocked_recovery_failed_panes
+            .insert(pane_id.to_string());
+    }
+}
+
 fn handle_runtime_command_error(
     ctx: &mut EventLoopCtx,
     effect: PendingRuntimeCommandEffect,
@@ -1378,6 +1822,79 @@ fn handle_runtime_command_error(
             let message = format!("{failure_prefix}: {detail}");
             push_dashboard_event(&ctx.dashboard_data, message.clone());
             tracing::warn!(pane = %pane_id, error = %detail, "{message}");
+        }
+        PendingRuntimeCommandEffect::WorkerRecycle {
+            pane_id,
+            owning_task_id,
+            blocked,
+            failure_prefix,
+            ..
+        } => {
+            let message = prompt_blocked_failure_message(
+                format!("{failure_prefix}: {detail}"),
+                blocked.as_ref(),
+            );
+            push_dashboard_event(&ctx.dashboard_data, message.clone());
+            tracing::warn!(pane = %pane_id, error = %detail, "{message}");
+            let brehon_root = ctx.dashboard_data.lock().unwrap().brehon_root.clone();
+            if let Some(brehon_root) = brehon_root {
+                if let Some(task_id) = owning_task_id {
+                    let blocked_task_result = block_task_for_prompt_block_recovery_failure(
+                        &brehon_root,
+                        &task_id,
+                        &pane_id,
+                        &message,
+                    );
+                    match blocked_task_result {
+                        Ok(()) => {
+                            clear_agent_health_marker(&brehon_root, &pane_id);
+                            push_dashboard_event(
+                                &ctx.dashboard_data,
+                                format!(
+                                    "blocked task {task_id} after prompt-blocked idle worker {pane_id} could not be recycled"
+                                ),
+                            );
+                        }
+                        Err(task_err) => {
+                            tracing::warn!(
+                                pane = %pane_id,
+                                task_id,
+                                error = %task_err,
+                                "Failed to mark prompt-blocked task as blocked after queued recycle failure"
+                            );
+                            let operator_failure = format!(
+                                "{message}; could not mark task {task_id} blocked: {task_err}"
+                            );
+                            if let Err(marker_err) =
+                                write_prompt_blocked_recovery_failed_marker_or_clear_stale_marker(
+                                    &brehon_root,
+                                    &pane_id,
+                                    &operator_failure,
+                                    blocked.as_ref(),
+                                )
+                            {
+                                tracing::warn!(
+                                    pane = %pane_id,
+                                    task_id,
+                                    error = %marker_err,
+                                    "Failed to persist prompt-blocked terminal recovery failure marker after queued recycle task update failed"
+                                );
+                                ctx.prompt_blocked_recovery_failed_panes
+                                    .insert(pane_id.clone());
+                            }
+                            push_dashboard_event(&ctx.dashboard_data, operator_failure);
+                        }
+                    }
+                } else {
+                    persist_taskless_prompt_blocked_recovery_failure(
+                        ctx,
+                        &brehon_root,
+                        &pane_id,
+                        &message,
+                        blocked.as_ref(),
+                    );
+                }
+            }
         }
         PendingRuntimeCommandEffect::DashboardAction { failure_prefix, .. } => {
             let message = format!("{failure_prefix}: {detail}");
@@ -1553,6 +2070,7 @@ pub(super) fn runtime_policy_context_for_pane(
             .map(|state| match state {
                 brehon_mux::PaneState::Ready { .. } => RuntimePaneState::Ready,
                 brehon_mux::PaneState::Busy { .. } => RuntimePaneState::Busy,
+                brehon_mux::PaneState::Blocked { .. } => RuntimePaneState::Blocked,
                 brehon_mux::PaneState::Dead { .. } => RuntimePaneState::Dead,
             });
     RuntimePolicyContext {
@@ -2320,30 +2838,278 @@ fn drain_pending_input(
     Ok(outcome)
 }
 
-pub(super) fn run(ctx: &mut EventLoopCtx) -> io::Result<()> {
-    while !ctx.shutdown.load(Ordering::Relaxed) {
-        let mut runtime_command_rx_disconnected = false;
-        if let Some(runtime_command_rx) = ctx.runtime_command_rx.as_mut() {
-            loop {
-                match runtime_command_rx.try_recv() {
-                    Ok(request) => {
-                        let result = ctx
-                            .mux
-                            .execute_runtime_command(&ctx.rt, request.command().clone());
-                        request.complete(result);
-                        ctx.needs_redraw = true;
-                    }
-                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
-                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                        runtime_command_rx_disconnected = true;
-                        break;
-                    }
+pub(super) fn detect_and_handle_supervisor_resets(
+    ctx: &mut EventLoopCtx,
+    batch_events: &[MuxEvent],
+    loop_now: Instant,
+) {
+    let supervisor_reset_cooldown = Duration::from_secs(60);
+    let mut supervisor_reset_candidates = std::collections::BTreeMap::new();
+    for ev in batch_events {
+        match ev {
+            MuxEvent::PaneExited { pane_id, .. } | MuxEvent::PaneOutput { pane_id, .. } => {
+                if let Some(reason) = supervisor_reset_reason(&ctx.mux, pane_id) {
+                    supervisor_reset_candidates
+                        .entry(pane_id.clone())
+                        .or_insert(reason);
                 }
             }
+            _ => {}
         }
-        if runtime_command_rx_disconnected {
-            ctx.runtime_command_rx = None;
+    }
+    for (pane_id, reason) in supervisor_reset_candidates {
+        if ctx
+            .last_supervisor_reset
+            .get(&pane_id)
+            .is_some_and(|last| loop_now.duration_since(*last) < supervisor_reset_cooldown)
+        {
+            continue;
         }
+        let startup_prompt = if pane_needs_post_spawn_prompt(&ctx.mux, &pane_id) {
+            let Some(startup_prompt) = build_supervisor_reset_startup_prompt(
+                &ctx.mux,
+                &pane_id,
+                ctx.runtime_agent_factory_host_owned,
+            ) else {
+                continue;
+            };
+            Some(startup_prompt)
+        } else {
+            None
+        };
+        let summary = format!(
+            "reset supervisor {pane_id} after detected {reason}; reloading coordination context"
+        );
+        let reset_reason = format!("supervisor runtime failure: {reason}");
+        let command = RuntimeCommand {
+            command_id: format!("supervisor-reset-{}", uuid::Uuid::new_v4()),
+            target: runtime_command_target_for_pane(ctx, &pane_id),
+            issued_at_ms: runtime_command_timestamp_ms(),
+            kind: RuntimeCommandKind::ResetPane {
+                reason: reset_reason.clone(),
+            },
+        };
+        let context = runtime_policy_context_for_pane(ctx, &pane_id);
+        if queue_runtime_command(
+            ctx,
+            command,
+            context,
+            PendingRuntimeCommandEffect::RecoveryReset {
+                pane_id: pane_id.clone(),
+                startup_prompt: startup_prompt.clone(),
+                success_message: summary.clone(),
+                failure_prefix: format!(
+                    "failed to reset supervisor {pane_id} after detected {reason}"
+                ),
+                marker: RecoveryResetMarker::Supervisor,
+            },
+        )
+        .is_ok()
+        {
+            ctx.needs_redraw = true;
+            continue;
+        }
+
+        let reset_result = if ctx.runtime_agent_factory_host_owned {
+            super::prompt_delivery::reset_terminal_host_pane(ctx, &pane_id, reset_reason)
+        } else {
+            ctx.rt
+                .block_on(ctx.mux.reset_supervisor_session(&pane_id))
+                .map_err(|err| err.to_string())
+        };
+        match reset_result {
+            Ok(()) => {
+                if let Some(startup_prompt) = startup_prompt {
+                    if ctx.runtime_agent_factory_host_owned {
+                        if let Err(err) =
+                            super::prompt_delivery::enqueue_terminal_host_startup_prompt(
+                                ctx,
+                                &pane_id,
+                                startup_prompt,
+                                "terminal-host supervisor reset startup prompt",
+                            )
+                        {
+                            tracing::warn!(
+                                pane = %pane_id,
+                                error = %err,
+                                "Failed to queue terminal-host supervisor reset startup prompt"
+                            );
+                        }
+                    } else {
+                        ctx.mux.queue_startup_prompt(&pane_id, startup_prompt);
+                    }
+                }
+                ctx.last_supervisor_reset.insert(pane_id.clone(), loop_now);
+                ctx.last_activity.insert(pane_id.clone(), loop_now);
+                ctx.needs_redraw = true;
+                push_dashboard_event(&ctx.dashboard_data, summary.clone());
+                tracing::warn!(pane = %pane_id, reason, "{summary}");
+            }
+            Err(err) => {
+                tracing::warn!(
+                    pane = %pane_id,
+                    reason,
+                    error = %err,
+                    "Failed to reset supervisor after detected runtime failure"
+                );
+            }
+        }
+    }
+}
+
+pub(super) fn new_headless_event_loop_ctx(
+    mux: Mux,
+    rt: tokio::runtime::Handle,
+    runtime_command_rx: Option<MuxRuntimeCommandReceiver>,
+    runtime_command_router: Option<Arc<dyn RuntimeCommandRouter>>,
+    runtime_agent_factory_host_owned: bool,
+) -> io::Result<EventLoopCtx> {
+    let now = Instant::now();
+    let worker_ids = mux
+        .panes()
+        .filter(|pane| pane.kind() == &PaneKind::Worker)
+        .map(|pane| pane.id().to_string())
+        .collect::<Vec<_>>();
+    let all_reviewer_ids = mux
+        .panes()
+        .filter(|pane| pane.kind() == &PaneKind::Reviewer)
+        .map(|pane| pane.id().to_string())
+        .collect::<Vec<_>>();
+    let advisor_ids = mux
+        .panes()
+        .filter(|pane| pane.kind() == &PaneKind::Advisor)
+        .map(|pane| pane.id().to_string())
+        .collect::<Vec<_>>();
+    let research_ids = mux
+        .panes()
+        .filter(|pane| pane.kind() == &PaneKind::Research)
+        .map(|pane| pane.id().to_string())
+        .collect::<Vec<_>>();
+    let supervisor_id = mux
+        .panes()
+        .find(|pane| pane.kind() == &PaneKind::Supervisor)
+        .map(|pane| pane.id().to_string());
+    let last_activity = mux
+        .panes()
+        .map(|pane| (pane.id().to_string(), now))
+        .collect::<std::collections::HashMap<_, _>>();
+    let terminal = Terminal::with_options(
+        ratatui::backend::CrosstermBackend::new(io::stdout()),
+        TerminalOptions {
+            viewport: Viewport::Fixed(Rect::new(0, 0, 80, 24)),
+        },
+    )?;
+    let dashboard_data = Arc::new(std::sync::Mutex::new(DashboardData::default()));
+    let runtime_session_name = mux.session_name().map(str::to_string);
+
+    let structured_mode = mux
+        .panes()
+        .filter(|pane| pane.is_gateway_backed())
+        .map(|pane| pane.id().to_string())
+        .collect::<std::collections::HashSet<_>>();
+
+    Ok(EventLoopCtx {
+        shutdown: Arc::new(AtomicBool::new(false)),
+        mux,
+        runtime_command_rx,
+        runtime_event_rx: None,
+        runtime_command_router,
+        rt,
+        terminal,
+        dashboard_data,
+        orchestration: OrchestrationConfig {
+            max_active_workers: 1,
+            worktree_isolation: true,
+            branch_prefix: "brehon/".to_string(),
+            auto_cleanup_worktrees: true,
+            worker_idle_behavior: brehon_types::config::WorkerIdleBehavior::Wait,
+            allow_mutating_idle_work: false,
+            self_improve_tasks: Vec::new(),
+            spawn_workers: None,
+            drain_timeout_secs: None,
+            worktree_root: None,
+        },
+        tick_active: Duration::from_millis(16),
+        tick_idle: Duration::from_millis(100),
+        idle_threshold: Duration::from_secs(1),
+        last_output_at: now,
+        started_at: now,
+        group_tab: GroupTab::Workers,
+        prev_group_tab: GroupTab::Workers,
+        click_regions: Vec::new(),
+        selection: None,
+        pending_down: None,
+        pending_escape_sequence: None,
+        left_pane_area: Rect::default(),
+        supervisor_pane_area: Rect::default(),
+        expanded_epics: std::collections::HashSet::new(),
+        expanded_activity_rows: std::collections::HashSet::new(),
+        structured_scroll_offsets: std::collections::HashMap::new(),
+        input_mode: InputMode::default(),
+        task_detail: None,
+        advisor_room_view: AdvisorRoomViewState::default(),
+        research_room_view: ResearchRoomViewState::default(),
+        dashboard_agent_list: DashboardAgentListState::default(),
+        dashboard_task_list: DashboardTaskListState::default(),
+        structured_mode,
+        last_activity,
+        auto_recover_threshold: Duration::from_secs(60),
+        review_obligation_nudge_threshold: Duration::from_secs(60),
+        review_obligation_reset_threshold: Duration::from_secs(120),
+        worker_context_reset_cooldown: Duration::from_secs(60),
+        self_improve_idle_threshold: Duration::from_secs(60),
+        self_improve_retry_cooldown: Duration::from_secs(60),
+        last_stall_check: now - Duration::from_secs(60),
+        stall_check_interval: Duration::from_secs(60),
+        supervisor_dispatch_nudge_quiet_threshold: Duration::from_secs(60),
+        supervisor_dispatch_nudge_cooldown: Duration::from_secs(60),
+        last_supervisor_dispatch_nudge: None,
+        last_supervisor_reset: std::collections::HashMap::new(),
+        last_worker_context_reset: std::collections::HashMap::new(),
+        pending_self_improve_prompt: std::collections::HashMap::new(),
+        next_self_improve_index: std::collections::HashMap::new(),
+        prompt_blocked_recovery_failed_panes: std::collections::HashSet::new(),
+        post_checkpoint_nudge_threshold: Duration::from_secs(60),
+        post_checkpoint_nudge_cooldown: Duration::from_secs(60),
+        post_checkpoint_nudges_sent: std::collections::HashMap::new(),
+        review_obligation_notifications_sent: std::collections::HashMap::new(),
+        review_obligation_resends_sent: std::collections::HashMap::new(),
+        review_obligation_failures_reported: std::collections::HashSet::new(),
+        active_worker_recovery_nudges_sent: std::collections::HashMap::new(),
+        active_worker_recovery_resets_sent: std::collections::HashMap::new(),
+        worker_ids,
+        all_reviewer_ids,
+        advisor_ids,
+        research_ids,
+        supervisor_id,
+        fallback_panels: Vec::new(),
+        has_panels: false,
+        panels: Vec::new(),
+        selected_worker: 0,
+        selected_panel: 0,
+        selected_member: Vec::new(),
+        reviewer_selection: ReviewerSelectionState::default(),
+        pending_initial_resize: false,
+        last_session_poll: now,
+        session_poll_interval: Duration::from_secs(60),
+        runtime_session_name,
+        last_shared_root_issue: None,
+        pending_dashboard_refresh: None,
+        pending_queued_gateway_prompt_deliveries: Vec::new(),
+        pending_runtime_commands: Vec::new(),
+        recent_runtime_commands: Vec::new(),
+        pending_runtime_approval_resolutions: Vec::new(),
+        entry_chrome_fade_complete: false,
+        project_config_loader: crate::run::no_project_config_loader(),
+        needs_redraw: false,
+        runtime_agent_factory_host_owned,
+        runtime_terminal_host_absolute_resize: false,
+    })
+}
+
+pub(super) fn run(ctx: &mut EventLoopCtx) -> io::Result<()> {
+    while !ctx.shutdown.load(Ordering::Relaxed) {
+        drain_runtime_command_receiver(ctx);
         drain_runtime_events_from_daemon(ctx);
 
         // Pre-drain: service any keystrokes that already accumulated so
@@ -2383,62 +3149,7 @@ pub(super) fn run(ctx: &mut EventLoopCtx) -> io::Result<()> {
         let loop_now = std::time::Instant::now();
 
         process_pending_runtime_commands(ctx);
-
-        let mut approval_resolution_index = 0usize;
-        while approval_resolution_index < ctx.pending_runtime_approval_resolutions.len() {
-            if ctx.pending_runtime_approval_resolutions[approval_resolution_index].is_finished() {
-                let task = ctx
-                    .pending_runtime_approval_resolutions
-                    .swap_remove(approval_resolution_index);
-                match ctx.rt.block_on(task) {
-                    Ok((approval_id, approved, Ok(result))) => {
-                        push_dashboard_event(
-                            &ctx.dashboard_data,
-                            format!(
-                                "{} runtime approval {}: {:?}",
-                                if approved { "approved" } else { "denied" },
-                                approval_id,
-                                result.status
-                            ),
-                        );
-                        if let Some(message) = result.message {
-                            tracing::info!(
-                                approval_id = %approval_id,
-                                approved,
-                                message = %message,
-                                "Resolved runtime approval"
-                            );
-                        }
-                    }
-                    Ok((approval_id, approved, Err(err))) => {
-                        push_dashboard_event(
-                            &ctx.dashboard_data,
-                            format!(
-                                "failed to {} runtime approval {}: {}",
-                                if approved { "approve" } else { "deny" },
-                                approval_id,
-                                err
-                            ),
-                        );
-                        tracing::warn!(
-                            approval_id = %approval_id,
-                            approved,
-                            error = %err,
-                            "Failed to resolve runtime approval"
-                        );
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            error = %err,
-                            "Runtime approval resolution task failed"
-                        );
-                    }
-                }
-                ctx.needs_redraw = true;
-            } else {
-                approval_resolution_index += 1;
-            }
-        }
+        process_pending_runtime_approval_resolutions(ctx);
 
         if ctx
             .pending_dashboard_refresh
@@ -2477,264 +3188,7 @@ pub(super) fn run(ctx: &mut EventLoopCtx) -> io::Result<()> {
             }
         }
 
-        let mut queued_gateway_completion_index = 0usize;
-        while queued_gateway_completion_index < ctx.pending_queued_gateway_prompt_deliveries.len() {
-            if ctx.pending_queued_gateway_prompt_deliveries[queued_gateway_completion_index]
-                .handle
-                .is_finished()
-            {
-                let task = ctx
-                    .pending_queued_gateway_prompt_deliveries
-                    .swap_remove(queued_gateway_completion_index);
-                let result = match ctx.rt.block_on(task.handle) {
-                    Ok(result) => result,
-                    Err(err) => Err(brehon_mux::AsyncGatewayPromptDeliveryError {
-                        error: err.to_string(),
-                    }),
-                };
-                match result {
-                    Ok(PromptDeliveryAttempt::Delivered { .. }) => {
-                        ctx.mux.finalize_async_gateway_prompt_delivery(
-                            &task.target,
-                            &task.prompt_text,
-                            task.from.as_deref(),
-                            Ok(()),
-                        );
-                        ctx.last_activity
-                            .insert(task.target.clone(), Instant::now());
-                        clear_prompt_retry_meta(&task.path);
-                        if let (Some(id), Some(root)) = (
-                            task.prompt_id.as_deref(),
-                            ctx.dashboard_data.lock().unwrap().brehon_root.clone(),
-                        ) {
-                            if let Err(err) = super::helpers::write_prompt_delivery_ack(
-                                &root,
-                                id,
-                                &task.target,
-                                "gateway",
-                            ) {
-                                tracing::warn!(
-                                    target = %task.target,
-                                    prompt_id = %id,
-                                    error = %err,
-                                    "Failed to persist prompt delivery ack after gateway delivery"
-                                );
-                            }
-                        }
-                        let _ = std::fs::remove_file(&task.path);
-                        tracing::info!(
-                            target = %task.target,
-                            "Delivered queued gateway prompt via background attempt"
-                        );
-                    }
-                    Ok(PromptDeliveryAttempt::Queued {
-                        prompt_id,
-                        ahead_of,
-                    }) => {
-                        if let Some(generation) = ctx
-                            .mux
-                            .get(&task.target)
-                            .map(|pane| pane.current_generation())
-                        {
-                            ctx.mux.mark_gateway_delivery_busy(
-                                &task.target,
-                                prompt_id.clone(),
-                                generation,
-                            );
-                        }
-                        let retry_after = queued_prompt_retry_delay(ahead_of);
-                        let next_retry_at = record_prompt_retry_deferral(
-                            &task.path,
-                            retry_after,
-                            "gateway delivery queued prompt",
-                        );
-                        super::stall_handling::recover_stale_deferred_prompt_delivery(
-                            ctx,
-                            &task.target,
-                            &task.path,
-                            Instant::now(),
-                        );
-                        tracing::info!(
-                            target = %task.target,
-                            prompt_id = %prompt_id,
-                            ahead_of,
-                            next_retry_at = %next_retry_at.to_rfc3339(),
-                            retry_after_ms = %retry_after.as_millis(),
-                            "Queued gateway prompt after background attempt"
-                        );
-                    }
-                    Ok(PromptDeliveryAttempt::AlreadyPresent {
-                        prompt_id,
-                        position,
-                    }) => {
-                        let retry_after = queued_prompt_retry_delay(position.retry_ahead_of());
-                        let next_retry_at = record_prompt_retry_deferral(
-                            &task.path,
-                            retry_after,
-                            "gateway delivery prompt already queued",
-                        );
-                        super::stall_handling::recover_stale_deferred_prompt_delivery(
-                            ctx,
-                            &task.target,
-                            &task.path,
-                            Instant::now(),
-                        );
-                        tracing::info!(
-                            target = %task.target,
-                            prompt_id = %prompt_id,
-                            position = %position,
-                            next_retry_at = %next_retry_at.to_rfc3339(),
-                            retry_after_ms = %retry_after.as_millis(),
-                            "Queued gateway prompt already present after background attempt"
-                        );
-                    }
-                    Ok(PromptDeliveryAttempt::Rejected { reason }) => {
-                        let err_text = format!("prompt delivery rejected: {reason:?}");
-                        ctx.mux.finalize_async_gateway_prompt_delivery(
-                            &task.target,
-                            &task.prompt_text,
-                            task.from.as_deref(),
-                            Err(brehon_mux::AsyncGatewayPromptDeliveryError {
-                                error: err_text.clone(),
-                            }),
-                        );
-                        let brehon_root = ctx.dashboard_data.lock().unwrap().brehon_root.clone();
-                        let Some(root) = brehon_root.as_ref() else {
-                            tracing::warn!(
-                                target = %task.target,
-                                error = %err_text,
-                                "Queued gateway prompt rejected without BREHON_ROOT available for retry handling"
-                            );
-                            continue;
-                        };
-                        if should_dead_letter_prompt_after_failure(&task.prompt_text, &err_text) {
-                            dead_letter_prompt_for_session(
-                                root,
-                                ctx.runtime_session_name.as_deref(),
-                                &task.path,
-                                &task.target,
-                                task.from.as_deref(),
-                                &task.prompt_text,
-                                &err_text,
-                                "nonrecoverable prompt delivery rejection",
-                            );
-                            push_dashboard_event(
-                                &ctx.dashboard_data,
-                                format!(
-                                    "dead-lettered queued prompt for {} after gateway delivery rejection",
-                                    task.target
-                                ),
-                            );
-                            tracing::warn!(
-                                target = %task.target,
-                                error = %err_text,
-                                "Dead-lettered queued gateway prompt after delivery rejection"
-                            );
-                        } else {
-                            let (attempts, next_retry_at) =
-                                record_prompt_retry_failure(&task.path, &err_text);
-                            tracing::warn!(
-                                target = %task.target,
-                                error = %err_text,
-                                attempts,
-                                next_retry_at = %next_retry_at.to_rfc3339(),
-                                "Rejected queued gateway prompt delivery; backing off retry"
-                            );
-                        }
-                    }
-                    Err(err) => {
-                        let err_text = err.error;
-                        ctx.mux.finalize_async_gateway_prompt_delivery(
-                            &task.target,
-                            &task.prompt_text,
-                            task.from.as_deref(),
-                            Err(brehon_mux::AsyncGatewayPromptDeliveryError {
-                                error: err_text.clone(),
-                            }),
-                        );
-                        let brehon_root = ctx.dashboard_data.lock().unwrap().brehon_root.clone();
-                        let Some(root) = brehon_root.as_ref() else {
-                            tracing::warn!(
-                                target = %task.target,
-                                error = %err_text,
-                                "Queued gateway prompt failed without BREHON_ROOT available for retry handling"
-                            );
-                            continue;
-                        };
-                        if should_dead_letter_prompt_after_failure(&task.prompt_text, &err_text) {
-                            dead_letter_prompt_for_session(
-                                root,
-                                ctx.runtime_session_name.as_deref(),
-                                &task.path,
-                                &task.target,
-                                task.from.as_deref(),
-                                &task.prompt_text,
-                                &err_text,
-                                "nonrecoverable prompt delivery failure",
-                            );
-                            push_dashboard_event(
-                                &ctx.dashboard_data,
-                                format!(
-                                    "dead-lettered queued prompt for {} after gateway delivery failure",
-                                    task.target
-                                ),
-                            );
-                            tracing::warn!(
-                                target = %task.target,
-                                error = %err_text,
-                                "Dead-lettered queued gateway prompt after nonrecoverable failure"
-                            );
-                        } else {
-                            let (attempts, next_retry_at) =
-                                record_prompt_retry_failure(&task.path, &err_text);
-                            tracing::warn!(
-                                target = %task.target,
-                                error = %err_text,
-                                attempts,
-                                next_retry_at = %next_retry_at.to_rfc3339(),
-                                "Failed queued gateway prompt delivery; backing off retry"
-                            );
-                        }
-                    }
-                }
-                ctx.needs_redraw = true;
-            } else {
-                let elapsed = ctx.pending_queued_gateway_prompt_deliveries
-                    [queued_gateway_completion_index]
-                    .started_at
-                    .elapsed();
-                if elapsed >= QUEUED_GATEWAY_PROMPT_WATCHDOG {
-                    let task = ctx
-                        .pending_queued_gateway_prompt_deliveries
-                        .swap_remove(queued_gateway_completion_index);
-                    task.handle.abort();
-                    ctx.mux.finalize_async_gateway_prompt_delivery(
-                        &task.target,
-                        &task.prompt_text,
-                        task.from.as_deref(),
-                        Err(brehon_mux::AsyncGatewayPromptDeliveryError {
-                            error: "watchdog aborted stuck queued gateway prompt delivery"
-                                .to_string(),
-                        }),
-                    );
-                    let (attempts, next_retry_at) = record_prompt_retry_failure(
-                        &task.path,
-                        "watchdog aborted stuck queued gateway prompt delivery",
-                    );
-                    tracing::warn!(
-                        target = %task.target,
-                        path = %task.path.display(),
-                        elapsed_ms = %elapsed.as_millis(),
-                        attempts,
-                        next_retry_at = %next_retry_at.to_rfc3339(),
-                        "Watchdog aborted stuck queued gateway prompt delivery; backing off retry"
-                    );
-                    ctx.needs_redraw = true;
-                } else {
-                    queued_gateway_completion_index += 1;
-                }
-            }
-        }
+        process_pending_queued_gateway_prompt_deliveries(ctx);
 
         // Mark dirty when new PTY output arrives.
         if !batch_events.is_empty() {
@@ -2930,116 +3384,7 @@ pub(super) fn run(ctx: &mut EventLoopCtx) -> io::Result<()> {
             }
         }
 
-        let supervisor_reset_cooldown = Duration::from_secs(60);
-        let mut supervisor_reset_candidates = std::collections::BTreeMap::new();
-        for ev in &batch_events {
-            match ev {
-                MuxEvent::PaneExited { pane_id, .. } | MuxEvent::PaneOutput { pane_id, .. } => {
-                    if let Some(reason) = supervisor_reset_reason(&ctx.mux, pane_id) {
-                        supervisor_reset_candidates
-                            .entry(pane_id.clone())
-                            .or_insert(reason);
-                    }
-                }
-                _ => {}
-            }
-        }
-        for (pane_id, reason) in supervisor_reset_candidates {
-            if ctx
-                .last_supervisor_reset
-                .get(&pane_id)
-                .is_some_and(|last| loop_now.duration_since(*last) < supervisor_reset_cooldown)
-            {
-                continue;
-            }
-            let startup_prompt = if pane_needs_post_spawn_prompt(&ctx.mux, &pane_id) {
-                let Some(startup_prompt) =
-                    build_supervisor_reset_startup_prompt(&ctx.mux, &pane_id)
-                else {
-                    continue;
-                };
-                Some(startup_prompt)
-            } else {
-                None
-            };
-            let summary = format!(
-                "reset supervisor {pane_id} after detected {reason}; reloading coordination context"
-            );
-            let reset_reason = format!("supervisor runtime failure: {reason}");
-            let command = RuntimeCommand {
-                command_id: format!("supervisor-reset-{}", uuid::Uuid::new_v4()),
-                target: runtime_command_target_for_pane(ctx, &pane_id),
-                issued_at_ms: runtime_command_timestamp_ms(),
-                kind: RuntimeCommandKind::ResetPane {
-                    reason: reset_reason.clone(),
-                },
-            };
-            let context = runtime_policy_context_for_pane(ctx, &pane_id);
-            if queue_runtime_command(
-                ctx,
-                command,
-                context,
-                PendingRuntimeCommandEffect::RecoveryReset {
-                    pane_id: pane_id.clone(),
-                    startup_prompt: startup_prompt.clone(),
-                    success_message: summary.clone(),
-                    failure_prefix: format!(
-                        "failed to reset supervisor {pane_id} after detected {reason}"
-                    ),
-                    marker: RecoveryResetMarker::Supervisor,
-                },
-            )
-            .is_ok()
-            {
-                ctx.needs_redraw = true;
-                continue;
-            }
-
-            let reset_result = if ctx.runtime_agent_factory_host_owned {
-                super::prompt_delivery::reset_terminal_host_pane(ctx, &pane_id, reset_reason)
-            } else {
-                ctx.rt
-                    .block_on(ctx.mux.reset_supervisor_session(&pane_id))
-                    .map_err(|err| err.to_string())
-            };
-            match reset_result {
-                Ok(()) => {
-                    if let Some(startup_prompt) = startup_prompt {
-                        if ctx.runtime_agent_factory_host_owned {
-                            if let Err(err) =
-                                super::prompt_delivery::enqueue_terminal_host_startup_prompt(
-                                    ctx,
-                                    &pane_id,
-                                    startup_prompt,
-                                    "terminal-host supervisor reset startup prompt",
-                                )
-                            {
-                                tracing::warn!(
-                                    pane = %pane_id,
-                                    error = %err,
-                                    "Failed to queue terminal-host supervisor reset startup prompt"
-                                );
-                            }
-                        } else {
-                            ctx.mux.queue_startup_prompt(&pane_id, startup_prompt);
-                        }
-                    }
-                    ctx.last_supervisor_reset.insert(pane_id.clone(), loop_now);
-                    ctx.last_activity.insert(pane_id.clone(), loop_now);
-                    ctx.needs_redraw = true;
-                    push_dashboard_event(&ctx.dashboard_data, summary.clone());
-                    tracing::warn!(pane = %pane_id, reason, "{summary}");
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        pane = %pane_id,
-                        reason,
-                        error = %err,
-                        "Failed to reset supervisor after detected runtime failure"
-                    );
-                }
-            }
-        }
+        detect_and_handle_supervisor_resets(ctx, &batch_events, loop_now);
 
         // Determine which left pane is active
         let active_left_id: Option<String> = match ctx.group_tab {
@@ -3529,6 +3874,7 @@ pub(super) fn runtime_command_timestamp_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::run::init_test_git_repo;
     use brehon_ports::RuntimeCommandRouter;
     use brehon_types::config::WorkerIdleBehavior;
     use ratatui::{TerminalOptions, Viewport};
@@ -3541,6 +3887,46 @@ mod tests {
 
     struct RecordingRouter {
         tx: std::sync::Mutex<mpsc::Sender<RecordedRoute>>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum TestRouteRejection {
+        SendPromptTo(String),
+        RecyclePaneTo(String),
+        ResetPaneTo(String),
+    }
+
+    struct SelectiveRecordingRouter {
+        tx: std::sync::Mutex<mpsc::Sender<RecordedRoute>>,
+        rejections: Vec<TestRouteRejection>,
+    }
+
+    impl SelectiveRecordingRouter {
+        fn should_reject(&self, command: &RuntimeCommand) -> bool {
+            self.rejections.iter().any(|rejection| match rejection {
+                TestRouteRejection::SendPromptTo(target) => {
+                    matches!(
+                        &command.kind,
+                        RuntimeCommandKind::SendPrompt { .. }
+                            if command.target.pane_id.as_deref() == Some(target.as_str())
+                    )
+                }
+                TestRouteRejection::RecyclePaneTo(target) => {
+                    matches!(
+                        &command.kind,
+                        RuntimeCommandKind::RecyclePane { .. }
+                            if command.target.pane_id.as_deref() == Some(target.as_str())
+                    )
+                }
+                TestRouteRejection::ResetPaneTo(target) => {
+                    matches!(
+                        &command.kind,
+                        RuntimeCommandKind::ResetPane { .. }
+                            if command.target.pane_id.as_deref() == Some(target.as_str())
+                    )
+                }
+            })
+        }
     }
 
     #[async_trait::async_trait]
@@ -3564,6 +3950,36 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
+    impl RuntimeCommandRouter for SelectiveRecordingRouter {
+        async fn route_command(
+            &self,
+            command: RuntimeCommand,
+            context: RuntimePolicyContext,
+        ) -> Result<brehon_types::RuntimeCommandResult, PortError> {
+            let command_id = command.command_id.clone();
+            let rejected = self.should_reject(&command);
+            self.tx
+                .lock()
+                .expect("router lock")
+                .send(RecordedRoute { command, context })
+                .expect("record route");
+            Ok(brehon_types::RuntimeCommandResult {
+                command_id,
+                status: if rejected {
+                    RuntimeCommandStatus::Rejected
+                } else {
+                    RuntimeCommandStatus::Applied
+                },
+                message: Some(if rejected {
+                    "rejected for test".to_string()
+                } else {
+                    "recorded".to_string()
+                }),
+            })
+        }
+    }
+
     struct TestHarness {
         _rt: tokio::runtime::Runtime,
         ctx: EventLoopCtx,
@@ -3581,6 +3997,7 @@ mod tests {
             self_improve_tasks: Vec::new(),
             spawn_workers: None,
             drain_timeout_secs: None,
+            worktree_root: None,
         }
     }
 
@@ -3654,12 +4071,34 @@ mod tests {
     }
 
     fn harness_with_mux_and_host_owned(mux: Mux, host_owned: bool) -> TestHarness {
-        let rt = tokio::runtime::Runtime::new().expect("runtime");
-        let rt_handle = rt.handle().clone();
         let (tx, rx) = mpsc::channel();
         let router: Arc<dyn RuntimeCommandRouter> = Arc::new(RecordingRouter {
             tx: std::sync::Mutex::new(tx),
         });
+        harness_with_runtime_router(mux, host_owned, router, rx)
+    }
+
+    fn harness_with_selective_router(
+        mux: Mux,
+        host_owned: bool,
+        rejections: Vec<TestRouteRejection>,
+    ) -> TestHarness {
+        let (tx, rx) = mpsc::channel();
+        let router: Arc<dyn RuntimeCommandRouter> = Arc::new(SelectiveRecordingRouter {
+            tx: std::sync::Mutex::new(tx),
+            rejections,
+        });
+        harness_with_runtime_router(mux, host_owned, router, rx)
+    }
+
+    fn harness_with_runtime_router(
+        mux: Mux,
+        host_owned: bool,
+        router: Arc<dyn RuntimeCommandRouter>,
+        rx: mpsc::Receiver<RecordedRoute>,
+    ) -> TestHarness {
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let rt_handle = rt.handle().clone();
         let now = Instant::now();
         let worker_ids = mux
             .panes()
@@ -3750,10 +4189,13 @@ mod tests {
                 last_worker_context_reset: std::collections::HashMap::new(),
                 pending_self_improve_prompt: std::collections::HashMap::new(),
                 next_self_improve_index: std::collections::HashMap::new(),
+                prompt_blocked_recovery_failed_panes: std::collections::HashSet::new(),
                 post_checkpoint_nudge_threshold: Duration::from_secs(60),
                 post_checkpoint_nudge_cooldown: Duration::from_secs(60),
                 post_checkpoint_nudges_sent: std::collections::HashMap::new(),
-                review_obligation_nudges_sent: std::collections::HashMap::new(),
+                review_obligation_notifications_sent: std::collections::HashMap::new(),
+                review_obligation_resends_sent: std::collections::HashMap::new(),
+                review_obligation_failures_reported: std::collections::HashSet::new(),
                 active_worker_recovery_nudges_sent: std::collections::HashMap::new(),
                 active_worker_recovery_resets_sent: std::collections::HashMap::new(),
                 worker_ids,
@@ -3791,6 +4233,14 @@ mod tests {
     fn recv_route(rx: &mpsc::Receiver<RecordedRoute>) -> RecordedRoute {
         rx.recv_timeout(Duration::from_secs(1))
             .expect("daemon route command")
+    }
+
+    fn recv_available_routes(rx: &mpsc::Receiver<RecordedRoute>) -> Vec<RecordedRoute> {
+        let mut routes = Vec::new();
+        while let Ok(route) = rx.recv_timeout(Duration::from_millis(50)) {
+            routes.push(route);
+        }
+        routes
     }
 
     fn drain_runtime_commands(harness: &mut TestHarness) {
@@ -3852,11 +4302,207 @@ mod tests {
                 "base_commit": "def5678",
                 "merge_target_head": "main",
                 "commits": ["abc1234"],
+                "reviewer_prompts": {
+                    "reviewer-1": canonical_review_request_prompt_fixture()
+                },
                 "context": "Focused context"
             })
             .to_string(),
         )
         .expect("review request");
+    }
+
+    fn canonical_review_request_prompt_fixture() -> String {
+        "Review request REV-review for task T-review: Pending review task\n\
+Panel: primary\n\
+Round: 1\n\
+Description: Review the pending change\n\
+Source: branch worker-branch (will merge into main)\n\
+Commit: abc1234\n\
+Base: def5678\n\
+Review fingerprint:\n\
+- review_round: 1\n\
+- base_commit: def5678\n\
+- merge_target_head: main\n\
+\n\
+Review handoff context:\n\
+Focused context\n\
+\n\
+Research context:\n\
+Research says look closely.\n\
+\n\
+Recorded proof of work so far:\n\
+  Commands: 1\n\
+\n\
+Inspecting the commit:\n\
+- All Brehon worktrees share one .git object database. The commit is reachable from your current worktree by SHA.\n\
+- git show abc1234 --stat\n\
+- git show abc1234\n\
+- git diff def5678..abc1234\n\
+- git log abc1234 -1\n\
+\n\
+Path interpretation:\n\
+Paths: treat all file paths as repository-relative to your current worktree root.\n\
+\n\
+Review for: correctness, security, performance, concurrency, error handling, and maintainability.\n\
+\n\
+Submit your review (IMPORTANT: include reviewer=reviewer-1):\n\
+  verification action=submit_review review_id=REV-review reviewer=reviewer-1 score=<1-10> verdict=<approved|needs_revision|rejected> summary=\"Your review\" findings='[{\"description\":\"...\", \"file\":\"...\", \"line\":42, \"severity\":\"blocking|suggestion|nitpick\", \"suggestion\":\"optional\"}]'\n\
+\n\
+Do not call request_review, reseat_panel, reassign_panel, release_panel, reset_rounds, or override."
+            .to_string()
+    }
+
+    fn sanitize_prompt_key(prompt_id: &str) -> String {
+        prompt_id
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                    ch
+                } else {
+                    '_'
+                }
+            })
+            .collect()
+    }
+
+    fn write_prompt_enqueue_ack(brehon_root: &std::path::Path, prompt_id: &str, target: &str) {
+        let ack_dir = brehon_root.join("runtime").join("prompt-enqueue-acks");
+        std::fs::create_dir_all(&ack_dir).expect("enqueue ack dir");
+        std::fs::write(
+            ack_dir.join(format!("{}.json", sanitize_prompt_key(prompt_id))),
+            serde_json::json!({
+                "prompt_id": prompt_id,
+                "target": target,
+                "queued_at": chrono::Utc::now().to_rfc3339()
+            })
+            .to_string(),
+        )
+        .expect("prompt enqueue ack");
+    }
+
+    fn write_review_obligation_fixture_with_uncertain_delivery(brehon_root: &std::path::Path) {
+        write_review_obligation_fixture(brehon_root);
+        let runtime_dir = brehon_root.join("runtime");
+        std::fs::write(
+            runtime_dir
+                .join("reviews")
+                .join("T-review")
+                .join("state.json"),
+            serde_json::json!({
+                "task_id": "T-review",
+                "status": "collecting",
+                "current_round": 1,
+                "current_review_id": "REV-review",
+                "max_rounds": 3,
+                "panel_id": "primary",
+                "panel": ["reviewer-1"],
+                "submissions_received": [],
+                "reviewer_assignments": {
+                    "reviewer-1": {
+                        "owner": "reviewer-1",
+                        "assignment_kind": "review",
+                        "assigned_at": chrono::Utc::now().to_rfc3339(),
+                        "prompt_id": "prompt-reviewer-1",
+                        "delivery_method": "queued"
+                    }
+                },
+                "created_at": chrono::Utc::now().to_rfc3339(),
+                "updated_at": chrono::Utc::now().to_rfc3339()
+            })
+            .to_string(),
+        )
+        .expect("review state with delivery");
+        write_prompt_enqueue_ack(brehon_root, "prompt-reviewer-1", "reviewer-1");
+    }
+
+    fn write_multi_reviewer_phase_gate_fixture(brehon_root: &std::path::Path) {
+        let runtime_dir = brehon_root.join("runtime");
+        std::fs::create_dir_all(runtime_dir.join("tasks")).expect("tasks dir");
+        let review_round_dir = runtime_dir
+            .join("reviews")
+            .join("T-phase-gate")
+            .join("round-1");
+        std::fs::create_dir_all(&review_round_dir).expect("review dir");
+        std::fs::write(
+            runtime_dir.join("tasks").join("T-phase-gate.json"),
+            serde_json::json!({
+                "task_id": "T-phase-gate",
+                "title": "Phase gate task",
+                "status": "in_review",
+                "task_type": "task"
+            })
+            .to_string(),
+        )
+        .expect("task file");
+        std::fs::write(
+            runtime_dir
+                .join("reviews")
+                .join("T-phase-gate")
+                .join("state.json"),
+            serde_json::json!({
+                "task_id": "T-phase-gate",
+                "status": "collecting",
+                "current_round": 1,
+                "current_review_id": "REV-phase-gate",
+                "max_rounds": 3,
+                "panel_id": "primary",
+                "panel": ["reviewer-active", "reviewer-resend", "reviewer-reset", "reviewer-missing"],
+                "submissions_received": ["reviewer-active"],
+                "reviewer_assignments": {
+                    "reviewer-resend": {
+                        "owner": "reviewer-resend",
+                        "assignment_kind": "review",
+                        "assigned_at": chrono::Utc::now().to_rfc3339(),
+                        "prompt_id": "prompt-reviewer-resend",
+                        "delivery_method": "queued"
+                    },
+                    "reviewer-reset": {
+                        "owner": "reviewer-reset",
+                        "assignment_kind": "review",
+                        "assigned_at": chrono::Utc::now().to_rfc3339(),
+                        "acknowledged_at": chrono::Utc::now().to_rfc3339(),
+                        "prompt_id": "prompt-reviewer-reset",
+                        "delivery_method": "queued"
+                    },
+                    "reviewer-missing": {
+                        "owner": "reviewer-missing",
+                        "assignment_kind": "review",
+                        "assigned_at": chrono::Utc::now().to_rfc3339(),
+                        "prompt_id": "prompt-reviewer-missing",
+                        "delivery_method": "queued"
+                    }
+                },
+                "created_at": chrono::Utc::now().to_rfc3339(),
+                "updated_at": chrono::Utc::now().to_rfc3339()
+            })
+            .to_string(),
+        )
+        .expect("review state");
+        std::fs::write(
+            review_round_dir.join("request.json"),
+            serde_json::json!({
+                "task_id": "T-phase-gate",
+                "review_id": "REV-phase-gate",
+                "requested_by": "supervisor",
+                "requested_at": chrono::Utc::now().to_rfc3339(),
+                "title": "Phase gate task",
+                "description": "Review the phase gate diff",
+                "commit": "abc1234",
+                "base_commit": "def5678",
+                "merge_target_head": "epic/phase-1",
+                "commits": ["abc1234"],
+                "reviewer_prompts": {
+                    "reviewer-resend": "Canonical resend prompt for reviewer-resend",
+                    "reviewer-reset": "Canonical resend prompt for reviewer-reset",
+                    "reviewer-missing": "Canonical resend prompt for reviewer-missing"
+                },
+                "context": "Phase 1 gate context"
+            })
+            .to_string(),
+        )
+        .expect("review request");
+        write_prompt_enqueue_ack(brehon_root, "prompt-reviewer-resend", "reviewer-resend");
     }
 
     fn write_active_assigned_task_fixture(brehon_root: &std::path::Path) {
@@ -3874,6 +4520,203 @@ mod tests {
             .to_string(),
         )
         .expect("task file");
+    }
+
+    fn write_inactive_task_fixture(brehon_root: &std::path::Path, task_id: &str) {
+        let runtime_dir = brehon_root.join("runtime");
+        std::fs::create_dir_all(runtime_dir.join("tasks")).expect("tasks dir");
+        std::fs::write(
+            runtime_dir.join("tasks").join(format!("{task_id}.json")),
+            serde_json::json!({
+                "task_id": task_id,
+                "title": "Inactive task",
+                "status": "pending",
+                "task_type": "task"
+            })
+            .to_string(),
+        )
+        .expect("task file");
+    }
+
+    fn write_terminal_task_fixture(brehon_root: &std::path::Path, task_id: &str, status: &str) {
+        let runtime_dir = brehon_root.join("runtime");
+        std::fs::create_dir_all(runtime_dir.join("tasks")).expect("tasks dir");
+        std::fs::write(
+            runtime_dir.join("tasks").join(format!("{task_id}.json")),
+            serde_json::json!({
+                "task_id": task_id,
+                "title": "Terminal task",
+                "status": status,
+                "task_type": "task"
+            })
+            .to_string(),
+        )
+        .expect("task file");
+    }
+
+    fn write_agent_session_fixture(brehon_root: &std::path::Path, agent_id: &str, role: &str) {
+        let runtime_dir = brehon_root.join("runtime");
+        std::fs::create_dir_all(runtime_dir.join("sessions")).expect("sessions dir");
+        std::fs::write(
+            runtime_dir
+                .join("sessions")
+                .join(format!("{agent_id}.json")),
+            serde_json::json!({
+                "name": agent_id,
+                "role": role,
+                "session_id": format!("session-{agent_id}"),
+                "last_seen_at": chrono::Utc::now().to_rfc3339()
+            })
+            .to_string(),
+        )
+        .expect("session file");
+    }
+
+    fn write_worker_session_fixture(brehon_root: &std::path::Path, worker_id: &str) {
+        write_agent_session_fixture(brehon_root, worker_id, "worker");
+    }
+
+    fn write_worker_worktree_fixture(
+        brehon_root: &std::path::Path,
+        worker_id: &str,
+    ) -> std::path::PathBuf {
+        let worktree = brehon_root
+            .join("worktrees")
+            .join("runs")
+            .join("run-1")
+            .join(worker_id);
+        init_test_git_repo(&worktree);
+        worktree
+    }
+
+    fn write_invalid_agent_health_path_fixture(brehon_root: &std::path::Path) {
+        let runtime_dir = brehon_root.join("runtime");
+        std::fs::create_dir_all(&runtime_dir).expect("runtime dir");
+        std::fs::write(runtime_dir.join("agent-health"), "not a directory")
+            .expect("invalid agent-health path");
+    }
+
+    fn write_prompt_blocked_worker_health_fixture(
+        brehon_root: &std::path::Path,
+        worker_id: &str,
+        task_id: &str,
+    ) -> std::path::PathBuf {
+        write_prompt_blocked_health_fixture(brehon_root, worker_id, Some(task_id))
+    }
+
+    fn write_taskless_prompt_blocked_health_fixture(
+        brehon_root: &std::path::Path,
+        worker_id: &str,
+    ) -> std::path::PathBuf {
+        write_prompt_blocked_health_fixture(brehon_root, worker_id, None)
+    }
+
+    fn write_prompt_blocked_health_fixture(
+        brehon_root: &std::path::Path,
+        worker_id: &str,
+        task_id: Option<&str>,
+    ) -> std::path::PathBuf {
+        let runtime_dir = brehon_root.join("runtime");
+        std::fs::create_dir_all(runtime_dir.join("agent-health")).expect("health dir");
+        let health_path = runtime_dir
+            .join("agent-health")
+            .join(format!("{worker_id}.json"));
+        let blocked = match task_id {
+            Some(task_id) => serde_json::json!({
+                "kind": "permission_request",
+                "summary": "permission request blocked automatic recovery: allow bash ls",
+                "command_or_tool": "allow bash ls",
+                "request_id": "perm-1",
+                "task_id": task_id
+            }),
+            None => serde_json::json!({
+                "kind": "permission_request",
+                "summary": "permission request blocked automatic recovery: allow bash ls",
+                "command_or_tool": "allow bash ls",
+                "request_id": "perm-1"
+            }),
+        };
+        std::fs::write(
+            &health_path,
+            serde_json::json!({
+                "agent": worker_id,
+                "status": "unavailable",
+                "reason": "prompt_blocked",
+                "blocked": blocked
+            })
+            .to_string(),
+        )
+        .expect("health file");
+        health_path
+    }
+
+    fn write_quarantined_worker_health_fixture(
+        brehon_root: &std::path::Path,
+        worker_id: &str,
+    ) -> std::path::PathBuf {
+        let runtime_dir = brehon_root.join("runtime");
+        std::fs::create_dir_all(runtime_dir.join("agent-health")).expect("health dir");
+        let health_path = runtime_dir
+            .join("agent-health")
+            .join(format!("{worker_id}.json"));
+        std::fs::write(
+            &health_path,
+            serde_json::json!({
+                "agent": worker_id,
+                "status": "unavailable",
+                "reason": "quota_exhausted"
+            })
+            .to_string(),
+        )
+        .expect("health file");
+        health_path
+    }
+
+    fn apply_prompt_blocked_runtime_state(mux: &mut Mux, pane_id: &str, task_id: &str) {
+        apply_prompt_blocked_runtime_state_with_task(mux, pane_id, Some(task_id));
+    }
+
+    fn apply_taskless_prompt_blocked_runtime_state(mux: &mut Mux, pane_id: &str) {
+        apply_prompt_blocked_runtime_state_with_task(mux, pane_id, None);
+    }
+
+    fn apply_prompt_blocked_runtime_state_with_task(
+        mux: &mut Mux,
+        pane_id: &str,
+        task_id: Option<&str>,
+    ) {
+        let generation = mux
+            .get(pane_id)
+            .expect("prompt-blocked pane")
+            .current_generation();
+        let event = brehon_types::RuntimeEvent::new(
+            brehon_types::RuntimeEventMeta::new(
+                "test-session",
+                pane_id,
+                generation.0,
+                brehon_types::RuntimeSource::Headless,
+                1,
+            ),
+            brehon_types::RuntimeEventKind::PaneStateChanged(brehon_types::PaneStateChangedEvent {
+                previous: Some(brehon_types::RuntimePaneState::Ready),
+                current: brehon_types::RuntimePaneState::Blocked,
+                reason: Some("prompt blocked".to_string()),
+                blocked: Some(brehon_types::RuntimePaneBlockInfo {
+                    kind: brehon_types::RuntimePaneBlockKind::PermissionRequest,
+                    summary: "permission request blocked automatic recovery: allow bash ls"
+                        .to_string(),
+                    command_or_tool: Some("allow bash ls".to_string()),
+                    request_id: Some("perm-1".to_string()),
+                    task_id: task_id.map(str::to_string),
+                    excerpt: None,
+                }),
+            }),
+        );
+        assert!(
+            mux.apply_terminal_host_runtime_event(&event)
+                .expect("blocked runtime event"),
+            "blocked runtime event should update the pane state",
+        );
     }
 
     #[test]
@@ -4024,6 +4867,72 @@ mod tests {
     }
 
     #[test]
+    fn manual_reset_context_never_requires_approval() {
+        let mut mux = Mux::new(24, 80);
+        mux.add_pane(make_supervisor_pane("supervisor"));
+        let mut harness = harness_with_mux(mux);
+
+        assert!(perform_manual_reset_request(&mut harness.ctx, "supervisor"));
+
+        let routed = recv_route(&harness.rx);
+        assert!(
+            !routed.context.approval_required,
+            "manual reset must not wait on a human approval path"
+        );
+
+        drain_runtime_commands(&mut harness);
+    }
+
+    #[test]
+    fn supervisor_auto_reset_context_never_requires_approval() {
+        let mut mux = Mux::new(24, 80);
+        let mut pane = make_supervisor_pane("claude-supervisor");
+        pane.append_output(
+            br#"<anonymous> (/bunfs/root/src/entrypoints/cli.js:577:98876)
+TypeError: Cannot read properties of undefined"#,
+        )
+        .expect("append crash output");
+        mux.add_pane(pane);
+
+        // Verify the crash scenario is detected before routing
+        assert_eq!(
+            supervisor_reset_reason(&mux, "claude-supervisor"),
+            Some("runtime crash"),
+            "pane must be in crash state for this test to guard the right scenario"
+        );
+
+        let mut harness = harness_with_mux(mux);
+
+        // data field is empty because supervisor_reset_reason reads from the
+        // pane's output buffer (populated above via append_output), not from
+        // the event payload.
+        let batch_events = vec![MuxEvent::PaneOutput {
+            pane_id: "claude-supervisor".to_string(),
+            data: vec![],
+            generation: brehon_mux::Generation(0),
+        }];
+        // Instant::now() works here because last_supervisor_reset is empty on a
+        // fresh harness, so the cooldown check always passes.
+        detect_and_handle_supervisor_resets(&mut harness.ctx, &batch_events, Instant::now());
+
+        let routed = recv_route(&harness.rx);
+        assert_eq!(
+            routed.command.target.pane_id.as_deref(),
+            Some("claude-supervisor")
+        );
+        assert!(matches!(
+            routed.command.kind,
+            RuntimeCommandKind::ResetPane { ref reason } if reason == "supervisor runtime failure: runtime crash"
+        ));
+        assert!(
+            !routed.context.approval_required,
+            "supervisor auto-reset must not wait on a human approval path"
+        );
+
+        drain_runtime_commands(&mut harness);
+    }
+
+    #[test]
     fn stall_recycle_routes_through_runtime_router() {
         let mut mux = Mux::new(24, 80);
         mux.add_pane(make_worker_pane("worker-1"));
@@ -4047,6 +4956,31 @@ mod tests {
                 if reason == "auto-recover idle worker pane via daemon recycle"
         ));
         assert_eq!(harness.ctx.pending_runtime_commands.len(), 1);
+    }
+
+    #[test]
+    fn stall_recycle_context_never_requires_approval() {
+        let mut mux = Mux::new(24, 80);
+        mux.add_pane(make_worker_pane("worker-1"));
+        let mut harness = harness_with_mux(mux);
+        let now = Instant::now();
+        harness.ctx.auto_recover_threshold = Duration::from_secs(1);
+        harness.ctx.stall_check_interval = Duration::ZERO;
+        harness.ctx.last_stall_check = now - Duration::from_secs(60);
+        harness
+            .ctx
+            .last_activity
+            .insert("worker-1".to_string(), now - Duration::from_secs(5));
+
+        crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
+
+        let routed = recv_route(&harness.rx);
+        assert!(
+            !routed.context.approval_required,
+            "stall recycle must not wait on a human approval path"
+        );
+
+        drain_runtime_commands(&mut harness);
     }
 
     #[test]
@@ -4119,10 +5053,998 @@ mod tests {
     }
 
     #[test]
-    fn stale_active_assigned_worker_resets_once_after_nudge_window() {
+    fn prompt_blocked_active_worker_resets_immediately_and_clears_health() {
         let temp = tempfile::tempdir().expect("tempdir");
         let brehon_root = temp.path().join(".brehon");
         write_active_assigned_task_fixture(&brehon_root);
+        write_worker_session_fixture(&brehon_root, "worker-1");
+        let health_path =
+            write_prompt_blocked_worker_health_fixture(&brehon_root, "worker-1", "T-owned");
+
+        let mut mux = Mux::new(24, 80);
+        mux.add_pane(make_worker_pane("worker-1"));
+        let mut harness = harness_with_mux(mux);
+        harness.ctx.stall_check_interval = Duration::ZERO;
+        harness.ctx.last_stall_check = Instant::now() - Duration::from_secs(60);
+        harness
+            .ctx
+            .dashboard_data
+            .lock()
+            .expect("dashboard")
+            .brehon_root = Some(brehon_root.clone());
+
+        crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
+
+        assert!(
+            !health_path.exists(),
+            "successful prompt-blocked recovery should clear health marker"
+        );
+        let task = serde_json::from_str::<serde_json::Value>(
+            &std::fs::read_to_string(
+                brehon_root
+                    .join("runtime")
+                    .join("tasks")
+                    .join("T-owned.json"),
+            )
+            .expect("task file"),
+        )
+        .expect("task json");
+        assert_eq!(
+            task.get("status").and_then(|value| value.as_str()),
+            Some("in_progress")
+        );
+        assert!(harness
+            .ctx
+            .last_worker_context_reset
+            .contains_key("worker-1"));
+        assert_eq!(harness.ctx.mux.pending_delayed_prompt_count(), 1);
+    }
+
+    #[test]
+    fn quarantined_worker_reset_context_never_requires_approval() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let brehon_root = temp.path().join(".brehon");
+        let runtime_dir = brehon_root.join("runtime");
+        std::fs::create_dir_all(runtime_dir.join("agent-health")).expect("health dir");
+
+        write_active_assigned_task_fixture(&brehon_root);
+        write_worker_session_fixture(&brehon_root, "worker-1");
+        std::fs::write(
+            runtime_dir.join("agent-health").join("worker-1.json"),
+            serde_json::json!({
+                "agent": "worker-1",
+                "status": "unavailable",
+                "reason": "non_retryable_http_status"
+            })
+            .to_string(),
+        )
+        .expect("health file");
+
+        let mut mux = Mux::new(24, 80);
+        mux.add_pane(make_worker_pane("worker-1"));
+        let mut harness = harness_with_mux(mux);
+        harness.ctx.stall_check_interval = Duration::ZERO;
+        harness.ctx.last_stall_check = Instant::now() - Duration::from_secs(60);
+        harness
+            .ctx
+            .dashboard_data
+            .lock()
+            .expect("dashboard")
+            .brehon_root = Some(brehon_root.clone());
+
+        crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
+
+        let routed = recv_route(&harness.rx);
+        assert_eq!(routed.command.target.pane_id.as_deref(), Some("worker-1"));
+        assert!(matches!(
+            routed.command.kind,
+            RuntimeCommandKind::ResetPane { .. }
+        ));
+        assert!(
+            !routed.context.approval_required,
+            "quarantined worker reset must not wait on a human approval path"
+        );
+
+        drain_runtime_commands(&mut harness);
+    }
+
+    #[test]
+    fn prompt_blocked_active_worker_without_session_file_still_resets() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let brehon_root = temp.path().join(".brehon");
+        write_active_assigned_task_fixture(&brehon_root);
+        let health_path =
+            write_prompt_blocked_worker_health_fixture(&brehon_root, "worker-1", "T-owned");
+
+        let mut mux = Mux::new(24, 80);
+        mux.add_pane(make_worker_pane("worker-1"));
+        let mut harness = harness_with_mux(mux);
+        harness.ctx.stall_check_interval = Duration::ZERO;
+        harness.ctx.last_stall_check = Instant::now() - Duration::from_secs(60);
+        harness
+            .ctx
+            .dashboard_data
+            .lock()
+            .expect("dashboard")
+            .brehon_root = Some(brehon_root.clone());
+
+        crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
+
+        assert!(
+            !health_path.exists(),
+            "prompt-blocked recovery should not require a session snapshot"
+        );
+        assert!(harness
+            .ctx
+            .last_worker_context_reset
+            .contains_key("worker-1"));
+        assert_eq!(harness.ctx.mux.pending_delayed_prompt_count(), 1);
+    }
+
+    #[test]
+    fn prompt_blocked_worker_with_review_ready_task_context_resets_without_task_snapshot() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let brehon_root = temp.path().join(".brehon");
+        let health_path =
+            write_prompt_blocked_worker_health_fixture(&brehon_root, "worker-1", "T-owned");
+
+        let mut mux = Mux::new(24, 80);
+        mux.add_pane(make_worker_pane("worker-1"));
+        mux.get_mut("worker-1")
+            .expect("worker pane")
+            .set_task_context(brehon_mux::TaskContextSnapshot {
+                task_id: "T-owned".to_string(),
+                title: "Review-ready task context".to_string(),
+                // TaskContextSnapshot normalizes raw `review_ready` task files
+                // to `TaskStatus::InReview`.
+                status: brehon_types::task::TaskStatus::InReview,
+                completion_mode: None,
+                merge_target: None,
+                parent_id: None,
+                epic_branch: None,
+                epic_worktree: None,
+                blocked_reason: None,
+                updated_at: Instant::now(),
+            });
+        let mut harness = harness_with_mux(mux);
+        harness.ctx.stall_check_interval = Duration::ZERO;
+        harness.ctx.last_stall_check = Instant::now() - Duration::from_secs(60);
+        harness
+            .ctx
+            .dashboard_data
+            .lock()
+            .expect("dashboard")
+            .brehon_root = Some(brehon_root.clone());
+
+        crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
+
+        assert!(
+            !health_path.exists(),
+            "successful prompt-blocked recovery should clear the health marker"
+        );
+        assert!(harness
+            .ctx
+            .last_worker_context_reset
+            .contains_key("worker-1"));
+        assert!(
+            harness.ctx.pending_runtime_commands.is_empty(),
+            "reserved task context should trigger direct reset, not idle recycle"
+        );
+        assert_eq!(harness.ctx.mux.pending_delayed_prompt_count(), 1);
+    }
+
+    #[test]
+    fn prompt_blocked_missing_worker_pane_blocks_marker_task_and_clears_health() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let brehon_root = temp.path().join(".brehon");
+        write_active_assigned_task_fixture(&brehon_root);
+        write_worker_session_fixture(&brehon_root, "worker-1");
+        let health_path =
+            write_prompt_blocked_worker_health_fixture(&brehon_root, "worker-1", "T-owned");
+
+        let mux = Mux::new(24, 80);
+        let mut harness = harness_with_mux(mux);
+        harness.ctx.stall_check_interval = Duration::ZERO;
+        harness.ctx.last_stall_check = Instant::now() - Duration::from_secs(60);
+        harness
+            .ctx
+            .dashboard_data
+            .lock()
+            .expect("dashboard")
+            .brehon_root = Some(brehon_root.clone());
+
+        crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
+
+        assert!(
+            !health_path.exists(),
+            "missing-pane prompt-blocked recovery should clear the stale health marker after blocking the task"
+        );
+        let task = serde_json::from_str::<serde_json::Value>(
+            &std::fs::read_to_string(
+                brehon_root
+                    .join("runtime")
+                    .join("tasks")
+                    .join("T-owned.json"),
+            )
+            .expect("task file"),
+        )
+        .expect("task json");
+        assert_eq!(
+            task.get("status").and_then(|value| value.as_str()),
+            Some("blocked")
+        );
+        assert_eq!(
+            task.get("activity").and_then(|value| value.as_str()),
+            Some("prompt-blocked recovery failed")
+        );
+        assert!(harness.ctx.pending_runtime_commands.is_empty());
+    }
+
+    #[test]
+    fn manual_reset_rejection_surfaces_explicit_runtime_failure() {
+        let mut mux = Mux::new(24, 80);
+        mux.add_pane(make_supervisor_pane("supervisor"));
+        let mut harness = harness_with_selective_router(
+            mux,
+            false,
+            vec![TestRouteRejection::ResetPaneTo("supervisor".to_string())],
+        );
+
+        assert!(perform_manual_reset_request(&mut harness.ctx, "supervisor"));
+
+        let routed = recv_route(&harness.rx);
+        assert!(matches!(
+            routed.command.kind,
+            RuntimeCommandKind::ResetPane { ref reason } if reason == "manual reset"
+        ));
+
+        drain_runtime_commands(&mut harness);
+
+        let dashboard = harness.ctx.dashboard_data.lock().expect("dashboard");
+        let found = dashboard.events.iter().any(|event| {
+            event
+                .description
+                .contains("manual reset for supervisor failed")
+                && event.description.contains("rejected for test")
+        });
+        assert!(
+            found,
+            "manual reset rejection should produce an explicit Brehon runtime failure on the dashboard, not a hidden terminal prompt; got events: {:?}",
+            dashboard.events
+        );
+    }
+
+    #[test]
+    fn stall_recycle_rejection_surfaces_explicit_runtime_failure_and_blocks_task() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let brehon_root = temp.path().join(".brehon");
+        let runtime_dir = brehon_root.join("runtime");
+        std::fs::create_dir_all(runtime_dir.join("tasks")).expect("tasks dir");
+        std::fs::write(
+            runtime_dir.join("tasks").join("T-owned.json"),
+            serde_json::json!({
+                "task_id": "T-owned",
+                "title": "Owned task",
+                "status": "pending",
+                "task_type": "task"
+            })
+            .to_string(),
+        )
+        .expect("task file");
+        write_worker_session_fixture(&brehon_root, "worker-1");
+        let health_path =
+            write_prompt_blocked_worker_health_fixture(&brehon_root, "worker-1", "T-owned");
+
+        let mut mux = Mux::new(24, 80);
+        mux.add_pane(make_worker_pane("worker-1"));
+        let mut harness = harness_with_selective_router(
+            mux,
+            false,
+            vec![TestRouteRejection::RecyclePaneTo("worker-1".to_string())],
+        );
+        let now = Instant::now();
+        harness.ctx.auto_recover_threshold = Duration::from_secs(1);
+        harness.ctx.stall_check_interval = Duration::ZERO;
+        harness.ctx.last_stall_check = now - Duration::from_secs(60);
+        harness
+            .ctx
+            .last_activity
+            .insert("worker-1".to_string(), now - Duration::from_secs(5));
+        harness
+            .ctx
+            .dashboard_data
+            .lock()
+            .expect("dashboard")
+            .brehon_root = Some(brehon_root.clone());
+
+        crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
+
+        let routed = recv_route(&harness.rx);
+        assert!(matches!(
+            routed.command.kind,
+            RuntimeCommandKind::RecyclePane { ref reason }
+                if reason.starts_with("auto-recover prompt-blocked idle worker pane:")
+        ));
+
+        drain_runtime_commands(&mut harness);
+
+        let dashboard = harness.ctx.dashboard_data.lock().expect("dashboard");
+        let found = dashboard.events.iter().any(|event| {
+            event
+                .description
+                .contains("failed to recycle prompt-blocked idle worker worker-1")
+                && event.description.contains("rejected for test")
+        });
+        assert!(
+            found,
+            "stall recycle rejection should produce an explicit Brehon runtime failure on the dashboard, not a hidden terminal prompt; got events: {:?}",
+            dashboard.events
+        );
+
+        assert!(
+            !health_path.exists(),
+            "failed recycle should still clear the stale health marker"
+        );
+        let task = serde_json::from_str::<serde_json::Value>(
+            &std::fs::read_to_string(
+                brehon_root
+                    .join("runtime")
+                    .join("tasks")
+                    .join("T-owned.json"),
+            )
+            .expect("task file"),
+        )
+        .expect("task json");
+        assert_eq!(
+            task.get("status").and_then(|value| value.as_str()),
+            Some("blocked"),
+            "failed recycle should block the owning task with a clear operator-visible reason"
+        );
+        assert_eq!(
+            task.get("activity").and_then(|value| value.as_str()),
+            Some("prompt-blocked recovery failed")
+        );
+    }
+
+    #[test]
+    fn prompt_blocked_active_reviewer_resets_and_clears_health() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let brehon_root = temp.path().join(".brehon");
+        write_review_obligation_fixture(&brehon_root);
+        let health_path =
+            write_prompt_blocked_worker_health_fixture(&brehon_root, "reviewer-1", "T-review");
+
+        let mut mux = Mux::new(24, 80);
+        mux.add_pane(make_reviewer_pane("reviewer-1"));
+        mux.get_mut("reviewer-1")
+            .expect("reviewer pane")
+            .set_review_context(brehon_mux::ReviewContextSnapshot {
+                review_id: "REV-review".to_string(),
+                task_id: "T-review".to_string(),
+                round: 1,
+                panel_total: 1,
+                panel_done: 0,
+                verdict: None,
+                score: None,
+                findings_summary: None,
+                updated_at: Instant::now(),
+            });
+        let mut harness = harness_with_mux(mux);
+        harness.ctx.stall_check_interval = Duration::ZERO;
+        harness.ctx.last_stall_check = Instant::now() - Duration::from_secs(60);
+        harness
+            .ctx
+            .dashboard_data
+            .lock()
+            .expect("dashboard")
+            .brehon_root = Some(brehon_root.clone());
+
+        crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
+
+        assert!(
+            !health_path.exists(),
+            "successful prompt-blocked reviewer recovery should clear health marker"
+        );
+        let pane = harness.ctx.mux.get("reviewer-1").expect("reviewer pane");
+        assert!(
+            pane.review_context().is_none(),
+            "reviewer reset should clear the active review context"
+        );
+        let task = serde_json::from_str::<serde_json::Value>(
+            &std::fs::read_to_string(
+                brehon_root
+                    .join("runtime")
+                    .join("tasks")
+                    .join("T-review.json"),
+            )
+            .expect("task file"),
+        )
+        .expect("task json");
+        assert_eq!(
+            task.get("status").and_then(|value| value.as_str()),
+            Some("in_review")
+        );
+        assert_eq!(harness.ctx.mux.pending_delayed_prompt_count(), 1);
+    }
+
+    #[test]
+    fn prompt_blocked_missing_reviewer_pane_blocks_marker_task_and_clears_health() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let brehon_root = temp.path().join(".brehon");
+        write_review_obligation_fixture(&brehon_root);
+        write_agent_session_fixture(&brehon_root, "reviewer-1", "reviewer");
+        let health_path =
+            write_prompt_blocked_worker_health_fixture(&brehon_root, "reviewer-1", "T-review");
+
+        let mux = Mux::new(24, 80);
+        let mut harness = harness_with_mux(mux);
+        harness.ctx.stall_check_interval = Duration::ZERO;
+        harness.ctx.last_stall_check = Instant::now() - Duration::from_secs(60);
+        harness
+            .ctx
+            .dashboard_data
+            .lock()
+            .expect("dashboard")
+            .brehon_root = Some(brehon_root.clone());
+
+        crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
+
+        assert!(
+            !health_path.exists(),
+            "missing-pane reviewer recovery should clear the stale health marker after blocking the task"
+        );
+        let task = serde_json::from_str::<serde_json::Value>(
+            &std::fs::read_to_string(
+                brehon_root
+                    .join("runtime")
+                    .join("tasks")
+                    .join("T-review.json"),
+            )
+            .expect("task file"),
+        )
+        .expect("task json");
+        assert_eq!(
+            task.get("status").and_then(|value| value.as_str()),
+            Some("blocked")
+        );
+        assert_eq!(
+            task.get("activity").and_then(|value| value.as_str()),
+            Some("prompt-blocked recovery failed")
+        );
+        assert!(harness.ctx.pending_runtime_commands.is_empty());
+    }
+
+    #[test]
+    fn prompt_blocked_supervisor_resets_and_clears_health() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let brehon_root = temp.path().join(".brehon");
+        let health_path = write_prompt_blocked_worker_health_fixture(
+            &brehon_root,
+            "claude-supervisor",
+            "T-supervisor",
+        );
+
+        let mut mux = Mux::new(24, 80);
+        mux.add_pane(make_supervisor_pane("claude-supervisor"));
+        let mut harness = harness_with_mux(mux);
+        harness.ctx.stall_check_interval = Duration::ZERO;
+        harness.ctx.last_stall_check = Instant::now() - Duration::from_secs(60);
+        harness
+            .ctx
+            .dashboard_data
+            .lock()
+            .expect("dashboard")
+            .brehon_root = Some(brehon_root.clone());
+
+        crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
+
+        assert!(
+            !health_path.exists(),
+            "successful prompt-blocked supervisor recovery should clear health marker"
+        );
+        assert!(harness
+            .ctx
+            .last_supervisor_reset
+            .contains_key("claude-supervisor"));
+        assert_eq!(harness.ctx.mux.pending_delayed_prompt_count(), 1);
+    }
+
+    #[test]
+    fn prompt_blocked_idle_worker_recycles_with_startup_prompt() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let brehon_root = temp.path().join(".brehon");
+        write_worker_session_fixture(&brehon_root, "worker-1");
+        let health_path =
+            write_prompt_blocked_worker_health_fixture(&brehon_root, "worker-1", "T-idle");
+
+        let mut mux = Mux::new(24, 80);
+        mux.add_pane(make_worker_pane("worker-1"));
+        mux.get_mut("worker-1")
+            .expect("worker pane")
+            .set_task_context(brehon_mux::TaskContextSnapshot {
+                task_id: "T-stale".to_string(),
+                title: "Stale task context".to_string(),
+                status: brehon_types::task::TaskStatus::Pending,
+                completion_mode: None,
+                merge_target: None,
+                parent_id: None,
+                epic_branch: None,
+                epic_worktree: None,
+                blocked_reason: None,
+                updated_at: Instant::now(),
+            });
+        let mut harness = harness_with_mux(mux);
+        harness.ctx.stall_check_interval = Duration::ZERO;
+        harness.ctx.last_stall_check = Instant::now() - Duration::from_secs(60);
+        harness
+            .ctx
+            .dashboard_data
+            .lock()
+            .expect("dashboard")
+            .brehon_root = Some(brehon_root.clone());
+
+        crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
+
+        let routed = recv_route(&harness.rx);
+        assert_eq!(routed.command.target.pane_id.as_deref(), Some("worker-1"));
+        assert!(matches!(
+            routed.command.kind,
+            RuntimeCommandKind::RecyclePane { ref reason }
+                if reason.contains("auto-recover prompt-blocked idle worker pane")
+        ));
+        assert_eq!(harness.ctx.pending_runtime_commands.len(), 1);
+        std::fs::remove_file(&health_path).expect("remove prompt-blocked marker before rejection");
+
+        drain_runtime_commands(&mut harness);
+
+        assert!(
+            !health_path.exists(),
+            "successful idle prompt-blocked recycle should clear health marker"
+        );
+        assert!(
+            harness
+                .ctx
+                .mux
+                .get("worker-1")
+                .expect("worker pane")
+                .task_context()
+                .is_none(),
+            "idle recycle should clear stale task context"
+        );
+        assert_eq!(harness.ctx.mux.pending_delayed_prompt_count(), 1);
+    }
+
+    #[test]
+    fn prompt_blocked_idle_worker_does_not_queue_duplicate_recycles_while_pending() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let brehon_root = temp.path().join(".brehon");
+        write_worker_session_fixture(&brehon_root, "worker-1");
+        write_prompt_blocked_worker_health_fixture(&brehon_root, "worker-1", "T-idle");
+
+        let mut mux = Mux::new(24, 80);
+        mux.add_pane(make_worker_pane("worker-1"));
+        let mut harness = harness_with_mux(mux);
+        harness.ctx.stall_check_interval = Duration::ZERO;
+        harness.ctx.last_stall_check = Instant::now() - Duration::from_secs(60);
+        harness
+            .ctx
+            .dashboard_data
+            .lock()
+            .expect("dashboard")
+            .brehon_root = Some(brehon_root.clone());
+
+        crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
+        let routed = recv_route(&harness.rx);
+        assert_eq!(routed.command.target.pane_id.as_deref(), Some("worker-1"));
+        assert!(matches!(
+            routed.command.kind,
+            RuntimeCommandKind::RecyclePane { ref reason }
+                if reason.contains("auto-recover prompt-blocked idle worker pane")
+        ));
+        assert_eq!(harness.ctx.pending_runtime_commands.len(), 1);
+
+        harness.ctx.last_stall_check = Instant::now() - Duration::from_secs(60);
+        crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
+
+        assert_eq!(
+            harness.ctx.pending_runtime_commands.len(),
+            1,
+            "prompt-blocked idle worker should not queue duplicate recycle commands while one is already pending"
+        );
+        assert!(
+            harness.rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "no second recycle command should be routed while the first is still pending"
+        );
+    }
+
+    #[test]
+    fn prompt_blocked_idle_worker_blocks_task_when_recycle_router_is_unavailable() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let brehon_root = temp.path().join(".brehon");
+        write_inactive_task_fixture(&brehon_root, "T-idle");
+        let health_path =
+            write_prompt_blocked_worker_health_fixture(&brehon_root, "worker-1", "T-idle");
+
+        let mut mux = Mux::new(24, 80);
+        mux.add_pane(make_worker_pane("worker-1"));
+        let mut harness = harness_with_host_owned_mux(mux);
+        harness.ctx.runtime_command_router = None;
+        harness.ctx.stall_check_interval = Duration::ZERO;
+        harness.ctx.last_stall_check = Instant::now() - Duration::from_secs(60);
+        harness
+            .ctx
+            .dashboard_data
+            .lock()
+            .expect("dashboard")
+            .brehon_root = Some(brehon_root.clone());
+
+        crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
+
+        assert!(
+            !health_path.exists(),
+            "blocking the task after failed idle recycle should clear health marker"
+        );
+        let task = serde_json::from_str::<serde_json::Value>(
+            &std::fs::read_to_string(
+                brehon_root
+                    .join("runtime")
+                    .join("tasks")
+                    .join("T-idle.json"),
+            )
+            .expect("task file"),
+        )
+        .expect("task json");
+        assert_eq!(
+            task.get("status").and_then(|value| value.as_str()),
+            Some("blocked")
+        );
+        assert_eq!(
+            task.get("activity").and_then(|value| value.as_str()),
+            Some("prompt-blocked recovery failed")
+        );
+        assert!(task
+            .get("blockers")
+            .and_then(|value| value.as_str())
+            .is_some_and(|value| value.contains("runtime command router unavailable")));
+    }
+
+    #[test]
+    fn prompt_blocked_idle_worker_blocks_task_when_queued_recycle_is_rejected() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let brehon_root = temp.path().join(".brehon");
+        write_inactive_task_fixture(&brehon_root, "T-idle");
+        let health_path =
+            write_prompt_blocked_worker_health_fixture(&brehon_root, "worker-1", "T-idle");
+
+        let mut mux = Mux::new(24, 80);
+        mux.add_pane(make_worker_pane("worker-1"));
+        let mut harness = harness_with_selective_router(
+            mux,
+            false,
+            vec![TestRouteRejection::RecyclePaneTo("worker-1".to_string())],
+        );
+        harness.ctx.stall_check_interval = Duration::ZERO;
+        harness.ctx.last_stall_check = Instant::now() - Duration::from_secs(60);
+        harness
+            .ctx
+            .dashboard_data
+            .lock()
+            .expect("dashboard")
+            .brehon_root = Some(brehon_root.clone());
+
+        crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
+
+        let routed = recv_route(&harness.rx);
+        assert_eq!(routed.command.target.pane_id.as_deref(), Some("worker-1"));
+        assert!(matches!(
+            routed.command.kind,
+            RuntimeCommandKind::RecyclePane { ref reason }
+                if reason.contains("auto-recover prompt-blocked idle worker pane")
+        ));
+        assert_eq!(harness.ctx.pending_runtime_commands.len(), 1);
+
+        drain_runtime_commands(&mut harness);
+
+        assert!(
+            !health_path.exists(),
+            "blocking the task after rejected queued recycle should clear health marker"
+        );
+        let task = serde_json::from_str::<serde_json::Value>(
+            &std::fs::read_to_string(
+                brehon_root
+                    .join("runtime")
+                    .join("tasks")
+                    .join("T-idle.json"),
+            )
+            .expect("task file"),
+        )
+        .expect("task json");
+        assert_eq!(
+            task.get("status").and_then(|value| value.as_str()),
+            Some("blocked")
+        );
+        assert_eq!(
+            task.get("activity").and_then(|value| value.as_str()),
+            Some("prompt-blocked recovery failed")
+        );
+        assert!(task
+            .get("blockers")
+            .and_then(|value| value.as_str())
+            .is_some_and(|value| {
+                value.contains("rejected for test")
+                    && value.contains("allow bash ls")
+                    && value.contains("request_id perm-1")
+            }));
+        assert!(task
+            .get("recovery_note")
+            .and_then(|value| value.as_str())
+            .is_some_and(|value| value.contains("allow bash ls")));
+    }
+
+    #[test]
+    fn prompt_blocked_idle_worker_queued_recycle_terminal_task_failure_converges() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let brehon_root = temp.path().join(".brehon");
+        write_terminal_task_fixture(&brehon_root, "T-idle", "merged");
+        let health_path =
+            write_prompt_blocked_worker_health_fixture(&brehon_root, "worker-1", "T-idle");
+
+        let mut mux = Mux::new(24, 80);
+        mux.add_pane(make_worker_pane("worker-1"));
+        let mut harness = harness_with_selective_router(
+            mux,
+            false,
+            vec![TestRouteRejection::RecyclePaneTo("worker-1".to_string())],
+        );
+        harness.ctx.stall_check_interval = Duration::ZERO;
+        harness.ctx.last_stall_check = Instant::now() - Duration::from_secs(60);
+        harness
+            .ctx
+            .dashboard_data
+            .lock()
+            .expect("dashboard")
+            .brehon_root = Some(brehon_root.clone());
+
+        crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
+
+        let routed = recv_route(&harness.rx);
+        assert_eq!(routed.command.target.pane_id.as_deref(), Some("worker-1"));
+        assert!(matches!(
+            routed.command.kind,
+            RuntimeCommandKind::RecyclePane { ref reason }
+                if reason.contains("auto-recover prompt-blocked idle worker pane")
+        ));
+        assert_eq!(harness.ctx.pending_runtime_commands.len(), 1);
+
+        drain_runtime_commands(&mut harness);
+
+        let first_marker =
+            std::fs::read_to_string(&health_path).expect("terminal queued recycle failure marker");
+        let first_marker_json =
+            serde_json::from_str::<serde_json::Value>(&first_marker).expect("marker json");
+        assert_eq!(
+            first_marker_json
+                .get("reason")
+                .and_then(|value| value.as_str()),
+            Some("prompt_blocked_recovery_failed")
+        );
+        assert!(first_marker_json
+            .get("error")
+            .and_then(|value| value.as_str())
+            .is_some_and(|value| {
+                value.contains("could not mark task T-idle blocked")
+                    && value.contains("terminal task T-idle")
+            }));
+        assert_eq!(
+            first_marker_json
+                .get("blocked")
+                .and_then(|value| value.get("command_or_tool"))
+                .and_then(|value| value.as_str()),
+            Some("allow bash ls")
+        );
+        let merged_task = serde_json::from_str::<serde_json::Value>(
+            &std::fs::read_to_string(
+                brehon_root
+                    .join("runtime")
+                    .join("tasks")
+                    .join("T-idle.json"),
+            )
+            .expect("task file"),
+        )
+        .expect("task json");
+        assert_eq!(
+            merged_task.get("status").and_then(|value| value.as_str()),
+            Some("merged")
+        );
+        let first_event_count = harness
+            .ctx
+            .dashboard_data
+            .lock()
+            .expect("dashboard")
+            .events
+            .len();
+
+        harness.ctx.last_stall_check = Instant::now() - Duration::from_secs(60);
+        crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
+
+        let second_marker = std::fs::read_to_string(&health_path).expect("marker after resweep");
+        let second_event_count = harness
+            .ctx
+            .dashboard_data
+            .lock()
+            .expect("dashboard")
+            .events
+            .len();
+        assert_eq!(
+            first_marker, second_marker,
+            "task-backed queued recycle failures that cannot rewrite a terminal task should converge to a one-shot terminal marker"
+        );
+        assert_eq!(
+            first_event_count, second_event_count,
+            "task-backed queued recycle failures that cannot rewrite a terminal task should not emit duplicate dashboard events after fallback marker convergence"
+        );
+    }
+
+    #[test]
+    fn prompt_blocked_idle_worker_queued_recycle_marker_write_failure_is_suppressed_in_memory() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let brehon_root = temp.path().join(".brehon");
+        write_terminal_task_fixture(&brehon_root, "T-idle", "merged");
+        write_invalid_agent_health_path_fixture(&brehon_root);
+
+        let mut mux = Mux::new(24, 80);
+        mux.add_pane(make_worker_pane("worker-1"));
+        apply_prompt_blocked_runtime_state_with_task(&mut mux, "worker-1", Some("T-idle"));
+        let mut harness = harness_with_selective_router(
+            mux,
+            false,
+            vec![TestRouteRejection::RecyclePaneTo("worker-1".to_string())],
+        );
+        harness.ctx.stall_check_interval = Duration::ZERO;
+        harness.ctx.last_stall_check = Instant::now() - Duration::from_secs(60);
+        harness
+            .ctx
+            .dashboard_data
+            .lock()
+            .expect("dashboard")
+            .brehon_root = Some(brehon_root.clone());
+
+        crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
+
+        let routed = recv_route(&harness.rx);
+        assert_eq!(routed.command.target.pane_id.as_deref(), Some("worker-1"));
+        drain_runtime_commands(&mut harness);
+
+        assert!(
+            harness
+                .ctx
+                .prompt_blocked_recovery_failed_panes
+                .contains("worker-1"),
+            "queued recycle failures should suppress the live blocked worker in memory when the recovery-failed marker cannot be persisted"
+        );
+        let first_event_count = harness
+            .ctx
+            .dashboard_data
+            .lock()
+            .expect("dashboard")
+            .events
+            .len();
+
+        harness.ctx.last_stall_check = Instant::now() - Duration::from_secs(60);
+        crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
+
+        let second_event_count = harness
+            .ctx
+            .dashboard_data
+            .lock()
+            .expect("dashboard")
+            .events
+            .len();
+        assert_eq!(
+            first_event_count, second_event_count,
+            "once in-memory suppression is recorded for a queued recycle failure, later stall sweeps should not retry the same blocked worker"
+        );
+        assert!(
+            harness.rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "suppressed queued recycle failures should not route a second recycle command"
+        );
+    }
+
+    #[test]
+    fn taskless_prompt_blocked_idle_worker_queued_recycle_failure_is_marked_once() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let brehon_root = temp.path().join(".brehon");
+        write_worker_session_fixture(&brehon_root, "worker-1");
+        let health_path = write_taskless_prompt_blocked_health_fixture(&brehon_root, "worker-1");
+
+        let mut mux = Mux::new(24, 80);
+        mux.add_pane(make_worker_pane("worker-1"));
+        let mut harness = harness_with_selective_router(
+            mux,
+            false,
+            vec![TestRouteRejection::RecyclePaneTo("worker-1".to_string())],
+        );
+        harness.ctx.stall_check_interval = Duration::ZERO;
+        harness.ctx.last_stall_check = Instant::now() - Duration::from_secs(60);
+        harness
+            .ctx
+            .dashboard_data
+            .lock()
+            .expect("dashboard")
+            .brehon_root = Some(brehon_root.clone());
+
+        crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
+
+        let routed = recv_route(&harness.rx);
+        assert_eq!(routed.command.target.pane_id.as_deref(), Some("worker-1"));
+        assert!(matches!(
+            routed.command.kind,
+            RuntimeCommandKind::RecyclePane { ref reason }
+                if reason.contains("auto-recover prompt-blocked idle worker pane")
+        ));
+        assert_eq!(harness.ctx.pending_runtime_commands.len(), 1);
+        std::fs::remove_file(&health_path)
+            .expect("remove prompt-blocked marker before taskless rejection");
+
+        drain_runtime_commands(&mut harness);
+
+        let first_marker =
+            std::fs::read_to_string(&health_path).expect("taskless queued failure marker");
+        let marker = serde_json::from_str::<serde_json::Value>(&first_marker).expect("marker");
+        assert_eq!(
+            marker.get("reason").and_then(|value| value.as_str()),
+            Some("prompt_blocked_recovery_failed")
+        );
+        assert_eq!(
+            marker
+                .get("blocked")
+                .and_then(|value| value.get("command_or_tool"))
+                .and_then(|value| value.as_str()),
+            Some("allow bash ls")
+        );
+        assert_eq!(
+            marker
+                .get("blocked")
+                .and_then(|value| value.get("request_id"))
+                .and_then(|value| value.as_str()),
+            Some("perm-1")
+        );
+        let first_event_count = harness
+            .ctx
+            .dashboard_data
+            .lock()
+            .expect("dashboard")
+            .events
+            .len();
+
+        harness.ctx.last_stall_check = Instant::now() - Duration::from_secs(60);
+        crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
+
+        let second_marker = std::fs::read_to_string(&health_path).expect("marker after resweep");
+        let second_event_count = harness
+            .ctx
+            .dashboard_data
+            .lock()
+            .expect("dashboard")
+            .events
+            .len();
+        assert_eq!(
+            first_marker, second_marker,
+            "queued recycle rejection for a taskless prompt-blocked worker should converge to a one-shot terminal marker"
+        );
+        assert_eq!(
+            first_event_count, second_event_count,
+            "queued recycle rejection for a taskless prompt-blocked worker should not emit duplicate dashboard events after the terminal marker is recorded"
+        );
+    }
+
+    #[test]
+    fn stale_dirty_active_assigned_worker_resets_once_after_nudge_window() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let brehon_root = temp.path().join(".brehon");
+        write_active_assigned_task_fixture(&brehon_root);
+        let worktree = write_worker_worktree_fixture(&brehon_root, "worker-1");
+        std::fs::write(worktree.join("dirty.txt"), "pending changes\n").expect("dirty worktree");
 
         let mut mux = Mux::new(24, 80);
         mux.add_pane(make_worker_pane("worker-1"));
@@ -4156,6 +6078,18 @@ mod tests {
                 if reason == "auto-recover idle assigned worker pane via daemon reset"
         ));
         assert_eq!(harness.ctx.pending_runtime_commands.len(), 1);
+        let task = serde_json::from_str::<serde_json::Value>(
+            &std::fs::read_to_string(
+                brehon_root
+                    .join("runtime")
+                    .join("tasks")
+                    .join("T-owned.json"),
+            )
+            .expect("task file"),
+        )
+        .expect("task json");
+        assert_eq!(task["status"], "in_progress");
+        assert_eq!(task["assignee"], "worker-1");
 
         drain_runtime_commands(&mut harness);
         assert_eq!(harness.ctx.mux.pending_delayed_prompt_count(), 1);
@@ -4177,6 +6111,1083 @@ mod tests {
     }
 
     #[test]
+    fn stale_clean_active_assigned_worker_requeues_task_after_nudge_window() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let brehon_root = temp.path().join(".brehon");
+        write_active_assigned_task_fixture(&brehon_root);
+        write_worker_worktree_fixture(&brehon_root, "worker-1");
+
+        let mut mux = Mux::new(24, 80);
+        mux.add_pane(make_worker_pane("worker-1"));
+        let mut harness = harness_with_mux(mux);
+        let now = Instant::now();
+        harness.ctx.auto_recover_threshold = Duration::from_secs(1);
+        harness.ctx.stall_check_interval = Duration::ZERO;
+        harness.ctx.last_stall_check = now - Duration::from_secs(60);
+        harness.ctx.active_worker_recovery_nudges_sent.insert(
+            ("worker-1".to_string(), "T-owned".to_string()),
+            now - Duration::from_secs(5),
+        );
+        harness
+            .ctx
+            .last_activity
+            .insert("worker-1".to_string(), now - Duration::from_secs(5));
+        harness
+            .ctx
+            .dashboard_data
+            .lock()
+            .expect("dashboard")
+            .brehon_root = Some(brehon_root.clone());
+
+        crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
+
+        let routed = recv_route(&harness.rx);
+        assert_eq!(routed.command.target.pane_id.as_deref(), Some("worker-1"));
+        assert!(matches!(
+            routed.command.kind,
+            RuntimeCommandKind::RecyclePane { ref reason }
+                if reason == "auto-fence recovered stalled worker pane after task T-owned handoff"
+        ));
+        let task = serde_json::from_str::<serde_json::Value>(
+            &std::fs::read_to_string(
+                brehon_root
+                    .join("runtime")
+                    .join("tasks")
+                    .join("T-owned.json"),
+            )
+            .expect("task file"),
+        )
+        .expect("task json");
+        assert_eq!(task["status"], "pending");
+        assert_eq!(task["assignee"], serde_json::Value::Null);
+        assert_eq!(task["review_owner"], serde_json::Value::Null);
+        assert!(task["recovery_note"]
+            .as_str()
+            .unwrap_or("")
+            .contains("Automatically reclaimed stalled task"));
+        assert_eq!(harness.ctx.pending_runtime_commands.len(), 1);
+    }
+
+    #[test]
+    fn stale_clean_active_assigned_worker_reassigns_to_live_idle_worker() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let brehon_root = temp.path().join(".brehon");
+        write_active_assigned_task_fixture(&brehon_root);
+        write_worker_worktree_fixture(&brehon_root, "worker-1");
+        write_worker_session_fixture(&brehon_root, "worker-2");
+
+        let mut mux = Mux::new(24, 80);
+        mux.add_pane(make_worker_pane("worker-1"));
+        mux.add_pane(make_worker_pane("worker-2"));
+        let mut harness = harness_with_mux(mux);
+        let now = Instant::now();
+        harness.ctx.auto_recover_threshold = Duration::from_secs(1);
+        harness.ctx.stall_check_interval = Duration::ZERO;
+        harness.ctx.last_stall_check = now - Duration::from_secs(60);
+        harness.ctx.active_worker_recovery_nudges_sent.insert(
+            ("worker-1".to_string(), "T-owned".to_string()),
+            now - Duration::from_secs(5),
+        );
+        harness
+            .ctx
+            .last_activity
+            .insert("worker-1".to_string(), now - Duration::from_secs(5));
+        harness
+            .ctx
+            .dashboard_data
+            .lock()
+            .expect("dashboard")
+            .brehon_root = Some(brehon_root.clone());
+
+        crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
+
+        let recycled = recv_route(&harness.rx);
+        assert_eq!(recycled.command.target.pane_id.as_deref(), Some("worker-1"));
+        assert!(matches!(
+            recycled.command.kind,
+            RuntimeCommandKind::RecyclePane { ref reason }
+                if reason == "auto-fence recovered stalled worker pane after task T-owned handoff"
+        ));
+        let routed = recv_route(&harness.rx);
+        assert_eq!(routed.command.target.pane_id.as_deref(), Some("worker-2"));
+        assert!(matches!(
+            routed.command.kind,
+            RuntimeCommandKind::SendPrompt { ref text, .. }
+                if text.contains("You have been assigned recovered task T-owned: Owned task")
+                    && text.contains("worker-1")
+                    && text.contains("action=mine")
+        ));
+        assert!(
+            harness.rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "newly reassigned worker should not be treated as stale again in the same sweep"
+        );
+        let task = serde_json::from_str::<serde_json::Value>(
+            &std::fs::read_to_string(
+                brehon_root
+                    .join("runtime")
+                    .join("tasks")
+                    .join("T-owned.json"),
+            )
+            .expect("task file"),
+        )
+        .expect("task json");
+        assert_eq!(task["status"], "assigned");
+        assert_eq!(task["assignee"], "worker-2");
+        assert_eq!(task["review_owner"], serde_json::Value::Null);
+        assert!(task["recovery_note"]
+            .as_str()
+            .unwrap_or("")
+            .contains("Automatically recovered stalled task"));
+    }
+
+    #[test]
+    fn dead_active_assigned_worker_reassigns_and_recycles_old_pane_same_sweep() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let brehon_root = temp.path().join(".brehon");
+        write_active_assigned_task_fixture(&brehon_root);
+        write_worker_worktree_fixture(&brehon_root, "worker-1");
+        write_worker_session_fixture(&brehon_root, "worker-2");
+
+        let mut mux = Mux::new(24, 80);
+        let mut pane = make_worker_pane("worker-1");
+        pane.mark_exited(Some(1));
+        mux.add_pane(pane);
+        mux.add_pane(make_worker_pane("worker-2"));
+        let mut harness = harness_with_mux(mux);
+        let now = Instant::now();
+        harness.ctx.auto_recover_threshold = Duration::from_secs(60 * 60);
+        harness.ctx.stall_check_interval = Duration::ZERO;
+        harness.ctx.last_stall_check = now - Duration::from_secs(60);
+        harness
+            .ctx
+            .dashboard_data
+            .lock()
+            .expect("dashboard")
+            .brehon_root = Some(brehon_root.clone());
+
+        crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
+
+        let first = recv_route(&harness.rx);
+        let second = recv_route(&harness.rx);
+        let routed = [first, second];
+        assert!(
+            routed.iter().any(|route| {
+                route.command.target.pane_id.as_deref() == Some("worker-1")
+                    && matches!(
+                        route.command.kind,
+                        RuntimeCommandKind::RecyclePane { ref reason }
+                            if reason
+                                == "auto-fence recovered stalled worker pane after task T-owned handoff"
+                    )
+            }),
+            "dead recovered worker should be recycled in the same sweep"
+        );
+        assert!(
+            routed.iter().any(|route| {
+                route.command.target.pane_id.as_deref() == Some("worker-2")
+                    && matches!(
+                        route.command.kind,
+                        RuntimeCommandKind::SendPrompt { ref text, .. }
+                            if text.contains("You have been assigned recovered task T-owned: Owned task")
+                    )
+            }),
+            "replacement worker should receive the recovered assignment prompt"
+        );
+
+        let task = serde_json::from_str::<serde_json::Value>(
+            &std::fs::read_to_string(
+                brehon_root
+                    .join("runtime")
+                    .join("tasks")
+                    .join("T-owned.json"),
+            )
+            .expect("task file"),
+        )
+        .expect("task json");
+        assert_eq!(task["status"], "assigned");
+        assert_eq!(task["assignee"], "worker-2");
+        assert_eq!(task["review_owner"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn stale_clean_active_assigned_worker_skips_quarantined_and_pending_recovery_workers() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let brehon_root = temp.path().join(".brehon");
+        write_active_assigned_task_fixture(&brehon_root);
+        write_worker_worktree_fixture(&brehon_root, "worker-1");
+        write_worker_session_fixture(&brehon_root, "worker-2");
+        write_worker_session_fixture(&brehon_root, "worker-3");
+        write_worker_session_fixture(&brehon_root, "worker-4");
+        write_taskless_prompt_blocked_health_fixture(&brehon_root, "worker-2");
+        write_quarantined_worker_health_fixture(&brehon_root, "worker-3");
+
+        let mut mux = Mux::new(24, 80);
+        mux.add_pane(make_worker_pane("worker-1"));
+        mux.add_pane(make_worker_pane("worker-2"));
+        mux.add_pane(make_worker_pane("worker-3"));
+        mux.add_pane(make_worker_pane("worker-4"));
+        let mut harness = harness_with_mux(mux);
+        let now = Instant::now();
+        harness.ctx.auto_recover_threshold = Duration::from_secs(1);
+        harness.ctx.stall_check_interval = Duration::ZERO;
+        harness.ctx.last_stall_check = now - Duration::from_secs(60);
+        harness.ctx.active_worker_recovery_nudges_sent.insert(
+            ("worker-1".to_string(), "T-owned".to_string()),
+            now - Duration::from_secs(5),
+        );
+        harness
+            .ctx
+            .last_activity
+            .insert("worker-1".to_string(), now - Duration::from_secs(5));
+        harness
+            .ctx
+            .dashboard_data
+            .lock()
+            .expect("dashboard")
+            .brehon_root = Some(brehon_root.clone());
+
+        crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
+
+        let first = recv_route(&harness.rx);
+        assert_eq!(first.command.target.pane_id.as_deref(), Some("worker-2"));
+        assert!(matches!(
+            first.command.kind,
+            RuntimeCommandKind::RecyclePane { ref reason }
+                if reason.contains("auto-recover prompt-blocked idle worker pane")
+        ));
+        let second = recv_route(&harness.rx);
+        assert_eq!(second.command.target.pane_id.as_deref(), Some("worker-1"));
+        assert!(matches!(
+            second.command.kind,
+            RuntimeCommandKind::RecyclePane { ref reason }
+                if reason == "auto-fence recovered stalled worker pane after task T-owned handoff"
+        ));
+        let third = recv_route(&harness.rx);
+        assert_eq!(third.command.target.pane_id.as_deref(), Some("worker-4"));
+        assert!(matches!(
+            third.command.kind,
+            RuntimeCommandKind::SendPrompt { ref text, .. }
+                if text.contains("You have been assigned recovered task T-owned: Owned task")
+        ));
+        assert!(
+            harness.rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "quarantined or already-recovering workers must not receive the recovered task"
+        );
+
+        let task = serde_json::from_str::<serde_json::Value>(
+            &std::fs::read_to_string(
+                brehon_root
+                    .join("runtime")
+                    .join("tasks")
+                    .join("T-owned.json"),
+            )
+            .expect("task file"),
+        )
+        .expect("task json");
+        assert_eq!(task["status"], "assigned");
+        assert_eq!(task["assignee"], "worker-4");
+    }
+
+    #[test]
+    fn stale_clean_active_assigned_worker_skips_same_sweep_taskless_recycle_workers() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let brehon_root = temp.path().join(".brehon");
+        write_active_assigned_task_fixture(&brehon_root);
+        write_worker_worktree_fixture(&brehon_root, "worker-1");
+        write_worker_session_fixture(&brehon_root, "worker-2");
+        write_worker_session_fixture(&brehon_root, "worker-3");
+
+        let mut mux = Mux::new(24, 80);
+        mux.add_pane(make_worker_pane("worker-2"));
+        mux.add_pane(make_worker_pane("worker-1"));
+        mux.add_pane(make_worker_pane("worker-3"));
+        let mut harness = harness_with_mux(mux);
+        let now = Instant::now();
+        harness.ctx.auto_recover_threshold = Duration::from_secs(1);
+        harness.ctx.stall_check_interval = Duration::ZERO;
+        harness.ctx.last_stall_check = now - Duration::from_secs(60);
+        harness.ctx.active_worker_recovery_nudges_sent.insert(
+            ("worker-1".to_string(), "T-owned".to_string()),
+            now - Duration::from_secs(5),
+        );
+        harness
+            .ctx
+            .last_activity
+            .insert("worker-1".to_string(), now - Duration::from_secs(5));
+        harness
+            .ctx
+            .last_activity
+            .insert("worker-2".to_string(), now - Duration::from_secs(5));
+        harness
+            .ctx
+            .dashboard_data
+            .lock()
+            .expect("dashboard")
+            .brehon_root = Some(brehon_root.clone());
+
+        crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
+
+        let first = recv_route(&harness.rx);
+        assert_eq!(first.command.target.pane_id.as_deref(), Some("worker-2"));
+        assert!(matches!(
+            first.command.kind,
+            RuntimeCommandKind::RecyclePane { ref reason }
+                if reason == "auto-recover idle worker pane via daemon recycle"
+        ));
+        let second = recv_route(&harness.rx);
+        assert_eq!(second.command.target.pane_id.as_deref(), Some("worker-1"));
+        assert!(matches!(
+            second.command.kind,
+            RuntimeCommandKind::RecyclePane { ref reason }
+                if reason == "auto-fence recovered stalled worker pane after task T-owned handoff"
+        ));
+        let third = recv_route(&harness.rx);
+        assert_eq!(third.command.target.pane_id.as_deref(), Some("worker-3"));
+        assert!(matches!(
+            third.command.kind,
+            RuntimeCommandKind::SendPrompt { ref text, .. }
+                if text.contains("You have been assigned recovered task T-owned: Owned task")
+        ));
+        assert!(
+            harness.rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "worker queued for same-sweep recycle must not be reused as the recovered assignee"
+        );
+
+        let task = serde_json::from_str::<serde_json::Value>(
+            &std::fs::read_to_string(
+                brehon_root
+                    .join("runtime")
+                    .join("tasks")
+                    .join("T-owned.json"),
+            )
+            .expect("task file"),
+        )
+        .expect("task json");
+        assert_eq!(task["status"], "assigned");
+        assert_eq!(task["assignee"], "worker-3");
+    }
+
+    #[test]
+    fn stale_missing_worktree_active_assigned_worker_blocks_for_manual_recovery() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let brehon_root = temp.path().join(".brehon");
+        write_active_assigned_task_fixture(&brehon_root);
+        write_worker_session_fixture(&brehon_root, "worker-2");
+
+        let mut mux = Mux::new(24, 80);
+        mux.add_pane(make_worker_pane("worker-1"));
+        mux.add_pane(make_worker_pane("worker-2"));
+        let mut harness = harness_with_mux(mux);
+        let now = Instant::now();
+        harness.ctx.auto_recover_threshold = Duration::from_secs(1);
+        harness.ctx.stall_check_interval = Duration::ZERO;
+        harness.ctx.last_stall_check = now - Duration::from_secs(60);
+        harness.ctx.active_worker_recovery_nudges_sent.insert(
+            ("worker-1".to_string(), "T-owned".to_string()),
+            now - Duration::from_secs(5),
+        );
+        harness
+            .ctx
+            .last_activity
+            .insert("worker-1".to_string(), now - Duration::from_secs(5));
+        harness
+            .ctx
+            .dashboard_data
+            .lock()
+            .expect("dashboard")
+            .brehon_root = Some(brehon_root.clone());
+
+        crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
+
+        assert!(
+            harness.rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "missing worktree must block the task instead of queueing a stale-worker reset"
+        );
+
+        let task = serde_json::from_str::<serde_json::Value>(
+            &std::fs::read_to_string(
+                brehon_root
+                    .join("runtime")
+                    .join("tasks")
+                    .join("T-owned.json"),
+            )
+            .expect("task file"),
+        )
+        .expect("task json");
+        assert_eq!(task["status"], "blocked");
+        assert_eq!(task["assignee"], serde_json::Value::Null);
+        assert_eq!(task["review_owner"], serde_json::Value::Null);
+        assert_eq!(
+            task["activity"],
+            crate::run::recovery::STALLED_WORKER_MANUAL_RECOVERY_ACTIVITY
+        );
+        assert!(task["blockers"]
+            .as_str()
+            .unwrap_or("")
+            .contains("worker worktree is missing; manual recovery is required"));
+        assert!(task["recovery_note"].as_str().unwrap_or("").contains(
+            "Cleared worker ownership and blocked the task for supervisor/manual recovery"
+        ));
+        assert!(
+            !harness
+                .ctx
+                .active_worker_recovery_resets_sent
+                .contains_key(&("worker-1".to_string(), "T-owned".to_string())),
+            "manual recovery blocking must not arm the stale-worker reset guard"
+        );
+    }
+
+    #[test]
+    fn stale_unmerged_active_assigned_worker_escalates_supervisor_conflict() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let brehon_root = temp.path().join(".brehon");
+        write_active_assigned_task_fixture(&brehon_root);
+        let worktree = write_worker_worktree_fixture(&brehon_root, "worker-1");
+
+        std::fs::write(worktree.join("shared.txt"), "base\n").expect("base file");
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&worktree)
+            .args(["add", "shared.txt"])
+            .status()
+            .expect("git add base");
+        assert!(status.success());
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&worktree)
+            .args(["commit", "-m", "base"])
+            .status()
+            .expect("git commit base");
+        assert!(status.success());
+
+        let default_branch_output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&worktree)
+            .args(["branch", "--show-current"])
+            .output()
+            .expect("git branch --show-current");
+        assert!(default_branch_output.status.success());
+        let default_branch = String::from_utf8_lossy(&default_branch_output.stdout)
+            .trim()
+            .to_string();
+
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&worktree)
+            .args(["checkout", "-b", "other"])
+            .status()
+            .expect("git checkout other");
+        assert!(status.success());
+        std::fs::write(worktree.join("shared.txt"), "other\n").expect("other file");
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&worktree)
+            .args(["add", "shared.txt"])
+            .status()
+            .expect("git add other");
+        assert!(status.success());
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&worktree)
+            .args(["commit", "-m", "other"])
+            .status()
+            .expect("git commit other");
+        assert!(status.success());
+
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&worktree)
+            .args(["checkout", &default_branch])
+            .status()
+            .expect("git checkout default branch");
+        assert!(status.success());
+        std::fs::write(worktree.join("shared.txt"), "main\n").expect("main file");
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&worktree)
+            .args(["add", "shared.txt"])
+            .status()
+            .expect("git add main");
+        assert!(status.success());
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&worktree)
+            .args(["commit", "-m", "main"])
+            .status()
+            .expect("git commit main");
+        assert!(status.success());
+
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&worktree)
+            .args(["merge", "other"])
+            .status()
+            .expect("git merge other");
+        assert!(!status.success(), "merge should conflict");
+
+        std::fs::write(
+            brehon_root
+                .join("runtime")
+                .join("tasks")
+                .join("T-owned.json"),
+            serde_json::json!({
+                "task_id": "T-owned",
+                "title": "Owned task",
+                "status": "in_progress",
+                "task_type": "task",
+                "assignee": "worker-1",
+                "review_owner": "worker-1",
+                "merge_target": "epic/test",
+                "latest_commit": "abc123"
+            })
+            .to_string(),
+        )
+        .expect("updated task fixture");
+
+        let mut mux = Mux::new(24, 80);
+        mux.add_pane(make_worker_pane("worker-1"));
+        let mut harness = harness_with_mux(mux);
+        let now = Instant::now();
+        harness.ctx.auto_recover_threshold = Duration::from_secs(1);
+        harness.ctx.stall_check_interval = Duration::ZERO;
+        harness.ctx.last_stall_check = now - Duration::from_secs(60);
+        harness.ctx.active_worker_recovery_nudges_sent.insert(
+            ("worker-1".to_string(), "T-owned".to_string()),
+            now - Duration::from_secs(5),
+        );
+        harness
+            .ctx
+            .last_activity
+            .insert("worker-1".to_string(), now - Duration::from_secs(5));
+        harness
+            .ctx
+            .dashboard_data
+            .lock()
+            .expect("dashboard")
+            .brehon_root = Some(brehon_root.clone());
+
+        crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
+
+        let routed = recv_route(&harness.rx);
+        assert_eq!(routed.command.target.pane_id.as_deref(), Some("worker-1"));
+        assert!(matches!(
+            routed.command.kind,
+            RuntimeCommandKind::RecyclePane { ref reason }
+                if reason == "auto-fence recovered stalled worker pane after task T-owned handoff"
+        ));
+        let task = serde_json::from_str::<serde_json::Value>(
+            &std::fs::read_to_string(
+                brehon_root
+                    .join("runtime")
+                    .join("tasks")
+                    .join("T-owned.json"),
+            )
+            .expect("task file"),
+        )
+        .expect("task json");
+        assert_eq!(task["status"], "changes_requested");
+        assert_eq!(task["assignee"], serde_json::Value::Null);
+        assert_eq!(task["review_owner"], serde_json::Value::Null);
+        assert_eq!(task["activity"], "integration_conflict");
+        assert_eq!(task["integration_conflict"]["owner"], "supervisor");
+        assert_eq!(task["integration_conflict"]["source"], "worker_unmerged");
+        assert_eq!(
+            task["integration_conflict"]["conflicting_files"][0],
+            "shared.txt"
+        );
+    }
+
+    #[test]
+    fn prompt_blocked_active_reviewer_blocks_task_when_reset_fails() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let brehon_root = temp.path().join(".brehon");
+        write_review_obligation_fixture(&brehon_root);
+        let health_path =
+            write_prompt_blocked_worker_health_fixture(&brehon_root, "reviewer-1", "T-review");
+
+        let mut mux = Mux::new(24, 80);
+        mux.add_pane(make_reviewer_pane("reviewer-1"));
+        mux.get_mut("reviewer-1")
+            .expect("reviewer pane")
+            .set_review_context(brehon_mux::ReviewContextSnapshot {
+                review_id: "REV-review".to_string(),
+                task_id: "T-review".to_string(),
+                round: 1,
+                panel_total: 1,
+                panel_done: 0,
+                verdict: None,
+                score: None,
+                findings_summary: None,
+                updated_at: Instant::now(),
+            });
+        let mut harness = harness_with_host_owned_mux(mux);
+        harness.ctx.runtime_command_router = None;
+        harness.ctx.stall_check_interval = Duration::ZERO;
+        harness.ctx.last_stall_check = Instant::now() - Duration::from_secs(60);
+        harness
+            .ctx
+            .dashboard_data
+            .lock()
+            .expect("dashboard")
+            .brehon_root = Some(brehon_root.clone());
+
+        crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
+
+        assert!(
+            !health_path.exists(),
+            "blocking the task after failed reviewer recovery should clear health marker"
+        );
+        let task = serde_json::from_str::<serde_json::Value>(
+            &std::fs::read_to_string(
+                brehon_root
+                    .join("runtime")
+                    .join("tasks")
+                    .join("T-review.json"),
+            )
+            .expect("task file"),
+        )
+        .expect("task json");
+        assert_eq!(
+            task.get("status").and_then(|value| value.as_str()),
+            Some("blocked")
+        );
+        assert_eq!(
+            task.get("activity").and_then(|value| value.as_str()),
+            Some("prompt-blocked recovery failed")
+        );
+        assert!(task
+            .get("blockers")
+            .and_then(|value| value.as_str())
+            .is_some_and(|value| value.contains("runtime command router unavailable")));
+    }
+
+    #[test]
+    fn prompt_blocked_active_reviewer_terminal_task_failure_converges_to_terminal_marker() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let brehon_root = temp.path().join(".brehon");
+        write_terminal_task_fixture(&brehon_root, "T-review", "merged");
+        let health_path =
+            write_prompt_blocked_worker_health_fixture(&brehon_root, "reviewer-1", "T-review");
+
+        let mut mux = Mux::new(24, 80);
+        mux.add_pane(make_reviewer_pane("reviewer-1"));
+        mux.get_mut("reviewer-1")
+            .expect("reviewer pane")
+            .set_review_context(brehon_mux::ReviewContextSnapshot {
+                review_id: "REV-review".to_string(),
+                task_id: "T-review".to_string(),
+                round: 1,
+                panel_total: 1,
+                panel_done: 0,
+                verdict: None,
+                score: None,
+                findings_summary: None,
+                updated_at: Instant::now(),
+            });
+        let mut harness = harness_with_host_owned_mux(mux);
+        harness.ctx.runtime_command_router = None;
+        harness.ctx.stall_check_interval = Duration::ZERO;
+        harness.ctx.last_stall_check = Instant::now() - Duration::from_secs(60);
+        harness
+            .ctx
+            .dashboard_data
+            .lock()
+            .expect("dashboard")
+            .brehon_root = Some(brehon_root.clone());
+
+        crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
+
+        let first_marker =
+            std::fs::read_to_string(&health_path).expect("terminal prompt-blocked marker");
+        let first_marker_json =
+            serde_json::from_str::<serde_json::Value>(&first_marker).expect("marker json");
+        assert_eq!(
+            first_marker_json
+                .get("reason")
+                .and_then(|value| value.as_str()),
+            Some("prompt_blocked_recovery_failed")
+        );
+        assert!(first_marker_json
+            .get("error")
+            .and_then(|value| value.as_str())
+            .is_some_and(|value| {
+                value.contains("could not mark task T-review blocked")
+                    && value.contains("terminal task T-review")
+            }));
+        let terminal_task = serde_json::from_str::<serde_json::Value>(
+            &std::fs::read_to_string(
+                brehon_root
+                    .join("runtime")
+                    .join("tasks")
+                    .join("T-review.json"),
+            )
+            .expect("task file"),
+        )
+        .expect("task json");
+        assert_eq!(
+            terminal_task.get("status").and_then(|value| value.as_str()),
+            Some("merged")
+        );
+        let first_event_count = harness
+            .ctx
+            .dashboard_data
+            .lock()
+            .expect("dashboard")
+            .events
+            .len();
+
+        harness.ctx.last_stall_check = Instant::now() - Duration::from_secs(60);
+        crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
+
+        let second_marker = std::fs::read_to_string(&health_path).expect("marker after resweep");
+        let second_event_count = harness
+            .ctx
+            .dashboard_data
+            .lock()
+            .expect("dashboard")
+            .events
+            .len();
+        assert_eq!(
+            first_marker, second_marker,
+            "terminal task prompt-blocked reviewer failures should converge to a one-shot terminal marker"
+        );
+        assert_eq!(
+            first_event_count, second_event_count,
+            "terminal task prompt-blocked reviewer failures should not emit duplicate dashboard events after fallback marker convergence"
+        );
+    }
+
+    #[test]
+    fn prompt_blocked_active_reviewer_marker_write_failure_is_suppressed_in_memory() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let brehon_root = temp.path().join(".brehon");
+        write_terminal_task_fixture(&brehon_root, "T-review", "merged");
+        write_invalid_agent_health_path_fixture(&brehon_root);
+
+        let mut mux = Mux::new(24, 80);
+        mux.add_pane(make_reviewer_pane("reviewer-1"));
+        mux.get_mut("reviewer-1")
+            .expect("reviewer pane")
+            .set_review_context(brehon_mux::ReviewContextSnapshot {
+                review_id: "REV-review".to_string(),
+                task_id: "T-review".to_string(),
+                round: 1,
+                panel_total: 1,
+                panel_done: 0,
+                verdict: None,
+                score: None,
+                findings_summary: None,
+                updated_at: Instant::now(),
+            });
+        apply_prompt_blocked_runtime_state_with_task(&mut mux, "reviewer-1", Some("T-review"));
+        let mut harness = harness_with_host_owned_mux(mux);
+        harness.ctx.runtime_command_router = None;
+        harness.ctx.stall_check_interval = Duration::ZERO;
+        harness.ctx.last_stall_check = Instant::now() - Duration::from_secs(60);
+        harness
+            .ctx
+            .dashboard_data
+            .lock()
+            .expect("dashboard")
+            .brehon_root = Some(brehon_root.clone());
+
+        crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
+
+        assert!(
+            harness
+                .ctx
+                .prompt_blocked_recovery_failed_panes
+                .contains("reviewer-1"),
+            "live blocked panes should be suppressed in memory when the recovery-failed marker cannot be persisted"
+        );
+        let merged_task = serde_json::from_str::<serde_json::Value>(
+            &std::fs::read_to_string(
+                brehon_root
+                    .join("runtime")
+                    .join("tasks")
+                    .join("T-review.json"),
+            )
+            .expect("task file"),
+        )
+        .expect("task json");
+        assert_eq!(
+            merged_task.get("status").and_then(|value| value.as_str()),
+            Some("merged")
+        );
+        let first_event_count = harness
+            .ctx
+            .dashboard_data
+            .lock()
+            .expect("dashboard")
+            .events
+            .len();
+
+        harness.ctx.last_stall_check = Instant::now() - Duration::from_secs(60);
+        crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
+
+        let second_event_count = harness
+            .ctx
+            .dashboard_data
+            .lock()
+            .expect("dashboard")
+            .events
+            .len();
+        assert_eq!(
+            first_event_count, second_event_count,
+            "once in-memory suppression is recorded for a live blocked reviewer, later stall sweeps should not retry the same failed recovery"
+        );
+    }
+
+    #[test]
+    fn prompt_blocked_active_worker_blocks_task_when_reset_fails() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let brehon_root = temp.path().join(".brehon");
+        write_active_assigned_task_fixture(&brehon_root);
+        write_worker_session_fixture(&brehon_root, "worker-1");
+        let health_path =
+            write_prompt_blocked_worker_health_fixture(&brehon_root, "worker-1", "T-owned");
+
+        let mut mux = Mux::new(24, 80);
+        mux.add_pane(make_worker_pane("worker-1"));
+        let mut harness = harness_with_host_owned_mux(mux);
+        harness.ctx.runtime_command_router = None;
+        harness.ctx.stall_check_interval = Duration::ZERO;
+        harness.ctx.last_stall_check = Instant::now() - Duration::from_secs(60);
+        harness
+            .ctx
+            .dashboard_data
+            .lock()
+            .expect("dashboard")
+            .brehon_root = Some(brehon_root.clone());
+
+        crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
+
+        assert!(
+            !health_path.exists(),
+            "blocking the task after failed recovery should clear health marker"
+        );
+        let task = serde_json::from_str::<serde_json::Value>(
+            &std::fs::read_to_string(
+                brehon_root
+                    .join("runtime")
+                    .join("tasks")
+                    .join("T-owned.json"),
+            )
+            .expect("task file"),
+        )
+        .expect("task json");
+        assert_eq!(
+            task.get("status").and_then(|value| value.as_str()),
+            Some("blocked")
+        );
+        assert_eq!(
+            task.get("activity").and_then(|value| value.as_str()),
+            Some("prompt-blocked recovery failed")
+        );
+        assert!(task
+            .get("blockers")
+            .and_then(|value| value.as_str())
+            .is_some_and(|value| value.contains("runtime command router unavailable")));
+        assert!(!harness
+            .ctx
+            .last_worker_context_reset
+            .contains_key("worker-1"));
+    }
+
+    #[test]
+    fn prompt_blocked_recovery_failure_is_not_retried_for_same_blocked_pane() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let brehon_root = temp.path().join(".brehon");
+        write_active_assigned_task_fixture(&brehon_root);
+        write_worker_session_fixture(&brehon_root, "worker-1");
+        let health_path =
+            write_prompt_blocked_worker_health_fixture(&brehon_root, "worker-1", "T-owned");
+
+        let mut mux = Mux::new(24, 80);
+        mux.add_pane(make_worker_pane("worker-1"));
+        apply_prompt_blocked_runtime_state(&mut mux, "worker-1", "T-owned");
+        let mut harness = harness_with_host_owned_mux(mux);
+        harness.ctx.runtime_command_router = None;
+        harness.ctx.stall_check_interval = Duration::ZERO;
+        harness.ctx.last_stall_check = Instant::now() - Duration::from_secs(60);
+        harness
+            .ctx
+            .dashboard_data
+            .lock()
+            .expect("dashboard")
+            .brehon_root = Some(brehon_root.clone());
+
+        crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
+
+        assert!(
+            !health_path.exists(),
+            "blocking the task after failed recovery should clear health marker"
+        );
+        let task_path = brehon_root
+            .join("runtime")
+            .join("tasks")
+            .join("T-owned.json");
+        let first_task = std::fs::read_to_string(&task_path).expect("task file after first sweep");
+        let first_event_count = harness
+            .ctx
+            .dashboard_data
+            .lock()
+            .expect("dashboard")
+            .events
+            .len();
+
+        harness.ctx.last_stall_check = Instant::now() - Duration::from_secs(60);
+        crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
+
+        let second_task =
+            std::fs::read_to_string(&task_path).expect("task file after second sweep");
+        let second_event_count = harness
+            .ctx
+            .dashboard_data
+            .lock()
+            .expect("dashboard")
+            .events
+            .len();
+        assert_eq!(
+            first_task, second_task,
+            "once prompt-blocked recovery marks the task blocked, later stall sweeps should not rewrite the task file for the same pane"
+        );
+        assert_eq!(
+            first_event_count, second_event_count,
+            "once prompt-blocked recovery marks the task blocked, later stall sweeps should not emit duplicate recovery-failure dashboard events"
+        );
+    }
+
+    #[test]
+    fn taskless_prompt_blocked_supervisor_failure_is_marked_once() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let brehon_root = temp.path().join(".brehon");
+        let health_path =
+            write_taskless_prompt_blocked_health_fixture(&brehon_root, "claude-supervisor");
+
+        let mut mux = Mux::new(24, 80);
+        mux.add_pane(make_supervisor_pane("claude-supervisor"));
+        apply_taskless_prompt_blocked_runtime_state(&mut mux, "claude-supervisor");
+        let mut harness = harness_with_host_owned_mux(mux);
+        harness.ctx.runtime_command_router = None;
+        harness.ctx.stall_check_interval = Duration::ZERO;
+        harness.ctx.last_stall_check = Instant::now() - Duration::from_secs(60);
+        harness
+            .ctx
+            .dashboard_data
+            .lock()
+            .expect("dashboard")
+            .brehon_root = Some(brehon_root.clone());
+
+        crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
+
+        let first_marker = std::fs::read_to_string(&health_path).expect("terminal failure marker");
+        let marker = serde_json::from_str::<serde_json::Value>(&first_marker).expect("marker json");
+        assert_eq!(
+            marker.get("reason").and_then(|value| value.as_str()),
+            Some("prompt_blocked_recovery_failed")
+        );
+        let first_event_count = harness
+            .ctx
+            .dashboard_data
+            .lock()
+            .expect("dashboard")
+            .events
+            .len();
+
+        harness.ctx.last_stall_check = Instant::now() - Duration::from_secs(60);
+        crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
+
+        let second_marker = std::fs::read_to_string(&health_path).expect("marker after resweep");
+        let second_event_count = harness
+            .ctx
+            .dashboard_data
+            .lock()
+            .expect("dashboard")
+            .events
+            .len();
+        assert_eq!(
+            first_marker,
+            second_marker,
+            "taskless prompt-blocked supervisor failures should keep a one-shot terminal marker instead of rewriting it every stall sweep"
+        );
+        assert_eq!(
+            first_event_count, second_event_count,
+            "taskless prompt-blocked supervisor failures should not emit duplicate dashboard events after the terminal marker is recorded"
+        );
+    }
+
+    #[test]
+    fn taskless_prompt_blocked_worker_failure_is_marked_once() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let brehon_root = temp.path().join(".brehon");
+        write_inactive_task_fixture(&brehon_root, "T-unrelated");
+        write_worker_session_fixture(&brehon_root, "worker-1");
+        let health_path = write_taskless_prompt_blocked_health_fixture(&brehon_root, "worker-1");
+
+        let mut mux = Mux::new(24, 80);
+        mux.add_pane(make_worker_pane("worker-1"));
+        apply_taskless_prompt_blocked_runtime_state(&mut mux, "worker-1");
+        let mut harness = harness_with_host_owned_mux(mux);
+        harness.ctx.runtime_command_router = None;
+        harness.ctx.stall_check_interval = Duration::ZERO;
+        harness.ctx.last_stall_check = Instant::now() - Duration::from_secs(60);
+        harness
+            .ctx
+            .dashboard_data
+            .lock()
+            .expect("dashboard")
+            .brehon_root = Some(brehon_root.clone());
+
+        crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
+
+        let first_marker =
+            std::fs::read_to_string(&health_path).expect("worker terminal failure marker");
+        let marker = serde_json::from_str::<serde_json::Value>(&first_marker).expect("marker");
+        assert_eq!(
+            marker.get("reason").and_then(|value| value.as_str()),
+            Some("prompt_blocked_recovery_failed")
+        );
+        let first_event_count = harness
+            .ctx
+            .dashboard_data
+            .lock()
+            .expect("dashboard")
+            .events
+            .len();
+        assert!(
+            harness
+                .ctx
+                .dashboard_data
+                .lock()
+                .expect("dashboard")
+                .tasks
+                .is_empty(),
+            "marker-only taskless recovery should not trigger an unrelated task refresh"
+        );
+
+        harness.ctx.last_stall_check = Instant::now() - Duration::from_secs(60);
+        crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
+
+        let second_marker = std::fs::read_to_string(&health_path).expect("marker after resweep");
+        let second_event_count = harness
+            .ctx
+            .dashboard_data
+            .lock()
+            .expect("dashboard")
+            .events
+            .len();
+        assert_eq!(
+            first_marker, second_marker,
+            "taskless prompt-blocked worker failures should keep a one-shot terminal marker instead of retrying the same failed recovery"
+        );
+        assert_eq!(
+            first_event_count, second_event_count,
+            "taskless prompt-blocked worker failures should not emit duplicate dashboard events after the terminal marker is recorded"
+        );
+    }
+
+    #[test]
     fn busy_active_assigned_worker_is_not_nudged_or_reset() {
         let temp = tempfile::tempdir().expect("tempdir");
         let brehon_root = temp.path().join(".brehon");
@@ -4192,6 +7203,7 @@ mod tests {
             "worker-1",
             brehon_types::PromptId::new("busy-prompt"),
             generation,
+            Instant::now(),
         );
         let mut harness = harness_with_mux(mux);
         let now = Instant::now();
@@ -4249,6 +7261,7 @@ mod tests {
             "worker-1",
             brehon_types::PromptId::new("busy-prompt"),
             generation,
+            Instant::now(),
         );
         let mut harness = harness_with_mux(mux);
         let now = Instant::now();
@@ -4312,7 +7325,51 @@ mod tests {
                 if text.contains("Review-obligation nudge")
                     && text.contains("action=review_status task_id=T-review review_id=REV-review")
         ));
-        assert!(harness.ctx.review_obligation_nudges_sent.contains_key(&(
+        assert!(harness
+            .ctx
+            .review_obligation_notifications_sent
+            .contains_key(&(
+                "reviewer-1".to_string(),
+                "T-review".to_string(),
+                "REV-review".to_string()
+            )));
+    }
+
+    #[test]
+    fn stale_live_reviewer_with_uncertain_delivery_gets_review_request_resent() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let brehon_root = temp.path().join(".brehon");
+        write_review_obligation_fixture_with_uncertain_delivery(&brehon_root);
+
+        let mut mux = Mux::new(24, 80);
+        mux.add_pane(make_reviewer_pane("reviewer-1"));
+        let mut harness = harness_with_mux(mux);
+        let now = Instant::now();
+        harness.ctx.review_obligation_nudge_threshold = Duration::from_secs(1);
+        harness.ctx.review_obligation_reset_threshold = Duration::from_secs(60);
+        harness.ctx.stall_check_interval = Duration::ZERO;
+        harness.ctx.last_stall_check = now - Duration::from_secs(60);
+        harness
+            .ctx
+            .last_activity
+            .insert("reviewer-1".to_string(), now - Duration::from_secs(5));
+        harness
+            .ctx
+            .dashboard_data
+            .lock()
+            .expect("dashboard")
+            .brehon_root = Some(brehon_root.clone());
+
+        crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
+
+        let routed = recv_route(&harness.rx);
+        assert_eq!(routed.command.target.pane_id.as_deref(), Some("reviewer-1"));
+        assert!(matches!(
+            routed.command.kind,
+            RuntimeCommandKind::SendPrompt { ref text, .. }
+                if text == &canonical_review_request_prompt_fixture()
+        ));
+        assert!(harness.ctx.review_obligation_resends_sent.contains_key(&(
             "reviewer-1".to_string(),
             "T-review".to_string(),
             "REV-review".to_string()
@@ -4333,7 +7390,7 @@ mod tests {
         harness.ctx.review_obligation_reset_threshold = Duration::from_secs(60);
         harness.ctx.stall_check_interval = Duration::ZERO;
         harness.ctx.last_stall_check = now - Duration::from_secs(60);
-        harness.ctx.review_obligation_nudges_sent.insert(
+        harness.ctx.review_obligation_notifications_sent.insert(
             (
                 "reviewer-1".to_string(),
                 "T-review".to_string(),
@@ -4420,9 +7477,432 @@ mod tests {
                 if reason == "auto-recover idle reviewer pane with pending review obligation"
         ));
         assert!(
-            harness.ctx.review_obligation_nudges_sent.is_empty(),
+            harness.ctx.review_obligation_notifications_sent.is_empty(),
             "reset threshold should not spend a turn on a nudge first"
         );
+    }
+
+    #[test]
+    fn missing_reviewer_obligation_hard_failure_notifies_supervisor_once() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let brehon_root = temp.path().join(".brehon");
+        write_review_obligation_fixture(&brehon_root);
+
+        let mut mux = Mux::new(24, 80);
+        mux.add_pane(make_supervisor_pane("claude-supervisor"));
+        let mut harness = harness_with_mux(mux);
+        let now = Instant::now();
+        harness.ctx.review_obligation_nudge_threshold = Duration::from_secs(1);
+        harness.ctx.review_obligation_reset_threshold = Duration::from_secs(60);
+        harness.ctx.stall_check_interval = Duration::ZERO;
+        harness.ctx.last_stall_check = now - Duration::from_secs(60);
+        harness
+            .ctx
+            .dashboard_data
+            .lock()
+            .expect("dashboard")
+            .brehon_root = Some(brehon_root.clone());
+
+        crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
+
+        let routes = recv_available_routes(&harness.rx);
+        assert_eq!(
+            routes.len(),
+            1,
+            "expected one supervisor hard-failure prompt"
+        );
+        assert_eq!(
+            routes[0].command.target.pane_id.as_deref(),
+            Some("claude-supervisor")
+        );
+        assert!(matches!(
+            routes[0].command.kind,
+            RuntimeCommandKind::SendPrompt { ref text, .. }
+                if text.contains("reviewer-1")
+                    && text.contains("hard failure")
+                    && text.contains("T-review")
+                    && text.contains("REV-review")
+        ));
+        assert!(harness.ctx.review_obligation_failures_reported.contains(&(
+            "reviewer-1".to_string(),
+            "T-review".to_string(),
+            "REV-review".to_string()
+        )));
+
+        drain_runtime_commands(&mut harness);
+        harness.ctx.last_stall_check = Instant::now() - Duration::from_secs(60);
+        crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
+        assert!(
+            harness.rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "already-reported hard failure should not loop"
+        );
+    }
+
+    #[test]
+    fn wrong_kind_reviewer_obligation_hard_failure_notifies_supervisor() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let brehon_root = temp.path().join(".brehon");
+        write_review_obligation_fixture(&brehon_root);
+
+        let mut mux = Mux::new(24, 80);
+        mux.add_pane(make_supervisor_pane("claude-supervisor"));
+        mux.add_pane(make_worker_pane("reviewer-1"));
+        let mut harness = harness_with_mux(mux);
+        let now = Instant::now();
+        harness.ctx.review_obligation_nudge_threshold = Duration::from_secs(1);
+        harness.ctx.review_obligation_reset_threshold = Duration::from_secs(60);
+        harness.ctx.stall_check_interval = Duration::ZERO;
+        harness.ctx.last_stall_check = now - Duration::from_secs(60);
+        harness
+            .ctx
+            .dashboard_data
+            .lock()
+            .expect("dashboard")
+            .brehon_root = Some(brehon_root.clone());
+
+        crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
+
+        let routes = recv_available_routes(&harness.rx);
+        assert_eq!(
+            routes.len(),
+            1,
+            "expected one supervisor hard-failure prompt"
+        );
+        assert_eq!(
+            routes[0].command.target.pane_id.as_deref(),
+            Some("claude-supervisor")
+        );
+        assert!(matches!(
+            routes[0].command.kind,
+            RuntimeCommandKind::SendPrompt { ref text, .. }
+                if text.contains("reviewer-1")
+                    && text.contains("hard failure")
+                    && text.contains("not a reviewer pane")
+        ));
+        assert!(harness.ctx.review_obligation_failures_reported.contains(&(
+            "reviewer-1".to_string(),
+            "T-review".to_string(),
+            "REV-review".to_string()
+        )));
+    }
+
+    #[test]
+    fn nudge_delivery_failure_reports_supervisor_hard_failure() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let brehon_root = temp.path().join(".brehon");
+        write_review_obligation_fixture(&brehon_root);
+
+        let mut mux = Mux::new(24, 80);
+        mux.add_pane(make_supervisor_pane("claude-supervisor"));
+        mux.add_pane(make_reviewer_pane("reviewer-1"));
+        let mut harness = harness_with_selective_router(
+            mux,
+            true,
+            vec![TestRouteRejection::SendPromptTo("reviewer-1".to_string())],
+        );
+        let now = Instant::now();
+        harness.ctx.review_obligation_nudge_threshold = Duration::from_secs(1);
+        harness.ctx.review_obligation_reset_threshold = Duration::from_secs(60);
+        harness.ctx.stall_check_interval = Duration::ZERO;
+        harness.ctx.last_stall_check = now - Duration::from_secs(60);
+        harness
+            .ctx
+            .last_activity
+            .insert("reviewer-1".to_string(), now - Duration::from_secs(5));
+        harness
+            .ctx
+            .dashboard_data
+            .lock()
+            .expect("dashboard")
+            .brehon_root = Some(brehon_root.clone());
+
+        crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
+
+        let routes = recv_available_routes(&harness.rx);
+        assert_eq!(
+            routes.len(),
+            2,
+            "expected rejected nudge and supervisor escalation"
+        );
+        assert!(routes.iter().any(|route| {
+            route.command.target.pane_id.as_deref() == Some("reviewer-1")
+                && matches!(
+                    route.command.kind,
+                    RuntimeCommandKind::SendPrompt { ref text, .. }
+                        if text.contains("Review-obligation nudge")
+                )
+        }));
+        assert!(routes.iter().any(|route| {
+            route.command.target.pane_id.as_deref() == Some("claude-supervisor")
+                && matches!(
+                    route.command.kind,
+                    RuntimeCommandKind::SendPrompt { ref text, .. }
+                        if text.contains("reviewer-1")
+                            && text.contains("hard failure")
+                            && text.contains("recovery nudge could not be delivered")
+                )
+        }));
+        assert!(harness.ctx.review_obligation_failures_reported.contains(&(
+            "reviewer-1".to_string(),
+            "T-review".to_string(),
+            "REV-review".to_string()
+        )));
+    }
+
+    #[test]
+    fn reset_queue_failure_reports_review_obligation_hard_failure() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let brehon_root = temp.path().join(".brehon");
+        write_review_obligation_fixture(&brehon_root);
+
+        let mut mux = Mux::new(24, 80);
+        mux.add_pane(make_supervisor_pane("claude-supervisor"));
+        mux.add_pane(make_reviewer_pane("reviewer-1"));
+        let mut harness = harness_with_mux(mux);
+        let now = Instant::now();
+        harness.ctx.review_obligation_nudge_threshold = Duration::from_secs(1);
+        harness.ctx.review_obligation_reset_threshold = Duration::from_secs(60);
+        harness.ctx.stall_check_interval = Duration::ZERO;
+        harness.ctx.last_stall_check = now - Duration::from_secs(60);
+        harness.ctx.review_obligation_notifications_sent.insert(
+            (
+                "reviewer-1".to_string(),
+                "T-review".to_string(),
+                "REV-review".to_string(),
+            ),
+            now - Duration::from_secs(5),
+        );
+        harness
+            .ctx
+            .last_activity
+            .insert("reviewer-1".to_string(), now - Duration::from_secs(5));
+        harness
+            .ctx
+            .dashboard_data
+            .lock()
+            .expect("dashboard")
+            .brehon_root = Some(brehon_root.clone());
+        harness.ctx.runtime_command_router = None;
+
+        crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
+
+        assert!(harness.ctx.review_obligation_failures_reported.contains(&(
+            "reviewer-1".to_string(),
+            "T-review".to_string(),
+            "REV-review".to_string()
+        )));
+        let dashboard = harness.ctx.dashboard_data.lock().expect("dashboard");
+        assert!(dashboard.events.iter().any(|event| {
+            event.description
+                == "reported review-obligation hard failure for reviewer reviewer-1 on T-review / REV-review"
+        }));
+    }
+
+    #[test]
+    fn phase_1_gate_multi_reviewer_simulation_prevents_silent_idle() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let brehon_root = temp.path().join(".brehon");
+        write_multi_reviewer_phase_gate_fixture(&brehon_root);
+
+        let mut mux = Mux::new(24, 80);
+        mux.add_pane(make_supervisor_pane("claude-supervisor"));
+        mux.add_pane(make_reviewer_pane("reviewer-resend"));
+        mux.add_pane(make_reviewer_pane("reviewer-reset"));
+        let mut harness = harness_with_mux(mux);
+        let now = Instant::now();
+        harness.ctx.review_obligation_nudge_threshold = Duration::from_secs(1);
+        harness.ctx.review_obligation_reset_threshold = Duration::from_secs(60);
+        harness.ctx.stall_check_interval = Duration::ZERO;
+        harness.ctx.last_stall_check = now - Duration::from_secs(60);
+        harness
+            .ctx
+            .last_activity
+            .insert("reviewer-resend".to_string(), now - Duration::from_secs(5));
+        harness
+            .ctx
+            .last_activity
+            .insert("reviewer-reset".to_string(), now - Duration::from_secs(5));
+        harness
+            .ctx
+            .dashboard_data
+            .lock()
+            .expect("dashboard")
+            .brehon_root = Some(brehon_root.clone());
+
+        crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
+
+        let routes = recv_available_routes(&harness.rx);
+        assert_eq!(
+            routes.len(),
+            3,
+            "expected resend, nudge, and hard-failure actions"
+        );
+        let mut saw_resend = false;
+        let mut saw_nudge = false;
+        let mut saw_hard_failure = false;
+        for route in &routes {
+            match &route.command.kind {
+                RuntimeCommandKind::SendPrompt { text, .. }
+                    if route.command.target.pane_id.as_deref() == Some("reviewer-resend")
+                        && text == "Canonical resend prompt for reviewer-resend" =>
+                {
+                    saw_resend = true;
+                }
+                RuntimeCommandKind::SendPrompt { text, .. }
+                    if route.command.target.pane_id.as_deref() == Some("reviewer-reset")
+                        && text.contains("Review-obligation nudge")
+                        && text.contains("REV-phase-gate") =>
+                {
+                    saw_nudge = true;
+                }
+                RuntimeCommandKind::SendPrompt { text, .. }
+                    if route.command.target.pane_id.as_deref() == Some("claude-supervisor")
+                        && text.contains("reviewer-missing")
+                        && text.contains("hard failure") =>
+                {
+                    saw_hard_failure = true;
+                }
+                other => panic!("unexpected routed command in phase-gate simulation: {other:?}"),
+            }
+        }
+        assert!(saw_resend, "uncertain delivery reviewer should get resend");
+        assert!(saw_nudge, "idle reviewer should get a recovery nudge first");
+        assert!(
+            saw_hard_failure,
+            "missing reviewer should produce a supervisor-visible hard failure"
+        );
+        assert!(harness.ctx.review_obligation_resends_sent.contains_key(&(
+            "reviewer-resend".to_string(),
+            "T-phase-gate".to_string(),
+            "REV-phase-gate".to_string()
+        )));
+        assert!(harness
+            .ctx
+            .review_obligation_notifications_sent
+            .contains_key(&(
+                "reviewer-reset".to_string(),
+                "T-phase-gate".to_string(),
+                "REV-phase-gate".to_string()
+            )));
+        assert!(harness.ctx.review_obligation_failures_reported.contains(&(
+            "reviewer-missing".to_string(),
+            "T-phase-gate".to_string(),
+            "REV-phase-gate".to_string()
+        )));
+
+        drain_runtime_commands(&mut harness);
+        harness.ctx.review_obligation_notifications_sent.insert(
+            (
+                "reviewer-reset".to_string(),
+                "T-phase-gate".to_string(),
+                "REV-phase-gate".to_string(),
+            ),
+            Instant::now() - Duration::from_secs(5),
+        );
+        harness.ctx.last_activity.insert(
+            "reviewer-reset".to_string(),
+            Instant::now() - Duration::from_secs(5),
+        );
+        harness.ctx.last_stall_check = Instant::now() - Duration::from_secs(60);
+
+        crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
+
+        let routes = recv_available_routes(&harness.rx);
+        assert_eq!(routes.len(), 1, "expected only the queued reviewer reset");
+        assert_eq!(
+            routes[0].command.target.pane_id.as_deref(),
+            Some("reviewer-reset")
+        );
+        assert!(matches!(
+            routes[0].command.kind,
+            RuntimeCommandKind::ResetPane { ref reason }
+                if reason == "auto-recover idle reviewer pane with pending review obligation"
+        ));
+        drain_runtime_commands(&mut harness);
+        let ack_path = brehon_root
+            .join("runtime")
+            .join("reviewer-reset-acks")
+            .join("T-phase-gate--REV-phase-gate--reviewer-reset.json");
+        assert!(ack_path.exists(), "reset simulation should persist an ack");
+    }
+
+    #[test]
+    fn completed_review_prunes_review_obligation_tracking_records() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let brehon_root = temp.path().join(".brehon");
+        write_review_obligation_fixture(&brehon_root);
+
+        let runtime_dir = brehon_root.join("runtime");
+        std::fs::write(
+            runtime_dir.join("tasks").join("T-review.json"),
+            serde_json::json!({
+                "task_id": "T-review",
+                "title": "Pending review task",
+                "status": "review_ready",
+                "task_type": "task"
+            })
+            .to_string(),
+        )
+        .expect("updated task file");
+        std::fs::write(
+            runtime_dir
+                .join("reviews")
+                .join("T-review")
+                .join("state.json"),
+            serde_json::json!({
+                "task_id": "T-review",
+                "status": "approved",
+                "current_round": 1,
+                "current_review_id": "REV-review",
+                "max_rounds": 3,
+                "panel_id": "primary",
+                "panel": ["reviewer-1"],
+                "submissions_received": ["reviewer-1"],
+                "created_at": chrono::Utc::now().to_rfc3339(),
+                "updated_at": chrono::Utc::now().to_rfc3339()
+            })
+            .to_string(),
+        )
+        .expect("updated review state");
+
+        let mux = Mux::new(24, 80);
+        let mut harness = harness_with_mux(mux);
+        let now = Instant::now();
+        harness.ctx.stall_check_interval = Duration::ZERO;
+        harness.ctx.last_stall_check = now - Duration::from_secs(60);
+        harness
+            .ctx
+            .dashboard_data
+            .lock()
+            .expect("dashboard")
+            .brehon_root = Some(brehon_root.clone());
+        harness.ctx.review_obligation_notifications_sent.insert(
+            (
+                "reviewer-1".to_string(),
+                "T-review".to_string(),
+                "REV-review".to_string(),
+            ),
+            now,
+        );
+        harness.ctx.review_obligation_resends_sent.insert(
+            (
+                "reviewer-1".to_string(),
+                "T-review".to_string(),
+                "REV-review".to_string(),
+            ),
+            now,
+        );
+        harness.ctx.review_obligation_failures_reported.insert((
+            "reviewer-1".to_string(),
+            "T-review".to_string(),
+            "REV-review".to_string(),
+        ));
+
+        crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
+
+        assert!(harness.ctx.review_obligation_notifications_sent.is_empty());
+        assert!(harness.ctx.review_obligation_resends_sent.is_empty());
+        assert!(harness.ctx.review_obligation_failures_reported.is_empty());
     }
 
     #[test]
@@ -4791,7 +8271,7 @@ mod tests {
             brehon_root
                 .join("runtime")
                 .join("prompt-delivery-acks")
-                .join("prompt-1.json")
+                .join(format!("{}.json", sanitize_prompt_key("prompt-1")))
                 .exists(),
             "successful daemon delivery writes prompt ack"
         );

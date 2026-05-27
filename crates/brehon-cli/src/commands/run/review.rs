@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -52,6 +52,8 @@ pub(crate) struct RuntimeReviewRequest {
     pub(crate) title: String,
     pub(crate) description: String,
     pub(crate) commit: String,
+    #[serde(default)]
+    pub(crate) reviewer_prompts: BTreeMap<String, String>,
     pub(crate) context: String,
 }
 
@@ -424,6 +426,9 @@ pub(crate) fn runtime_review_prompt(
     request: &RuntimeReviewRequest,
     reviewer: &str,
 ) -> String {
+    if let Some(prompt) = request.reviewer_prompts.get(reviewer) {
+        return prompt.clone();
+    }
     format!(
         "Review request {} for task {}: {}\n\
          Panel: {}\n\
@@ -796,9 +801,22 @@ pub(crate) fn reconcile_review_runtime_for_run(
             if state.status == "collecting" {
                 let request_path = round_dir.join("request.json");
                 if let Ok(request_content) = std::fs::read_to_string(&request_path) {
-                    if let Ok(request) =
+                    if let Ok(mut request) =
                         serde_json::from_str::<RuntimeReviewRequest>(&request_content)
                     {
+                        let old_prompts = std::mem::take(&mut request.reviewer_prompts);
+                        let mut remapped_prompts = BTreeMap::new();
+                        for (old_reviewer, prompt) in old_prompts {
+                            let new_reviewer = rename_map
+                                .get(&old_reviewer)
+                                .cloned()
+                                .unwrap_or(old_reviewer);
+                            remapped_prompts.insert(new_reviewer, prompt);
+                        }
+                        request.reviewer_prompts = remapped_prompts;
+
+                        std::fs::write(&request_path, serde_json::to_string_pretty(&request)?)?;
+
                         for reviewer in desired_panel_names
                             .iter()
                             .filter(|reviewer| !state.submissions_received.contains(*reviewer))
@@ -1184,6 +1202,20 @@ mod tests {
                 title: "Task 1".to_string(),
                 description: "Review me".to_string(),
                 commit: "abc123".to_string(),
+                reviewer_prompts: BTreeMap::from([
+                    (
+                        "claude-old".to_string(),
+                        "Canonical prompt for claude".to_string(),
+                    ),
+                    (
+                        "codex-old".to_string(),
+                        "Canonical prompt for codex".to_string(),
+                    ),
+                    (
+                        "gemini-old".to_string(),
+                        "Canonical prompt for gemini".to_string(),
+                    ),
+                ]),
                 context: "extra".to_string(),
             })
             .unwrap(),
@@ -1314,6 +1346,54 @@ mod tests {
         assert_eq!(
             targets,
             vec!["codex-new".to_string(), "gemini-new".to_string()]
+        );
+
+        // Verify that re-seated pending reviewers receive their canonical prompts,
+        // not the fallback generic prompt.
+        let queued_files = std::fs::read_dir(brehon_root.join("runtime").join("prompt-queue"))
+            .unwrap()
+            .flatten()
+            .collect::<Vec<_>>();
+        for entry in queued_files {
+            let value: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(entry.path()).unwrap()).unwrap();
+            let target = value["target"].as_str().unwrap();
+            let message = value["message"].as_str().unwrap();
+            match target {
+                "codex-new" => assert!(message.contains("Canonical prompt for codex")),
+                "gemini-new" => assert!(message.contains("Canonical prompt for gemini")),
+                other => panic!("unexpected queued target: {}", other),
+            }
+        }
+
+        // Verify that request.json was rewritten with remapped reviewer_prompts keys
+        // so the next restart finds canonical prompts without needing a rename_map.
+        let rewritten_request: RuntimeReviewRequest =
+            serde_json::from_str(&std::fs::read_to_string(round_dir.join("request.json")).unwrap())
+                .unwrap();
+        assert!(
+            rewritten_request
+                .reviewer_prompts
+                .contains_key("claude-new")
+                || rewritten_request.reviewer_prompts.contains_key("codex-new")
+                || rewritten_request
+                    .reviewer_prompts
+                    .contains_key("gemini-new"),
+            "request.json should have at least one new reviewer key after reseat"
+        );
+        assert!(
+            !rewritten_request
+                .reviewer_prompts
+                .contains_key("claude-old"),
+            "request.json should no longer contain old reviewer keys"
+        );
+        assert_eq!(
+            rewritten_request.reviewer_prompts.get("codex-new"),
+            Some(&"Canonical prompt for codex".to_string())
+        );
+        assert_eq!(
+            rewritten_request.reviewer_prompts.get("gemini-new"),
+            Some(&"Canonical prompt for gemini".to_string())
         );
     }
 

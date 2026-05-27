@@ -23,6 +23,7 @@
 mod branch;
 mod diff;
 mod error;
+mod gitignore;
 mod integration;
 mod merge;
 mod ops;
@@ -33,6 +34,10 @@ mod worktree;
 pub use branch::BranchOps;
 pub use diff::DiffOps;
 pub use error::GitError;
+pub use gitignore::{
+    is_legacy_brehon_dir_ignore, remove_legacy_brehon_dir_ignores, resolve_git_info_dir,
+    WORKTREE_AWARE_BREHON_IGNORE_PATTERNS,
+};
 pub use integration::IntegrationOps;
 pub use merge::MergeOps;
 pub use ops::Git2Operations;

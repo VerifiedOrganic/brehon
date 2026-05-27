@@ -20,11 +20,12 @@ use brehon_types::{
 use crate::error::McpError;
 use crate::server::{ContentBlock, ToolResult};
 use crate::tools::agent::try_deliver_message;
+use crate::tools::assignment_observability::AssignmentPropagation;
 use crate::tools::{error_result, text_result, Tool};
 
 use super::helpers::{brehon_root, current_git_head_short, reviews_dir, workspace_root};
 use super::maintenance::{PanelReassignmentResult, ReviewMaintenanceAction};
-use super::notifications::{notify_agent, notify_review_stakeholders, reviewer_reset_ack_exists};
+use super::notifications::{notify_review_stakeholders, reviewer_reset_ack_exists};
 use super::panel::{
     build_full_council_panel, build_panel, find_agents_by_role, find_agents_by_role_with_type,
     find_panel_lease_by_task, read_all_panel_leases, read_panel_seat, release_panel_lease_for_task,
@@ -39,9 +40,9 @@ use super::scoring::{
 use super::state::{
     acquire_review_lock, current_review_cycle_round, delete_review_state, parse_verdict,
     read_review_state, read_round_submissions, round_dir, total_review_round_limit,
-    total_review_rounds_exhausted, write_consolidated, write_review_state, ConsolidatedReport,
-    ReviewRequestFile, ReviewState, StoredCalibration, StoredCalibrationEntry, StoredFinding,
-    StoredSubmission,
+    total_review_rounds_exhausted, write_consolidated, write_review_state, write_round_request,
+    ConsolidatedReport, ReviewRequestFile, ReviewState, StoredCalibration,
+    StoredCalibrationEntry, StoredFinding, StoredSubmission,
 };
 use super::tasks::{
     detect_default_branch, merge_target_requires_epic_integration, read_task,
@@ -1605,20 +1606,20 @@ impl VerificationTool {
             })?;
         }
 
-        let request =
-            super::state::read_round_request(task_id, state.current_round).ok_or_else(|| {
+        let mut request = super::state::read_round_request(task_id, state.current_round)
+            .ok_or_else(|| {
                 format!(
                     "Review request metadata is missing for task {task_id} round {}. \
                  Cannot reassign panel without request.json.",
                     state.current_round
                 )
             })?;
-        let title = request.title.as_str();
-        let description = request.description.as_str();
-        let commit = request.commit.as_str();
-        let context = request.context.as_str();
-        let base_commit = request.base_commit.trim();
-        let base_commit = (!base_commit.is_empty()).then_some(base_commit);
+        let title = request.title.clone();
+        let description = request.description.clone();
+        let commit = request.commit.clone();
+        let context = request.context.clone();
+        let base_commit_owned = request.base_commit.trim().to_string();
+        let base_commit = (!base_commit_owned.is_empty()).then_some(base_commit_owned.as_str());
         let task_for_prompt = read_task(task_id);
         let worker_branch = task_for_prompt
             .as_ref()
@@ -1674,17 +1675,18 @@ impl VerificationTool {
             String::new()
         };
 
+        let mut rendered_review_prompts = Vec::new();
         for reviewer in &new_reviewers {
             let review_prompt = build_review_request_prompt(&ReviewRequestPromptInput {
                 review_id: &state.current_review_id,
                 task_id,
-                title,
-                description,
+                title: &title,
+                description: &description,
                 context: &reassignment_context,
                 panel_id: &state.panel_id,
                 round: state.current_round,
                 reviewer,
-                commit,
+                commit: &commit,
                 base_commit,
                 worker_branch,
                 merge_target: Some(&merge_target),
@@ -1692,8 +1694,34 @@ impl VerificationTool {
                 proof_summary: proof_summary.as_ref(),
                 research_context: Some(&research_context),
             });
-            notify_agent(reviewer, requested_by, &review_prompt);
+            request
+                .reviewer_prompts
+                .insert(reviewer.clone(), review_prompt.clone());
+            rendered_review_prompts.push((reviewer.clone(), review_prompt));
         }
+        write_round_request(task_id, state.current_round, &request).map_err(|err| {
+            format!(
+                "Failed to persist reassigned review request metadata for task {task_id}: {err}"
+            )
+        })?;
+
+        for (reviewer, review_prompt) in rendered_review_prompts {
+            let delivery = try_deliver_message(&reviewer, requested_by, &review_prompt);
+            state.reviewer_assignments.insert(
+                reviewer.clone(),
+                AssignmentPropagation::new(
+                    &reviewer,
+                    "review",
+                    (!delivery.prompt_id.trim().is_empty()).then(|| delivery.prompt_id.clone()),
+                    Some(delivery.method.clone()),
+                ),
+            );
+        }
+        write_review_state(task_id, state).map_err(|err| {
+            format!(
+                "Failed to persist reassigned reviewer assignment propagation for task {task_id}: {err}"
+            )
+        })?;
 
         Ok(Some(PanelReassignmentResult {
             review_id: state.current_review_id.clone(),

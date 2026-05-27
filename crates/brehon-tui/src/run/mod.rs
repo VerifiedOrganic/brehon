@@ -33,6 +33,7 @@
 //! ```
 
 mod advisors;
+mod automation;
 mod composer;
 mod confirmed_state;
 mod crash_detection;
@@ -62,6 +63,7 @@ mod task_scope_summary;
 mod terminal_guard;
 mod types;
 
+pub use automation::RuntimeAutomationHarness;
 pub use types::{AgentInfo, DashboardData, EventInfo, ReviewerPanel, TaskInfo};
 
 use gateway_prompts::*;
@@ -160,6 +162,7 @@ pub fn run_tui(shutdown: Arc<AtomicBool>, mux: Mux, rt: tokio::runtime::Handle) 
             self_improve_tasks: Vec::new(),
             spawn_workers: None,
             drain_timeout_secs: None,
+            worktree_root: None,
         },
     )
 }
@@ -221,6 +224,7 @@ pub fn run_dashboard_tui(
             self_improve_tasks: Vec::new(),
             spawn_workers: None,
             drain_timeout_secs: None,
+            worktree_root: None,
         },
         None,
         None,
@@ -301,6 +305,8 @@ pub fn run_tui_with_panels_and_runtime_commands(
         std::collections::HashMap::new();
     let next_self_improve_index: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
+    let prompt_blocked_recovery_failed_panes: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
     // Post-checkpoint handoff nudge tuning. 90 s of idle after a checkpoint
     // is long enough to rule out "worker is writing a follow-up message"
     // but short enough to rescue the task well before the 15-minute
@@ -312,10 +318,16 @@ pub fn run_tui_with_panels_and_runtime_commands(
         (String, String, String),
         std::time::Instant,
     > = std::collections::HashMap::new();
-    let review_obligation_nudges_sent: std::collections::HashMap<
+    let review_obligation_notifications_sent: std::collections::HashMap<
         (String, String, String),
         std::time::Instant,
     > = std::collections::HashMap::new();
+    let review_obligation_resends_sent: std::collections::HashMap<
+        (String, String, String),
+        std::time::Instant,
+    > = std::collections::HashMap::new();
+    let review_obligation_failures_reported: std::collections::HashSet<(String, String, String)> =
+        std::collections::HashSet::new();
     let active_worker_recovery_nudges_sent: std::collections::HashMap<
         (String, String),
         std::time::Instant,
@@ -448,10 +460,13 @@ pub fn run_tui_with_panels_and_runtime_commands(
         last_worker_context_reset,
         pending_self_improve_prompt,
         next_self_improve_index,
+        prompt_blocked_recovery_failed_panes,
         post_checkpoint_nudge_threshold,
         post_checkpoint_nudge_cooldown,
         post_checkpoint_nudges_sent,
-        review_obligation_nudges_sent,
+        review_obligation_notifications_sent,
+        review_obligation_resends_sent,
+        review_obligation_failures_reported,
         active_worker_recovery_nudges_sent,
         active_worker_recovery_resets_sent,
         worker_ids,
@@ -493,8 +508,41 @@ pub fn run_tui_with_panels_and_runtime_commands(
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+pub(crate) fn init_test_git_repo(path: &std::path::Path) {
+    std::fs::create_dir_all(path).unwrap();
+    let status = std::process::Command::new("git")
+        .arg("init")
+        .arg(path)
+        .status()
+        .expect("git init");
+    assert!(status.success(), "git init should succeed");
+    let status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["config", "user.name", "Brehon Test"])
+        .status()
+        .expect("git config user.name");
+    assert!(status.success(), "git config user.name should succeed");
+    let status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["config", "user.email", "brehon@example.com"])
+        .status()
+        .expect("git config user.email");
+    assert!(status.success(), "git config user.email should succeed");
+    let status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["config", "commit.gpgsign", "false"])
+        .status()
+        .expect("git config commit.gpgsign");
+    assert!(status.success(), "git config commit.gpgsign should succeed");
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    use crate::theme::StatusKind;
     use brehon_types::task::TaskStatus;
     use crossterm::event::{MouseButton, MouseEventKind};
     use ratatui::backend::TestBackend;
@@ -515,30 +563,6 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
             .unwrap_or(0)
-    }
-
-    fn init_test_git_repo(path: &Path) {
-        std::fs::create_dir_all(path).unwrap();
-        let status = Command::new("git")
-            .arg("init")
-            .arg(path)
-            .status()
-            .expect("git init");
-        assert!(status.success(), "git init should succeed");
-        let status = Command::new("git")
-            .arg("-C")
-            .arg(path)
-            .args(["config", "user.name", "Brehon Test"])
-            .status()
-            .expect("git config user.name");
-        assert!(status.success(), "git config user.name should succeed");
-        let status = Command::new("git")
-            .arg("-C")
-            .arg(path)
-            .args(["config", "user.email", "brehon@example.com"])
-            .status()
-            .expect("git config user.email");
-        assert!(status.success(), "git config user.email should succeed");
     }
 
     fn write_test_task(root: &Path, task_id: &str, status: &str) {
@@ -715,8 +739,33 @@ mod tests {
         .expect("create reviewer pane")
     }
 
-    fn make_custom_worker_pane(name: &str, provider: &str) -> brehon_mux::Pane {
+    fn make_worker_pane_with_adapter(
+        name: &str,
+        configured_agent_type: &str,
+        adapter: &brehon_mux::AgentAdapter,
+    ) -> brehon_mux::Pane {
         let dir = tempfile::tempdir().expect("tempdir");
+        brehon_mux::Pane::worker_with_agent_type(
+            name,
+            dir.path().to_path_buf(),
+            None,
+            None,
+            "supervisor",
+            adapter,
+            None,
+            None,
+            24,
+            80,
+            None,
+            None,
+            Some(configured_agent_type),
+            &[],
+            None,
+        )
+        .expect("create worker pane")
+    }
+
+    fn make_custom_worker_pane(name: &str, provider: &str) -> brehon_mux::Pane {
         let adapter = brehon_mux::AgentAdapter::Custom(brehon_mux::CustomAgentConfig {
             name: provider.to_string(),
             command: Some("codex".to_string()),
@@ -735,30 +784,14 @@ mod tests {
                 supports_teams: false,
                 one_shot: false,
                 uses_ink_prompt: false,
+                prompt_injection_strategy: brehon_mux::PromptInjectionStrategy::ImmediateSubmit,
                 tool_prefix: std::borrow::Cow::Borrowed("mcp__brehon__"),
                 transport: brehon_mux::HarnessTransport::AppServer,
                 preferred_control_plane: brehon_mux::HarnessControlPlane::Acp,
             },
         });
 
-        brehon_mux::Pane::worker_with_agent_type(
-            name,
-            dir.path().to_path_buf(),
-            None,
-            None,
-            "supervisor",
-            &adapter,
-            None,
-            None,
-            24,
-            80,
-            None,
-            None,
-            Some(provider),
-            &[],
-            None,
-        )
-        .expect("create custom worker pane")
+        make_worker_pane_with_adapter(name, provider, &adapter)
     }
 
     fn custom_interactive_agent(
@@ -780,6 +813,7 @@ mod tests {
                 supports_teams: false,
                 one_shot: false,
                 uses_ink_prompt: false,
+                prompt_injection_strategy: brehon_mux::PromptInjectionStrategy::ImmediateSubmit,
                 tool_prefix: std::borrow::Cow::Borrowed("mcp_brehon_"),
                 transport: brehon_mux::HarnessTransport::InteractivePty,
                 preferred_control_plane: brehon_mux::HarnessControlPlane::PtyInjection,
@@ -806,6 +840,24 @@ mod tests {
         .expect("create worker pane")
     }
 
+    fn make_builtin_worker_pane(
+        name: &str,
+        configured_agent_type: &str,
+        cli: brehon_mux::SupervisorCli,
+    ) -> brehon_mux::Pane {
+        let adapter = brehon_mux::AgentAdapter::Custom(brehon_mux::CustomAgentConfig {
+            name: cli.as_str().to_string(),
+            command: Some(cli.as_str().to_string()),
+            args: vec![],
+            base_url: None,
+            api_key_env: None,
+            headers: Vec::new(),
+            capabilities: cli.capabilities(),
+        });
+
+        make_worker_pane_with_adapter(name, configured_agent_type, &adapter)
+    }
+
     fn headless_host_owned_dashboard_status(pane_id: &str) -> RuntimeDaemonDashboardStatus {
         RuntimeDaemonDashboardStatus {
             generated_at_ms: 1,
@@ -824,6 +876,7 @@ mod tests {
                     last_output_ms: Some(1234),
                     exit_code: None,
                     exit_reason: None,
+                    blocked: None,
                 }],
             },
             approvals: RuntimeApprovalDashboardSnapshot::default(),
@@ -1031,6 +1084,66 @@ mod tests {
         assert!(
             obligations.is_empty(),
             "non-review tasks should not produce live reviewer obligations from stale collecting state"
+        );
+    }
+
+    #[test]
+    fn test_read_pending_review_obligations_populates_assignment_delivery_fields() {
+        let temp = tempfile::tempdir().unwrap();
+        write_test_task(temp.path(), "T-review", "in_review");
+        let review_dir = temp.path().join("runtime").join("reviews").join("T-review");
+        std::fs::create_dir_all(&review_dir).unwrap();
+        std::fs::write(
+            review_dir.join("state.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "task_id": "T-review",
+                "status": "collecting",
+                "current_round": 1,
+                "current_review_id": "REV-live",
+                "panel_id": "primary",
+                "panel": ["reviewer-a"],
+                "submissions_received": [],
+                "reviewer_assignments": {
+                    "reviewer-a": {
+                        "owner": "reviewer-a",
+                        "assignment_kind": "review",
+                        "assigned_at": "2026-04-02T00:00:00Z",
+                        "prompt_id": "prompt+reviewer$a",
+                        "delivery_method": "queued",
+                        "acknowledged_at": "2026-04-02T00:01:00Z"
+                    }
+                },
+                "created_at": "2026-04-02T00:00:00Z",
+                "updated_at": "2026-04-02T00:00:00Z"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let prompt_id = "prompt+reviewer$a";
+        let enqueue_dir = temp.path().join("runtime").join("prompt-enqueue-acks");
+        std::fs::create_dir_all(&enqueue_dir).unwrap();
+        std::fs::write(
+            enqueue_dir.join(format!(
+                "{}.json",
+                crate::run::helpers::sanitize_runtime_key(prompt_id)
+            )),
+            serde_json::json!({
+                "prompt_id": prompt_id
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let tasks = read_task_files(temp.path());
+        let obligations = read_pending_review_obligations(temp.path(), &tasks);
+        let obligation = &obligations["reviewer-a"][0];
+        assert_eq!(
+            obligation.assignment_delivery_state.as_deref(),
+            Some("drained_without_ack")
+        );
+        assert_eq!(
+            obligation.assignment_acknowledged_at.as_deref(),
+            Some("2026-04-02T00:01:00Z")
         );
     }
 
@@ -1631,6 +1744,65 @@ mod tests {
         let saved = read_raw_task_file(brehon_root, "T-stalled").unwrap();
         assert_eq!(saved["status"], "in_progress");
         assert_eq!(saved["assignee"], "worker-1");
+    }
+
+    #[test]
+    fn test_attempt_auto_recover_stalled_worker_blocks_missing_worktree() {
+        let temp = tempfile::tempdir().unwrap();
+        let brehon_root = temp.path();
+
+        let tasks_dir = brehon_root.join("runtime").join("tasks");
+        std::fs::create_dir_all(&tasks_dir).unwrap();
+        std::fs::write(
+            tasks_dir.join("T-stalled.json"),
+            serde_json::json!({
+                "task_id": "T-stalled",
+                "title": "Stalled task",
+                "status": "in_progress",
+                "task_type": "task",
+                "assignee": "worker-1"
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let mut stalled = make_task("T-stalled", "Stalled task", "in_progress", "task", None);
+        stalled.assignee = Some("worker-1".to_string());
+        let tasks = vec![stalled];
+        let sessions = std::collections::HashMap::from([
+            (
+                "worker-1".to_string(),
+                (
+                    "worker".to_string(),
+                    "sess-1".to_string(),
+                    "now".to_string(),
+                ),
+            ),
+            (
+                "worker-2".to_string(),
+                (
+                    "worker".to_string(),
+                    "sess-2".to_string(),
+                    "now".to_string(),
+                ),
+            ),
+        ]);
+
+        let outcome =
+            attempt_auto_recover_stalled_worker(brehon_root, "worker-1", &tasks, &sessions, 20);
+        assert_eq!(
+            outcome,
+            Some(StalledRecoveryOutcome::ManualRecoveryRequired {
+                task_id: "T-stalled".to_string(),
+                worker: "worker-1".to_string(),
+                reason: "worker worktree is missing; manual recovery is required".to_string(),
+            })
+        );
+
+        let saved = read_raw_task_file(brehon_root, "T-stalled").unwrap();
+        assert_eq!(saved["status"], "in_progress");
+        assert_eq!(saved["assignee"], "worker-1");
+        assert!(saved.get("recovery_note").is_none());
     }
 
     #[test]
@@ -3333,10 +3505,52 @@ mod tests {
         assert_eq!(frontier.review_ready_tasks, vec!["T-review".to_string()]);
         assert_eq!(frontier.approved_tasks, vec!["T-approved".to_string()]);
 
-        let message = build_supervisor_dispatch_nudge_message(&frontier);
+        let message = build_supervisor_dispatch_nudge_message(&frontier, false);
         assert!(message.contains("T-review"));
         assert!(message.contains("T-approved"));
         assert!(message.contains("task action=ready"));
+        assert!(message.contains("Re-run"));
+    }
+
+    #[test]
+    fn test_build_supervisor_dispatch_nudge_message_headless_uses_direct_tools() {
+        let tasks = vec![make_task(
+            "T-review",
+            "Review Task",
+            "review_ready",
+            "task",
+            None,
+        )];
+        let sessions = std::collections::HashMap::new();
+        let frontier =
+            compute_supervisor_dispatch_frontier(&tasks, &sessions).expect("dispatch frontier");
+        let message = build_supervisor_dispatch_nudge_message(&frontier, true);
+        assert!(message.contains("T-review"));
+        assert!(!message.contains("Re-run"));
+        assert!(message.contains("Do not wait for operator confirmation"));
+    }
+
+    #[test]
+    fn test_build_supervisor_dispatch_nudge_message_headless_conflicts_uses_direct_tools() {
+        let mut conflict = make_task(
+            "T-conflict",
+            "Conflict Task",
+            "changes_requested",
+            "task",
+            None,
+        );
+        conflict.integration_conflict_owner = Some("supervisor".to_string());
+        conflict.integration_conflict_source = Some("approved_integration".to_string());
+        let tasks = vec![conflict];
+        let sessions = std::collections::HashMap::new();
+
+        let frontier =
+            compute_supervisor_dispatch_frontier(&tasks, &sessions).expect("dispatch frontier");
+        let message = build_supervisor_dispatch_nudge_message(&frontier, true);
+        assert!(message.contains("T-conflict"));
+        assert!(message.contains("task action=conflicts"));
+        assert!(!message.contains("Re-run"));
+        assert!(message.contains("Do not wait for operator confirmation"));
     }
 
     #[test]
@@ -3371,7 +3585,7 @@ mod tests {
         );
         assert!(frontier.changes_requested_tasks.is_empty());
 
-        let message = build_supervisor_dispatch_nudge_message(&frontier);
+        let message = build_supervisor_dispatch_nudge_message(&frontier, false);
         assert!(message.contains("T-conflict"));
         assert!(message.contains("task action=conflicts"));
         assert!(message.contains("before requesting review"));
@@ -4666,6 +4880,7 @@ mod tests {
                         last_output_ms: None,
                         exit_code: None,
                         exit_reason: None,
+                        blocked: None,
                     },
                     RuntimePaneDashboardInfo {
                         session_id: "session-1".to_string(),
@@ -4678,6 +4893,7 @@ mod tests {
                         last_output_ms: None,
                         exit_code: None,
                         exit_reason: None,
+                        blocked: None,
                     },
                 ],
             },
@@ -4738,6 +4954,7 @@ mod tests {
                     last_output_ms: None,
                     exit_code: None,
                     exit_reason: None,
+                    blocked: None,
                 }],
             },
             approvals: RuntimeApprovalDashboardSnapshot::default(),
@@ -4817,6 +5034,7 @@ mod tests {
                         last_output_ms: None,
                         exit_code: None,
                         exit_reason: None,
+                        blocked: None,
                     },
                     RuntimePaneDashboardInfo {
                         session_id: "session-1".to_string(),
@@ -4829,6 +5047,7 @@ mod tests {
                         last_output_ms: None,
                         exit_code: None,
                         exit_reason: None,
+                        blocked: None,
                     },
                 ],
             },
@@ -4928,6 +5147,36 @@ mod tests {
         .join("\n");
 
         assert_snapshot!("dashboard_factory_status_role_glyphs_and_states", snapshot);
+    }
+
+    #[test]
+    fn test_dashboard_agent_status_uses_distinct_blocked_glyph() {
+        let now = Instant::now();
+        let (blocked_glyph, blocked_text, blocked_kind) = dashboard_agent_status_for_state(
+            Some(&brehon_mux::PaneState::Blocked {
+                info: brehon_types::RuntimePaneBlockInfo {
+                    kind: brehon_types::RuntimePaneBlockKind::TerminalPrompt,
+                    summary: "terminal prompt".to_string(),
+                    command_or_tool: Some("allow cargo test".to_string()),
+                    request_id: Some("prompt-1".to_string()),
+                    task_id: Some("T-1".to_string()),
+                    excerpt: None,
+                },
+                at: now,
+            }),
+            true,
+            0,
+        );
+        let (starting_glyph, starting_text, starting_kind) =
+            dashboard_agent_status_for_state(None, true, 0);
+
+        assert_eq!(blocked_glyph, "⛔");
+        assert_eq!(blocked_text, "blocked");
+        assert_eq!(blocked_kind, StatusKind::Warning);
+        assert_eq!(starting_glyph, "◐");
+        assert_eq!(starting_text, "starting");
+        assert_eq!(starting_kind, StatusKind::Info);
+        assert_ne!(blocked_glyph, starting_glyph);
     }
 
     #[test]
@@ -7558,6 +7807,102 @@ mod tests {
     }
 
     #[test]
+    fn test_is_worker_context_reset_candidate_uses_worker_capabilities_not_provider_name() {
+        fn assert_candidate(pane: brehon_mux::Pane, message: &str, expected: bool) {
+            let pane_id = pane.id().to_string();
+            let mut mux = Mux::new(24, 80);
+            mux.add_pane(pane);
+            let entry = brehon_mux::ActivityEntry {
+                kind: brehon_mux::ActivityKind::Progress,
+                ingested_at: std::time::Instant::now(),
+                tool_id: None,
+                tool_name: None,
+                status: None,
+                message: Some(message.to_string()),
+                output_chunks: None,
+                duration: None,
+            };
+
+            assert_eq!(
+                is_worker_context_reset_candidate(&mux, &pane_id, &entry),
+                expected,
+                "unexpected worker context reset classification for {pane_id} and message {message:?}"
+            );
+        }
+
+        let context_length = "The prompt is too long: 203272, model maximum context length: 202752";
+        let stream_disconnect = "stream disconnected before completion: An error occurred while processing your request. You can retry your request, or contact us through our help center.";
+
+        for message in [context_length, stream_disconnect] {
+            assert_candidate(
+                make_builtin_worker_pane(
+                    "worker-gemini",
+                    "gemini-worker",
+                    brehon_mux::SupervisorCli::Gemini,
+                ),
+                message,
+                true,
+            );
+            assert_candidate(
+                make_builtin_worker_pane(
+                    "worker-kimi",
+                    "kimi-worker",
+                    brehon_mux::SupervisorCli::Kimi,
+                ),
+                message,
+                true,
+            );
+            assert_candidate(
+                make_builtin_worker_pane(
+                    "worker-opencode",
+                    "opencode-worker",
+                    brehon_mux::SupervisorCli::OpenCode,
+                ),
+                message,
+                true,
+            );
+            assert_candidate(
+                make_custom_worker_pane("worker-custom-acp", "native-openai-worker"),
+                message,
+                true,
+            );
+            assert_candidate(
+                make_builtin_worker_pane(
+                    "worker-claude",
+                    "claude-worker",
+                    brehon_mux::SupervisorCli::Claude,
+                ),
+                message,
+                false,
+            );
+            assert_candidate(
+                make_builtin_worker_pane(
+                    "worker-junie",
+                    "junie-worker",
+                    brehon_mux::SupervisorCli::Junie,
+                ),
+                message,
+                false,
+            );
+            assert_candidate(
+                make_builtin_worker_pane(
+                    "worker-agy",
+                    "agy-worker",
+                    brehon_mux::SupervisorCli::Agy,
+                ),
+                message,
+                false,
+            );
+            let custom_pty = custom_interactive_agent("custom-pty", "cat", &[]);
+            assert_candidate(
+                make_worker_pane_with_adapter("worker-custom-pty", "custom-pty", &custom_pty),
+                message,
+                false,
+            );
+        }
+    }
+
+    #[test]
     fn test_supervisor_reset_reason_matches_claude_runtime_crash_dump() {
         let mut mux = Mux::new(24, 80);
         let mut pane = make_supervisor_pane("claude-supervisor");
@@ -7580,11 +7925,25 @@ T===K.execq():if(!K)return_;let S=Number(K[1]);"#,
         let mut mux = Mux::new(24, 80);
         mux.add_pane(make_supervisor_pane("claude-supervisor"));
 
-        let prompt = build_supervisor_reset_startup_prompt(&mux, "claude-supervisor")
+        let prompt = build_supervisor_reset_startup_prompt(&mux, "claude-supervisor", false)
             .expect("startup prompt");
         assert!(prompt.contains("supervisor session reset"));
         assert!(prompt.contains("task action=ready"));
         assert!(prompt.contains("runtime failure"));
+    }
+
+    #[test]
+    fn test_build_supervisor_reset_startup_prompt_headless_skips_bootstrap() {
+        let mut mux = Mux::new(24, 80);
+        mux.add_pane(make_supervisor_pane("claude-supervisor"));
+
+        let prompt = build_supervisor_reset_startup_prompt(&mux, "claude-supervisor", true)
+            .expect("startup prompt");
+        assert!(prompt.contains("unattended headless run"));
+        assert!(!prompt.contains("action=session_start name="));
+        assert!(prompt.contains("task action=conflicts"));
+        assert!(prompt.contains("task action=list task_type=epic"));
+        assert!(prompt.contains("Do not wait for operator confirmation"));
     }
 
     #[test]
@@ -7683,5 +8042,56 @@ T===K.execq():if(!K)return_;let S=Number(K[1]);"#,
         assert!(prompt_retry_not_due(&prompt_path));
         assert_eq!(read_prompt_retry_attempts(&prompt_path), 0);
         assert!(next_retry_at > chrono::Utc::now());
+    }
+
+    #[test]
+    fn test_force_prompt_retry_due_preserves_retry_metadata_but_makes_prompt_immediately_eligible()
+    {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let prompt_path = dir.path().join("queued.prompt");
+        std::fs::write(&prompt_path, "prompt").expect("write prompt");
+
+        record_prompt_retry_deferral(
+            &prompt_path,
+            Duration::from_secs(30),
+            "transport deferred queued prompt delivery",
+        );
+        assert!(prompt_retry_not_due(&prompt_path));
+
+        assert!(force_prompt_retry_due(&prompt_path));
+        assert!(
+            !prompt_retry_not_due(&prompt_path),
+            "forced retry should make the prompt immediately eligible"
+        );
+
+        let meta = serde_json::from_str::<serde_json::Value>(
+            &std::fs::read_to_string(prompt_retry_meta_path(&prompt_path))
+                .expect("retry metadata should exist"),
+        )
+        .expect("retry metadata should parse");
+        assert_eq!(meta["deferrals"], 1);
+        assert_eq!(meta["attempts"], 0);
+        assert_eq!(
+            meta["last_deferred_reason"].as_str(),
+            Some("transport deferred queued prompt delivery")
+        );
+    }
+
+    #[test]
+    fn test_force_prompt_retry_due_rejects_non_object_metadata_without_clobbering_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let prompt_path = dir.path().join("queued.prompt");
+        let meta_path = prompt_retry_meta_path(&prompt_path);
+        std::fs::write(&prompt_path, "prompt").expect("write prompt");
+        std::fs::write(&meta_path, "\"not an object\"").expect("write retry metadata");
+
+        assert!(
+            !force_prompt_retry_due(&prompt_path),
+            "forcing retry due should fail for non-object metadata"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&meta_path).expect("retry metadata should remain readable"),
+            "\"not an object\""
+        );
     }
 }

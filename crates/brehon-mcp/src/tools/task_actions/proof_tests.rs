@@ -122,11 +122,14 @@ fn proof_tool(root: &TempDir) -> (TaskActionsTool, Arc<dyn ProofStore + Send + S
 async fn proof_completion_creates_worker_evidence_bundle() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    init_git_workspace(project.path());
     let workspace = tempfile::tempdir().unwrap();
     init_git_workspace(workspace.path());
     std::fs::write(workspace.path().join("feature.txt"), "completed\n").unwrap();
     let _env = ScopedEnv::set(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
+        ("BREHON_PROJECT_ROOT", project.path().to_str().unwrap()),
         ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "worker"),
         ("BREHON_AGENT_NAME", "worker-1"),

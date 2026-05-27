@@ -114,7 +114,11 @@ pub(crate) fn build_worker_recycle_startup_prompt(mux: &Mux, worker: &str) -> Op
     ))
 }
 
-pub(crate) fn build_supervisor_reset_startup_prompt(mux: &Mux, supervisor: &str) -> Option<String> {
+pub(crate) fn build_supervisor_reset_startup_prompt(
+    mux: &Mux,
+    supervisor: &str,
+    host_owned: bool,
+) -> Option<String> {
     let pane = mux.panes().find(|pane| pane.id() == supervisor)?;
     if pane.kind() != &PaneKind::Supervisor {
         return None;
@@ -122,14 +126,25 @@ pub(crate) fn build_supervisor_reset_startup_prompt(mux: &Mux, supervisor: &str)
     let caps = pane.cli_type().capabilities();
     let agent_cmd = format!("{}agent", caps.tool_prefix);
     let task_cmd = format!("{}task", caps.tool_prefix);
-    Some(format!(
-        "Brehon supervisor session reset. Your previous supervisor session was restarted after a runtime failure.\n\
+    if host_owned {
+        Some(format!(
+            "Brehon supervisor session reset (unattended headless run). Your previous supervisor session was restarted after a runtime failure.\n\
+ 1) Your session is already registered. Do not call {agent_cmd} action=session_start or {agent_cmd} action=whoami.\n\
+ 2) Use {task_cmd} action=ready and {task_cmd} action=conflicts directly to inspect current state. If you need the full epic backlog context after the reset, call {task_cmd} action=list task_type=epic. Then act immediately. Do not wait for operator confirmation.\n\
+ 3) Resume supervisor-only orchestration. Do NOT implement ordinary worker tasks yourself.\n\
+ 4) If no action is required after checking state, emit one short status line and stop.\n\
+ 5) Do not narrate MCP bootstrap/tool calls in normal text."
+        ))
+    } else {
+        Some(format!(
+            "Brehon supervisor session reset. Your previous supervisor session was restarted after a runtime failure.\n\
  1) Call these silently, without narrating each step: {agent_cmd} action=session_start name={supervisor} agent_type=supervisor ; {agent_cmd} action=whoami\n\
  2) Rebuild live coordination context now: {task_cmd} action=list task_type=epic ; {task_cmd} action=conflicts ; {task_cmd} action=ready\n\
  3) Resume supervisor-only orchestration. Do NOT implement ordinary worker tasks yourself.\n\
  4) If no action is currently required after reloading context, emit one short status line and stop.\n\
  5) Do not narrate MCP bootstrap/tool calls in normal text."
-    ))
+        ))
+    }
 }
 
 pub(crate) fn is_review_wait_task_status(status: &str) -> bool {

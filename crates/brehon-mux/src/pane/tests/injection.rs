@@ -1,4 +1,6 @@
-use crate::harness::{AgentAdapter, SupervisorCli};
+use crate::harness::{
+    AgentAdapter, CustomAgentConfig, HarnessCapabilities, PromptInjectionStrategy, SupervisorCli,
+};
 use crate::pane::spawn::{
     uses_delayed_submit_injection, uses_ink_echo_injection, uses_pre_submit_interrupt_reset,
 };
@@ -132,6 +134,33 @@ fn builtin(cli: SupervisorCli) -> AgentAdapter {
     AgentAdapter::BuiltIn(cli)
 }
 
+fn custom_with_strategy(
+    name: &str,
+    uses_ink_prompt: bool,
+    prompt_injection_strategy: PromptInjectionStrategy,
+) -> AgentAdapter {
+    AgentAdapter::Custom(CustomAgentConfig {
+        name: name.to_string(),
+        command: Some(name.to_string()),
+        args: vec![],
+        base_url: None,
+        api_key_env: None,
+        headers: Vec::new(),
+        capabilities: HarnessCapabilities {
+            supports_hooks: false,
+            supports_subagents: false,
+            supports_textbox_submit: false,
+            supports_teams: false,
+            one_shot: false,
+            uses_ink_prompt,
+            prompt_injection_strategy,
+            tool_prefix: std::borrow::Cow::Borrowed("mcp_brehon_"),
+            transport: crate::harness::HarnessTransport::InteractivePty,
+            preferred_control_plane: crate::harness::HarnessControlPlane::PtyInjection,
+        },
+    })
+}
+
 #[allow(dead_code)]
 fn assert_copilot_gateway_config(config: &crate::pane::types::GatewaySpawnConfig) {
     assert_eq!(config.protocol, GatewayProtocol::AcpStdio);
@@ -211,8 +240,21 @@ fn test_codex_family_uses_ink_echo_injection() {
     assert!(uses_ink_echo_injection(&builtin(SupervisorCli::Codex)));
     assert!(uses_ink_echo_injection(&builtin(SupervisorCli::OpenCode)));
     assert!(uses_ink_echo_injection(&builtin(SupervisorCli::Junie)));
+    assert!(!uses_ink_echo_injection(&builtin(SupervisorCli::Agy)));
     assert!(!uses_ink_echo_injection(&builtin(SupervisorCli::Kimi)));
     assert!(!uses_ink_echo_injection(&builtin(SupervisorCli::Copilot)));
+}
+
+#[test]
+fn test_custom_pty_injection_strategy_controls_submission_behavior() {
+    let delayed =
+        custom_with_strategy("gemini-like", false, PromptInjectionStrategy::DelayedSubmit);
+    assert!(uses_delayed_submit_injection(&delayed));
+    assert!(!uses_ink_echo_injection(&delayed));
+
+    let ink_echo = custom_with_strategy("junie-like", true, PromptInjectionStrategy::InkEcho);
+    assert!(uses_ink_echo_injection(&ink_echo));
+    assert!(!uses_delayed_submit_injection(&ink_echo));
 }
 
 /// Gemini uses delayed submit (not Ink echo), and Ink CLIs don't use
@@ -253,6 +295,11 @@ fn test_injection_modes_are_mutually_exclusive() {
     assert!(!uses_ink_echo_injection(&kimi));
     assert!(!uses_delayed_submit_injection(&kimi));
     assert!(!uses_pre_submit_interrupt_reset(&kimi));
+
+    let agy = builtin(SupervisorCli::Agy);
+    assert!(!uses_ink_echo_injection(&agy));
+    assert!(!uses_delayed_submit_injection(&agy));
+    assert!(!uses_pre_submit_interrupt_reset(&agy));
 
     // Claude uses none of the special injection modes
     let claude = builtin(SupervisorCli::Claude);

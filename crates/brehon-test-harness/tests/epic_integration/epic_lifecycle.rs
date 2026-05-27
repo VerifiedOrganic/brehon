@@ -10,7 +10,17 @@ use std::path::Path;
 use std::process::Command;
 
 fn run_git(workspace: &Path, args: &[&str]) -> String {
-    let output = Command::new("git")
+    let mut command = Command::new("git");
+    match args.first().copied() {
+        Some("commit" | "merge") => {
+            command.args(["-c", "commit.gpgsign=false"]);
+        }
+        Some("tag") => {
+            command.args(["-c", "tag.gpgsign=false"]);
+        }
+        _ => {}
+    }
+    let output = command
         .args(args)
         .current_dir(workspace)
         .output()
@@ -342,16 +352,7 @@ fn multi_subtask_sequential_integration_into_epic_branch() {
     let _subtask2_commit = run_git(workspace.path(), &["rev-parse", "HEAD"]);
 
     run_git(workspace.path(), &["checkout", integration_branch]);
-    let merge_status = Command::new("git")
-        .args(["merge", subtask2_branch, "--no-edit"])
-        .current_dir(workspace.path())
-        .status()
-        .unwrap();
-
-    assert!(
-        merge_status.success(),
-        "Second subtask should merge successfully after first"
-    );
+    run_git(workspace.path(), &["merge", subtask2_branch, "--no-edit"]);
 
     let mut subtask2 = read_task(&tasks_dir, subtask2_id).unwrap();
     subtask2["status"] = serde_json::Value::String("merged".to_string());

@@ -4,6 +4,7 @@
 
 pub mod advisor;
 pub mod agent;
+pub(crate) mod assignment_observability;
 pub(crate) mod context_efficiency;
 pub mod factory;
 pub mod freshness;
@@ -18,15 +19,15 @@ pub mod skills;
 pub mod stability;
 pub mod task_actions;
 pub mod tasks;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod verification;
 
 use async_trait::async_trait;
 use serde_json::Value;
-#[cfg(test)]
-use std::sync::Mutex;
 
 #[cfg(test)]
-pub(crate) static TEST_ENV_LOCK: Mutex<()> = Mutex::new(());
+pub(crate) use brehon_test_harness::{ScopedEnv, TEST_ENV_LOCK};
 
 use crate::error::McpError;
 use crate::server::{ContentBlock, ToolResult};

@@ -6,6 +6,7 @@ pub mod epic_truth;
 pub mod factory;
 pub mod import_plan;
 pub mod init;
+pub mod maintenance;
 pub mod process;
 pub mod reset;
 pub mod run;

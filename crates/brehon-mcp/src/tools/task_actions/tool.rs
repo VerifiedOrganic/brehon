@@ -100,6 +100,10 @@ impl Tool for TaskActionsTool {
                     "type": "boolean",
                     "description": "If true, include closed tasks in list results (default: false)"
                 },
+                "include_assignment_observability": {
+                    "type": "boolean",
+                    "description": "For action=list, include assignment_observability by resolving prompt-delivery and pane-context runtime state. Defaults to false to keep list queries on the hot path lightweight."
+                },
                 "title": {
                     "type": "string",
                     "description": "Task title (for create)"

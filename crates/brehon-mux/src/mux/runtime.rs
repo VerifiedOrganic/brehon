@@ -7,8 +7,8 @@ use brehon_ports::RuntimeEventSink;
 use brehon_types::{
     ActivityObservedEvent, PaneExitedEvent, PaneOutputEvent, PaneSpawnedEvent,
     PaneStateChangedEvent, PromptDeliveredEvent, PromptQueuedEvent, PromptRejectedEvent,
-    RuntimeActivityKind, RuntimeEvent, RuntimeEventKind, RuntimeEventMeta, RuntimePaneKind,
-    RuntimePaneState, RuntimeSource,
+    RuntimeActivityKind, RuntimeEvent, RuntimeEventKind, RuntimeEventMeta, RuntimePaneBlockInfo,
+    RuntimePaneKind, RuntimePaneState, RuntimeSource,
 };
 
 use super::Mux;
@@ -68,6 +68,7 @@ impl Mux {
         previous: Option<RuntimePaneState>,
         current: RuntimePaneState,
         reason: Option<String>,
+        blocked: Option<RuntimePaneBlockInfo>,
     ) {
         self.publish_runtime_event(RuntimeEvent::new(
             self.runtime_meta(pane_id, generation),
@@ -75,6 +76,7 @@ impl Mux {
                 previous,
                 current,
                 reason,
+                blocked,
             }),
         ));
     }
@@ -83,7 +85,17 @@ impl Mux {
         match state {
             PaneState::Ready { .. } => RuntimePaneState::Ready,
             PaneState::Busy { .. } => RuntimePaneState::Busy,
+            PaneState::Blocked { .. } => RuntimePaneState::Blocked,
             PaneState::Dead { .. } => RuntimePaneState::Dead,
+        }
+    }
+
+    pub(crate) fn runtime_pane_block_info_for_state(
+        state: &PaneState,
+    ) -> Option<RuntimePaneBlockInfo> {
+        match state {
+            PaneState::Blocked { info, .. } => Some(info.clone()),
+            _ => None,
         }
     }
 
@@ -91,12 +103,23 @@ impl Mux {
         previous: Option<RuntimePaneState>,
         current: Option<&PaneState>,
         reason: impl Into<String>,
-    ) -> Option<(Option<RuntimePaneState>, RuntimePaneState, String)> {
-        let current = current.map(Self::runtime_pane_state_for_state)?;
+    ) -> Option<(
+        Option<RuntimePaneState>,
+        RuntimePaneState,
+        String,
+        Option<RuntimePaneBlockInfo>,
+    )> {
+        let current_state = current?;
+        let current = Self::runtime_pane_state_for_state(current_state);
         if previous.as_ref() == Some(&current) {
             return None;
         }
-        Some((previous, current, reason.into()))
+        Some((
+            previous,
+            current,
+            reason.into(),
+            Self::runtime_pane_block_info_for_state(current_state),
+        ))
     }
 
     pub(crate) fn runtime_event_for_mux_event(&self, event: &MuxEvent) -> Option<RuntimeEvent> {

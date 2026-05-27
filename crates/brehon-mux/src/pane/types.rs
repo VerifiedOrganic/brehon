@@ -117,6 +117,16 @@ pub struct ReviewContextSnapshot {
     pub updated_at: Instant,
 }
 
+/// Captured pane state that should be restored once a temporary blocked prompt
+/// is resolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BlockedResumeState {
+    /// Last non-blocked pane state before the pane entered `Blocked`.
+    pub(crate) pane_state: Option<PaneState>,
+    /// Whether the pane was still executing work before it became blocked.
+    pub(crate) tool_executing: bool,
+}
+
 /// The kind of pane
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PaneKind {
@@ -271,6 +281,10 @@ pub struct Pane {
     /// Tracks whether the last synthetic output byte was '\r' so lone '\n'
     /// from non-PTY transports can be normalized to CRLF across chunk boundaries.
     pub(crate) synthetic_prev_was_cr: bool,
+    /// Small rolling raw-output tail used to prefilter split terminal-prompt
+    /// keywords across PTY chunk boundaries without rescanning the full
+    /// viewport on every chunk.
+    pub(crate) terminal_prompt_prefilter_tail: String,
     /// Carries incomplete supervisor startup MCP blocks across PTY chunks so
     /// they can be suppressed only once the full block boundary is known.
     pub(crate) supervisor_pending_structured_output: Vec<u8>,
@@ -306,6 +320,12 @@ pub struct Pane {
     pub(crate) prompt_queue: PanePromptQueue,
     /// Authoritative pane lifecycle state.
     pub(crate) pane_state: Option<PaneState>,
+    /// Best-effort snapshot of the last non-blocked state before a temporary
+    /// blocked prompt paused the pane.
+    pub(crate) blocked_resume_state: Option<BlockedResumeState>,
+    /// Deadline for auto-correlating a PTY-only blocked pane with a later
+    /// permission-resolution activity when no stable request_id is available.
+    pub(crate) permission_resolution_fallback_until: Option<Instant>,
     /// Task context snapshot for worker panes.
     /// Populated from runtime/tasks/*.json when a task is assigned.
     pub(crate) task_context: Option<TaskContextSnapshot>,

@@ -11,6 +11,9 @@ mod runtime_policy;
 
 use std::{collections::HashSet, sync::LazyLock};
 
+use brehon_adapter_sdk::harness::{
+    builtin_cli_from_launcher_shape, HarnessControlPlane, HarnessTransport, SupervisorCli,
+};
 use brehon_types::{
     BrehonConfig, PermissionProfile, ResearchPermissions, RoleKind, RuntimeTerminalHostKind,
     RuntimeTerminalHostPaneOwnership,
@@ -19,21 +22,6 @@ use brehon_types::{
 use runtime_policy::validate_runtime_policy;
 
 const SUPPORTED_RUNTIME_WORKFLOWS: &[&str] = &["rate_limit.quarantine_recommendation"];
-const SUPPORTED_HARNESS_TRANSPORTS: &[&str] = &[
-    "native_hooks",
-    "app_server",
-    "managed_api",
-    "interactive_pty",
-    "one_shot_pty",
-];
-const SUPPORTED_HARNESS_CONTROL_PLANES: &[&str] = &[
-    "native_hooks",
-    "acp",
-    "acp_sidecar",
-    "openai_compatible",
-    "pty_injection",
-    "one_shot",
-];
 static VALID_PERMISSION_PROFILES: LazyLock<HashSet<&'static str>> =
     LazyLock::new(|| PermissionProfile::names().collect());
 static VALID_ROLE_KINDS: LazyLock<HashSet<&'static str>> =
@@ -89,6 +77,7 @@ pub enum ValidationWarningKind {
     AdvisorPolicyConflict,
     ResearchPolicyConflict,
     ProfilePolicyConflict,
+    InvalidWorktreeRoot,
 }
 
 impl ValidationWarningKind {
@@ -105,6 +94,7 @@ impl ValidationWarningKind {
                 | ValidationWarningKind::InvalidContextConfig
                 | ValidationWarningKind::ResearchPolicyConflict
                 | ValidationWarningKind::ProfilePolicyConflict
+                | ValidationWarningKind::InvalidWorktreeRoot
         )
     }
 }
@@ -162,6 +152,7 @@ impl std::fmt::Display for ValidationWarningKind {
             ValidationWarningKind::AdvisorPolicyConflict => write!(f, "Advisor policy conflict"),
             ValidationWarningKind::ResearchPolicyConflict => write!(f, "Research policy conflict"),
             ValidationWarningKind::ProfilePolicyConflict => write!(f, "Profile policy conflict"),
+            ValidationWarningKind::InvalidWorktreeRoot => write!(f, "Invalid worktree root"),
         }
     }
 }
@@ -189,6 +180,7 @@ pub fn validate(config: &BrehonConfig) -> Vec<ValidationWarning> {
     warnings.extend(validate_retention(config));
     warnings.extend(validate_context(config));
     warnings.extend(validate_profiles(config));
+    warnings.extend(validate_worktree_root(config));
 
     warnings
 }
@@ -224,7 +216,9 @@ fn validate_routing_policy(config: &BrehonConfig) -> Vec<ValidationWarning> {
             if !worker_lanes.contains(lane) {
                 warnings.push(ValidationWarning::new(
                     ValidationWarningKind::RoutingPolicyConflict,
-                    format!("{label} references worker lane '{lane}', but no worker pool uses that lane"),
+                    format!(
+                        "{label} references worker lane '{lane}', but no worker pool uses that lane"
+                    ),
                 ));
             }
         }
@@ -810,16 +804,102 @@ fn validate_profiles(config: &BrehonConfig) -> Vec<ValidationWarning> {
     warnings
 }
 
-fn normalize_capability_value(value: &str) -> String {
-    value.trim().to_ascii_lowercase()
+fn validate_worktree_root(config: &BrehonConfig) -> Vec<ValidationWarning> {
+    let mut warnings = Vec::new();
+    let Some(root) = config.orchestration.worktree_root.as_deref() else {
+        return warnings;
+    };
+
+    if root.trim().is_empty() {
+        warnings.push(ValidationWarning::new(
+            ValidationWarningKind::InvalidWorktreeRoot,
+            "orchestration.worktree_root must not be empty",
+        ));
+        return warnings;
+    }
+
+    let normalized = root.replace('\\', "/");
+    if normalized.contains("/../")
+        || normalized.starts_with("../")
+        || normalized.ends_with("/..")
+        || normalized == ".."
+    {
+        warnings.push(ValidationWarning::new(
+            ValidationWarningKind::InvalidWorktreeRoot,
+            format!(
+                "orchestration.worktree_root '{root}' contains path traversal ('..')"
+            ),
+        ));
+    }
+
+    if root.contains('\0') {
+        warnings.push(ValidationWarning::new(
+            ValidationWarningKind::InvalidWorktreeRoot,
+            format!(
+                "orchestration.worktree_root '{root}' contains invalid null bytes"
+            ),
+        ));
+    }
+
+    let path = std::path::Path::new(root);
+    if !path.is_absolute() {
+        warnings.push(ValidationWarning::new(
+            ValidationWarningKind::InvalidWorktreeRoot,
+            format!(
+                "orchestration.worktree_root '{root}' must be an absolute path"
+            ),
+        ));
+    }
+
+    warnings
+}
+
+fn launcher_transport_override(
+    launcher: &brehon_types::AgentConnectionConfig,
+) -> Result<Option<HarnessTransport>, String> {
+    launcher
+        .transport_str()
+        .map(str::parse::<HarnessTransport>)
+        .transpose()
+}
+
+fn launcher_control_plane_override(
+    launcher: &brehon_types::AgentConnectionConfig,
+) -> Result<Option<HarnessControlPlane>, String> {
+    launcher
+        .control_plane_str()
+        .map(str::parse::<HarnessControlPlane>)
+        .transpose()
+}
+
+fn launcher_effective_capabilities(
+    launcher: &brehon_types::AgentConnectionConfig,
+) -> Option<(HarnessTransport, HarnessControlPlane)> {
+    let builtin = builtin_cli_from_launcher(launcher);
+    let mut transport = builtin
+        .map(|cli| cli.capabilities().transport)
+        .or_else(|| launcher_transport_override(launcher).ok().flatten())?;
+    let mut control_plane = builtin
+        .map(|cli| cli.capabilities().preferred_control_plane)
+        .or_else(|| launcher_control_plane_override(launcher).ok().flatten())?;
+
+    if let Ok(Some(cp_override)) = launcher_control_plane_override(launcher) {
+        control_plane = cp_override;
+        transport = cp_override.canonical_transport();
+    } else if let Ok(Some(transport_override)) = launcher_transport_override(launcher) {
+        if transport_override.supports_control_plane(control_plane) {
+            transport = transport_override;
+        }
+    }
+
+    Some((transport, control_plane))
 }
 
 fn validate_launcher_capability_overrides(config: &BrehonConfig) -> Vec<ValidationWarning> {
     let mut warnings = Vec::new();
     for (name, launcher) in &config.launchers {
         if let Some(transport) = launcher.transport_str() {
-            let normalized = normalize_capability_value(transport);
-            if !SUPPORTED_HARNESS_TRANSPORTS.contains(&normalized.as_str()) {
+            if transport.parse::<HarnessTransport>().is_err() {
                 warnings.push(ValidationWarning::new(
                     ValidationWarningKind::LauncherCapabilityConflict,
                     format!("launcher '{name}' has unsupported transport override '{transport}'"),
@@ -827,14 +907,60 @@ fn validate_launcher_capability_overrides(config: &BrehonConfig) -> Vec<Validati
             }
         }
         if let Some(control_plane) = launcher.control_plane_str() {
-            let normalized = normalize_capability_value(control_plane);
-            if !SUPPORTED_HARNESS_CONTROL_PLANES.contains(&normalized.as_str()) {
+            if control_plane.parse::<HarnessControlPlane>().is_err() {
                 warnings.push(ValidationWarning::new(
                     ValidationWarningKind::LauncherCapabilityConflict,
                     format!(
                         "launcher '{name}' has unsupported control_plane override '{control_plane}'"
                     ),
                 ));
+            }
+        }
+
+        let transport_override = launcher_transport_override(launcher).ok().flatten();
+        let control_plane_override = launcher_control_plane_override(launcher).ok().flatten();
+        if let (Some(transport), Some(control_plane)) = (transport_override, control_plane_override)
+        {
+            if !transport.supports_control_plane(control_plane) {
+                warnings.push(ValidationWarning::new(
+                    ValidationWarningKind::LauncherCapabilityConflict,
+                    format!(
+                        "launcher '{name}' has incompatible transport/control_plane overrides: transport='{}' cannot carry control_plane='{}'",
+                        transport, control_plane
+                    ),
+                ));
+            }
+        }
+
+        if control_plane_override.is_none() {
+            if let Some(transport) = transport_override {
+                if let Some((_, control_plane)) = launcher_effective_capabilities(launcher) {
+                    if !transport.supports_control_plane(control_plane) {
+                        warnings.push(ValidationWarning::new(
+                            ValidationWarningKind::LauncherCapabilityConflict,
+                            format!(
+                                "launcher '{name}' transport override '{}' conflicts with effective control_plane '{}'; specify a compatible control_plane override too",
+                                transport, control_plane
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+
+        if let Some(cli) = builtin_cli_from_launcher(launcher) {
+            if let Some((transport, control_plane)) = launcher_effective_capabilities(launcher) {
+                if !cli.supports_transport_control_plane(transport, control_plane) {
+                    warnings.push(ValidationWarning::new(
+                        ValidationWarningKind::LauncherCapabilityConflict,
+                        format!(
+                            "launcher '{name}' requests built-in '{}' with unsupported transport/control_plane overrides: transport='{}' control_plane='{}'",
+                            cli.as_str(),
+                            transport,
+                            control_plane
+                        ),
+                    ));
+                }
             }
         }
     }
@@ -907,7 +1033,7 @@ fn validate_supervisor_terminal_contract(config: &BrehonConfig) -> Vec<Validatio
         return warnings;
     };
 
-    if supervisor_launcher_supports_pty(supervisor_lane, launcher) {
+    if supervisor_launcher_supports_pty(launcher) {
         return warnings;
     }
 
@@ -922,27 +1048,18 @@ fn validate_supervisor_terminal_contract(config: &BrehonConfig) -> Vec<Validatio
     warnings
 }
 
-fn supervisor_launcher_supports_pty(
-    lane_name: &str,
-    launcher: &brehon_types::AgentConnectionConfig,
-) -> bool {
+fn supervisor_launcher_supports_pty(launcher: &brehon_types::AgentConnectionConfig) -> bool {
     use brehon_types::agent::AdapterKind;
 
-    if is_builtin_supervisor_name(lane_name) {
+    if launcher_invokes_builtin_supervisor(launcher) {
         return true;
     }
 
-    if launcher
-        .control_plane_str()
-        .map(normalize_capability_value)
-        .as_deref()
-        == Some("acp_sidecar")
+    if launcher_control_plane_override(launcher).ok().flatten()
+        == Some(HarnessControlPlane::AcpSidecar)
     {
-        return launcher
-            .transport_str()
-            .map(normalize_capability_value)
-            .as_deref()
-            == Some("interactive_pty")
+        return launcher_transport_override(launcher).ok().flatten()
+            == Some(HarnessTransport::InteractivePty)
             && (launcher.adapter == AdapterKind::NativeAgent
                 || launcher
                     .command_str()
@@ -964,46 +1081,8 @@ fn supervisor_launcher_supports_pty(
     }
 }
 
-fn is_builtin_supervisor_name(name: &str) -> bool {
-    matches!(
-        name,
-        "claude-code"
-            | "claude"
-            | "codex"
-            | "gemini"
-            | "kimi"
-            | "opencode"
-            | "junie"
-            | "copilot"
-            | "gh-copilot"
-            | "agy"
-    )
-}
-
 fn launcher_invokes_builtin_supervisor(launcher: &brehon_types::AgentConnectionConfig) -> bool {
-    let command = launcher.command_str().unwrap_or_default();
-    let args: Vec<&str> = launcher.args.iter().map(String::as_str).collect();
-
-    match (command, args.as_slice()) {
-        ("claude", []) => true,
-        ("codex", args) if args.contains(&"app-server") => true,
-        ("gemini", ["--acp"]) | ("gemini", ["--experimental-acp"]) => true,
-        ("kimi", ["acp"]) => true,
-        ("opencode", [])
-        | ("opencode", ["acp"])
-        | ("opencode", ["acp", "--cwd", "."])
-        | ("opencode", ["serve"])
-        | ("opencode", ["serve", "--pure"]) => true,
-        ("junie", []) => true,
-        ("copilot", args) if args.is_empty() || args.contains(&"--acp") => true,
-        ("agy", args) => {
-            args.is_empty()
-                || args.contains(&"--prompt-interactive")
-                || args.contains(&"-i")
-                || args.contains(&"--dangerously-skip-permissions")
-        }
-        _ => false,
-    }
+    builtin_cli_from_launcher(launcher).is_some()
 }
 
 fn validate_structure(config: &BrehonConfig) -> Vec<ValidationWarning> {
@@ -1189,34 +1268,115 @@ fn validate_review_panels(config: &BrehonConfig) -> Vec<ValidationWarning> {
     warnings
 }
 
+/// Try to resolve a launcher configuration to a built-in [`SupervisorCli`]
+/// so that its canonical [`HarnessCapabilities`] can be used instead of
+/// hardcoded `AdapterKind` branches.
+fn builtin_cli_from_launcher(
+    launcher: &brehon_types::AgentConnectionConfig,
+) -> Option<SupervisorCli> {
+    builtin_cli_from_launcher_shape(launcher.adapter, launcher.command_str(), &launcher.args)
+}
+
+fn launcher_requests_unsupported_builtin_one_shot(
+    launcher: &brehon_types::AgentConnectionConfig,
+    transport: Option<HarnessTransport>,
+    control_plane: Option<HarnessControlPlane>,
+) -> bool {
+    let requests_one_shot = transport.is_some_and(HarnessTransport::is_one_shot)
+        || control_plane.is_some_and(HarnessControlPlane::is_one_shot);
+    requests_one_shot
+        && builtin_cli_from_launcher(launcher).is_some_and(|cli| !cli.capabilities().one_shot)
+}
+
+fn reviewer_launcher_uses_junie_one_shot_contract(
+    launcher: &brehon_types::AgentConnectionConfig,
+) -> bool {
+    use brehon_types::agent::AdapterKind;
+
+    if launcher.adapter == AdapterKind::Junie {
+        return true;
+    }
+
+    if launcher.adapter != AdapterKind::Acp {
+        return false;
+    }
+
+    let command = launcher.command_str().unwrap_or_default();
+    let command_basename = std::path::Path::new(command)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(command);
+    command_basename == "junie"
+        && (launcher.args.is_empty() || launcher.args.iter().any(|arg| arg == "--task"))
+}
+
 fn reviewer_lane_supports_shared_reset(config: &BrehonConfig, lane: &str) -> bool {
     let Some(launcher) = config.lane_launcher(lane) else {
         return false;
     };
 
+    // Junie reviewer sessions always use `--task` one-shot execution today,
+    // even when the launcher shape otherwise looks like a reusable PTY lane.
+    // Until Junie exposes a real reusable reviewer contract, shared-reset
+    // reviewers must reject these lanes.
+    if reviewer_launcher_uses_junie_one_shot_contract(launcher) {
+        return false;
+    }
+
+    let transport_override = launcher_transport_override(launcher).ok().flatten();
+    let control_plane_override = launcher_control_plane_override(launcher).ok().flatten();
+    if let (Some(transport), Some(control_plane)) = (transport_override, control_plane_override) {
+        if !transport.supports_control_plane(control_plane) {
+            return false;
+        }
+    }
+
+    if control_plane_override.is_none() {
+        if let Some(transport) = transport_override {
+            if let Some((_, control_plane)) = launcher_effective_capabilities(launcher) {
+                if !transport.supports_control_plane(control_plane) {
+                    return false;
+                }
+            }
+        }
+    }
+
+    if let Some((transport, control_plane)) = launcher_effective_capabilities(launcher) {
+        if launcher_requests_unsupported_builtin_one_shot(
+            launcher,
+            Some(transport),
+            Some(control_plane),
+        ) {
+            return false;
+        }
+        return control_plane.needs_post_spawn_prompt()
+            || (transport.is_pty()
+                && launcher
+                    .command_str()
+                    .is_some_and(|command| !command.trim().is_empty()));
+    }
+
+    // Fall back to AdapterKind defaults for non-built-in adapters.
     match launcher.adapter {
         brehon_types::agent::AdapterKind::OpenAiCompatible => true,
         brehon_types::agent::AdapterKind::Mock => true,
         brehon_types::agent::AdapterKind::PtyHooks => true,
-        brehon_types::agent::AdapterKind::Codex => true,
         brehon_types::agent::AdapterKind::NativeAgent => true,
-        brehon_types::agent::AdapterKind::Acp => {
-            let command = launcher.command_str().unwrap_or_default();
-            let args: Vec<&str> = launcher.args.iter().map(String::as_str).collect();
-            if command == "claude" && args.is_empty() {
-                return true;
-            }
-            if command == "junie" && args.is_empty() {
-                return false;
-            }
-            true
-        }
+        brehon_types::agent::AdapterKind::Acp => true,
         brehon_types::agent::AdapterKind::Agy => launcher
             .command_str()
             .is_some_and(|command| !command.trim().is_empty()),
-        brehon_types::agent::AdapterKind::Kimi
-        | brehon_types::agent::AdapterKind::Junie
-        | brehon_types::agent::AdapterKind::Copilot => false,
+        // Built-in adapters with dedicated AdapterKind variants (Codex, Kimi,
+        // Junie, Copilot) are resolved via `builtin_cli_from_launcher` above
+        // and never reach this fallback. New variants must be explicitly wired
+        // into either `builtin_cli_from_launcher` or this match to opt in.
+        _ => {
+            tracing::debug!(
+                adapter_kind = ?launcher.adapter,
+                "unrecognized AdapterKind variant reached shared_reset fallback; defaulting to false"
+            );
+            false
+        }
     }
 }
 
@@ -1567,6 +1727,37 @@ mod tests {
     };
     use std::collections::HashMap;
 
+    fn launcher_with_details(
+        adapter: AdapterKind,
+        command: Option<&str>,
+        args: &[&str],
+        transport: Option<&str>,
+        control_plane: Option<&str>,
+    ) -> AgentConnectionConfig {
+        AgentConnectionConfig {
+            adapter,
+            command: command.map(|s| s.into()),
+            args: args.iter().map(|arg| arg.to_string()).collect(),
+            provider: None,
+            transport: transport.map(|value| value.to_string()),
+            control_plane: control_plane.map(|value| value.to_string()),
+            base_url: None,
+            api_key_env: None,
+            permission_mode: None,
+            profile: None,
+            max_parallel_tool_calls: None,
+            assistant_message_passthrough_fields: Vec::new(),
+            reasoning_effort_param: None,
+            extra_body: None,
+            env: HashMap::new(),
+            headers: HashMap::new(),
+        }
+    }
+
+    fn launcher(adapter: AdapterKind, command: Option<&str>) -> AgentConnectionConfig {
+        launcher_with_details(adapter, command, &[], None, None)
+    }
+
     fn minimal_valid_config() -> BrehonConfig {
         let mut launchers = HashMap::new();
         launchers.insert(
@@ -1718,6 +1909,7 @@ mod tests {
                 self_improve_tasks: vec![],
                 spawn_workers: None,
                 drain_timeout_secs: None,
+                worktree_root: None,
             },
             runtime: RuntimeConfig::default(),
             budget: BudgetConfig {
@@ -2228,6 +2420,75 @@ rooms:
     }
 
     #[test]
+    fn launcher_capability_validation_rejects_incompatible_override_pair() {
+        let mut config = minimal_valid_config();
+        let launcher = config.launchers.get_mut("codex").unwrap();
+        launcher.transport = Some("app_server".into());
+        launcher.control_plane = Some("pty_injection".into());
+
+        let warnings = validate(&config);
+
+        assert!(warnings.iter().any(|warning| {
+            warning.kind == ValidationWarningKind::LauncherCapabilityConflict
+                && warning
+                    .message
+                    .contains("incompatible transport/control_plane overrides")
+        }));
+    }
+
+    #[test]
+    fn launcher_capability_validation_rejects_transport_only_conflict_with_builtin_shape() {
+        let mut config = minimal_valid_config();
+        let launcher = config.launchers.get_mut("claude-code").unwrap();
+        launcher.transport = Some("interactive_pty".into());
+        launcher.control_plane = None;
+
+        let warnings = validate(&config);
+
+        assert!(warnings.iter().any(|warning| {
+            warning.kind == ValidationWarningKind::LauncherCapabilityConflict
+                && warning
+                    .message
+                    .contains("specify a compatible control_plane override too")
+        }));
+    }
+
+    #[test]
+    fn launcher_capability_validation_rejects_unsupported_builtin_gateway_override() {
+        let mut config = minimal_valid_config();
+        let launcher = config.launchers.get_mut("claude-code").unwrap();
+        launcher.transport = Some("app_server".into());
+        launcher.control_plane = Some("acp".into());
+
+        let warnings = validate(&config);
+
+        assert!(warnings.iter().any(|warning| {
+            warning.kind == ValidationWarningKind::LauncherCapabilityConflict
+                && warning.message.contains(
+                    "requests built-in 'claude' with unsupported transport/control_plane overrides",
+                )
+        }));
+    }
+
+    #[test]
+    fn launcher_capability_validation_rejects_unsupported_builtin_managed_api_override() {
+        let mut config = minimal_valid_config();
+        let launcher = config.launchers.get_mut("codex").unwrap();
+        launcher.args = vec!["app-server".into()];
+        launcher.transport = Some("managed_api".into());
+        launcher.control_plane = Some("openai_compatible".into());
+
+        let warnings = validate(&config);
+
+        assert!(warnings.iter().any(|warning| {
+            warning.kind == ValidationWarningKind::LauncherCapabilityConflict
+                && warning.message.contains(
+                    "requests built-in 'codex' with unsupported transport/control_plane overrides",
+                )
+        }));
+    }
+
+    #[test]
     fn supervisor_terminal_contract_accepts_acp_junie_launcher() {
         let mut config = minimal_valid_config();
         config.launchers.insert(
@@ -2262,6 +2523,49 @@ rooms:
             },
         );
         config.roles.supervisor.name = "junie-supervisor".into();
+
+        let warnings = validate(&config);
+
+        assert!(!warnings
+            .iter()
+            .any(|warning| warning.kind == ValidationWarningKind::SupervisorTerminalContract));
+    }
+
+    #[test]
+    fn supervisor_terminal_contract_accepts_builtin_launcher_with_custom_lane_name() {
+        let mut config = minimal_valid_config();
+        config.launchers.insert(
+            "alias-claude".into(),
+            AgentConnectionConfig {
+                adapter: AdapterKind::Acp,
+                command: Some("claude".into()),
+                args: Vec::new(),
+                provider: None,
+                transport: None,
+                control_plane: None,
+                base_url: None,
+                api_key_env: None,
+                permission_mode: None,
+                profile: None,
+                max_parallel_tool_calls: None,
+                assistant_message_passthrough_fields: Vec::new(),
+                reasoning_effort_param: None,
+                extra_body: None,
+                env: HashMap::new(),
+                headers: HashMap::new(),
+            },
+        );
+        config.lanes.insert(
+            "safety-supervisor".into(),
+            LaneConfig {
+                launcher: "alias-claude".into(),
+                model: None,
+                reasoning_effort: None,
+                system_prompt: None,
+                profile: None,
+            },
+        );
+        config.roles.supervisor.name = "safety-supervisor".into();
 
         let warnings = validate(&config);
 
@@ -2373,26 +2677,57 @@ rooms:
     #[test]
     fn share_after_submit_allows_agy_reviewers() {
         let mut config = minimal_valid_config();
+        config
+            .launchers
+            .insert("agy".into(), launcher(AdapterKind::Agy, Some("agy")));
+        config.lanes.insert(
+            "agy-reviewer".into(),
+            LaneConfig {
+                launcher: "agy".into(),
+                model: None,
+                reasoning_effort: None,
+                system_prompt: None,
+                profile: None,
+            },
+        );
+        config.roles.reviewers = vec![ReviewerPoolConfig {
+            lane: "agy-reviewer".into(),
+            model: Some(ModelConfig {
+                provider: "google".into(),
+                name: "antigravity-2.0".into(),
+            }),
+            reasoning_effort: None,
+            system_prompt: None,
+            min: 1,
+            max: 1,
+        }];
+        config.review.lease_mode = brehon_types::config::ReviewLeaseMode::ShareAfterSubmit;
+        config.review.default_reviewers = vec!["agy-reviewer".into()];
+        config.review.panels = vec![brehon_types::ReviewPanelConfig {
+            id: "primary".into(),
+            reviewers: vec!["agy-reviewer".into()],
+        }];
+
+        let warnings = validate(&config);
+
+        assert!(!warnings.iter().any(|warning| {
+            warning.kind == ValidationWarningKind::ReviewPanelConflict
+                && warning.message.contains("share_after_submit")
+        }));
+    }
+
+    #[test]
+    fn share_after_submit_allows_acp_agy_reviewers_with_one_shot_override() {
+        let mut config = minimal_valid_config();
         config.launchers.insert(
             "agy".into(),
-            AgentConnectionConfig {
-                adapter: AdapterKind::Agy,
-                command: Some("agy".into()),
-                args: vec![],
-                provider: None,
-                transport: None,
-                control_plane: None,
-                base_url: None,
-                api_key_env: None,
-                permission_mode: None,
-                profile: None,
-                max_parallel_tool_calls: None,
-                assistant_message_passthrough_fields: Vec::new(),
-                reasoning_effort_param: None,
-                extra_body: None,
-                env: HashMap::new(),
-                headers: HashMap::new(),
-            },
+            launcher_with_details(
+                AdapterKind::Acp,
+                Some("agy"),
+                &["--prompt-interactive"],
+                None,
+                Some("one_shot"),
+            ),
         );
         config.lanes.insert(
             "agy-reviewer".into(),
@@ -2876,5 +3211,914 @@ rooms:
                 && w.message
                     .contains("lane 'codex' references profile 'dependency'")
         }));
+    }
+
+    #[test]
+    fn share_after_submit_allows_kimi_reviewers() {
+        let mut config = minimal_valid_config();
+        config
+            .launchers
+            .insert("kimi".into(), launcher(AdapterKind::Kimi, Some("kimi")));
+        config.lanes.insert(
+            "kimi-reviewer".into(),
+            LaneConfig {
+                launcher: "kimi".into(),
+                model: None,
+                reasoning_effort: None,
+                system_prompt: None,
+                profile: None,
+            },
+        );
+        config.roles.reviewers = vec![ReviewerPoolConfig {
+            lane: "kimi-reviewer".into(),
+            model: Some(ModelConfig {
+                provider: "moonshot".into(),
+                name: "kimi-k2".into(),
+            }),
+            reasoning_effort: None,
+            system_prompt: None,
+            min: 1,
+            max: 1,
+        }];
+        config.review.lease_mode = brehon_types::config::ReviewLeaseMode::ShareAfterSubmit;
+        config.review.default_reviewers = vec!["kimi-reviewer".into()];
+        config.review.panels = vec![brehon_types::ReviewPanelConfig {
+            id: "primary".into(),
+            reviewers: vec!["kimi-reviewer".into()],
+        }];
+
+        let warnings = validate(&config);
+
+        assert!(!warnings.iter().any(|warning| {
+            warning.kind == ValidationWarningKind::ReviewPanelConflict
+                && warning.message.contains("share_after_submit")
+        }));
+    }
+
+    #[test]
+    fn share_after_submit_acp_form_allows_kimi_reviewers() {
+        let mut config = minimal_valid_config();
+        config
+            .launchers
+            .insert("kimi".into(), launcher(AdapterKind::Acp, Some("kimi")));
+        config.launchers.get_mut("kimi").unwrap().args = vec!["acp".into()];
+        config.lanes.insert(
+            "kimi-reviewer".into(),
+            LaneConfig {
+                launcher: "kimi".into(),
+                model: None,
+                reasoning_effort: None,
+                system_prompt: None,
+                profile: None,
+            },
+        );
+        config.roles.reviewers = vec![ReviewerPoolConfig {
+            lane: "kimi-reviewer".into(),
+            model: Some(ModelConfig {
+                provider: "moonshot".into(),
+                name: "kimi-k2".into(),
+            }),
+            reasoning_effort: None,
+            system_prompt: None,
+            min: 1,
+            max: 1,
+        }];
+        config.review.lease_mode = brehon_types::config::ReviewLeaseMode::ShareAfterSubmit;
+        config.review.default_reviewers = vec!["kimi-reviewer".into()];
+        config.review.panels = vec![brehon_types::ReviewPanelConfig {
+            id: "primary".into(),
+            reviewers: vec!["kimi-reviewer".into()],
+        }];
+
+        let warnings = validate(&config);
+
+        assert!(!warnings.iter().any(|warning| {
+            warning.kind == ValidationWarningKind::ReviewPanelConflict
+                && warning.message.contains("share_after_submit")
+        }));
+    }
+
+    #[test]
+    fn share_after_submit_allows_gemini_reviewers() {
+        let mut config = minimal_valid_config();
+        config.launchers.insert(
+            "gemini".into(),
+            launcher_with_details(AdapterKind::Acp, Some("gemini"), &["--acp"], None, None),
+        );
+        config.lanes.insert(
+            "gemini-reviewer".into(),
+            LaneConfig {
+                launcher: "gemini".into(),
+                model: None,
+                reasoning_effort: None,
+                system_prompt: None,
+                profile: None,
+            },
+        );
+        config.roles.reviewers = vec![ReviewerPoolConfig {
+            lane: "gemini-reviewer".into(),
+            model: Some(ModelConfig {
+                provider: "google".into(),
+                name: "gemini-2.5-pro".into(),
+            }),
+            reasoning_effort: None,
+            system_prompt: None,
+            min: 1,
+            max: 1,
+        }];
+        config.review.lease_mode = brehon_types::config::ReviewLeaseMode::ShareAfterSubmit;
+        config.review.default_reviewers = vec!["gemini-reviewer".into()];
+        config.review.panels = vec![brehon_types::ReviewPanelConfig {
+            id: "primary".into(),
+            reviewers: vec!["gemini-reviewer".into()],
+        }];
+
+        let warnings = validate(&config);
+
+        assert!(!warnings.iter().any(|warning| {
+            warning.kind == ValidationWarningKind::ReviewPanelConflict
+                && warning.message.contains("share_after_submit")
+        }));
+    }
+
+    #[test]
+    fn share_after_submit_allows_gemini_reviewers_with_pty_control_plane_override() {
+        let mut config = minimal_valid_config();
+        config.launchers.insert(
+            "gemini".into(),
+            launcher_with_details(
+                AdapterKind::Acp,
+                Some("gemini"),
+                &["--acp"],
+                None,
+                Some("pty_injection"),
+            ),
+        );
+        config.lanes.insert(
+            "gemini-reviewer".into(),
+            LaneConfig {
+                launcher: "gemini".into(),
+                model: None,
+                reasoning_effort: None,
+                system_prompt: None,
+                profile: None,
+            },
+        );
+        config.roles.reviewers = vec![ReviewerPoolConfig {
+            lane: "gemini-reviewer".into(),
+            model: Some(ModelConfig {
+                provider: "google".into(),
+                name: "gemini-2.5-pro".into(),
+            }),
+            reasoning_effort: None,
+            system_prompt: None,
+            min: 1,
+            max: 1,
+        }];
+        config.review.lease_mode = brehon_types::config::ReviewLeaseMode::ShareAfterSubmit;
+        config.review.default_reviewers = vec!["gemini-reviewer".into()];
+        config.review.panels = vec![brehon_types::ReviewPanelConfig {
+            id: "primary".into(),
+            reviewers: vec!["gemini-reviewer".into()],
+        }];
+
+        let warnings = validate(&config);
+
+        assert!(!warnings.iter().any(|warning| {
+            warning.kind == ValidationWarningKind::ReviewPanelConflict
+                && warning.message.contains("share_after_submit")
+        }));
+    }
+
+    #[test]
+    fn share_after_submit_rejects_junie_reviewers() {
+        let mut config = minimal_valid_config();
+        config
+            .launchers
+            .insert("junie".into(), launcher(AdapterKind::Junie, Some("junie")));
+        config.lanes.insert(
+            "junie-reviewer".into(),
+            LaneConfig {
+                launcher: "junie".into(),
+                model: None,
+                reasoning_effort: None,
+                system_prompt: None,
+                profile: None,
+            },
+        );
+        config.roles.reviewers = vec![ReviewerPoolConfig {
+            lane: "junie-reviewer".into(),
+            model: Some(ModelConfig {
+                provider: "jetbrains".into(),
+                name: "junie-pro".into(),
+            }),
+            reasoning_effort: None,
+            system_prompt: None,
+            min: 1,
+            max: 1,
+        }];
+        config.review.lease_mode = brehon_types::config::ReviewLeaseMode::ShareAfterSubmit;
+        config.review.default_reviewers = vec!["junie-reviewer".into()];
+        config.review.panels = vec![brehon_types::ReviewPanelConfig {
+            id: "primary".into(),
+            reviewers: vec!["junie-reviewer".into()],
+        }];
+
+        let warnings = validate(&config);
+
+        assert!(warnings.iter().any(|warning| {
+            warning.kind == ValidationWarningKind::ReviewPanelConflict
+                && warning.message.contains("share_after_submit")
+                && warning.message.contains("junie-reviewer")
+        }));
+    }
+
+    #[test]
+    fn share_after_submit_rejects_acp_form_junie_reviewers() {
+        let mut config = minimal_valid_config();
+        config
+            .launchers
+            .insert("junie".into(), launcher(AdapterKind::Acp, Some("junie")));
+        config.lanes.insert(
+            "junie-reviewer".into(),
+            LaneConfig {
+                launcher: "junie".into(),
+                model: None,
+                reasoning_effort: None,
+                system_prompt: None,
+                profile: None,
+            },
+        );
+        config.roles.reviewers = vec![ReviewerPoolConfig {
+            lane: "junie-reviewer".into(),
+            model: Some(ModelConfig {
+                provider: "jetbrains".into(),
+                name: "junie-pro".into(),
+            }),
+            reasoning_effort: None,
+            system_prompt: None,
+            min: 1,
+            max: 1,
+        }];
+        config.review.lease_mode = brehon_types::config::ReviewLeaseMode::ShareAfterSubmit;
+        config.review.default_reviewers = vec!["junie-reviewer".into()];
+        config.review.panels = vec![brehon_types::ReviewPanelConfig {
+            id: "primary".into(),
+            reviewers: vec!["junie-reviewer".into()],
+        }];
+
+        let warnings = validate(&config);
+
+        assert!(warnings.iter().any(|warning| {
+            warning.kind == ValidationWarningKind::ReviewPanelConflict
+                && warning.message.contains("share_after_submit")
+                && warning.message.contains("junie-reviewer")
+        }));
+    }
+
+    #[test]
+    fn share_after_submit_rejects_junie_reviewers_without_command() {
+        let mut config = minimal_valid_config();
+        config
+            .launchers
+            .insert("junie".into(), launcher(AdapterKind::Junie, None));
+        config.lanes.insert(
+            "junie-reviewer".into(),
+            LaneConfig {
+                launcher: "junie".into(),
+                model: None,
+                reasoning_effort: None,
+                system_prompt: None,
+                profile: None,
+            },
+        );
+        config.roles.reviewers = vec![ReviewerPoolConfig {
+            lane: "junie-reviewer".into(),
+            model: Some(ModelConfig {
+                provider: "jetbrains".into(),
+                name: "junie-pro".into(),
+            }),
+            reasoning_effort: None,
+            system_prompt: None,
+            min: 1,
+            max: 1,
+        }];
+        config.review.lease_mode = brehon_types::config::ReviewLeaseMode::ShareAfterSubmit;
+        config.review.default_reviewers = vec!["junie-reviewer".into()];
+        config.review.panels = vec![brehon_types::ReviewPanelConfig {
+            id: "primary".into(),
+            reviewers: vec!["junie-reviewer".into()],
+        }];
+
+        let warnings = validate(&config);
+
+        assert!(warnings.iter().any(|warning| {
+            warning.kind == ValidationWarningKind::ReviewPanelConflict
+                && warning.message.contains("share_after_submit")
+                && warning.message.contains("junie-reviewer")
+        }));
+    }
+
+    #[test]
+    fn share_after_submit_rejects_acp_form_junie_with_task_args() {
+        let mut config = minimal_valid_config();
+        let mut junie = launcher(AdapterKind::Acp, Some("junie"));
+        junie.args = vec!["--task".into()];
+        config.launchers.insert("junie".into(), junie);
+        config.lanes.insert(
+            "junie-reviewer".into(),
+            LaneConfig {
+                launcher: "junie".into(),
+                model: None,
+                reasoning_effort: None,
+                system_prompt: None,
+                profile: None,
+            },
+        );
+        config.roles.reviewers = vec![ReviewerPoolConfig {
+            lane: "junie-reviewer".into(),
+            model: Some(ModelConfig {
+                provider: "jetbrains".into(),
+                name: "junie-pro".into(),
+            }),
+            reasoning_effort: None,
+            system_prompt: None,
+            min: 1,
+            max: 1,
+        }];
+        config.review.lease_mode = brehon_types::config::ReviewLeaseMode::ShareAfterSubmit;
+        config.review.default_reviewers = vec!["junie-reviewer".into()];
+        config.review.panels = vec![brehon_types::ReviewPanelConfig {
+            id: "primary".into(),
+            reviewers: vec!["junie-reviewer".into()],
+        }];
+
+        let warnings = validate(&config);
+
+        assert!(warnings.iter().any(|warning| {
+            warning.kind == ValidationWarningKind::ReviewPanelConflict
+                && warning.message.contains("share_after_submit")
+                && warning.message.contains("junie-reviewer")
+        }));
+    }
+
+    #[test]
+    fn share_after_submit_allows_copilot_reviewers() {
+        let mut config = minimal_valid_config();
+        config.launchers.insert(
+            "copilot".into(),
+            launcher(AdapterKind::Copilot, Some("copilot")),
+        );
+        config.lanes.insert(
+            "copilot-reviewer".into(),
+            LaneConfig {
+                launcher: "copilot".into(),
+                model: None,
+                reasoning_effort: None,
+                system_prompt: None,
+                profile: None,
+            },
+        );
+        config.roles.reviewers = vec![ReviewerPoolConfig {
+            lane: "copilot-reviewer".into(),
+            model: Some(ModelConfig {
+                provider: "github".into(),
+                name: "copilot-latest".into(),
+            }),
+            reasoning_effort: None,
+            system_prompt: None,
+            min: 1,
+            max: 1,
+        }];
+        config.review.lease_mode = brehon_types::config::ReviewLeaseMode::ShareAfterSubmit;
+        config.review.default_reviewers = vec!["copilot-reviewer".into()];
+        config.review.panels = vec![brehon_types::ReviewPanelConfig {
+            id: "primary".into(),
+            reviewers: vec!["copilot-reviewer".into()],
+        }];
+
+        let warnings = validate(&config);
+
+        assert!(!warnings.iter().any(|warning| {
+            warning.kind == ValidationWarningKind::ReviewPanelConflict
+                && warning.message.contains("share_after_submit")
+        }));
+    }
+
+    #[test]
+    fn share_after_submit_acp_form_allows_copilot_reviewers() {
+        let mut config = minimal_valid_config();
+        config.launchers.insert(
+            "copilot".into(),
+            launcher(AdapterKind::Acp, Some("copilot")),
+        );
+        config.lanes.insert(
+            "copilot-reviewer".into(),
+            LaneConfig {
+                launcher: "copilot".into(),
+                model: None,
+                reasoning_effort: None,
+                system_prompt: None,
+                profile: None,
+            },
+        );
+        config.roles.reviewers = vec![ReviewerPoolConfig {
+            lane: "copilot-reviewer".into(),
+            model: Some(ModelConfig {
+                provider: "github".into(),
+                name: "copilot-latest".into(),
+            }),
+            reasoning_effort: None,
+            system_prompt: None,
+            min: 1,
+            max: 1,
+        }];
+        config.review.lease_mode = brehon_types::config::ReviewLeaseMode::ShareAfterSubmit;
+        config.review.default_reviewers = vec!["copilot-reviewer".into()];
+        config.review.panels = vec![brehon_types::ReviewPanelConfig {
+            id: "primary".into(),
+            reviewers: vec!["copilot-reviewer".into()],
+        }];
+
+        let warnings = validate(&config);
+
+        assert!(!warnings.iter().any(|warning| {
+            warning.kind == ValidationWarningKind::ReviewPanelConflict
+                && warning.message.contains("share_after_submit")
+        }));
+    }
+
+    #[test]
+    fn share_after_submit_allows_opencode_reviewers() {
+        let mut config = minimal_valid_config();
+        config.launchers.insert(
+            "opencode".into(),
+            launcher(AdapterKind::Acp, Some("opencode")),
+        );
+        config.lanes.insert(
+            "opencode-reviewer".into(),
+            LaneConfig {
+                launcher: "opencode".into(),
+                model: None,
+                reasoning_effort: None,
+                system_prompt: None,
+                profile: None,
+            },
+        );
+        config.roles.reviewers = vec![ReviewerPoolConfig {
+            lane: "opencode-reviewer".into(),
+            model: Some(ModelConfig {
+                provider: "opencode".into(),
+                name: "opencode-latest".into(),
+            }),
+            reasoning_effort: None,
+            system_prompt: None,
+            min: 1,
+            max: 1,
+        }];
+        config.review.lease_mode = brehon_types::config::ReviewLeaseMode::ShareAfterSubmit;
+        config.review.default_reviewers = vec!["opencode-reviewer".into()];
+        config.review.panels = vec![brehon_types::ReviewPanelConfig {
+            id: "primary".into(),
+            reviewers: vec!["opencode-reviewer".into()],
+        }];
+
+        let warnings = validate(&config);
+
+        assert!(!warnings.iter().any(|warning| {
+            warning.kind == ValidationWarningKind::ReviewPanelConflict
+                && warning.message.contains("share_after_submit")
+        }));
+    }
+
+    #[test]
+    fn capability_override_acp_allows_shared_reset() {
+        let mut config = minimal_valid_config();
+        config.launchers.insert(
+            "custom-gateway".into(),
+            launcher_with_details(
+                AdapterKind::Acp,
+                Some("custom-gateway"),
+                &[],
+                None,
+                Some("acp"),
+            ),
+        );
+        config.lanes.insert(
+            "custom-gateway-reviewer".into(),
+            LaneConfig {
+                launcher: "custom-gateway".into(),
+                model: None,
+                reasoning_effort: None,
+                system_prompt: None,
+                profile: None,
+            },
+        );
+        config.roles.reviewers = vec![ReviewerPoolConfig {
+            lane: "custom-gateway-reviewer".into(),
+            model: Some(ModelConfig {
+                provider: "custom".into(),
+                name: "custom-model".into(),
+            }),
+            reasoning_effort: None,
+            system_prompt: None,
+            min: 1,
+            max: 1,
+        }];
+        config.review.lease_mode = brehon_types::config::ReviewLeaseMode::ShareAfterSubmit;
+        config.review.default_reviewers = vec!["custom-gateway-reviewer".into()];
+        config.review.panels = vec![brehon_types::ReviewPanelConfig {
+            id: "primary".into(),
+            reviewers: vec!["custom-gateway-reviewer".into()],
+        }];
+
+        let warnings = validate(&config);
+
+        assert!(!warnings.iter().any(|warning| {
+            warning.kind == ValidationWarningKind::ReviewPanelConflict
+                && warning.message.contains("share_after_submit")
+        }));
+    }
+
+    #[test]
+    fn capability_override_pty_requires_command_for_shared_reset() {
+        let mut config = minimal_valid_config();
+        config.launchers.insert(
+            "custom-pty".into(),
+            launcher_with_details(
+                AdapterKind::Acp,
+                None,
+                &[],
+                Some("interactive_pty"),
+                Some("pty_injection"),
+            ),
+        );
+        config.lanes.insert(
+            "custom-pty-reviewer".into(),
+            LaneConfig {
+                launcher: "custom-pty".into(),
+                model: None,
+                reasoning_effort: None,
+                system_prompt: None,
+                profile: None,
+            },
+        );
+        config.roles.reviewers = vec![ReviewerPoolConfig {
+            lane: "custom-pty-reviewer".into(),
+            model: Some(ModelConfig {
+                provider: "custom".into(),
+                name: "custom-model".into(),
+            }),
+            reasoning_effort: None,
+            system_prompt: None,
+            min: 1,
+            max: 1,
+        }];
+        config.review.lease_mode = brehon_types::config::ReviewLeaseMode::ShareAfterSubmit;
+        config.review.default_reviewers = vec!["custom-pty-reviewer".into()];
+        config.review.panels = vec![brehon_types::ReviewPanelConfig {
+            id: "primary".into(),
+            reviewers: vec!["custom-pty-reviewer".into()],
+        }];
+
+        let warnings = validate(&config);
+
+        assert!(warnings.iter().any(|warning| {
+            warning.kind == ValidationWarningKind::ReviewPanelConflict
+                && warning.message.contains("share_after_submit")
+                && warning.message.contains("custom-pty-reviewer")
+        }));
+    }
+
+    #[test]
+    fn capability_override_pty_with_incompatible_transport_rejects_shared_reset() {
+        let mut config = minimal_valid_config();
+        config.launchers.insert(
+            "custom-pty-bad-transport".into(),
+            launcher_with_details(
+                AdapterKind::Acp,
+                Some("custom-pty-agent"),
+                &[],
+                Some("app_server"),
+                Some("pty_injection"),
+            ),
+        );
+        config.lanes.insert(
+            "custom-pty-bad-transport-reviewer".into(),
+            LaneConfig {
+                launcher: "custom-pty-bad-transport".into(),
+                model: None,
+                reasoning_effort: None,
+                system_prompt: None,
+                profile: None,
+            },
+        );
+        config.roles.reviewers = vec![ReviewerPoolConfig {
+            lane: "custom-pty-bad-transport-reviewer".into(),
+            model: Some(ModelConfig {
+                provider: "custom".into(),
+                name: "custom-model".into(),
+            }),
+            reasoning_effort: None,
+            system_prompt: None,
+            min: 1,
+            max: 1,
+        }];
+        config.review.lease_mode = brehon_types::config::ReviewLeaseMode::ShareAfterSubmit;
+        config.review.default_reviewers = vec!["custom-pty-bad-transport-reviewer".into()];
+        config.review.panels = vec![brehon_types::ReviewPanelConfig {
+            id: "primary".into(),
+            reviewers: vec!["custom-pty-bad-transport-reviewer".into()],
+        }];
+
+        let warnings = validate(&config);
+
+        assert!(warnings.iter().any(|warning| {
+            warning.kind == ValidationWarningKind::ReviewPanelConflict
+                && warning.message.contains("share_after_submit")
+                && warning
+                    .message
+                    .contains("custom-pty-bad-transport-reviewer")
+        }));
+    }
+
+    #[test]
+    fn capability_override_pty_with_command_allows_shared_reset() {
+        let mut config = minimal_valid_config();
+        config.launchers.insert(
+            "custom-pty-cmd".into(),
+            launcher_with_details(
+                AdapterKind::Acp,
+                Some("custom-pty-agent"),
+                &[],
+                Some("interactive_pty"),
+                Some("pty_injection"),
+            ),
+        );
+        config.lanes.insert(
+            "custom-pty-cmd-reviewer".into(),
+            LaneConfig {
+                launcher: "custom-pty-cmd".into(),
+                model: None,
+                reasoning_effort: None,
+                system_prompt: None,
+                profile: None,
+            },
+        );
+        config.roles.reviewers = vec![ReviewerPoolConfig {
+            lane: "custom-pty-cmd-reviewer".into(),
+            model: Some(ModelConfig {
+                provider: "custom".into(),
+                name: "custom-model".into(),
+            }),
+            reasoning_effort: None,
+            system_prompt: None,
+            min: 1,
+            max: 1,
+        }];
+        config.review.lease_mode = brehon_types::config::ReviewLeaseMode::ShareAfterSubmit;
+        config.review.default_reviewers = vec!["custom-pty-cmd-reviewer".into()];
+        config.review.panels = vec![brehon_types::ReviewPanelConfig {
+            id: "primary".into(),
+            reviewers: vec!["custom-pty-cmd-reviewer".into()],
+        }];
+
+        let warnings = validate(&config);
+
+        assert!(!warnings.iter().any(|warning| {
+            warning.kind == ValidationWarningKind::ReviewPanelConflict
+                && warning.message.contains("share_after_submit")
+        }));
+    }
+
+    #[test]
+    fn builtin_one_shot_override_rejects_shared_reset() {
+        let mut config = minimal_valid_config();
+        config.launchers.insert(
+            "codex".into(),
+            launcher_with_details(
+                AdapterKind::Acp,
+                Some("codex"),
+                &["app-server"],
+                None,
+                Some("one_shot"),
+            ),
+        );
+        config.lanes.insert(
+            "codex-reviewer".into(),
+            LaneConfig {
+                launcher: "codex".into(),
+                model: None,
+                reasoning_effort: None,
+                system_prompt: None,
+                profile: None,
+            },
+        );
+        config.roles.reviewers = vec![ReviewerPoolConfig {
+            lane: "codex-reviewer".into(),
+            model: Some(ModelConfig {
+                provider: "openai".into(),
+                name: "codex".into(),
+            }),
+            reasoning_effort: None,
+            system_prompt: None,
+            min: 1,
+            max: 1,
+        }];
+        config.review.lease_mode = brehon_types::config::ReviewLeaseMode::ShareAfterSubmit;
+        config.review.default_reviewers = vec!["codex-reviewer".into()];
+        config.review.panels = vec![brehon_types::ReviewPanelConfig {
+            id: "primary".into(),
+            reviewers: vec!["codex-reviewer".into()],
+        }];
+
+        let warnings = validate(&config);
+
+        assert!(warnings.iter().any(|warning| {
+            warning.kind == ValidationWarningKind::ReviewPanelConflict
+                && warning.message.contains("share_after_submit")
+                && warning.message.contains("codex-reviewer")
+        }));
+    }
+
+    #[test]
+    fn custom_codex_app_server_one_shot_override_allows_shared_reset() {
+        let mut config = minimal_valid_config();
+        config.launchers.insert(
+            "codex".into(),
+            launcher_with_details(
+                AdapterKind::Acp,
+                Some("codex"),
+                &["app-server", "--flag"],
+                None,
+                Some("one_shot"),
+            ),
+        );
+        config.lanes.insert(
+            "codex-reviewer".into(),
+            LaneConfig {
+                launcher: "codex".into(),
+                model: None,
+                reasoning_effort: None,
+                system_prompt: None,
+                profile: None,
+            },
+        );
+        config.roles.reviewers = vec![ReviewerPoolConfig {
+            lane: "codex-reviewer".into(),
+            model: Some(ModelConfig {
+                provider: "openai".into(),
+                name: "codex".into(),
+            }),
+            reasoning_effort: None,
+            system_prompt: None,
+            min: 1,
+            max: 1,
+        }];
+        config.review.lease_mode = brehon_types::config::ReviewLeaseMode::ShareAfterSubmit;
+        config.review.default_reviewers = vec!["codex-reviewer".into()];
+        config.review.panels = vec![brehon_types::ReviewPanelConfig {
+            id: "primary".into(),
+            reviewers: vec!["codex-reviewer".into()],
+        }];
+
+        let warnings = validate(&config);
+
+        assert!(!warnings.iter().any(|warning| {
+            warning.kind == ValidationWarningKind::ReviewPanelConflict
+                && warning.message.contains("share_after_submit")
+        }));
+    }
+
+    #[test]
+    fn capability_override_native_hooks_allows_shared_reset() {
+        let mut config = minimal_valid_config();
+        config.launchers.insert(
+            "custom-native".into(),
+            launcher_with_details(
+                AdapterKind::NativeAgent,
+                Some("custom-native-agent"),
+                &[],
+                Some("native_hooks"),
+                Some("native_hooks"),
+            ),
+        );
+        config.lanes.insert(
+            "custom-native-reviewer".into(),
+            LaneConfig {
+                launcher: "custom-native".into(),
+                model: None,
+                reasoning_effort: None,
+                system_prompt: None,
+                profile: None,
+            },
+        );
+        config.roles.reviewers = vec![ReviewerPoolConfig {
+            lane: "custom-native-reviewer".into(),
+            model: Some(ModelConfig {
+                provider: "custom".into(),
+                name: "custom-model".into(),
+            }),
+            reasoning_effort: None,
+            system_prompt: None,
+            min: 1,
+            max: 1,
+        }];
+        config.review.lease_mode = brehon_types::config::ReviewLeaseMode::ShareAfterSubmit;
+        config.review.default_reviewers = vec!["custom-native-reviewer".into()];
+        config.review.panels = vec![brehon_types::ReviewPanelConfig {
+            id: "primary".into(),
+            reviewers: vec!["custom-native-reviewer".into()],
+        }];
+
+        let warnings = validate(&config);
+
+        assert!(!warnings.iter().any(|warning| {
+            warning.kind == ValidationWarningKind::ReviewPanelConflict
+                && warning.message.contains("share_after_submit")
+        }));
+    }
+
+    #[test]
+    fn worktree_root_validation_accepts_none() {
+        let config = minimal_valid_config();
+        let warnings = validate(&config);
+        assert!(!warnings.iter().any(|w| w.kind == ValidationWarningKind::InvalidWorktreeRoot));
+    }
+
+    #[test]
+    fn worktree_root_validation_accepts_valid_absolute_path() {
+        let mut config = minimal_valid_config();
+        config.orchestration.worktree_root = Some("/tmp/brehon-worktrees".into());
+        let warnings = validate(&config);
+        assert!(!warnings.iter().any(|w| w.kind == ValidationWarningKind::InvalidWorktreeRoot));
+    }
+
+    #[test]
+    fn worktree_root_validation_rejects_relative_path() {
+        let mut config = minimal_valid_config();
+        config.orchestration.worktree_root = Some(".brehon/worktrees".into());
+        let warnings = validate(&config);
+        assert!(warnings.iter().any(|w| {
+            w.kind == ValidationWarningKind::InvalidWorktreeRoot
+                && w.is_fatal
+                && w.message.contains("must be an absolute path")
+        }));
+    }
+
+    #[test]
+    fn worktree_root_validation_rejects_empty_string() {
+        let mut config = minimal_valid_config();
+        config.orchestration.worktree_root = Some("".into());
+        let warnings = validate(&config);
+        assert!(warnings.iter().any(|w| {
+            w.kind == ValidationWarningKind::InvalidWorktreeRoot
+                && w.is_fatal
+                && w.message.contains("must not be empty")
+        }));
+    }
+
+    #[test]
+    fn worktree_root_validation_rejects_path_traversal() {
+        let mut config = minimal_valid_config();
+        config.orchestration.worktree_root = Some("../outside".into());
+        let warnings = validate(&config);
+        assert!(warnings.iter().any(|w| {
+            w.kind == ValidationWarningKind::InvalidWorktreeRoot
+                && w.is_fatal
+                && w.message.contains("path traversal")
+        }));
+    }
+
+    #[test]
+    fn worktree_root_validation_rejects_embedded_traversal() {
+        let mut config = minimal_valid_config();
+        config.orchestration.worktree_root = Some("/safe/../unsafe".into());
+        let warnings = validate(&config);
+        assert!(warnings.iter().any(|w| {
+            w.kind == ValidationWarningKind::InvalidWorktreeRoot
+                && w.is_fatal
+                && w.message.contains("path traversal")
+        }));
+    }
+
+    #[test]
+    fn worktree_root_validation_rejects_null_bytes() {
+        let mut config = minimal_valid_config();
+        config.orchestration.worktree_root = Some("/tmp/brehon\0worktrees".into());
+        let warnings = validate(&config);
+        assert!(warnings.iter().any(|w| {
+            w.kind == ValidationWarningKind::InvalidWorktreeRoot
+                && w.is_fatal
+                && w.message.contains("null bytes")
+        }));
+    }
+
+    #[test]
+    fn worktree_root_validation_accepts_dotdot_as_path_component_prefix() {
+        let mut config = minimal_valid_config();
+        config.orchestration.worktree_root = Some("/tmp/..cache/build".into());
+        let warnings = validate(&config);
+        assert!(!warnings.iter().any(|w| w.kind == ValidationWarningKind::InvalidWorktreeRoot));
     }
 }

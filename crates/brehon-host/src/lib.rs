@@ -502,6 +502,7 @@ impl RuntimeCommandPort for TerminalHostCommandPort {
                         previous: None,
                         current: RuntimePaneState::Ready,
                         reason: Some("terminal host spawn".to_string()),
+                        blocked: None,
                     }),
                 ))
                 .await?;
@@ -661,6 +662,7 @@ impl RuntimeCommandPort for TerminalHostCommandPort {
                         previous: None,
                         current: RuntimePaneState::Ready,
                         reason: Some("terminal host respawn".to_string()),
+                        blocked: None,
                     }),
                 ))
                 .await?;
@@ -823,6 +825,7 @@ impl TerminalHostAdapter for HeadlessTerminalHost {
                     previous: previous_state,
                     current: RuntimePaneState::Ready,
                     reason: Some("headless spawn".to_string()),
+                    blocked: None,
                 }),
             ),
         ])

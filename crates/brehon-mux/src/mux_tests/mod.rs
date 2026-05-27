@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+pub(crate) use brehon_test_harness::{ScopedEnv, TEST_ENV_LOCK};
+
 mod activity;
 mod basic;
 mod delivery;

@@ -3,12 +3,14 @@
 
 use brehon_mux::{PaneKind, PaneState};
 use brehon_types::config::WorkerIdleBehavior;
-use brehon_types::{RuntimeCommand, RuntimeCommandKind};
+use brehon_types::task::TaskStatus;
+use brehon_types::{RuntimeCommand, RuntimeCommandKind, RuntimePaneBlockInfo};
 
 use super::dashboard::read_task_files;
 use super::event_loop::{
     queue_runtime_command, runtime_command_target_for_pane, runtime_command_timestamp_ms,
-    runtime_policy_context_for_pane, EventLoopCtx, PendingRuntimeCommandEffect,
+    runtime_policy_context_for_pane, worker_recycle_command_pending,
+    worker_reset_or_recycle_command_pending, EventLoopCtx, PendingRuntimeCommandEffect,
     RecoveryResetMarker,
 };
 use super::helpers::{
@@ -21,20 +23,29 @@ use super::prompt_delivery::{
 };
 use super::recovery::{
     active_worker_task, agent_health_marker_reason, agent_is_quarantined_for_run,
-    clear_agent_health_marker, push_dashboard_event, quarantined_supervisor_names,
-    quarantined_worker_names, read_prompt_retry_deferral_snapshot,
+    attempt_auto_recover_stalled_worker, block_task_for_prompt_block_recovery_failure,
+    block_task_for_stalled_worker_manual_recovery, clear_agent_health_marker,
+    prompt_blocked_detail, prompt_blocked_info, push_dashboard_event,
+    quarantined_supervisor_names, quarantined_worker_names, read_agent_health_marker,
+    read_prompt_retry_deferral_snapshot, sync_worker_task_contexts,
+    write_prompt_blocked_recovery_failed_marker_or_clear_stale_marker,
+    PROMPT_BLOCKED_HEALTH_REASON, PROMPT_BLOCKED_RECOVERY_FAILED_HEALTH_REASON,
+    PROMPT_BLOCKED_RECOVERY_FAILURE_ACTIVITY, STALLED_WORKER_MANUAL_RECOVERY_ACTIVITY,
 };
 use super::self_improvement::{
+    build_advisor_reset_startup_prompt, build_research_reset_startup_prompt,
     build_reviewer_reset_startup_prompt, build_supervisor_reset_startup_prompt,
-    build_worker_context_reset_startup_prompt, find_review_wait_task_for_worker,
-    next_self_improvement_prompt,
+    build_worker_context_reset_startup_prompt, build_worker_recycle_startup_prompt,
+    find_review_wait_task_for_worker, next_self_improvement_prompt,
 };
 use super::session::read_session_files;
-use super::types::{PendingReviewObligation, TaskInfo};
+use super::types::{PendingReviewObligation, StalledRecoveryOutcome, TaskInfo};
 
 fn queue_worker_recycle(
     ctx: &mut EventLoopCtx,
     pane_id: &str,
+    owning_task_id: Option<&str>,
+    blocked: Option<RuntimePaneBlockInfo>,
     reason: String,
     success_message: String,
     failure_prefix: String,
@@ -43,6 +54,11 @@ fn queue_worker_recycle(
     if ctx.mux.get(pane_id).is_none() {
         return false;
     }
+    let startup_prompt = if pane_needs_post_spawn_prompt(&ctx.mux, pane_id) {
+        build_worker_recycle_startup_prompt(&ctx.mux, pane_id)
+    } else {
+        None
+    };
     let command = RuntimeCommand {
         command_id: format!("worker-recycle-{}", uuid::Uuid::new_v4()),
         target: runtime_command_target_for_pane(ctx, pane_id),
@@ -54,12 +70,13 @@ fn queue_worker_recycle(
         ctx,
         command,
         context,
-        PendingRuntimeCommandEffect::DashboardAction {
-            pane_id: Some(pane_id.to_string()),
-            success_message: Some(success_message),
+        PendingRuntimeCommandEffect::WorkerRecycle {
+            pane_id: pane_id.to_string(),
+            owning_task_id: owning_task_id.map(str::to_string),
+            blocked,
+            startup_prompt,
+            success_message,
             failure_prefix,
-            update_activity: true,
-            clear_pending_self_improve: true,
         },
     )
     .is_err()
@@ -89,6 +106,8 @@ struct ReviewRequestRecoverySnapshot {
     merge_target_head: String,
     #[serde(default)]
     commits: Vec<String>,
+    #[serde(default)]
+    reviewer_prompts: std::collections::BTreeMap<String, String>,
 }
 
 fn read_review_request_recovery_snapshot(
@@ -195,6 +214,48 @@ fn build_review_obligation_recovery_prompt(
     out
 }
 
+fn build_review_request_resend_prompt(
+    brehon_root: &std::path::Path,
+    obligation: &PendingReviewObligation,
+    reviewer: &str,
+) -> Option<String> {
+    let request = read_review_request_recovery_snapshot(brehon_root, obligation)?;
+    request.reviewer_prompts.get(reviewer).cloned()
+}
+
+type ReviewObligationTrackingKey = (String, String, String);
+
+fn review_obligation_tracking_key(
+    reviewer: &str,
+    obligation: &PendingReviewObligation,
+) -> ReviewObligationTrackingKey {
+    (
+        reviewer.to_string(),
+        obligation.task_id.clone(),
+        obligation.review_id.clone(),
+    )
+}
+
+fn tracked_review_obligation_keys(
+    obligations: &std::collections::HashMap<String, Vec<PendingReviewObligation>>,
+) -> std::collections::HashSet<ReviewObligationTrackingKey> {
+    let mut active_keys = std::collections::HashSet::new();
+    for (reviewer, reviewer_obligations) in obligations {
+        for obligation in reviewer_obligations {
+            active_keys.insert(review_obligation_tracking_key(reviewer, obligation));
+        }
+    }
+    active_keys
+}
+
+fn live_reviewer_should_receive_resend(obligation: &PendingReviewObligation) -> bool {
+    obligation.assignment_acknowledged_at.is_none()
+        && matches!(
+            obligation.assignment_delivery_state.as_deref(),
+            Some("dead_lettered" | "drained_without_ack" | "unknown")
+        )
+}
+
 fn queue_reviewer_obligation_reset(
     ctx: &mut EventLoopCtx,
     brehon_root: &std::path::Path,
@@ -296,14 +357,8 @@ fn send_review_obligation_nudge(
     if !dispatch_runtime_prompt(ctx, reviewer, prompt, None) {
         return false;
     }
-    ctx.review_obligation_nudges_sent.insert(
-        (
-            reviewer.to_string(),
-            obligation.task_id.clone(),
-            obligation.review_id.clone(),
-        ),
-        now,
-    );
+    ctx.review_obligation_notifications_sent
+        .insert(review_obligation_tracking_key(reviewer, obligation), now);
     push_dashboard_event(
         &ctx.dashboard_data,
         format!(
@@ -314,13 +369,87 @@ fn send_review_obligation_nudge(
     true
 }
 
+fn resend_review_request_to_live_reviewer(
+    ctx: &mut EventLoopCtx,
+    brehon_root: &std::path::Path,
+    reviewer: &str,
+    obligation: &PendingReviewObligation,
+    now: std::time::Instant,
+) -> bool {
+    let Some(prompt) = build_review_request_resend_prompt(brehon_root, obligation, reviewer) else {
+        return false;
+    };
+    if !dispatch_runtime_prompt(ctx, reviewer, prompt, None) {
+        return false;
+    }
+    ctx.review_obligation_resends_sent
+        .insert(review_obligation_tracking_key(reviewer, obligation), now);
+    push_dashboard_event(
+        &ctx.dashboard_data,
+        format!(
+            "resent review request to reviewer {} for pending review {} on {} after uncertain delivery",
+            reviewer, obligation.review_id, obligation.task_id
+        ),
+    );
+    true
+}
+
+fn report_review_obligation_hard_failure(
+    ctx: &mut EventLoopCtx,
+    reviewer: &str,
+    obligation: &PendingReviewObligation,
+    detail: &str,
+) {
+    if !ctx
+        .review_obligation_failures_reported
+        .insert(review_obligation_tracking_key(reviewer, obligation))
+    {
+        return;
+    }
+
+    let surfaced_to_supervisor = if let Some(supervisor_id) = ctx.supervisor_id.clone() {
+        dispatch_runtime_prompt(
+            ctx,
+            &supervisor_id,
+            format!(
+                "Review-obligation hard failure for reviewer '{reviewer}'.\n\
+                 Task {} ({}) is still in collecting review {} on panel {} with {} pending reviewer(s), \
+                 but automatic recovery could not continue because {}.\n\
+                 This review must not remain silently idle. Inspect reviewer liveness, panel state, and \
+                 the persisted review request before deciding whether to reseat or reset the round.",
+                obligation.task_id,
+                obligation.task_title,
+                obligation.review_id,
+                obligation.panel_id.as_deref().unwrap_or("unassigned"),
+                obligation.pending_reviewers,
+                detail,
+            ),
+            None,
+        )
+    } else {
+        false
+    };
+
+    let event_description = if surfaced_to_supervisor {
+        format!(
+            "reported review-obligation hard failure for reviewer {} on {} / {}",
+            reviewer, obligation.task_id, obligation.review_id
+        )
+    } else {
+        format!(
+            "review-obligation hard failure for reviewer {} on {} / {}: {}",
+            reviewer, obligation.task_id, obligation.review_id, detail
+        )
+    };
+    push_dashboard_event(&ctx.dashboard_data, event_description);
+}
+
 fn recover_stale_reviewer_obligations(
     ctx: &mut EventLoopCtx,
     brehon_root: &std::path::Path,
-    tasks: &[TaskInfo],
+    obligations: &std::collections::HashMap<String, Vec<PendingReviewObligation>>,
     now: std::time::Instant,
 ) {
-    let obligations = read_pending_review_obligations(brehon_root, tasks);
     for (reviewer, reviewer_obligations) in obligations {
         let Some(obligation) = reviewer_obligations.first() else {
             continue;
@@ -334,10 +463,22 @@ fn recover_stale_reviewer_obligations(
         if reviewer_reset_ack_exists(brehon_root, &reset_request) {
             continue;
         }
-        let Some(pane) = ctx.mux.get(&reviewer) else {
+        let Some(pane) = ctx.mux.get(reviewer) else {
+            report_review_obligation_hard_failure(
+                ctx,
+                reviewer,
+                obligation,
+                "the assigned reviewer pane is absent from the current run",
+            );
             continue;
         };
         if *pane.kind() != PaneKind::Reviewer {
+            report_review_obligation_hard_failure(
+                ctx,
+                reviewer,
+                obligation,
+                "the assigned pane is not a reviewer pane",
+            );
             continue;
         }
         let pane_dead =
@@ -349,7 +490,7 @@ fn recover_stale_reviewer_obligations(
         let reviewer_idle = now
             .checked_duration_since(
                 ctx.last_activity
-                    .get(&reviewer)
+                    .get(reviewer.as_str())
                     .copied()
                     .unwrap_or(std::time::Instant::now()),
             )
@@ -359,34 +500,72 @@ fn recover_stale_reviewer_obligations(
         }
 
         let idle_mins = (reviewer_idle.as_secs() / 60).max(1);
-        let nudge_key = (
-            reviewer.clone(),
-            obligation.task_id.clone(),
-            obligation.review_id.clone(),
-        );
+        let nudge_key = review_obligation_tracking_key(reviewer, obligation);
         if !pane_dead {
-            let nudge_sent_at = ctx.review_obligation_nudges_sent.get(&nudge_key).copied();
+            let nudge_sent_at = ctx
+                .review_obligation_notifications_sent
+                .get(&nudge_key)
+                .copied();
+            let resend_sent_at = ctx.review_obligation_resends_sent.get(&nudge_key).copied();
             let reset_due = reviewer_idle >= ctx.review_obligation_reset_threshold
                 || nudge_sent_at.is_some_and(|sent_at| {
                     now.duration_since(sent_at) >= ctx.review_obligation_nudge_threshold
                 });
             if !reset_due {
-                if nudge_sent_at.is_none() {
-                    send_review_obligation_nudge(ctx, brehon_root, &reviewer, obligation, now);
+                if nudge_sent_at.is_none() && resend_sent_at.is_none() {
+                    let resent = live_reviewer_should_receive_resend(obligation)
+                        && resend_review_request_to_live_reviewer(
+                            ctx,
+                            brehon_root,
+                            reviewer,
+                            obligation,
+                            now,
+                        );
+                    if resent {
+                        continue;
+                    }
+                    if !send_review_obligation_nudge(ctx, brehon_root, reviewer, obligation, now) {
+                        report_review_obligation_hard_failure(
+                            ctx,
+                            reviewer,
+                            obligation,
+                            "the recovery nudge could not be delivered",
+                        );
+                    }
                 }
                 continue;
             }
         }
-        queue_reviewer_obligation_reset(
+        if !queue_reviewer_obligation_reset(
             ctx,
             brehon_root,
-            &reviewer,
+            reviewer,
             obligation,
             idle_mins,
             pane_dead,
             now,
-        );
+        ) {
+            report_review_obligation_hard_failure(
+                ctx,
+                reviewer,
+                obligation,
+                "the reviewer pane could not be reset",
+            );
+        }
     }
+}
+
+fn prune_review_obligation_tracking_records(
+    ctx: &mut EventLoopCtx,
+    obligations: &std::collections::HashMap<String, Vec<PendingReviewObligation>>,
+) {
+    let active_keys = tracked_review_obligation_keys(obligations);
+    ctx.review_obligation_notifications_sent
+        .retain(|key, _| active_keys.contains(key));
+    ctx.review_obligation_resends_sent
+        .retain(|key, _| active_keys.contains(key));
+    ctx.review_obligation_failures_reported
+        .retain(|key| active_keys.contains(key));
 }
 
 pub(super) fn recover_stale_deferred_prompt_delivery(
@@ -450,6 +629,8 @@ pub(super) fn recover_stale_deferred_prompt_delivery(
     queue_worker_recycle(
         ctx,
         target,
+        None,
+        None,
         "auto-recover worker after stale queued prompt delivery via daemon recycle".to_string(),
         format!(
             "recycled worker {target} after queued prompt delivery stalled {deferred_mins}m and pane was idle {idle_mins}m via daemon recycle"
@@ -509,6 +690,741 @@ fn queue_worker_context_reset(
     true
 }
 
+fn prompt_blocked_recoverable_pane_kind(kind: &PaneKind) -> bool {
+    matches!(
+        kind,
+        PaneKind::Worker
+            | PaneKind::Reviewer
+            | PaneKind::Advisor
+            | PaneKind::Research
+            | PaneKind::Supervisor
+    )
+}
+
+fn prompt_blocked_recoverable_session_role(role: &str) -> bool {
+    matches!(
+        role,
+        "worker" | "reviewer" | "advisor" | "research" | "supervisor"
+    )
+}
+
+fn prompt_blocked_session_pane_kind(
+    sessions: &std::collections::HashMap<String, (String, String, String)>,
+    pane_id: &str,
+) -> Option<PaneKind> {
+    let (role, _, _) = sessions.get(pane_id)?;
+    let role = role.as_str();
+    match role {
+        "worker" => Some(PaneKind::Worker),
+        "reviewer" => Some(PaneKind::Reviewer),
+        "advisor" => Some(PaneKind::Advisor),
+        "research" => Some(PaneKind::Research),
+        "supervisor" => Some(PaneKind::Supervisor),
+        _ => None,
+    }
+}
+
+fn prompt_blocked_agent_names(
+    ctx: &mut EventLoopCtx,
+    brehon_root: &std::path::Path,
+    tasks: &[TaskInfo],
+    sessions: &std::collections::HashMap<String, (String, String, String)>,
+) -> Vec<String> {
+    let mut agents = std::collections::BTreeSet::new();
+    let mut cleared_suppressions = Vec::new();
+    for pane in ctx.mux.panes() {
+        if !prompt_blocked_recoverable_pane_kind(pane.kind()) {
+            continue;
+        }
+        let pane_id = pane.id();
+        let marker = read_agent_health_marker(brehon_root, pane_id);
+        let marker_prompt_blocked = marker.as_ref().and_then(|marker| marker.reason.as_deref())
+            == Some(PROMPT_BLOCKED_HEALTH_REASON);
+        let pane_prompt_blocked = matches!(pane.pane_state(), Some(PaneState::Blocked { .. }));
+        if ctx.prompt_blocked_recovery_failed_panes.contains(pane_id) {
+            if !(marker_prompt_blocked || pane_prompt_blocked) {
+                cleared_suppressions.push(pane_id.to_string());
+            }
+            continue;
+        }
+        if marker.as_ref().and_then(|marker| marker.reason.as_deref())
+            == Some(PROMPT_BLOCKED_RECOVERY_FAILED_HEALTH_REASON)
+        {
+            continue;
+        }
+        if prompt_blocked_recovery_failure_already_recorded(
+            tasks,
+            prompt_blocked_owned_task_id(ctx, brehon_root, pane_id).as_deref(),
+        ) {
+            continue;
+        }
+        if marker_prompt_blocked || pane_prompt_blocked {
+            agents.insert(pane_id.to_string());
+        }
+    }
+    for (name, (role, _, _)) in sessions {
+        let marker = read_agent_health_marker(brehon_root, name);
+        let marker_prompt_blocked = marker.as_ref().and_then(|marker| marker.reason.as_deref())
+            == Some(PROMPT_BLOCKED_HEALTH_REASON);
+        if ctx.prompt_blocked_recovery_failed_panes.contains(name) {
+            if !marker_prompt_blocked {
+                cleared_suppressions.push(name.clone());
+            }
+            continue;
+        }
+        if marker.as_ref().and_then(|marker| marker.reason.as_deref())
+            == Some(PROMPT_BLOCKED_RECOVERY_FAILED_HEALTH_REASON)
+        {
+            continue;
+        }
+        if prompt_blocked_recoverable_session_role(role)
+            && marker_prompt_blocked
+            && !prompt_blocked_recovery_failure_already_recorded(
+                tasks,
+                prompt_blocked_owned_task_id(ctx, brehon_root, name).as_deref(),
+            )
+        {
+            agents.insert(name.clone());
+        }
+    }
+    for pane_id in cleared_suppressions {
+        ctx.prompt_blocked_recovery_failed_panes.remove(&pane_id);
+    }
+    agents.into_iter().collect()
+}
+
+fn prompt_blocked_marker_detail(brehon_root: &std::path::Path, worker_id: &str) -> Option<String> {
+    let marker = read_agent_health_marker(brehon_root, worker_id)?;
+    if marker.reason.as_deref() != Some(PROMPT_BLOCKED_HEALTH_REASON) {
+        return None;
+    }
+    Some(prompt_blocked_detail(&marker.blocked?))
+}
+
+fn prompt_blocked_pane_detail(ctx: &EventLoopCtx, worker_id: &str) -> Option<String> {
+    let pane = ctx.mux.get(worker_id)?;
+    let PaneState::Blocked { info, .. } = pane.pane_state()? else {
+        return None;
+    };
+    Some(prompt_blocked_detail(info))
+}
+
+fn pane_task_context_is_active_for_prompt_blocked(pane: &brehon_mux::Pane) -> Option<String> {
+    let task = pane.task_context()?;
+    // TaskContextSnapshot normalizes both raw `review_ready` and `in_review`
+    // task files to `TaskStatus::InReview`, so this fallback intentionally
+    // treats `InReview` as covering both worker-reserving states.
+    matches!(
+        task.status,
+        TaskStatus::Assigned
+            | TaskStatus::InProgress
+            | TaskStatus::InReview
+            | TaskStatus::ChangesRequested
+            | TaskStatus::Approved
+    )
+    .then(|| task.task_id.clone())
+}
+
+fn prompt_blocked_active_task_id(
+    ctx: &EventLoopCtx,
+    tasks: &[TaskInfo],
+    worker_id: &str,
+) -> Option<String> {
+    active_assigned_task_for_worker(tasks, worker_id)
+        .map(|task| task.id.clone())
+        .or_else(|| {
+            ctx.mux
+                .get(worker_id)
+                .and_then(pane_task_context_is_active_for_prompt_blocked)
+        })
+}
+
+fn prompt_blocked_owned_task_id(
+    ctx: &EventLoopCtx,
+    brehon_root: &std::path::Path,
+    worker_id: &str,
+) -> Option<String> {
+    let pane = ctx.mux.get(worker_id);
+    read_agent_health_marker(brehon_root, worker_id)
+        .filter(|marker| marker.reason.as_deref() == Some(PROMPT_BLOCKED_HEALTH_REASON))
+        .and_then(|marker| marker.blocked.and_then(|blocked| blocked.task_id))
+        .or_else(|| {
+            pane.as_ref().and_then(|pane| match pane.pane_state() {
+                Some(PaneState::Blocked { info, .. }) => info.task_id.clone(),
+                _ => None,
+            })
+        })
+        .or_else(|| {
+            pane.as_ref().and_then(|pane| {
+                pane.review_context()
+                    .map(|review| review.task_id.clone())
+                    .or_else(|| pane.task_context().map(|task| task.task_id.clone()))
+            })
+        })
+}
+
+fn prompt_blocked_recovery_failure_already_recorded(
+    tasks: &[TaskInfo],
+    task_id: Option<&str>,
+) -> bool {
+    let Some(task_id) = task_id else {
+        return false;
+    };
+    tasks.iter().any(|task| {
+        task.id == task_id
+            && brehon_types::task::normalize_task_status(&task.status) == Some("blocked")
+            && task.activity.as_deref() == Some(PROMPT_BLOCKED_RECOVERY_FAILURE_ACTIVITY)
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PromptBlockedRecoveryOutcome {
+    RecoveredNoTaskChange,
+    TaskModified,
+}
+
+impl PromptBlockedRecoveryOutcome {
+    fn task_files_modified(self) -> bool {
+        matches!(self, Self::TaskModified)
+    }
+}
+
+fn terminally_mark_taskless_prompt_block_recovery_failure(
+    ctx: &mut EventLoopCtx,
+    brehon_root: &std::path::Path,
+    pane_id: &str,
+    failure: &str,
+) -> PromptBlockedRecoveryOutcome {
+    let blocked = prompt_blocked_info(brehon_root, pane_id, ctx.mux.get(pane_id));
+    match write_prompt_blocked_recovery_failed_marker_or_clear_stale_marker(
+        brehon_root,
+        pane_id,
+        failure,
+        blocked.as_ref(),
+    ) {
+        Ok(()) => {
+            push_dashboard_event(&ctx.dashboard_data, failure.to_string());
+            PromptBlockedRecoveryOutcome::RecoveredNoTaskChange
+        }
+        Err(marker_err) => {
+            tracing::warn!(
+                pane = %pane_id,
+                error = %marker_err,
+                "Failed to persist prompt-blocked terminal recovery failure marker"
+            );
+            ctx.prompt_blocked_recovery_failed_panes
+                .insert(pane_id.to_string());
+            push_dashboard_event(&ctx.dashboard_data, failure.to_string());
+            PromptBlockedRecoveryOutcome::RecoveredNoTaskChange
+        }
+    }
+}
+
+fn persist_task_backed_prompt_blocked_recovery_failure(
+    ctx: &mut EventLoopCtx,
+    brehon_root: &std::path::Path,
+    pane_id: &str,
+    task_id: &str,
+    failure: &str,
+    task_err: &str,
+    blocked: Option<RuntimePaneBlockInfo>,
+) -> PromptBlockedRecoveryOutcome {
+    let operator_failure = format!("{failure}; could not mark task {task_id} blocked: {task_err}");
+    let blocked =
+        blocked.or_else(|| prompt_blocked_info(brehon_root, pane_id, ctx.mux.get(pane_id)));
+    match write_prompt_blocked_recovery_failed_marker_or_clear_stale_marker(
+        brehon_root,
+        pane_id,
+        &operator_failure,
+        blocked.as_ref(),
+    ) {
+        Ok(()) => {
+            push_dashboard_event(&ctx.dashboard_data, operator_failure);
+            PromptBlockedRecoveryOutcome::RecoveredNoTaskChange
+        }
+        Err(marker_err) => {
+            tracing::warn!(
+                pane = %pane_id,
+                task_id,
+                error = %marker_err,
+                "Failed to persist prompt-blocked terminal recovery failure marker after task update failed"
+            );
+            ctx.prompt_blocked_recovery_failed_panes
+                .insert(pane_id.to_string());
+            push_dashboard_event(&ctx.dashboard_data, operator_failure);
+            PromptBlockedRecoveryOutcome::RecoveredNoTaskChange
+        }
+    }
+}
+
+fn prompt_blocked_reset_startup_prompt(
+    ctx: &EventLoopCtx,
+    pane_id: &str,
+    kind: &PaneKind,
+) -> Option<String> {
+    if !pane_needs_post_spawn_prompt(&ctx.mux, pane_id) {
+        return None;
+    }
+    match kind {
+        PaneKind::Worker => build_worker_context_reset_startup_prompt(&ctx.mux, pane_id),
+        PaneKind::Reviewer => build_reviewer_reset_startup_prompt(&ctx.mux, pane_id),
+        PaneKind::Advisor => build_advisor_reset_startup_prompt(&ctx.mux, pane_id),
+        PaneKind::Research => build_research_reset_startup_prompt(&ctx.mux, pane_id),
+        PaneKind::Supervisor => build_supervisor_reset_startup_prompt(
+            &ctx.mux,
+            pane_id,
+            ctx.runtime_agent_factory_host_owned,
+        ),
+        PaneKind::Director | PaneKind::Shell => None,
+    }
+}
+
+fn enqueue_prompt_blocked_reset_startup_prompt(
+    ctx: &mut EventLoopCtx,
+    pane_id: &str,
+    pane_kind: &PaneKind,
+    startup_prompt: String,
+) {
+    if ctx.runtime_agent_factory_host_owned {
+        let reason = format!(
+            "terminal-host prompt-blocked {} reset startup prompt",
+            pane_kind.as_str()
+        );
+        if let Err(err) = super::prompt_delivery::enqueue_terminal_host_startup_prompt(
+            ctx,
+            pane_id,
+            startup_prompt,
+            &reason,
+        ) {
+            tracing::warn!(
+                pane = %pane_id,
+                kind = pane_kind.as_str(),
+                error = %err,
+                "Failed to queue prompt-blocked reset startup prompt"
+            );
+        }
+    } else {
+        ctx.mux.queue_startup_prompt(pane_id, startup_prompt);
+    }
+}
+
+fn recover_prompt_blocked_missing_pane(
+    ctx: &mut EventLoopCtx,
+    brehon_root: &std::path::Path,
+    pane_id: &str,
+    agent_label: &str,
+    owning_task_id: Option<&str>,
+    detail: &str,
+) -> PromptBlockedRecoveryOutcome {
+    let failure =
+        format!("prompt-blocked {agent_label} {pane_id} no longer has a live pane: {detail}");
+    tracing::warn!(pane = %pane_id, kind = agent_label, detail, "{failure}");
+
+    if let Some(task_id) = owning_task_id {
+        let blocked_task_result =
+            block_task_for_prompt_block_recovery_failure(brehon_root, task_id, pane_id, &failure);
+        match blocked_task_result {
+            Ok(()) => {
+                clear_agent_health_marker(brehon_root, pane_id);
+                push_dashboard_event(
+                    &ctx.dashboard_data,
+                    format!(
+                        "blocked task {task_id} after prompt-blocked {agent_label} {pane_id} lost its live pane"
+                    ),
+                );
+                PromptBlockedRecoveryOutcome::TaskModified
+            }
+            Err(task_err) => {
+                tracing::warn!(
+                    pane = %pane_id,
+                    task_id,
+                    error = %task_err,
+                    "Failed to mark prompt-blocked task as blocked after pane disappeared"
+                );
+                persist_task_backed_prompt_blocked_recovery_failure(
+                    ctx,
+                    brehon_root,
+                    pane_id,
+                    task_id,
+                    &failure,
+                    &task_err,
+                    None,
+                )
+            }
+        }
+    } else {
+        clear_agent_health_marker(brehon_root, pane_id);
+        push_dashboard_event(
+            &ctx.dashboard_data,
+            format!(
+                "cleared stale prompt-blocked marker for {agent_label} {pane_id} after pane disappeared"
+            ),
+        );
+        PromptBlockedRecoveryOutcome::RecoveredNoTaskChange
+    }
+}
+
+fn reset_prompt_blocked_non_worker(
+    ctx: &mut EventLoopCtx,
+    brehon_root: &std::path::Path,
+    pane_id: &str,
+    pane_kind: PaneKind,
+    owning_task_id: Option<&str>,
+    detail: &str,
+    now: std::time::Instant,
+) -> PromptBlockedRecoveryOutcome {
+    let startup_prompt = prompt_blocked_reset_startup_prompt(ctx, pane_id, &pane_kind);
+    let reset_reason = format!(
+        "auto-recover prompt-blocked {} pane: {detail}",
+        pane_kind.as_str()
+    );
+    let reset_result = if ctx.runtime_agent_factory_host_owned {
+        super::prompt_delivery::reset_terminal_host_pane(ctx, pane_id, reset_reason.clone())
+    } else {
+        match pane_kind {
+            PaneKind::Reviewer => ctx
+                .rt
+                .block_on(ctx.mux.reset_reviewer_session(pane_id))
+                .map_err(|err| err.to_string()),
+            PaneKind::Advisor => ctx
+                .rt
+                .block_on(ctx.mux.reset_advisor_session(pane_id))
+                .map_err(|err| err.to_string()),
+            PaneKind::Research => ctx
+                .rt
+                .block_on(ctx.mux.reset_research_session(pane_id))
+                .map_err(|err| err.to_string()),
+            PaneKind::Supervisor => ctx
+                .rt
+                .block_on(ctx.mux.reset_supervisor_session(pane_id))
+                .map_err(|err| err.to_string()),
+            PaneKind::Worker | PaneKind::Director | PaneKind::Shell => Err(format!(
+                "unsupported prompt-blocked auto-reset for {} pane {pane_id}",
+                pane_kind.as_str()
+            )),
+        }
+    };
+
+    match reset_result {
+        Ok(()) => {
+            clear_agent_health_marker(brehon_root, pane_id);
+            if let Some(startup_prompt) = startup_prompt {
+                enqueue_prompt_blocked_reset_startup_prompt(
+                    ctx,
+                    pane_id,
+                    &pane_kind,
+                    startup_prompt,
+                );
+            }
+            ctx.last_activity.insert(pane_id.to_string(), now);
+            ctx.pending_self_improve_prompt.remove(pane_id);
+            if matches!(pane_kind, PaneKind::Supervisor) {
+                ctx.last_supervisor_reset.insert(pane_id.to_string(), now);
+            }
+            let event = if let Some(task_id) = owning_task_id {
+                format!(
+                    "reset prompt-blocked {} {} for {task_id} after {detail}",
+                    pane_kind.as_str(),
+                    pane_id,
+                )
+            } else {
+                format!(
+                    "reset prompt-blocked {} {} after {detail}",
+                    pane_kind.as_str(),
+                    pane_id,
+                )
+            };
+            push_dashboard_event(&ctx.dashboard_data, event.clone());
+            tracing::warn!(pane = %pane_id, kind = pane_kind.as_str(), "{event}");
+            PromptBlockedRecoveryOutcome::RecoveredNoTaskChange
+        }
+        Err(err) => {
+            let failure = format!(
+                "failed to reset prompt-blocked {} {pane_id}: {detail}; reset error: {err}",
+                pane_kind.as_str(),
+            );
+            tracing::warn!(
+                pane = %pane_id,
+                kind = pane_kind.as_str(),
+                error = %err,
+                detail,
+                "{failure}"
+            );
+            if let Some(task_id) = owning_task_id {
+                let blocked_task_result = block_task_for_prompt_block_recovery_failure(
+                    brehon_root,
+                    task_id,
+                    pane_id,
+                    &failure,
+                );
+                match blocked_task_result {
+                    Ok(()) => {
+                        clear_agent_health_marker(brehon_root, pane_id);
+                        push_dashboard_event(
+                            &ctx.dashboard_data,
+                            format!(
+                                "blocked task {task_id} after prompt-blocked {} {pane_id} could not be reset",
+                                pane_kind.as_str(),
+                            ),
+                        );
+                        PromptBlockedRecoveryOutcome::TaskModified
+                    }
+                    Err(task_err) => {
+                        tracing::warn!(
+                            pane = %pane_id,
+                            task_id,
+                            error = %task_err,
+                            "Failed to mark prompt-blocked task as blocked after reset failure"
+                        );
+                        persist_task_backed_prompt_blocked_recovery_failure(
+                            ctx,
+                            brehon_root,
+                            pane_id,
+                            task_id,
+                            &failure,
+                            &task_err,
+                            None,
+                        )
+                    }
+                }
+            } else {
+                terminally_mark_taskless_prompt_block_recovery_failure(
+                    ctx,
+                    brehon_root,
+                    pane_id,
+                    &failure,
+                )
+            }
+        }
+    }
+}
+
+fn recover_prompt_blocked_worker(
+    ctx: &mut EventLoopCtx,
+    brehon_root: &std::path::Path,
+    worker_id: &str,
+    active_task_id: Option<&str>,
+    owning_task_id: Option<&str>,
+    detail: &str,
+    now: std::time::Instant,
+) -> PromptBlockedRecoveryOutcome {
+    if active_task_id.is_none() {
+        if worker_recycle_command_pending(ctx, worker_id) {
+            return PromptBlockedRecoveryOutcome::RecoveredNoTaskChange;
+        }
+        let blocked = prompt_blocked_info(brehon_root, worker_id, ctx.mux.get(worker_id));
+        let recycle_reason = format!("auto-recover prompt-blocked idle worker pane: {detail}");
+        let success_message =
+            format!("recycled prompt-blocked idle worker {worker_id} after {detail}");
+        if queue_worker_recycle(
+            ctx,
+            worker_id,
+            owning_task_id,
+            blocked,
+            recycle_reason.clone(),
+            success_message.clone(),
+            format!("failed to recycle prompt-blocked idle worker {worker_id}"),
+            now,
+        ) {
+            return PromptBlockedRecoveryOutcome::RecoveredNoTaskChange;
+        }
+
+        let startup_prompt = if pane_needs_post_spawn_prompt(&ctx.mux, worker_id) {
+            build_worker_recycle_startup_prompt(&ctx.mux, worker_id)
+        } else {
+            None
+        };
+        let recycle_result = if ctx.runtime_agent_factory_host_owned {
+            recycle_terminal_host_pane(ctx, worker_id, recycle_reason.clone())
+        } else {
+            let generation = ctx.rt.block_on(ctx.mux.recycle(worker_id, &recycle_reason));
+            (generation.0 > 0)
+                .then_some(())
+                .ok_or_else(|| "authoritative recycle failed".to_string())
+        };
+
+        return match recycle_result {
+            Ok(()) => {
+                clear_agent_health_marker(brehon_root, worker_id);
+                ctx.mux.clear_pane_task_context(worker_id);
+                if let Some(startup_prompt) = startup_prompt {
+                    if ctx.runtime_agent_factory_host_owned {
+                        if let Err(err) =
+                            super::prompt_delivery::enqueue_terminal_host_startup_prompt(
+                                ctx,
+                                worker_id,
+                                startup_prompt,
+                                "terminal-host prompt-blocked idle worker recycle startup prompt",
+                            )
+                        {
+                            tracing::warn!(
+                                worker = %worker_id,
+                                error = %err,
+                                "Failed to queue prompt-blocked idle worker recycle startup prompt"
+                            );
+                        }
+                    } else {
+                        ctx.mux.queue_startup_prompt(worker_id, startup_prompt);
+                    }
+                }
+                ctx.last_activity.insert(worker_id.to_string(), now);
+                ctx.pending_self_improve_prompt.remove(worker_id);
+                push_dashboard_event(&ctx.dashboard_data, success_message.clone());
+                tracing::warn!(worker = %worker_id, "{success_message}");
+                PromptBlockedRecoveryOutcome::RecoveredNoTaskChange
+            }
+            Err(err) => {
+                let failure = format!(
+                    "failed to recycle prompt-blocked idle worker {worker_id}: {detail}; recycle error: {err}"
+                );
+                tracing::warn!(worker = %worker_id, error = %err, detail, "{failure}");
+                if let Some(task_id) = owning_task_id {
+                    let blocked_task_result = block_task_for_prompt_block_recovery_failure(
+                        brehon_root,
+                        task_id,
+                        worker_id,
+                        &failure,
+                    );
+                    match blocked_task_result {
+                        Ok(()) => {
+                            clear_agent_health_marker(brehon_root, worker_id);
+                            push_dashboard_event(
+                                &ctx.dashboard_data,
+                                format!(
+                                    "blocked task {task_id} after prompt-blocked idle worker {worker_id} could not be recycled"
+                                ),
+                            );
+                            PromptBlockedRecoveryOutcome::TaskModified
+                        }
+                        Err(task_err) => {
+                            tracing::warn!(
+                                worker = %worker_id,
+                                task_id,
+                                error = %task_err,
+                                "Failed to mark prompt-blocked task as blocked after recycle failure"
+                            );
+                            persist_task_backed_prompt_blocked_recovery_failure(
+                                ctx,
+                                brehon_root,
+                                worker_id,
+                                task_id,
+                                &failure,
+                                &task_err,
+                                None,
+                            )
+                        }
+                    }
+                } else {
+                    terminally_mark_taskless_prompt_block_recovery_failure(
+                        ctx,
+                        brehon_root,
+                        worker_id,
+                        &failure,
+                    )
+                }
+            }
+        };
+    }
+
+    let startup_prompt = if pane_needs_post_spawn_prompt(&ctx.mux, worker_id) {
+        build_worker_context_reset_startup_prompt(&ctx.mux, worker_id)
+    } else {
+        None
+    };
+    let reset_reason = format!("auto-recover prompt-blocked worker pane: {detail}");
+    let reset_result = if ctx.runtime_agent_factory_host_owned {
+        super::prompt_delivery::reset_terminal_host_pane(ctx, worker_id, reset_reason.clone())
+    } else {
+        ctx.rt
+            .block_on(ctx.mux.reset_worker_gateway_session(worker_id))
+            .map_err(|err| err.to_string())
+    };
+
+    match reset_result {
+        Ok(()) => {
+            clear_agent_health_marker(brehon_root, worker_id);
+            if let Some(startup_prompt) = startup_prompt {
+                if ctx.runtime_agent_factory_host_owned {
+                    if let Err(err) = super::prompt_delivery::enqueue_terminal_host_startup_prompt(
+                        ctx,
+                        worker_id,
+                        startup_prompt,
+                        "terminal-host prompt-blocked worker reset startup prompt",
+                    ) {
+                        tracing::warn!(
+                            worker = %worker_id,
+                            error = %err,
+                            "Failed to queue prompt-blocked worker startup prompt"
+                        );
+                    }
+                } else {
+                    ctx.mux.queue_startup_prompt(worker_id, startup_prompt);
+                }
+            }
+            ctx.last_activity.insert(worker_id.to_string(), now);
+            ctx.last_worker_context_reset
+                .insert(worker_id.to_string(), now);
+            ctx.pending_self_improve_prompt.remove(worker_id);
+            let task_id = active_task_id.expect("active task checked above");
+            let event =
+                format!("reset prompt-blocked worker {worker_id} for {task_id} after {detail}");
+            push_dashboard_event(&ctx.dashboard_data, event.clone());
+            tracing::warn!(worker = %worker_id, active_task_id, "{event}");
+            PromptBlockedRecoveryOutcome::RecoveredNoTaskChange
+        }
+        Err(err) => {
+            let failure = format!(
+                "failed to reset prompt-blocked worker {worker_id}: {detail}; reset error: {err}"
+            );
+            tracing::warn!(worker = %worker_id, error = %err, detail, "{failure}");
+            if let Some(task_id) = active_task_id.or(owning_task_id) {
+                let blocked_task_result = block_task_for_prompt_block_recovery_failure(
+                    brehon_root,
+                    task_id,
+                    worker_id,
+                    &failure,
+                );
+                return match blocked_task_result {
+                    Ok(()) => {
+                        clear_agent_health_marker(brehon_root, worker_id);
+                        push_dashboard_event(
+                            &ctx.dashboard_data,
+                            format!(
+                                "blocked task {task_id} after prompt-blocked worker {worker_id} could not be reset"
+                            ),
+                        );
+                        PromptBlockedRecoveryOutcome::TaskModified
+                    }
+                    Err(task_err) => {
+                        tracing::warn!(
+                            worker = %worker_id,
+                            task_id,
+                            error = %task_err,
+                            "Failed to mark prompt-blocked task as blocked after reset failure"
+                        );
+                        persist_task_backed_prompt_blocked_recovery_failure(
+                            ctx,
+                            brehon_root,
+                            worker_id,
+                            task_id,
+                            &failure,
+                            &task_err,
+                            None,
+                        )
+                    }
+                };
+            } else {
+                return terminally_mark_taskless_prompt_block_recovery_failure(
+                    ctx,
+                    brehon_root,
+                    worker_id,
+                    &failure,
+                );
+            }
+        }
+    }
+}
+
 fn queue_supervisor_context_reset(
     ctx: &mut EventLoopCtx,
     pane_id: &str,
@@ -524,7 +1440,7 @@ fn queue_supervisor_context_reset(
         return false;
     }
     let startup_prompt = if pane_needs_post_spawn_prompt(&ctx.mux, pane_id) {
-        build_supervisor_reset_startup_prompt(&ctx.mux, pane_id)
+        build_supervisor_reset_startup_prompt(&ctx.mux, pane_id, ctx.runtime_agent_factory_host_owned)
     } else {
         None
     };
@@ -570,6 +1486,75 @@ fn active_assigned_task_for_worker<'a>(
 
 fn active_worker_recovery_key(worker_id: &str, task_id: &str) -> (String, String) {
     (worker_id.to_string(), task_id.to_string())
+}
+
+fn worker_sessions_available_for_auto_recovery(
+    ctx: &EventLoopCtx,
+    brehon_root: &std::path::Path,
+    sessions: &std::collections::HashMap<String, (String, String, String)>,
+) -> std::collections::HashMap<String, (String, String, String)> {
+    sessions
+        .iter()
+        .filter_map(|(worker_name, (role, session_id, last_seen_at))| {
+            if role != "worker" {
+                return None;
+            }
+            if agent_is_quarantined_for_run(brehon_root, worker_name)
+                || worker_reset_or_recycle_command_pending(ctx, worker_name)
+            {
+                return None;
+            }
+            let pane = ctx.mux.get(worker_name)?;
+            if *pane.kind() != PaneKind::Worker
+                || pane.has_exited()
+                || pane.is_tool_executing()
+                || matches!(
+                    pane.pane_state(),
+                    Some(
+                        PaneState::Busy { .. } | PaneState::Blocked { .. } | PaneState::Dead { .. }
+                    )
+                )
+            {
+                return None;
+            }
+            Some((
+                worker_name.clone(),
+                (role.clone(), session_id.clone(), last_seen_at.clone()),
+            ))
+        })
+        .collect()
+}
+
+fn current_worker_idle_duration(
+    ctx: &EventLoopCtx,
+    worker_id: &str,
+    now: std::time::Instant,
+) -> std::time::Duration {
+    now.checked_duration_since(
+        ctx.last_activity
+            .get(worker_id)
+            .copied()
+            .unwrap_or(std::time::Instant::now()),
+    )
+    .unwrap_or_default()
+}
+
+fn build_recovered_task_assignment_prompt(
+    task: &TaskInfo,
+    old_worker: &str,
+    idle_mins: u64,
+    task_cmd: &str,
+) -> String {
+    format!(
+        "You have been assigned recovered task {}: {}\n\
+         Call the task tool with `{task_cmd} action=mine` to see your assigned tasks, \
+         then begin working on them.\n\n\
+         Brehon automatically recovered this task after worker '{old_worker}' was idle for \
+         {idle_mins}m without pane output and their worktree inspected clean.\n\
+         Resume from the current worktree state; do not restart from scratch, change \
+         branches, or discard local work.",
+        task.id, task.title
+    )
 }
 
 fn send_active_worker_recovery_nudge(
@@ -709,6 +1694,301 @@ fn reset_active_assigned_worker(
     }
 }
 
+fn refresh_stall_recovery_snapshot(
+    ctx: &mut EventLoopCtx,
+    brehon_root: &std::path::Path,
+    tasks_snapshot: &mut Vec<TaskInfo>,
+    sessions_snapshot: &mut std::collections::HashMap<String, (String, String, String)>,
+) {
+    *tasks_snapshot = read_task_files(brehon_root);
+    *sessions_snapshot = read_session_files(brehon_root);
+    sync_worker_task_contexts(&mut ctx.mux, tasks_snapshot, sessions_snapshot);
+    ctx.dashboard_data.lock().unwrap().tasks = tasks_snapshot.clone();
+    ctx.needs_redraw = true;
+}
+
+fn fence_recovered_worker_pane(
+    ctx: &mut EventLoopCtx,
+    worker_id: &str,
+    task_id: &str,
+    idle_mins: u64,
+    now: std::time::Instant,
+) -> bool {
+    if ctx.mux.get(worker_id).is_none() || worker_reset_or_recycle_command_pending(ctx, worker_id) {
+        return true;
+    }
+
+    let recycle_via = if ctx.runtime_agent_factory_host_owned {
+        "via terminal-host recycle"
+    } else {
+        "via authoritative recycle"
+    };
+    let recycle_reason =
+        format!("auto-fence recovered stalled worker pane after task {task_id} handoff");
+    let success_message = format!(
+        "recycled recovered worker {worker_id} after task {task_id} handoff following {idle_mins}m idle {recycle_via}"
+    );
+
+    if queue_worker_recycle(
+        ctx,
+        worker_id,
+        None,
+        None,
+        recycle_reason.clone(),
+        success_message.clone(),
+        format!("failed to recycle recovered worker {worker_id} after task handoff"),
+        now,
+    ) {
+        ctx.mux.clear_pane_task_context(worker_id);
+        return true;
+    }
+
+    let startup_prompt = if pane_needs_post_spawn_prompt(&ctx.mux, worker_id) {
+        build_worker_recycle_startup_prompt(&ctx.mux, worker_id)
+    } else {
+        None
+    };
+    let recycle_result = if ctx.runtime_agent_factory_host_owned {
+        recycle_terminal_host_pane(ctx, worker_id, recycle_reason.clone())
+    } else {
+        let generation = ctx.rt.block_on(ctx.mux.recycle(worker_id, &recycle_reason));
+        (generation.0 > 0)
+            .then_some(())
+            .ok_or_else(|| "authoritative recycle failed".to_string())
+    };
+    match recycle_result {
+        Ok(()) => {
+            ctx.mux.clear_pane_task_context(worker_id);
+            if let Some(startup_prompt) = startup_prompt {
+                if ctx.runtime_agent_factory_host_owned {
+                    if let Err(err) = super::prompt_delivery::enqueue_terminal_host_startup_prompt(
+                        ctx,
+                        worker_id,
+                        startup_prompt,
+                        "terminal-host recovered worker recycle startup prompt",
+                    ) {
+                        tracing::warn!(
+                            worker = %worker_id,
+                            task_id = %task_id,
+                            error = %err,
+                            "Failed to queue recovered worker recycle startup prompt"
+                        );
+                    }
+                } else {
+                    ctx.mux.queue_startup_prompt(worker_id, startup_prompt);
+                }
+            }
+            ctx.last_activity.insert(worker_id.to_string(), now);
+            ctx.pending_self_improve_prompt.remove(worker_id);
+            ctx.needs_redraw = true;
+            push_dashboard_event(&ctx.dashboard_data, success_message.clone());
+            tracing::warn!(worker = %worker_id, task_id = %task_id, "{success_message}");
+            true
+        }
+        Err(err) => {
+            tracing::warn!(
+                worker = %worker_id,
+                task_id = %task_id,
+                error = %err,
+                "Failed to fence recovered worker after task handoff"
+            );
+            false
+        }
+    }
+}
+
+#[must_use = "return false to fall through to reset_active_assigned_worker"]
+fn handle_auto_recovered_stalled_worker(
+    ctx: &mut EventLoopCtx,
+    brehon_root: &std::path::Path,
+    task: &TaskInfo,
+    tasks_snapshot: &mut Vec<TaskInfo>,
+    sessions_snapshot: &mut std::collections::HashMap<String, (String, String, String)>,
+    idle_mins: u64,
+    now: std::time::Instant,
+    outcome: StalledRecoveryOutcome,
+) -> bool {
+    match outcome {
+        StalledRecoveryOutcome::Reassigned {
+            task_id,
+            old_worker,
+            new_worker,
+        } => {
+            refresh_stall_recovery_snapshot(ctx, brehon_root, tasks_snapshot, sessions_snapshot);
+            ctx.last_activity.insert(new_worker.clone(), now);
+            if !fence_recovered_worker_pane(ctx, &old_worker, &task_id, idle_mins, now) {
+                return false;
+            }
+            let event = format!(
+                "reassigned stalled task {task_id} from {old_worker} to {new_worker} after {idle_mins}m idle"
+            );
+            tracing::warn!(
+                task_id = %task_id,
+                old_worker = %old_worker,
+                new_worker = %new_worker,
+                idle_minutes = idle_mins,
+                "{event}"
+            );
+            push_dashboard_event(&ctx.dashboard_data, event);
+            let task_cmd = ctx
+                .mux
+                .get(&new_worker)
+                .map(|pane| format!("{}task", pane.cli_type().capabilities().tool_prefix));
+            if let Some(task_cmd) = task_cmd {
+                let prompt =
+                    build_recovered_task_assignment_prompt(task, &old_worker, idle_mins, &task_cmd);
+                if !dispatch_runtime_prompt(ctx, &new_worker, prompt, None) {
+                    let warning = format!(
+                        "automatic reassignment delivered task {task_id} to {new_worker}, but the recovery assignment prompt could not be delivered"
+                    );
+                    tracing::warn!(
+                        task_id = %task_id,
+                        old_worker = %old_worker,
+                        new_worker = %new_worker,
+                        "{warning}"
+                    );
+                    push_dashboard_event(&ctx.dashboard_data, warning);
+                }
+            } else {
+                tracing::debug!(
+                    worker = %new_worker,
+                    task_id = %task_id,
+                    "pane not found after recovery; skipping assignment prompt"
+                );
+            }
+            true
+        }
+        StalledRecoveryOutcome::Requeued {
+            task_id,
+            old_worker,
+        } => {
+            refresh_stall_recovery_snapshot(ctx, brehon_root, tasks_snapshot, sessions_snapshot);
+            if !fence_recovered_worker_pane(ctx, &old_worker, &task_id, idle_mins, now) {
+                return false;
+            }
+            let event = format!(
+                "requeued stalled task {task_id} after {idle_mins}m idle; previous worker was {old_worker}"
+            );
+            tracing::warn!(
+                task_id = %task_id,
+                old_worker = %old_worker,
+                idle_minutes = idle_mins,
+                "{event}"
+            );
+            push_dashboard_event(&ctx.dashboard_data, event);
+            true
+        }
+        StalledRecoveryOutcome::ReviewReady { task_id, worker } => {
+            refresh_stall_recovery_snapshot(ctx, brehon_root, tasks_snapshot, sessions_snapshot);
+            // ReviewReady preserves worker ownership — do not fence/recycle the pane.
+            let event = format!(
+                "moved stalled task {task_id} to review_ready after {idle_mins}m idle; preserving worker ownership for {worker}"
+            );
+            tracing::warn!(
+                task_id = %task_id,
+                worker = %worker,
+                idle_minutes = idle_mins,
+                "{event}"
+            );
+            push_dashboard_event(&ctx.dashboard_data, event);
+            true
+        }
+        StalledRecoveryOutcome::SupervisorConflict {
+            task_id,
+            worker,
+            files,
+        } => {
+            refresh_stall_recovery_snapshot(ctx, brehon_root, tasks_snapshot, sessions_snapshot);
+            if !fence_recovered_worker_pane(ctx, &worker, &task_id, idle_mins, now) {
+                return false;
+            }
+            let file_list = if files.is_empty() {
+                "unknown files".to_string()
+            } else {
+                files.join(", ")
+            };
+            let event = format!(
+                "escalated stalled task {task_id} to supervisor-owned integration_conflict after {idle_mins}m idle; previous worker {worker}; conflicting files: {file_list}"
+            );
+            tracing::warn!(
+                task_id = %task_id,
+                worker = %worker,
+                idle_minutes = idle_mins,
+                conflicting_files = %file_list,
+                "{event}"
+            );
+            push_dashboard_event(&ctx.dashboard_data, event);
+            true
+        }
+        StalledRecoveryOutcome::Blocked {
+            task_id,
+            worker,
+            reason,
+        } => {
+            // Dirty/uninspectable-but-present worktrees still fall through to an in-place reset.
+            let event = format!(
+                "stalled task {task_id} stayed with worker {worker}; safe reassignment was blocked because {reason}"
+            );
+            tracing::warn!(
+                task_id = %task_id,
+                worker = %worker,
+                idle_minutes = idle_mins,
+                reason = %reason,
+                "{event}"
+            );
+            push_dashboard_event(&ctx.dashboard_data, event);
+            false
+        }
+        StalledRecoveryOutcome::ManualRecoveryRequired {
+            task_id,
+            worker,
+            reason,
+        } => match block_task_for_stalled_worker_manual_recovery(
+            brehon_root,
+            &task_id,
+            &worker,
+            &reason,
+        ) {
+            Ok(()) => {
+                refresh_stall_recovery_snapshot(
+                    ctx,
+                    brehon_root,
+                    tasks_snapshot,
+                    sessions_snapshot,
+                );
+                let event = format!(
+                    "blocked stalled task {task_id} for supervisor/manual recovery after {idle_mins}m idle; previous worker {worker}; reason: {reason}"
+                );
+                tracing::warn!(
+                    task_id = %task_id,
+                    worker = %worker,
+                    idle_minutes = idle_mins,
+                    reason = %reason,
+                    activity = STALLED_WORKER_MANUAL_RECOVERY_ACTIVITY,
+                    "{event}"
+                );
+                push_dashboard_event(&ctx.dashboard_data, event);
+                true
+            }
+            Err(err) => {
+                let event = format!(
+                    "failed to persist manual stalled-worker recovery block for task {task_id}: {err}"
+                );
+                tracing::warn!(
+                    task_id = %task_id,
+                    worker = %worker,
+                    idle_minutes = idle_mins,
+                    reason = %reason,
+                    error = %err,
+                    "{event}"
+                );
+                push_dashboard_event(&ctx.dashboard_data, event);
+                true
+            }
+        },
+    }
+}
+
 fn prune_active_worker_recovery_records(ctx: &mut EventLoopCtx, tasks: &[TaskInfo]) {
     let active_keys: std::collections::HashSet<(String, String)> = tasks
         .iter()
@@ -739,13 +2019,66 @@ pub(super) fn detect_and_handle_stalls(ctx: &mut EventLoopCtx) {
     }
 
     let brehon_root = ctx.dashboard_data.lock().unwrap().brehon_root.clone();
-    let (mut tasks_snapshot, sessions_snapshot) = if let Some(ref root) = brehon_root {
+    let (mut tasks_snapshot, mut sessions_snapshot) = if let Some(ref root) = brehon_root {
         (read_task_files(root), read_session_files(root))
     } else {
         (Vec::new(), std::collections::HashMap::new())
     };
 
     if let Some(root) = brehon_root.as_ref() {
+        for pane_id in prompt_blocked_agent_names(ctx, root, &tasks_snapshot, &sessions_snapshot) {
+            let live_pane_kind = ctx.mux.get(&pane_id).map(|pane| pane.kind().clone());
+            let pane_kind = live_pane_kind
+                .clone()
+                .or_else(|| prompt_blocked_session_pane_kind(&sessions_snapshot, &pane_id));
+            if pane_kind
+                .as_ref()
+                .is_some_and(|kind| !prompt_blocked_recoverable_pane_kind(kind))
+            {
+                continue;
+            }
+            let detail = prompt_blocked_marker_detail(root, &pane_id)
+                .or_else(|| prompt_blocked_pane_detail(ctx, &pane_id))
+                .unwrap_or_else(|| "prompt-blocked terminal approval request".to_string());
+            let owning_task_id = prompt_blocked_owned_task_id(ctx, root, &pane_id);
+            let recovery = if live_pane_kind.is_none() {
+                let agent_label = pane_kind.as_ref().map(PaneKind::as_str).unwrap_or("agent");
+                recover_prompt_blocked_missing_pane(
+                    ctx,
+                    root,
+                    &pane_id,
+                    agent_label,
+                    owning_task_id.as_deref(),
+                    &detail,
+                )
+            } else if pane_kind.as_ref() == Some(&PaneKind::Worker) {
+                let active_task_id = prompt_blocked_active_task_id(ctx, &tasks_snapshot, &pane_id);
+                recover_prompt_blocked_worker(
+                    ctx,
+                    root,
+                    &pane_id,
+                    active_task_id.as_deref(),
+                    owning_task_id.as_deref(),
+                    &detail,
+                    now,
+                )
+            } else {
+                reset_prompt_blocked_non_worker(
+                    ctx,
+                    root,
+                    &pane_id,
+                    pane_kind.expect("live prompt-blocked pane kind"),
+                    owning_task_id.as_deref(),
+                    &detail,
+                    now,
+                )
+            };
+            if recovery.task_files_modified() {
+                tasks_snapshot = read_task_files(root);
+                ctx.dashboard_data.lock().unwrap().tasks = tasks_snapshot.clone();
+            }
+        }
+
         const SUPERVISOR_QUARANTINE_RESET_COOLDOWN: std::time::Duration =
             std::time::Duration::from_secs(60);
         for supervisor_id in quarantined_supervisor_names(root, &sessions_snapshot) {
@@ -792,7 +2125,7 @@ pub(super) fn detect_and_handle_stalls(ctx: &mut EventLoopCtx) {
                 continue;
             }
             let startup_prompt = if pane_needs_post_spawn_prompt(&ctx.mux, &supervisor_id) {
-                build_supervisor_reset_startup_prompt(&ctx.mux, &supervisor_id)
+                build_supervisor_reset_startup_prompt(&ctx.mux, &supervisor_id, ctx.runtime_agent_factory_host_owned)
             } else {
                 None
             };
@@ -990,7 +2323,10 @@ pub(super) fn detect_and_handle_stalls(ctx: &mut EventLoopCtx) {
                 };
             if should_nudge {
                 let signature = frontier.signature();
-                let message = build_supervisor_dispatch_nudge_message(&frontier);
+                let message = build_supervisor_dispatch_nudge_message(
+                    &frontier,
+                    ctx.runtime_agent_factory_host_owned,
+                );
                 dispatch_runtime_prompt(ctx, &supervisor_pane_id, message, None);
                 ctx.last_supervisor_dispatch_nudge = Some((signature, now));
                 push_dashboard_event(
@@ -1010,7 +2346,9 @@ pub(super) fn detect_and_handle_stalls(ctx: &mut EventLoopCtx) {
     }
 
     if let Some(root) = brehon_root.as_ref() {
-        recover_stale_reviewer_obligations(ctx, root, &tasks_snapshot, now);
+        let pending_review_obligations = read_pending_review_obligations(root, &tasks_snapshot);
+        recover_stale_reviewer_obligations(ctx, root, &pending_review_obligations, now);
+        prune_review_obligation_tracking_records(ctx, &pending_review_obligations);
     }
 
     // ── Post-checkpoint handoff nudge ───────────────────────────────────────
@@ -1030,7 +2368,7 @@ pub(super) fn detect_and_handle_stalls(ctx: &mut EventLoopCtx) {
     // checkpoint (new commit SHA) legitimately earns a new nudge window.
     send_post_checkpoint_handoff_nudges(ctx, &tasks_snapshot, now);
 
-    let stale_worker_candidates: Vec<(String, u64, bool)> = ctx
+    let stale_worker_candidates: Vec<(String, bool)> = ctx
         .mux
         .panes()
         .filter_map(|pane| {
@@ -1052,21 +2390,37 @@ pub(super) fn detect_and_handle_stalls(ctx: &mut EventLoopCtx) {
                         .unwrap_or(std::time::Instant::now()),
                 )
                 .unwrap_or_default();
-            (pane_dead || worker_idle >= ctx.auto_recover_threshold).then_some((
-                pane_id,
-                (worker_idle.as_secs() / 60).max(1),
-                pane_dead,
-            ))
+            (pane_dead || worker_idle >= ctx.auto_recover_threshold).then_some((pane_id, pane_dead))
         })
         .collect();
 
-    for (pane_id, idle_mins, pane_dead) in stale_worker_candidates {
+    for (pane_id, pane_dead) in stale_worker_candidates {
         if brehon_root
             .as_ref()
             .is_some_and(|root| agent_is_quarantined_for_run(root, &pane_id))
         {
             continue;
         }
+        if worker_reset_or_recycle_command_pending(ctx, &pane_id) {
+            continue;
+        }
+        let Some(pane) = ctx.mux.get(&pane_id) else {
+            continue;
+        };
+        let pane_dead = pane_dead
+            || pane.has_exited()
+            || matches!(pane.pane_state(), Some(PaneState::Dead { .. }));
+        if !pane_dead
+            && (pane.is_tool_executing()
+                || matches!(pane.pane_state(), Some(PaneState::Busy { .. })))
+        {
+            continue;
+        }
+        let worker_idle = current_worker_idle_duration(ctx, &pane_id, now);
+        if !pane_dead && worker_idle < ctx.auto_recover_threshold {
+            continue;
+        }
+        let idle_mins = (worker_idle.as_secs() / 60).max(1);
         if let Some(task) = active_assigned_task_for_worker(&tasks_snapshot, &pane_id).cloned() {
             let key = active_worker_recovery_key(&pane_id, &task.id);
             if ctx.active_worker_recovery_resets_sent.contains_key(&key) {
@@ -1078,6 +2432,30 @@ pub(super) fn detect_and_handle_stalls(ctx: &mut EventLoopCtx) {
                     Some(_) => continue,
                     None => {
                         send_active_worker_recovery_nudge(ctx, &pane_id, &task, idle_mins, now);
+                        continue;
+                    }
+                }
+            }
+            if let Some(root) = brehon_root.as_ref() {
+                let live_sessions =
+                    worker_sessions_available_for_auto_recovery(ctx, root, &sessions_snapshot);
+                if let Some(outcome) = attempt_auto_recover_stalled_worker(
+                    root,
+                    &pane_id,
+                    &tasks_snapshot,
+                    &live_sessions,
+                    idle_mins,
+                ) {
+                    if handle_auto_recovered_stalled_worker(
+                        ctx,
+                        root,
+                        &task,
+                        &mut tasks_snapshot,
+                        &mut sessions_snapshot,
+                        idle_mins,
+                        now,
+                        outcome,
+                    ) {
                         continue;
                     }
                 }
@@ -1109,6 +2487,8 @@ pub(super) fn detect_and_handle_stalls(ctx: &mut EventLoopCtx) {
         if queue_worker_recycle(
             ctx,
             &pane_id,
+            None,
+            None,
             daemon_reason.to_string(),
             success_message,
             if pane_dead {
@@ -1797,5 +3177,36 @@ mod post_checkpoint_nudge_tests {
         assert!(!nudges_sent.contains_key(&("w".into(), "T-moved".into(), "c-moved".into())));
         assert!(!nudges_sent.contains_key(&("w".into(), "T-rolled".into(), "c-old-rolled".into())));
         assert!(nudges_sent.contains_key(&("w".into(), "T-live".into(), "c-live".into())));
+    }
+
+    #[test]
+    fn live_reviewer_resend_requires_uncertain_unacknowledged_delivery() {
+        let mut obligation = PendingReviewObligation {
+            task_id: "T-review".to_string(),
+            task_title: "Pending review".to_string(),
+            review_id: "REV-review".to_string(),
+            panel_id: Some("primary".to_string()),
+            round: Some(1),
+            pending_reviewers: 1,
+            assignment_delivery_state: Some("drained_without_ack".to_string()),
+            assignment_acknowledged_at: None,
+        };
+        assert!(live_reviewer_should_receive_resend(&obligation));
+
+        obligation.assignment_delivery_state = Some("dead_lettered".to_string());
+        assert!(live_reviewer_should_receive_resend(&obligation));
+
+        obligation.assignment_delivery_state = Some("unknown".to_string());
+        assert!(live_reviewer_should_receive_resend(&obligation));
+
+        obligation.assignment_acknowledged_at = Some("2026-05-24T00:00:00Z".to_string());
+        assert!(!live_reviewer_should_receive_resend(&obligation));
+
+        obligation.assignment_acknowledged_at = None;
+        obligation.assignment_delivery_state = Some("queued".to_string());
+        assert!(!live_reviewer_should_receive_resend(&obligation));
+
+        obligation.assignment_delivery_state = Some("injected".to_string());
+        assert!(!live_reviewer_should_receive_resend(&obligation));
     }
 }

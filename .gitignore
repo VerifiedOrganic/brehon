@@ -15,8 +15,11 @@ coverage/
 # ─── Compiler crashes ────────────────────────────────────────────
 rustc-ice-*.txt
 
-# ─── Brehon runtime state (created by `brehon run`) ──────────────
-**/.brehon/
+# ─── Brehon runtime state in nested crate/test workspaces ────────
+# Nested workspaces need `**/*/.brehon/` because gitignore globs are
+# relative to the file they appear in; the root `.gitignore` cannot
+# match a `.brehon` directory two levels deep with `/.brehon/`.
+**/*/.brehon/
 brehon-*.log
 
 # ─── Internal planning / research / scratch (not for OSS) ────────
@@ -98,4 +101,11 @@ logs/
 .pantheon/
 
 # Brehon orchestration data
-.brehon/
+!/.brehon/
+/.brehon/*
+!/.brehon/worktrees/
+/.brehon/worktrees/**
+!/.brehon/worktrees/**/
+
+# Test gate output transcripts
+*_gate_output.txt

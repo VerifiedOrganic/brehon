@@ -255,6 +255,7 @@ fn runtime_pane_state(state: &PaneState) -> RuntimePaneState {
     match state {
         PaneState::Ready { .. } => RuntimePaneState::Ready,
         PaneState::Busy { .. } => RuntimePaneState::Busy,
+        PaneState::Blocked { .. } => RuntimePaneState::Blocked,
         PaneState::Dead { .. } => RuntimePaneState::Dead,
     }
 }

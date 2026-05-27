@@ -17,23 +17,59 @@ use std::time::{Duration, Instant};
 const ACP_SIDECAR_CONNECT_TIMEOUT_MS: u64 = 5_000;
 
 pub(crate) fn uses_ink_echo_injection(cli_type: &AgentAdapter) -> bool {
-    matches!(
-        cli_type.as_builtin(),
-        Some(SupervisorCli::Codex | SupervisorCli::OpenCode | SupervisorCli::Junie)
-    )
+    cli_type
+        .capabilities()
+        .prompt_injection_strategy
+        .uses_ink_echo()
 }
 
 pub(crate) fn uses_delayed_submit_injection(cli_type: &AgentAdapter) -> bool {
     // Only used as fallback when ACP delivery is unavailable.
-    matches!(cli_type.as_builtin(), Some(SupervisorCli::Gemini))
+    cli_type
+        .capabilities()
+        .prompt_injection_strategy
+        .uses_delayed_submit()
 }
 
+/// Resolve the gateway protocol for a gateway-backed adapter.
+///
+/// Callers must only invoke this after PTY-first built-ins have been filtered
+/// out via `built_in_uses_pty_launch_contract()`. Unsupported built-in
+/// transport/control-plane overrides are normalized away at adapter
+/// construction/validation time, so built-in identity remains authoritative for
+/// the gateway-capable contracts implemented here.
 fn gateway_protocol_for(cli_type: &AgentAdapter) -> GatewayProtocol {
+    if let Some(builtin) = cli_type.as_builtin() {
+        let transport = cli_type.capabilities().transport;
+        if matches!(
+            transport,
+            crate::harness::HarnessTransport::NativeHooks
+                | crate::harness::HarnessTransport::InteractivePty
+                | crate::harness::HarnessTransport::OneShotPty
+        ) {
+            debug_assert!(
+                false,
+                "gateway_protocol_for called for built-in '{}' with non-gateway transport {}; gate with built_in_uses_pty_launch_contract() before selecting a gateway protocol",
+                builtin.as_str(),
+                transport,
+            );
+            tracing::error!(
+                builtin = builtin.as_str(),
+                transport = %transport,
+                "gateway_protocol_for called for built-in with non-gateway transport; defaulting to ACP stdio"
+            );
+            return GatewayProtocol::AcpStdio;
+        }
+        return match builtin {
+            SupervisorCli::Codex => GatewayProtocol::CodexAppServerWs,
+            SupervisorCli::Gemini => GatewayProtocol::GeminiAcpStdio,
+            SupervisorCli::Kimi => GatewayProtocol::AcpStdio,
+            SupervisorCli::OpenCode => GatewayProtocol::OpenCodeServer,
+            _ => GatewayProtocol::AcpStdio,
+        };
+    }
+
     match cli_type {
-        AgentAdapter::BuiltIn(SupervisorCli::Codex) => GatewayProtocol::CodexAppServerWs,
-        AgentAdapter::BuiltIn(SupervisorCli::Gemini) => GatewayProtocol::GeminiAcpStdio,
-        AgentAdapter::BuiltIn(SupervisorCli::Kimi) => GatewayProtocol::AcpStdio,
-        AgentAdapter::BuiltIn(SupervisorCli::OpenCode) => GatewayProtocol::OpenCodeServer,
         AgentAdapter::Custom(custom) if is_custom_codex_app_server(custom) => {
             GatewayProtocol::CodexAppServerWs
         }
@@ -51,6 +87,45 @@ fn gateway_protocol_for(cli_type: &AgentAdapter) -> GatewayProtocol {
         }
         _ => GatewayProtocol::AcpStdio,
     }
+}
+
+fn built_in_uses_pty_launch_contract(
+    adapter: &AgentAdapter,
+    materialization: AgentPaneMaterialization,
+) -> bool {
+    materialization.is_plan_only()
+        || matches!(
+            adapter.capabilities().transport,
+            crate::harness::HarnessTransport::NativeHooks
+                | crate::harness::HarnessTransport::InteractivePty
+        )
+}
+
+fn unsupported_builtin_one_shot_override(adapter: &AgentAdapter) -> Option<String> {
+    use crate::harness::{HarnessControlPlane, HarnessTransport};
+
+    let builtin = adapter.as_builtin()?;
+    let builtin_capabilities = builtin.capabilities();
+    let effective_capabilities = adapter.capabilities();
+    let requests_one_shot_contract = effective_capabilities.one_shot
+        || matches!(
+            effective_capabilities.transport,
+            HarnessTransport::OneShotPty
+        )
+        || matches!(
+            effective_capabilities.preferred_control_plane,
+            HarnessControlPlane::OneShot
+        );
+    if !requests_one_shot_contract || builtin_capabilities.one_shot {
+        return None;
+    }
+
+    Some(format!(
+        "Built-in agent '{}' does not support one-shot overrides; got transport={} control_plane={}. Configure a real one-shot launcher instead.",
+        adapter.name(),
+        effective_capabilities.transport,
+        effective_capabilities.preferred_control_plane
+    ))
 }
 
 #[cfg(any(test, feature = "test-pty-fallback"))]
@@ -585,6 +660,7 @@ impl Pane {
             pending_ink_submit: Arc::new(std::sync::Mutex::new(None)),
             ink_submit_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             synthetic_prev_was_cr: false,
+            terminal_prompt_prefilter_tail: String::new(),
             supervisor_pending_structured_output: Vec::new(),
             gateway_session_id: None,
             current_generation: crate::pane::Generation(0),
@@ -598,6 +674,8 @@ impl Pane {
             activity_buffer: None,
             prompt_queue: crate::pane::state::PanePromptQueue::default(),
             pane_state: None,
+            blocked_resume_state: None,
+            permission_resolution_fallback_until: None,
             task_context: None,
             review_context: None,
         };
@@ -1151,6 +1229,9 @@ impl Pane {
         let builtin = adapter
             .as_builtin()
             .expect("custom adapters returned earlier");
+        if let Some(reason) = unsupported_builtin_one_shot_override(adapter) {
+            return Err(Error::pty(reason));
+        }
 
         match builtin {
             SupervisorCli::Claude => {
@@ -1189,7 +1270,7 @@ impl Pane {
             // Build PtyConfig for command/args/env, then create a gateway pane.
             SupervisorCli::Codex => {
                 let _ = server_url;
-                if materialization.is_plan_only() {
+                if built_in_uses_pty_launch_contract(adapter, materialization) {
                     let mut config = PtyConfig::codex(
                         name,
                         "worker",
@@ -1246,7 +1327,7 @@ impl Pane {
                 )
             }
             SupervisorCli::Gemini => {
-                if materialization.is_plan_only() {
+                if built_in_uses_pty_launch_contract(adapter, materialization) {
                     let mut config = PtyConfig::gemini(
                         name,
                         "worker",
@@ -1301,7 +1382,7 @@ impl Pane {
                 )
             }
             SupervisorCli::Kimi => {
-                if materialization.is_plan_only() {
+                if built_in_uses_pty_launch_contract(adapter, materialization) {
                     let mut config = PtyConfig::kimi(
                         name,
                         "worker",
@@ -1356,7 +1437,7 @@ impl Pane {
             }
             SupervisorCli::OpenCode => {
                 let _ = server_url;
-                if materialization.is_plan_only() {
+                if built_in_uses_pty_launch_contract(adapter, materialization) {
                     let mut config = PtyConfig::opencode(
                         name,
                         "worker",
@@ -1471,7 +1552,7 @@ impl Pane {
                 )
             }
             SupervisorCli::Copilot => {
-                if materialization.is_plan_only() {
+                if built_in_uses_pty_launch_contract(adapter, materialization) {
                     let mut config = PtyConfig::copilot(
                         name,
                         "worker",
@@ -1923,6 +2004,9 @@ impl Pane {
         let builtin = adapter
             .as_builtin()
             .expect("custom adapters returned earlier");
+        if let Some(reason) = unsupported_builtin_one_shot_override(adapter) {
+            return Err(Error::pty(reason));
+        }
 
         match builtin {
             SupervisorCli::Claude => {
@@ -1960,7 +2044,7 @@ impl Pane {
             // ACP-capable role agents: gateway panes (piped stdio, no PTY)
             SupervisorCli::Codex => {
                 let _ = server_url;
-                if materialization.is_plan_only() {
+                if built_in_uses_pty_launch_contract(adapter, materialization) {
                     let mut config = PtyConfig::codex(
                         name,
                         role,
@@ -2017,7 +2101,7 @@ impl Pane {
                 )
             }
             SupervisorCli::Gemini => {
-                if materialization.is_plan_only() {
+                if built_in_uses_pty_launch_contract(adapter, materialization) {
                     let mut config = PtyConfig::gemini(
                         name,
                         role,
@@ -2072,7 +2156,7 @@ impl Pane {
                 )
             }
             SupervisorCli::Kimi => {
-                if materialization.is_plan_only() {
+                if built_in_uses_pty_launch_contract(adapter, materialization) {
                     let mut config = PtyConfig::kimi(
                         name,
                         role,
@@ -2127,7 +2211,7 @@ impl Pane {
             }
             SupervisorCli::OpenCode => {
                 let _ = server_url;
-                if materialization.is_plan_only() {
+                if built_in_uses_pty_launch_contract(adapter, materialization) {
                     let mut config = PtyConfig::opencode(
                         name,
                         role,
@@ -2226,7 +2310,7 @@ impl Pane {
                 )
             }
             SupervisorCli::Copilot => {
-                if materialization.is_plan_only() {
+                if built_in_uses_pty_launch_contract(adapter, materialization) {
                     let mut config = PtyConfig::copilot(
                         name,
                         role,
@@ -2481,6 +2565,9 @@ impl Pane {
         let builtin = adapter
             .as_builtin()
             .expect("custom adapters returned earlier");
+        if let Some(reason) = unsupported_builtin_one_shot_override(adapter) {
+            return Err(Error::pty(reason));
+        }
 
         match builtin {
             SupervisorCli::Claude => {
@@ -2805,7 +2892,12 @@ impl Pane {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_runtime_model_metadata, build_gateway_metadata_env, merge_launcher_env};
+    use super::{
+        apply_runtime_model_metadata, build_gateway_metadata_env, gateway_protocol_for,
+        merge_launcher_env,
+    };
+    use crate::harness::{AgentAdapter, HarnessControlPlane, HarnessTransport, SupervisorCli};
+    use brehon_acp::GatewayProtocol;
     use std::path::{Path, PathBuf};
 
     fn env_value<'a>(env: &'a [(String, String)], key: &str) -> Option<&'a str> {
@@ -2891,5 +2983,24 @@ mod tests {
             env_value(&env, "BREHON_WORKSPACE_ROOT"),
             Some("/repo/.brehon/worktrees/runs/brehon-1/worker-1")
         );
+    }
+
+    #[test]
+    fn gateway_protocol_for_keeps_builtin_gateway_mapping() {
+        assert_eq!(
+            gateway_protocol_for(&AgentAdapter::BuiltIn(SupervisorCli::OpenCode)),
+            GatewayProtocol::OpenCodeServer
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "gateway_protocol_for called for built-in")]
+    fn gateway_protocol_for_panics_for_builtin_pty_override() {
+        let mut capabilities = SupervisorCli::Gemini.capabilities();
+        capabilities.transport = HarnessTransport::InteractivePty;
+        capabilities.preferred_control_plane = HarnessControlPlane::PtyInjection;
+        let adapter = AgentAdapter::built_in_with_capabilities(SupervisorCli::Gemini, capabilities);
+
+        let _ = gateway_protocol_for(&adapter);
     }
 }

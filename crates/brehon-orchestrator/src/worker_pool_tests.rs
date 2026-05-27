@@ -5,6 +5,7 @@ use brehon_types::{TaskId, TaskStatus};
 
 use crate::error::OrchestratorError;
 use crate::task_board::{TaskBoard, TaskEntry};
+use crate::test_support::ShutdownTestGateway;
 use crate::worker_pool::{parse_worker_overrides, WorkerKind, WorkerPool, WorkerPoolConfig};
 
 #[test]
@@ -411,4 +412,25 @@ async fn assignment_history_is_bounded() {
     }
 
     assert_eq!(pool.assignment_history().len(), 3);
+}
+
+#[tokio::test]
+async fn shutdown_is_best_effort_marks_dead_despite_kill_failure() {
+    let gateway = Arc::new(ShutdownTestGateway::always_fail_kill());
+    let config = WorkerPoolConfig::default();
+    let mut pool = WorkerPool::new(config, gateway.clone());
+    pool.spawn_worker(0).await.unwrap();
+
+    let worker = pool.alive_workers().next().unwrap().clone();
+    assert_eq!(pool.alive_count(), 1);
+    pool.shutdown().await.unwrap(); // best-effort: always returns Ok
+    assert_eq!(
+        pool.alive_count(),
+        0,
+        "shutdown should mark all workers dead even when kill_session fails"
+    );
+    assert!(
+        gateway.is_session_alive(&worker.session_id),
+        "best-effort shutdown should leave the gateway session alive when kill fails"
+    );
 }

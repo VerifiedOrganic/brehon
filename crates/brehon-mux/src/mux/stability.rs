@@ -2,8 +2,11 @@
 
 use crate::error::{Error, Result};
 use crate::pane::{PaneKind, PaneState};
-use brehon_types::RuntimeCommandKind;
+use brehon_types::{RuntimeCommandKind, RuntimePaneBlockInfo};
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::mpsc::{self, Sender};
+use std::sync::{Mutex, OnceLock};
 
 use super::Mux;
 
@@ -29,21 +32,163 @@ fn agent_health_path(agent_name: &str) -> Option<PathBuf> {
     agent_health_dir().map(|dir| dir.join(format!("{file_name}.json")))
 }
 
+fn agent_health_epochs() -> &'static Mutex<HashMap<String, u64>> {
+    static AGENT_HEALTH_EPOCHS: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+    AGENT_HEALTH_EPOCHS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn advance_agent_health_epoch_locked(epochs: &mut HashMap<String, u64>, agent_name: &str) -> u64 {
+    let epoch = epochs.entry(agent_name.to_string()).or_insert(0);
+    *epoch = epoch.saturating_add(1);
+    *epoch
+}
+
+struct AgentHealthWrite {
+    agent_name: String,
+    payload: serde_json::Value,
+    epoch: u64,
+}
+
+fn agent_health_writer() -> Option<&'static Sender<AgentHealthWrite>> {
+    static AGENT_HEALTH_WRITER: OnceLock<Option<Sender<AgentHealthWrite>>> = OnceLock::new();
+    AGENT_HEALTH_WRITER
+        .get_or_init(|| {
+            let (sender, receiver) = mpsc::channel::<AgentHealthWrite>();
+            match std::thread::Builder::new()
+                .name("agent-health-writer".to_string())
+                .spawn(move || {
+                    for write in receiver {
+                        write_agent_health_payload_async_commit(
+                            &write.agent_name,
+                            &write.payload,
+                            write.epoch,
+                        );
+                    }
+                }) {
+                Ok(_) => Some(sender),
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        "Failed to spawn shared agent-health marker writer"
+                    );
+                    None
+                }
+            }
+        })
+        .as_ref()
+}
+
+pub fn suppress_pending_agent_health_marker_writes(agent_name: &str) {
+    let mut epochs = agent_health_epochs()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    advance_agent_health_epoch_locked(&mut epochs, agent_name);
+}
+
 pub(crate) fn write_agent_health_marker(agent_name: &str, error: &str) {
+    write_agent_health_payload_sync(
+        agent_name,
+        serde_json::json!({
+            "agent": agent_name,
+            "status": "unavailable",
+            "reason": "nonrecoverable_delivery_failure",
+            "error": error,
+            "updated_at": chrono::Utc::now().to_rfc3339(),
+        }),
+    );
+}
+
+pub(crate) fn write_agent_prompt_blocked_marker(agent_name: &str, blocked: &RuntimePaneBlockInfo) {
+    let agent_name = agent_name.to_string();
+    let epoch = {
+        let mut epochs = agent_health_epochs()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        advance_agent_health_epoch_locked(&mut epochs, &agent_name)
+    };
+    let payload = serde_json::json!({
+        "agent": agent_name.clone(),
+        "status": "unavailable",
+        "reason": "prompt_blocked",
+        "blocked": blocked,
+        "updated_at": chrono::Utc::now().to_rfc3339(),
+    });
+    let write = AgentHealthWrite {
+        agent_name,
+        payload,
+        epoch,
+    };
+    if let Some(writer) = agent_health_writer() {
+        if let Err(err) = writer.send(write) {
+            let write = err.0;
+            write_agent_health_payload_async_commit(&write.agent_name, &write.payload, write.epoch);
+        }
+    } else {
+        write_agent_health_payload_async_commit(&write.agent_name, &write.payload, write.epoch);
+    }
+}
+
+fn write_agent_health_payload_async_commit(
+    agent_name: &str,
+    payload: &serde_json::Value,
+    epoch: u64,
+) {
     let Some(dir) = agent_health_dir() else {
         return;
     };
     let Some(path) = agent_health_path(agent_name) else {
         return;
     };
+    let data = serde_json::to_string_pretty(payload).unwrap_or_else(|_| "{}".to_string());
+    let epochs = agent_health_epochs()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if epochs.get(agent_name).copied() != Some(epoch) {
+        return;
+    }
+    drop(epochs);
+
     let _ = std::fs::create_dir_all(&dir);
-    let payload = serde_json::json!({
-        "agent": agent_name,
-        "status": "unavailable",
-        "reason": "nonrecoverable_delivery_failure",
-        "error": error,
-        "updated_at": chrono::Utc::now().to_rfc3339(),
-    });
+    let tmp_path = path.with_extension(format!("json.tmp-{epoch}"));
+    if std::fs::write(&tmp_path, data).is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+        return;
+    }
+
+    let mut should_commit = false;
+    {
+        let epochs = agent_health_epochs()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if epochs.get(agent_name).copied() == Some(epoch) {
+            should_commit = true;
+        }
+    }
+
+    if should_commit {
+        if std::fs::rename(&tmp_path, &path).is_err() {
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::rename(&tmp_path, &path);
+        }
+    } else {
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+}
+
+fn write_agent_health_payload_sync(agent_name: &str, payload: serde_json::Value) {
+    let Some(dir) = agent_health_dir() else {
+        return;
+    };
+    let Some(path) = agent_health_path(agent_name) else {
+        return;
+    };
+    {
+        let mut epochs = agent_health_epochs()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        advance_agent_health_epoch_locked(&mut epochs, agent_name);
+    }
+    let _ = std::fs::create_dir_all(&dir);
     let _ = std::fs::write(
         path,
         serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string()),
@@ -54,6 +199,10 @@ pub(crate) fn clear_agent_health_marker(agent_name: &str) {
     let Some(path) = agent_health_path(agent_name) else {
         return;
     };
+    let mut epochs = agent_health_epochs()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    advance_agent_health_epoch_locked(&mut epochs, agent_name);
     let _ = std::fs::remove_file(path);
 }
 
@@ -115,17 +264,21 @@ impl Mux {
             pane.set_pane_state(PaneState::Ready {
                 since: std::time::Instant::now(),
             });
-            Self::runtime_state_change(previous, pane.pane_state(), reason)
-                .map(|(previous, current, reason)| (generation, previous, current, reason))
+            Self::runtime_state_change(previous, pane.pane_state(), reason).map(
+                |(previous, current, reason, blocked)| {
+                    (generation, previous, current, reason, blocked)
+                },
+            )
         };
 
-        if let Some((generation, previous, current, reason)) = state_change {
+        if let Some((generation, previous, current, reason, blocked)) = state_change {
             self.publish_runtime_pane_state_changed(
                 pane_id,
                 generation,
                 previous,
                 current,
                 Some(reason),
+                blocked,
             );
         }
     }
@@ -171,8 +324,7 @@ impl Mux {
             && let Err(err) = brehon_ports::AgentGateway::kill_session(gateway, &session_id).await
         {
             let err_text = err.to_string();
-            let lower = err_text.to_ascii_lowercase();
-            if !(lower.contains("not found") || lower.contains("unknown session")) {
+            if !Self::is_missing_gateway_session_error(&err_text) {
                 return Err(Error::pty(format!(
                     "Failed to kill reviewer gateway session for {pane_id}: {err_text}"
                 )));
@@ -192,8 +344,10 @@ impl Mux {
                     activity.clear();
                 }
             }
-            pane.clear_review_context();
             pane.set_tool_executing(false);
+        }
+        self.clear_pane_review_context(pane_id);
+        if let Some(pane) = self.panes.get_mut(pane_id) {
             let notice = if is_gateway_backed {
                 "\x1b[2mBrehon reset reviewer session after completed submission. Starting a fresh review context.\x1b[0m\r\n"
             } else if restarted_with_panesmith {
@@ -207,12 +361,6 @@ impl Mux {
         }
         self.mark_pane_ready_after_reset(pane_id, "reviewer session reset");
         clear_agent_health_marker(pane_id);
-        let _ = self
-            .event_tx
-            .try_send(super::MuxEvent::ReviewContextChanged {
-                pane_id: pane_id.to_string(),
-                context: None,
-            });
 
         Ok(())
     }
@@ -256,8 +404,7 @@ impl Mux {
             && let Err(err) = brehon_ports::AgentGateway::kill_session(gateway, &session_id).await
         {
             let err_text = err.to_string();
-            let lower = err_text.to_ascii_lowercase();
-            if !(lower.contains("not found") || lower.contains("unknown session")) {
+            if !Self::is_missing_gateway_session_error(&err_text) {
                 return Err(Error::pty(format!(
                     "Failed to kill advisor gateway session for {pane_id}: {err_text}"
                 )));
@@ -335,8 +482,7 @@ impl Mux {
             && let Err(err) = brehon_ports::AgentGateway::kill_session(gateway, &session_id).await
         {
             let err_text = err.to_string();
-            let lower = err_text.to_ascii_lowercase();
-            if !(lower.contains("not found") || lower.contains("unknown session")) {
+            if !Self::is_missing_gateway_session_error(&err_text) {
                 return Err(Error::pty(format!(
                     "Failed to kill research gateway session for {pane_id}: {err_text}"
                 )));
@@ -416,8 +562,7 @@ impl Mux {
             && let Err(err) = brehon_ports::AgentGateway::kill_session(gateway, &session_id).await
         {
             let err_text = err.to_string();
-            let lower = err_text.to_ascii_lowercase();
-            if !(lower.contains("not found") || lower.contains("unknown session")) {
+            if !Self::is_missing_gateway_session_error(&err_text) {
                 return Err(Error::pty(format!(
                     "Failed to kill supervisor gateway session for {pane_id}: {err_text}"
                 )));
@@ -499,8 +644,7 @@ impl Mux {
             && let Err(err) = brehon_ports::AgentGateway::kill_session(gateway, &session_id).await
         {
             let err_text = err.to_string();
-            let lower = err_text.to_ascii_lowercase();
-            if !(lower.contains("not found") || lower.contains("unknown session")) {
+            if !Self::is_missing_gateway_session_error(&err_text) {
                 return Err(Error::pty(format!(
                     "Failed to kill worker gateway session for {pane_id}: {err_text}"
                 )));
@@ -570,6 +714,11 @@ impl Mux {
         ]
         .iter()
         .any(|needle| lower.contains(needle))
+    }
+
+    pub(crate) fn is_missing_gateway_session_error(error: &str) -> bool {
+        let lower = error.to_ascii_lowercase();
+        lower.contains("not found") || lower.contains("unknown session")
     }
 
     pub(crate) fn is_busy_gateway_delivery_error(error: &str) -> bool {

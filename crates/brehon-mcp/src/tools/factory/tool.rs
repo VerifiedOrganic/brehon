@@ -11,7 +11,12 @@ use brehon_types::{
 
 use crate::error::McpError;
 use crate::server::ToolResult;
-use crate::tools::agent::try_deliver_message;
+use crate::tools::agent::{
+    prepare_delivery_message, try_deliver_prepared_message, PROMPT_QUEUE_DELIVERY_METHOD,
+};
+use crate::tools::assignment_observability::{
+    read_task_assignment_propagation, write_task_assignment_propagation, AssignmentPropagation,
+};
 use crate::tools::routing::{resolve_execution_policy, ExecutionPolicySource};
 use crate::tools::stability::increment_assignment_history;
 use crate::tools::task_actions::{
@@ -19,6 +24,7 @@ use crate::tools::task_actions::{
     task_has_active_or_unconsolidated_review, unmet_dependency_ids_for_task,
 };
 use crate::tools::{error_result, text_result, Tool};
+use brehon_mux::PromptQueueEntry;
 
 use super::git_sync::{
     AssignmentSeedKind, AssignmentSeedSyncResult, MergeTargetBaseSyncResult,
@@ -161,6 +167,81 @@ fn policy_work_classes(policy: Option<&serde_json::Map<String, Value>>) -> Vec<S
     classes.sort();
     classes.dedup();
     classes
+}
+
+pub(super) fn stage_task_assignment_propagation(
+    task: &mut serde_json::Map<String, Value>,
+    owner: &str,
+    assignment_kind: &str,
+) -> AssignmentPropagation {
+    let propagation = AssignmentPropagation::new(owner, assignment_kind, None, None);
+    write_task_assignment_propagation(task, &propagation);
+    propagation
+}
+
+pub(super) fn merge_assignment_delivery_metadata(
+    task: &mut serde_json::Map<String, Value>,
+    owner: &str,
+    prompt_id: &str,
+    delivery_method: &str,
+    fallback: Option<&AssignmentPropagation>,
+) {
+    let mut propagation = read_task_assignment_propagation(task)
+        .filter(|propagation| propagation.owner.trim() == owner.trim())
+        .or_else(|| fallback.cloned())
+        .unwrap_or_else(|| AssignmentPropagation::new(owner, "task", None, None));
+    if !prompt_id.trim().is_empty() {
+        propagation.prompt_id = Some(prompt_id.to_string());
+    }
+    if !delivery_method.trim().is_empty() {
+        propagation.delivery_method = Some(delivery_method.to_string());
+    }
+    write_task_assignment_propagation(task, &propagation);
+}
+
+pub(super) fn persist_assignment_delivery_metadata(
+    task_id: &str,
+    owner: &str,
+    prompt_id: &str,
+    delivery_method: &str,
+    fallback: Option<&AssignmentPropagation>,
+) -> Result<(), String> {
+    let Some(mut task) = read_task(task_id) else {
+        return Err(format!("could not re-read task {task_id} before delivery"));
+    };
+    let current_assignee = task
+        .get("assignee")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .unwrap_or("");
+    if current_assignee != owner.trim() {
+        return Err(format!(
+            "task assignee changed to '{current_assignee}' before delivery metadata was recorded"
+        ));
+    }
+    merge_assignment_delivery_metadata(&mut task, owner, prompt_id, delivery_method, fallback);
+    if write_task(task_id, &task) {
+        Ok(())
+    } else {
+        Err(format!("write failed for task {task_id}"))
+    }
+}
+
+/// Validate that a prepared delivery entry has a non-empty prompt_id.
+/// Returns the prompt_id on success, or an error message on failure.
+pub(super) fn validate_assignment_delivery_entry(
+    entry: &PromptQueueEntry,
+    task_id: &str,
+    assignee: &str,
+) -> Result<String, String> {
+    let prompt_id = entry.prompt_id.clone().unwrap_or_default();
+    if prompt_id.trim().is_empty() {
+        return Err(format!(
+            "Task {task_id} was assigned to {assignee}, but Brehon could not mint assignment delivery metadata before notification dispatch. \
+             No prompt was sent; the task remains assigned_without_delivery."
+        ));
+    }
+    Ok(prompt_id)
 }
 
 fn execution_policy_is_strict(policy: Option<&serde_json::Map<String, Value>>) -> bool {
@@ -624,6 +705,7 @@ impl Tool for FactoryTool {
                 let mut routing_result: Option<Value> = None;
                 let mut research_jobs_queued: Vec<Value> = Vec::new();
                 let mut research_warning: Option<String> = None;
+                let mut assignment_propagation: Option<AssignmentPropagation> = None;
 
                 if let Some(mut task) = read_task(task_id) {
                     let task_type = task
@@ -927,6 +1009,8 @@ impl Tool for FactoryTool {
 
                     task.insert("assignee".into(), Value::String(assignee.to_string()));
                     task.insert("status".into(), Value::String("assigned".to_string()));
+                    assignment_propagation =
+                        Some(stage_task_assignment_propagation(&mut task, assignee, "task"));
 
                     if orphaned_active_reassignment {
                         let worktree_archived = task
@@ -1109,7 +1193,50 @@ impl Tool for FactoryTool {
                         "\n\nResearch jobs queued for this task: {job_ids}. Do not wait for them synchronously; they will attach artifacts as they complete."
                     ));
                 }
-                let inbox_ok = try_deliver_message(assignee, &from, &notification).queued;
+                // Persist the prompt_id before enqueue so delivery observability
+                // cannot be lost if the worker receives the prompt immediately.
+                let delivery_entry = prepare_delivery_message(assignee, &from, &notification);
+                let prompt_id = match validate_assignment_delivery_entry(
+                    &delivery_entry,
+                    task_id,
+                    assignee,
+                ) {
+                    Ok(id) => id,
+                    Err(msg) => return Ok(error_result(msg)),
+                };
+                if let Err(err) = persist_assignment_delivery_metadata(
+                    task_id,
+                    assignee,
+                    &prompt_id,
+                    PROMPT_QUEUE_DELIVERY_METHOD,
+                    assignment_propagation.as_ref(),
+                ) {
+                    return Ok(error_result(format!(
+                        "Task {task_id} was assigned to {assignee}, but Brehon could not persist assignment delivery metadata before notification dispatch ({err}). \
+                         No prompt was sent; the task remains assigned_without_delivery."
+                    )));
+                }
+                let delivery = try_deliver_prepared_message(delivery_entry);
+
+                // If enqueue failed after the pre-dispatch persist, update the
+                // propagation so delivery_method reflects the actual outcome
+                // rather than leaving a misleading "queued" marker.
+                if !delivery.queued {
+                    if let Err(err) = persist_assignment_delivery_metadata(
+                        task_id,
+                        assignee,
+                        &prompt_id,
+                        "persisted_not_enqueued",
+                        assignment_propagation.as_ref(),
+                    ) {
+                        tracing::warn!(
+                            task_id = %task_id,
+                            assignee = %assignee,
+                            error = %err,
+                            "Failed to update propagation after delivery failure"
+                        );
+                    }
+                }
 
                 let refreshed_task = read_task(task_id);
                 let mut result = serde_json::json!({
@@ -1117,9 +1244,12 @@ impl Tool for FactoryTool {
                     "task_id": task_id,
                     "assignee": assignee,
                     "all_workers": worker_names,
-                    "inbox_delivered": inbox_ok,
+                    "inbox_delivered": delivery.queued,
                     "message": format!("Task {task_id} assigned to {assignee}")
                 });
+                if !delivery.prompt_id.is_empty() {
+                    result["prompt_id"] = Value::String(delivery.prompt_id.clone());
+                }
                 if let Some(task) = refreshed_task.as_ref() {
                     if let Some(note) = task.get("recovery_note").and_then(|v| v.as_str()) {
                         result["recovery_note"] = Value::String(note.to_string());
@@ -1231,7 +1361,20 @@ impl Tool for FactoryTool {
                             "Cannot change ownership for task {task_id}: status '{normalized_status}' is terminal."
                         )));
                     }
+                    let existing_assignee = task
+                        .get("assignee")
+                        .and_then(|value| value.as_str())
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty());
+                    let existing_assignee = existing_assignee.map(str::to_string);
+                    let propagation_owner_matches = read_task_assignment_propagation(&task)
+                        .as_ref()
+                        .map(|propagation| propagation.owner.trim())
+                        == Some(worker);
                     task.insert("assignee".into(), Value::String(worker.to_string()));
+                    if existing_assignee.as_deref() != Some(worker) || !propagation_owner_matches {
+                        stage_task_assignment_propagation(&mut task, worker, "task");
+                    }
                     set = write_task(task_id, &task);
                 }
 

@@ -54,6 +54,14 @@ pub(crate) use epic::{
     task_has_integration_conflict_recovery_marker, task_has_supervisor_integration_conflict,
 };
 pub(crate) use followups::append_task_review_followups;
+pub(crate) use git_ops::dirty_primary_checkout_terminal_blocker;
+
+#[cfg(test)]
+pub(crate) use git_ops::{
+    clear_test_force_dirty_on_invocation, reset_test_dirty_check_invocation,
+    set_test_force_dirty_on_invocation,
+};
+
 pub(crate) use integration_state::task_has_active_integration;
 pub(crate) use lifecycle::{
     task_has_active_or_unconsolidated_review, unmet_dependency_ids_for_task,

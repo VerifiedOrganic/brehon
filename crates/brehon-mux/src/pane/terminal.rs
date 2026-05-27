@@ -382,6 +382,14 @@ impl Pane {
         self.review_context.as_ref()
     }
 
+    /// Get the task id associated with this pane, preferring task context and
+    /// then falling back to review ownership when the pane is reviewer-owned.
+    pub fn assignment_task_id(&self) -> Option<String> {
+        self.task_context()
+            .map(|task| task.task_id.clone())
+            .or_else(|| self.review_context().map(|review| review.task_id.clone()))
+    }
+
     /// Get a mutable reference to the review context snapshot.
     pub fn review_context_mut(&mut self) -> Option<&mut ReviewContextSnapshot> {
         self.review_context.as_mut()

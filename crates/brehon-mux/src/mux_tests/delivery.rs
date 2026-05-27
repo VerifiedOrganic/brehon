@@ -1,3 +1,4 @@
+use super::{ScopedEnv, TEST_ENV_LOCK};
 use crate::mux::*;
 use crate::teams::{TeamsManager, TeamsPaths};
 use crate::{AgentAdapter, Pane, SupervisorCli};
@@ -994,6 +995,12 @@ fn test_r2_four_back_to_back_worker_prompts_deliver_fifo_without_duplicate_retry
     use std::collections::HashSet;
     use std::time::{Duration, Instant};
 
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let brehon_root = temp.path().join(".brehon");
+    std::fs::create_dir_all(&brehon_root).expect("create brehon root");
+    let _env = ScopedEnv::set(&[("BREHON_ROOT", brehon_root.to_str().unwrap())]);
+
     let mut mux = Mux::new(24, 80);
     let home = std::env::temp_dir().join(format!("brehon-mux-home-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&home).expect("create fake home");
@@ -1619,6 +1626,12 @@ async fn test_deliver_prompt_clears_stale_gateway_session_before_respawn_attempt
 
 #[test]
 fn test_begin_async_gateway_prompt_delivery_clears_stale_session_before_respawn_attempt() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let brehon_root = temp.path().join(".brehon");
+    std::fs::create_dir_all(&brehon_root).expect("create brehon root");
+    let _env = ScopedEnv::set(&[("BREHON_ROOT", brehon_root.to_str().unwrap())]);
+
     let mut mux = Mux::new(24, 80);
     let mut pane = Pane::reviewer(
         "codex-reviewer",
@@ -1715,6 +1728,12 @@ async fn test_deliver_prompt_buffers_second_codex_pty_prompt_until_first_submits
 
 #[tokio::test]
 async fn test_deliver_prompt_buffers_gateway_prompt_while_tool_executing() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let brehon_root = temp.path().join(".brehon");
+    std::fs::create_dir_all(&brehon_root).expect("create brehon root");
+    let _env = ScopedEnv::set(&[("BREHON_ROOT", brehon_root.to_str().unwrap())]);
+
     let mut mux = Mux::new(24, 80);
     let mut pane = Pane::reviewer(
         "codex-reviewer",
@@ -1792,6 +1811,12 @@ fn test_fresh_gateway_placeholder_busy_does_not_count_as_live_turn() {
 #[test]
 fn test_attempt_prompt_delivery_returns_already_present_for_duplicate_queued_prompt() {
     use std::time::{Duration, Instant};
+
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let brehon_root = temp.path().join(".brehon");
+    std::fs::create_dir_all(&brehon_root).expect("create brehon root");
+    let _env = ScopedEnv::set(&[("BREHON_ROOT", brehon_root.to_str().unwrap())]);
 
     let mut mux = Mux::new(24, 80);
     let home = std::env::temp_dir().join(format!("brehon-mux-home-{}", uuid::Uuid::new_v4()));

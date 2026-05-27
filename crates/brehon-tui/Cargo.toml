@@ -6,6 +6,7 @@ description = "Terminal user interface built with Ratatui for Brehon"
 license = "MIT"
 
 [dependencies]
+async-trait = { workspace = true }
 brehon-mux = { path = "../brehon-mux" }
 brehon-ports = { path = "../brehon-ports" }
 brehon-types = { path = "../brehon-types" }
@@ -23,7 +24,6 @@ base64 = "0.22"
 unicode-width = { workspace = true }
 
 [dev-dependencies]
-async-trait = { workspace = true }
 brehon-config = { path = "../brehon-config" }
 brehon-mux = { path = "../brehon-mux", features = ["test-pty-fallback"] }
 insta = "1"

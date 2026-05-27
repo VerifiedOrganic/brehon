@@ -399,6 +399,25 @@ The test suite includes unit tests in each crate plus integration tests under
 `soak_tests`, `stress_tests`, `epic_integration_tests`, `git_tests`,
 `supervised_sidecar`, `review_flow`, and `doctor_integration`).
 
+## Stability gate harnesses
+
+The repo also ships operator-facing validation harnesses under `scripts/` for
+the current hardening phases. They preflight required symbols, fail fast if a
+test filter goes vacuous, and save you from retyping long `cargo test`
+selectors.
+
+```bash
+./scripts/phase0_stability_gate.sh --dry-run
+./scripts/phase1_stability_gate.sh
+./scripts/phase3_stability_gate.sh
+./scripts/phase4_stability_gate.sh
+./scripts/phase5_stability_gate.sh   # full final-hardening pass
+```
+
+Use `--dry-run` on any gate to print the exact checks it will execute. The
+Phase 5 harness composes the earlier stability gates and then runs the crash,
+doctor, lease-recovery, soak, and chaos checks that gate final hardening.
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md).

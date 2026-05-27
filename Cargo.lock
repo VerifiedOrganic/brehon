@@ -421,6 +421,7 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
+ "strum",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -475,6 +476,7 @@ dependencies = [
 name = "brehon-config"
 version = "0.1.0"
 dependencies = [
+ "brehon-adapter-sdk",
  "brehon-types",
  "directories",
  "serde",
@@ -579,6 +581,7 @@ dependencies = [
  "brehon-ports",
  "brehon-review",
  "brehon-store-fjall",
+ "brehon-test-harness",
  "brehon-types",
  "chrono",
  "futures-util",
@@ -613,6 +616,7 @@ dependencies = [
  "brehon-pty",
  "brehon-recording",
  "brehon-runtime",
+ "brehon-test-harness",
  "brehon-types",
  "chrono",
  "crossterm 0.29.0",
@@ -623,6 +627,7 @@ dependencies = [
  "ratatui",
  "serde",
  "serde_json",
+ "strum",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -852,8 +857,11 @@ name = "brehon-test-harness"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "brehon-mcp",
+ "brehon-mux",
  "brehon-ports",
  "brehon-pty",
+ "brehon-tui",
  "brehon-types",
  "chrono",
  "futures",
@@ -901,6 +909,7 @@ name = "brehon-types"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "directories",
  "libc",
  "serde",
  "serde_json",

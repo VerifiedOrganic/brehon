@@ -1,6 +1,7 @@
 mod direct_tools;
 mod review;
 mod setup;
+pub(crate) use setup::{compute_repo_identity, normalize_project_root};
 #[cfg(test)]
 mod startup_reconciliation_tests;
 mod workers;
@@ -1286,14 +1287,15 @@ pub async fn execute(
     use brehon_config::load_config_with_override;
     use brehon_mux::{AgentAdapter, HarnessControlPlane, Mux, MuxConfig, SupervisorCli};
 
-    let cwd = project_path
+    let raw_cwd = project_path
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let cwd = normalize_project_root(&raw_cwd);
     let mut splash = crate::ui::StartupSplash::new();
     splash.set_stage("Loading configuration");
     splash.record(format!("Project root: {}", cwd.display()));
 
-    let config = load_config_with_override(project_path, config_override)?;
+    let config = load_config_with_override(Some(&cwd), config_override)?;
     ensure_runtime_terminal_host_supported(&config)?;
     let eager_gateway_bootstrap = eager_gateway_bootstrap_enabled(&config.runtime.terminal_host);
 
@@ -4123,6 +4125,100 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
 
         assert_eq!(summary["status"]["running"], false);
+    }
+
+    static EXECUTE_DOTBREHON_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[tokio::test]
+    async fn execute_normalizes_dotbrehon_cwd_for_all_project_root_helpers() {
+        let _guard = EXECUTE_DOTBREHON_TEST_LOCK.lock().unwrap();
+
+        // Save original env vars so we can restore them after the test.
+        let original_root = std::env::var("BREHON_ROOT").ok();
+        let original_workspace = std::env::var("BREHON_WORKSPACE_ROOT").ok();
+        let original_session = std::env::var("BREHON_SESSION_NAME").ok();
+
+        let temp = tempfile::tempdir().unwrap();
+        let repo_root = temp.path().to_path_buf();
+        let brehon_dir = repo_root.join(".brehon");
+
+        std::fs::create_dir_all(&brehon_dir).unwrap();
+
+        // Write a minimal project config that disables worktree isolation so
+        // execute gets as far as Mux::factory (which fails without tmux).
+        std::fs::write(
+            brehon_dir.join("config.yaml"),
+            "orchestration:\n  worktree_isolation: false\n",
+        )
+        .unwrap();
+
+        // Pass an invalid workers override so execute fails deterministically at
+        // resolve_worker_pool_counts — after all project-root helpers have run
+        // but before Mux::factory (which may succeed in environments with tmux).
+        let result = execute(Some(&brehon_dir), None, Some("invalid")).await;
+
+        assert!(
+            result.is_err(),
+            "execute should fail on invalid workers override, got: {:?}",
+            result
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Invalid --workers value"),
+            "expected worker-count validation failure, got: {}",
+            err_msg
+        );
+
+        // BREHON_WORKSPACE_ROOT must point to the repo root, not .brehon/.
+        let workspace_root = std::env::var("BREHON_WORKSPACE_ROOT")
+            .expect("BREHON_WORKSPACE_ROOT should be set");
+        assert_eq!(
+            workspace_root,
+            repo_root.to_string_lossy().to_string(),
+            "BREHON_WORKSPACE_ROOT should be the normalized repo root"
+        );
+
+        // BREHON_ROOT must point to repo_root/.brehon, not .brehon/.brehon.
+        let brehon_root = std::env::var("BREHON_ROOT").expect("BREHON_ROOT should be set");
+        assert_eq!(
+            brehon_root,
+            brehon_dir.to_string_lossy().to_string(),
+            "BREHON_ROOT should be repo_root/.brehon"
+        );
+
+        // ensure_mcp_config writes .mcp.json at the project root.
+        assert!(
+            repo_root.join(".mcp.json").exists(),
+            ".mcp.json should be created at repo root"
+        );
+        assert!(
+            !brehon_dir.join(".mcp.json").exists(),
+            ".mcp.json should NOT be created inside .brehon"
+        );
+
+        // ensure_codex_instruction_files writes under .brehon/instructions/.
+        assert!(
+            brehon_dir.join("instructions").is_dir(),
+            ".brehon/instructions should exist at repo root level"
+        );
+        assert!(
+            !brehon_dir.join(".brehon").exists(),
+            ".brehon/.brehon should not be created"
+        );
+
+        // Restore original env vars.
+        match original_root {
+            Some(v) => std::env::set_var("BREHON_ROOT", v),
+            None => std::env::remove_var("BREHON_ROOT"),
+        }
+        match original_workspace {
+            Some(v) => std::env::set_var("BREHON_WORKSPACE_ROOT", v),
+            None => std::env::remove_var("BREHON_WORKSPACE_ROOT"),
+        }
+        match original_session {
+            Some(v) => std::env::set_var("BREHON_SESSION_NAME", v),
+            None => std::env::remove_var("BREHON_SESSION_NAME"),
+        }
     }
 
     fn test_runtime_command(

@@ -8,6 +8,7 @@ use brehon_types::normalize_task_status;
 
 use crate::tools::agent::{current_runtime_session_name_from_root, session_is_live};
 
+use super::git_ops::dirty_primary_checkout_terminal_blocker;
 use super::lifecycle::reconcile_dependency_states_with_task_lock;
 use super::locking::acquire_task_lock;
 use super::persistence::{read_task, write_task};
@@ -198,6 +199,14 @@ pub async fn update_task_status_atomic(task_id: &str, new_status: &str) -> Resul
         .ok_or_else(|| format!("Invalid status value: {new_status}"))?;
 
     let _lock = acquire_task_lock(task_id).await?;
+
+    if normalized == "approved" {
+        if let Some(err) =
+            dirty_primary_checkout_terminal_blocker(&format!("approve task {task_id}"))
+        {
+            return Err(err);
+        }
+    }
 
     let Some(mut task) = read_task(task_id) else {
         return Err(format!("Task not found: {task_id}"));

@@ -17,5 +17,5 @@ pub use run::research::ProjectConfigLoader;
 pub use run::{
     no_project_config_loader, run_dashboard_tui, run_tui, run_tui_with_panels,
     run_tui_with_panels_and_runtime_commands, AgentInfo, DashboardData, EventInfo, ReviewerPanel,
-    TaskInfo,
+    RuntimeAutomationHarness, TaskInfo,
 };

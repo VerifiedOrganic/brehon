@@ -41,7 +41,10 @@ pub use brehon_types::{
     AdapterKind, AgentCapabilities, HealthStatus, PromptHandle, PromptId, PromptTurn, SessionId,
     SessionInfo, SessionSpec, TerminalId,
 };
-pub use harness::{HarnessCapabilities, HarnessControlPlane, HarnessTransport, SupervisorCli};
+pub use harness::{
+    HarnessCapabilities, HarnessControlPlane, HarnessTransport, PromptInjectionStrategy,
+    SupervisorCli,
+};
 #[cfg(feature = "process")]
 pub use process::AgentProcess;
 pub use protocol::{

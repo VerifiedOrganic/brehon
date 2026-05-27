@@ -1,3 +1,4 @@
+use super::{ScopedEnv, TEST_ENV_LOCK};
 use crate::mux::*;
 use crate::teams::{TeamsManager, TeamsPaths};
 use crate::{
@@ -6,8 +7,9 @@ use crate::{
 };
 use brehon_ports::{RuntimeCommandPort, RuntimeEventStream};
 use brehon_types::{
-    PromptDeliveryMode, RuntimeCommand, RuntimeCommandKind, RuntimeCommandStatus,
-    RuntimeCommandTarget, RuntimePaneKind, RuntimePaneState, RuntimePolicyContext,
+    PaneAssignmentContext, PromptDeliveryMode, RuntimeCommand, RuntimeCommandKind,
+    RuntimeCommandStatus, RuntimeCommandTarget, RuntimePaneKind, RuntimePaneState,
+    RuntimePolicyContext,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -125,6 +127,92 @@ fn test_set_and_clear_pane_review_context() {
     mux.clear_pane_review_context("reviewer-1");
     let pane = mux.get("reviewer-1").expect("pane exists");
     assert!(pane.review_context().is_none());
+}
+
+#[test]
+fn test_task_context_persists_runtime_assignment_snapshot() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().unwrap();
+    let _brehon_root = temp.path().join(".brehon");
+    std::fs::create_dir_all(&_brehon_root).unwrap();
+    let _env = ScopedEnv::set(&[("BREHON_ROOT", _brehon_root.to_str().unwrap())]);
+
+    let mut mux = Mux::new(24, 80);
+    mux.add_pane(Pane::director("worker-ctx", 24, 80).unwrap());
+    mux.set_pane_task_context(
+        "worker-ctx",
+        crate::TaskContextSnapshot {
+            task_id: "T-ctx".to_string(),
+            title: "Task context".to_string(),
+            status: brehon_types::task::TaskStatus::Assigned,
+            completion_mode: Some("merge".to_string()),
+            merge_target: None,
+            parent_id: None,
+            epic_branch: None,
+            epic_worktree: None,
+            blocked_reason: None,
+            updated_at: std::time::Instant::now(),
+        },
+    );
+
+    let path = _brehon_root
+        .join("runtime")
+        .join("pane-assignment-context")
+        .join("worker-ctx.json");
+    let persisted: PaneAssignmentContext =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(persisted.pane_id, "worker-ctx");
+    assert_eq!(persisted.assignment_kind, "task");
+    assert_eq!(persisted.task_id, "T-ctx");
+    assert_eq!(persisted.status, "assigned");
+
+    mux.clear_pane_task_context("worker-ctx");
+    assert!(!path.exists(), "clearing task context should delete mirror");
+}
+
+#[test]
+fn test_review_context_persists_runtime_assignment_snapshot() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().unwrap();
+    let _brehon_root = temp.path().join(".brehon");
+    std::fs::create_dir_all(&_brehon_root).unwrap();
+    let _env = ScopedEnv::set(&[("BREHON_ROOT", _brehon_root.to_str().unwrap())]);
+
+    let mut mux = Mux::new(24, 80);
+    mux.add_pane(Pane::director("reviewer-ctx", 24, 80).unwrap());
+    mux.set_pane_review_context(
+        "reviewer-ctx",
+        crate::ReviewContextSnapshot {
+            review_id: "R-ctx".to_string(),
+            task_id: "T-ctx".to_string(),
+            round: 2,
+            panel_total: 3,
+            panel_done: 1,
+            verdict: None,
+            score: None,
+            findings_summary: Some("pending".to_string()),
+            updated_at: std::time::Instant::now(),
+        },
+    );
+
+    let path = _brehon_root
+        .join("runtime")
+        .join("pane-assignment-context")
+        .join("reviewer-ctx.json");
+    let persisted: PaneAssignmentContext =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(persisted.pane_id, "reviewer-ctx");
+    assert_eq!(persisted.assignment_kind, "review");
+    assert_eq!(persisted.task_id, "T-ctx");
+    assert_eq!(persisted.review_id.as_deref(), Some("R-ctx"));
+    assert_eq!(persisted.round, Some(2));
+    assert_eq!(persisted.status, "collecting");
+
+    mux.clear_pane_review_context("reviewer-ctx");
+    assert!(
+        !path.exists(),
+        "clearing review context should delete mirror"
+    );
 }
 
 #[test]

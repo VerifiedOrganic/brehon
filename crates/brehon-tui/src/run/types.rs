@@ -383,6 +383,8 @@ pub(crate) struct PendingReviewObligation {
     pub panel_id: Option<String>,
     pub round: Option<u64>,
     pub pending_reviewers: usize,
+    pub assignment_delivery_state: Option<String>,
+    pub assignment_acknowledged_at: Option<String>,
 }
 
 /// A timestamped activity event shown in the dashboard.
@@ -411,6 +413,11 @@ pub(crate) enum StalledRecoveryOutcome {
         old_worker: String,
     },
     Blocked {
+        task_id: String,
+        worker: String,
+        reason: String,
+    },
+    ManualRecoveryRequired {
         task_id: String,
         worker: String,
         reason: String,

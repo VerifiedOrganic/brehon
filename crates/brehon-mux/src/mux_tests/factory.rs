@@ -1,18 +1,42 @@
+use super::{ScopedEnv, TEST_ENV_LOCK};
 use crate::mux::*;
 use crate::pane::panesmith_shim::FORCE_PANESMITH_SPAWN_FAILURE_PANE_ID;
 use crate::pty::{Pty, PtyConfig};
 use crate::teams::{TeamsManager, TeamsPaths};
 use crate::{
     AgentAdapter, CustomAgentConfig, HarnessCapabilities, HarnessControlPlane, HarnessTransport,
-    Pane, PaneBackend, PaneKind, PaneState, SupervisorCli,
+    Pane, PaneBackend, PaneKind, PaneState, PromptInjectionStrategy, SupervisorCli,
 };
 use brehon_types::{
-    PaneExitedEvent, PaneOutputEvent, RuntimeEvent, RuntimeEventKind, RuntimeEventMeta,
-    RuntimePaneKind, RuntimeSource,
+    PaneExitedEvent, PaneOutputEvent, PaneStateChangedEvent, RuntimeEvent, RuntimeEventKind,
+    RuntimeEventMeta, RuntimePaneBlockInfo, RuntimePaneBlockKind, RuntimePaneKind,
+    RuntimePaneState, RuntimeSource,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
+
+fn wait_for_agent_health_marker_json(marker_path: &std::path::Path) -> serde_json::Value {
+    for _ in 0..50 {
+        if let Ok(marker) = std::fs::read_to_string(marker_path)
+            && let Ok(marker_json) = serde_json::from_str::<serde_json::Value>(&marker)
+        {
+            return marker_json;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("timed out waiting for agent health marker at {marker_path:?}");
+}
+
+fn wait_for_agent_health_marker_exists(marker_path: &std::path::Path) {
+    for _ in 0..50 {
+        if marker_path.exists() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("timed out waiting for agent health marker at {marker_path:?}");
+}
 
 #[test]
 fn test_mux_remains_send_for_cross_thread_hosts() {
@@ -804,9 +828,60 @@ fn custom_interactive_agent(name: &str, command: &str, args: &[&str]) -> AgentAd
             supports_teams: false,
             one_shot: false,
             uses_ink_prompt: false,
+            prompt_injection_strategy: PromptInjectionStrategy::ImmediateSubmit,
             tool_prefix: std::borrow::Cow::Borrowed("mcp_brehon_"),
             transport: HarnessTransport::InteractivePty,
             preferred_control_plane: HarnessControlPlane::PtyInjection,
+        },
+    })
+}
+
+fn grok_adapter(name: &str) -> AgentAdapter {
+    AgentAdapter::Custom(CustomAgentConfig {
+        name: name.to_string(),
+        command: Some("grok".to_string()),
+        args: vec![
+            "agent".to_string(),
+            "--always-approve".to_string(),
+            "stdio".to_string(),
+        ],
+        base_url: None,
+        api_key_env: None,
+        headers: Vec::new(),
+        capabilities: HarnessCapabilities {
+            supports_hooks: false,
+            supports_subagents: false,
+            supports_textbox_submit: true,
+            supports_teams: false,
+            one_shot: false,
+            uses_ink_prompt: false,
+            prompt_injection_strategy: PromptInjectionStrategy::ImmediateSubmit,
+            tool_prefix: std::borrow::Cow::Borrowed("brehon__"),
+            transport: HarnessTransport::AppServer,
+            preferred_control_plane: HarnessControlPlane::Acp,
+        },
+    })
+}
+
+fn custom_acp_adapter(name: &str) -> AgentAdapter {
+    AgentAdapter::Custom(CustomAgentConfig {
+        name: name.to_string(),
+        command: Some("my-agent".to_string()),
+        args: vec!["--stdio".to_string()],
+        base_url: None,
+        api_key_env: None,
+        headers: Vec::new(),
+        capabilities: HarnessCapabilities {
+            supports_hooks: false,
+            supports_subagents: false,
+            supports_textbox_submit: true,
+            supports_teams: false,
+            one_shot: false,
+            uses_ink_prompt: false,
+            prompt_injection_strategy: PromptInjectionStrategy::ImmediateSubmit,
+            tool_prefix: std::borrow::Cow::Borrowed("mcp_brehon_"),
+            transport: HarnessTransport::AppServer,
+            preferred_control_plane: HarnessControlPlane::Acp,
         },
     })
 }
@@ -1026,6 +1101,434 @@ fn terminal_host_runtime_events_mirror_output_and_fence_generation() {
 }
 
 #[test]
+fn terminal_host_blocked_state_event_writes_prompt_blocked_marker() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let brehon_root = temp.path().join(".brehon");
+    std::fs::create_dir_all(&brehon_root).expect("create brehon root");
+    let _env = ScopedEnv::set(&[("BREHON_ROOT", brehon_root.to_str().unwrap())]);
+
+    let mut mux = Mux::new(5, 40);
+    let pane = Pane::new_with_backend_cli(
+        "worker-1",
+        "worker-1",
+        PaneKind::Worker,
+        PaneBackend::None,
+        5,
+        40,
+        AgentAdapter::BuiltIn(SupervisorCli::Claude),
+    )
+    .expect("create host-owned placeholder pane");
+    mux.add_pane(pane);
+
+    let blocked = RuntimePaneBlockInfo {
+        kind: RuntimePaneBlockKind::PermissionRequest,
+        summary: "permission request blocked automatic recovery: allow bash ls".to_string(),
+        command_or_tool: Some("allow bash ls".to_string()),
+        request_id: Some("perm-1".to_string()),
+        task_id: Some("T-owned".to_string()),
+        excerpt: None,
+    };
+    let event = RuntimeEvent::new(
+        RuntimeEventMeta::new("session-1", "worker-1", 0, RuntimeSource::Headless, 101),
+        RuntimeEventKind::PaneStateChanged(PaneStateChangedEvent {
+            previous: Some(RuntimePaneState::Ready),
+            current: RuntimePaneState::Blocked,
+            reason: Some("permission request blocked automatic recovery".to_string()),
+            blocked: Some(blocked.clone()),
+        }),
+    );
+
+    assert!(
+        mux.apply_terminal_host_runtime_event(&event)
+            .expect("apply blocked state event"),
+        "host blocked state should update the local pane"
+    );
+
+    let marker_path = brehon_root
+        .join("runtime")
+        .join("agent-health")
+        .join("worker-1.json");
+    let marker_json = wait_for_agent_health_marker_json(&marker_path);
+    assert_eq!(
+        marker_json.get("reason").and_then(|value| value.as_str()),
+        Some("prompt_blocked")
+    );
+    assert_eq!(
+        marker_json
+            .get("blocked")
+            .and_then(|value| value.get("task_id"))
+            .and_then(|value| value.as_str()),
+        Some("T-owned")
+    );
+}
+
+#[test]
+fn terminal_host_blocked_state_event_without_payload_uses_review_context_task_id() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let brehon_root = temp.path().join(".brehon");
+    std::fs::create_dir_all(&brehon_root).expect("create brehon root");
+    let _env = ScopedEnv::set(&[("BREHON_ROOT", brehon_root.to_str().unwrap())]);
+
+    let mut mux = Mux::new(5, 40);
+    let pane = Pane::new_with_backend_cli(
+        "reviewer-1",
+        "reviewer-1",
+        PaneKind::Reviewer,
+        PaneBackend::None,
+        5,
+        40,
+        AgentAdapter::BuiltIn(SupervisorCli::Claude),
+    )
+    .expect("create host-owned placeholder pane");
+    mux.add_pane(pane);
+    mux.get_mut("reviewer-1")
+        .expect("reviewer pane")
+        .set_review_context(crate::ReviewContextSnapshot {
+            review_id: "REV-1".to_string(),
+            task_id: "T-review".to_string(),
+            round: 1,
+            panel_total: 3,
+            panel_done: 1,
+            verdict: None,
+            score: None,
+            findings_summary: None,
+            updated_at: std::time::Instant::now(),
+        });
+
+    let event = RuntimeEvent::new(
+        RuntimeEventMeta::new("session-1", "reviewer-1", 0, RuntimeSource::Headless, 101),
+        RuntimeEventKind::PaneStateChanged(PaneStateChangedEvent {
+            previous: Some(RuntimePaneState::Busy),
+            current: RuntimePaneState::Blocked,
+            reason: Some("terminal approval prompt".to_string()),
+            blocked: None,
+        }),
+    );
+
+    assert!(
+        mux.apply_terminal_host_runtime_event(&event)
+            .expect("apply blocked state event"),
+        "host blocked state should update the local reviewer pane"
+    );
+
+    let marker_path = brehon_root
+        .join("runtime")
+        .join("agent-health")
+        .join("reviewer-1.json");
+    let marker_json = wait_for_agent_health_marker_json(&marker_path);
+    assert_eq!(
+        marker_json
+            .get("blocked")
+            .and_then(|value| value.get("task_id"))
+            .and_then(|value| value.as_str()),
+        Some("T-review")
+    );
+}
+
+#[test]
+fn terminal_host_duplicate_blocked_state_event_refreshes_marker_payload() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let brehon_root = temp.path().join(".brehon");
+    std::fs::create_dir_all(&brehon_root).expect("create brehon root");
+    let _env = ScopedEnv::set(&[("BREHON_ROOT", brehon_root.to_str().unwrap())]);
+
+    let mut mux = Mux::new(5, 40);
+    let pane = Pane::new_with_backend_cli(
+        "worker-1",
+        "worker-1",
+        PaneKind::Worker,
+        PaneBackend::None,
+        5,
+        40,
+        AgentAdapter::BuiltIn(SupervisorCli::Claude),
+    )
+    .expect("create host-owned placeholder pane");
+    mux.add_pane(pane);
+
+    let original = RuntimePaneBlockInfo {
+        kind: RuntimePaneBlockKind::PermissionRequest,
+        summary: "permission request blocked automatic recovery: allow bash ls".to_string(),
+        command_or_tool: Some("allow bash ls".to_string()),
+        request_id: Some("perm-1".to_string()),
+        task_id: Some("T-owned".to_string()),
+        excerpt: None,
+    };
+    mux.get_mut("worker-1")
+        .expect("worker pane")
+        .set_pane_blocked(original.clone(), std::time::Instant::now());
+
+    let duplicate = RuntimePaneBlockInfo {
+        kind: RuntimePaneBlockKind::TerminalPrompt,
+        summary: "terminal prompt blocked automatic recovery: Do you want to allow this command?"
+            .to_string(),
+        command_or_tool: Some("Do you want to allow this command?".to_string()),
+        request_id: Some("prompt-2".to_string()),
+        task_id: Some("T-other".to_string()),
+        excerpt: None,
+    };
+    let event = RuntimeEvent::new(
+        RuntimeEventMeta::new("session-1", "worker-1", 0, RuntimeSource::Headless, 101),
+        RuntimeEventKind::PaneStateChanged(PaneStateChangedEvent {
+            previous: Some(RuntimePaneState::Busy),
+            current: RuntimePaneState::Blocked,
+            reason: Some("duplicate blocked update".to_string()),
+            blocked: Some(duplicate.clone()),
+        }),
+    );
+
+    assert!(
+        mux.apply_terminal_host_runtime_event(&event)
+            .expect("apply duplicate blocked state event"),
+        "duplicate host blocked state should still be acknowledged"
+    );
+
+    match mux.get("worker-1").expect("worker pane").pane_state() {
+        Some(PaneState::Blocked { info, .. }) => {
+            assert_eq!(info, &duplicate);
+        }
+        other => panic!("expected blocked pane state, got {other:?}"),
+    }
+
+    let marker_path = brehon_root
+        .join("runtime")
+        .join("agent-health")
+        .join("worker-1.json");
+    let marker_json = wait_for_agent_health_marker_json(&marker_path);
+    assert_eq!(
+        marker_json
+            .get("blocked")
+            .and_then(|value| value.get("kind"))
+            .and_then(|value| value.as_str()),
+        Some("terminal_prompt")
+    );
+    assert_eq!(
+        marker_json
+            .get("blocked")
+            .and_then(|value| value.get("request_id"))
+            .and_then(|value| value.as_str()),
+        Some("prompt-2")
+    );
+    assert_eq!(
+        marker_json
+            .get("blocked")
+            .and_then(|value| value.get("task_id"))
+            .and_then(|value| value.as_str()),
+        Some("T-other")
+    );
+}
+
+#[test]
+fn terminal_host_ready_event_clears_prompt_blocked_marker() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let brehon_root = temp.path().join(".brehon");
+    std::fs::create_dir_all(&brehon_root).expect("create brehon root");
+    let _env = ScopedEnv::set(&[("BREHON_ROOT", brehon_root.to_str().unwrap())]);
+
+    let mut mux = Mux::new(5, 40);
+    let pane = Pane::new_with_backend_cli(
+        "worker-1",
+        "worker-1",
+        PaneKind::Worker,
+        PaneBackend::None,
+        5,
+        40,
+        AgentAdapter::BuiltIn(SupervisorCli::Claude),
+    )
+    .expect("create host-owned placeholder pane");
+    mux.add_pane(pane);
+
+    let blocked = RuntimePaneBlockInfo {
+        kind: RuntimePaneBlockKind::PermissionRequest,
+        summary: "permission request blocked automatic recovery: allow bash ls".to_string(),
+        command_or_tool: Some("allow bash ls".to_string()),
+        request_id: Some("perm-1".to_string()),
+        task_id: Some("T-owned".to_string()),
+        excerpt: None,
+    };
+    let blocked_event = RuntimeEvent::new(
+        RuntimeEventMeta::new("session-1", "worker-1", 0, RuntimeSource::Headless, 101),
+        RuntimeEventKind::PaneStateChanged(PaneStateChangedEvent {
+            previous: Some(RuntimePaneState::Ready),
+            current: RuntimePaneState::Blocked,
+            reason: Some("permission request blocked automatic recovery".to_string()),
+            blocked: Some(blocked),
+        }),
+    );
+    assert!(
+        mux.apply_terminal_host_runtime_event(&blocked_event)
+            .expect("apply blocked state event")
+    );
+
+    let marker_path = brehon_root
+        .join("runtime")
+        .join("agent-health")
+        .join("worker-1.json");
+    wait_for_agent_health_marker_exists(&marker_path);
+
+    let ready_event = RuntimeEvent::new(
+        RuntimeEventMeta::new("session-1", "worker-1", 0, RuntimeSource::Headless, 102),
+        RuntimeEventKind::PaneStateChanged(PaneStateChangedEvent {
+            previous: Some(RuntimePaneState::Blocked),
+            current: RuntimePaneState::Ready,
+            reason: Some("permission resolved".to_string()),
+            blocked: None,
+        }),
+    );
+    assert!(
+        mux.apply_terminal_host_runtime_event(&ready_event)
+            .expect("apply ready state event")
+    );
+
+    assert!(
+        !marker_path.exists(),
+        "non-blocked terminal-host state should clear the prompt-blocked marker"
+    );
+    assert!(matches!(
+        mux.get("worker-1").expect("worker pane").pane_state(),
+        Some(PaneState::Ready { .. })
+    ));
+}
+
+#[test]
+fn terminal_host_ready_event_preempts_pending_async_blocked_marker_write() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let brehon_root = temp.path().join(".brehon");
+    std::fs::create_dir_all(&brehon_root).expect("create brehon root");
+    let _env = ScopedEnv::set(&[("BREHON_ROOT", brehon_root.to_str().unwrap())]);
+
+    let mut mux = Mux::new(5, 40);
+    let pane = Pane::new_with_backend_cli(
+        "worker-1",
+        "worker-1",
+        PaneKind::Worker,
+        PaneBackend::None,
+        5,
+        40,
+        AgentAdapter::BuiltIn(SupervisorCli::Claude),
+    )
+    .expect("create host-owned placeholder pane");
+    mux.add_pane(pane);
+
+    let blocked = RuntimePaneBlockInfo {
+        kind: RuntimePaneBlockKind::PermissionRequest,
+        summary: "permission request blocked automatic recovery: allow bash ls".to_string(),
+        command_or_tool: Some("allow bash ls".to_string()),
+        request_id: Some("perm-1".to_string()),
+        task_id: Some("T-owned".to_string()),
+        excerpt: None,
+    };
+    let blocked_event = RuntimeEvent::new(
+        RuntimeEventMeta::new("session-1", "worker-1", 0, RuntimeSource::Headless, 101),
+        RuntimeEventKind::PaneStateChanged(PaneStateChangedEvent {
+            previous: Some(RuntimePaneState::Ready),
+            current: RuntimePaneState::Blocked,
+            reason: Some("permission request blocked automatic recovery".to_string()),
+            blocked: Some(blocked),
+        }),
+    );
+    let ready_event = RuntimeEvent::new(
+        RuntimeEventMeta::new("session-1", "worker-1", 0, RuntimeSource::Headless, 102),
+        RuntimeEventKind::PaneStateChanged(PaneStateChangedEvent {
+            previous: Some(RuntimePaneState::Blocked),
+            current: RuntimePaneState::Ready,
+            reason: Some("permission resolved".to_string()),
+            blocked: None,
+        }),
+    );
+
+    assert!(
+        mux.apply_terminal_host_runtime_event(&blocked_event)
+            .expect("apply blocked state event")
+    );
+    assert!(
+        mux.apply_terminal_host_runtime_event(&ready_event)
+            .expect("apply ready state event")
+    );
+
+    let marker_path = brehon_root
+        .join("runtime")
+        .join("agent-health")
+        .join("worker-1.json");
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(
+        !marker_path.exists(),
+        "ready state should suppress any pending async prompt-blocked marker write"
+    );
+}
+
+#[test]
+fn terminal_host_stale_ready_or_busy_event_does_not_revive_dead_pane() {
+    let mut mux = Mux::new(5, 40);
+    let pane = Pane::new_with_backend_cli(
+        "worker-1",
+        "worker-1",
+        PaneKind::Worker,
+        PaneBackend::None,
+        5,
+        40,
+        AgentAdapter::BuiltIn(SupervisorCli::Claude),
+    )
+    .expect("create host-owned placeholder pane");
+    mux.add_pane(pane);
+
+    let exited = RuntimeEvent::new(
+        RuntimeEventMeta::new("session-1", "worker-1", 0, RuntimeSource::Headless, 101),
+        RuntimeEventKind::PaneExited(PaneExitedEvent {
+            exit_code: Some(1),
+            reason: Some("session dropped".to_string()),
+        }),
+    );
+    assert!(
+        mux.apply_terminal_host_runtime_event(&exited)
+            .expect("apply exit event"),
+        "pane exit should transition the pane to dead"
+    );
+
+    let ready = RuntimeEvent::new(
+        RuntimeEventMeta::new("session-1", "worker-1", 0, RuntimeSource::Headless, 102),
+        RuntimeEventKind::PaneStateChanged(PaneStateChangedEvent {
+            previous: Some(RuntimePaneState::Dead),
+            current: RuntimePaneState::Ready,
+            reason: Some("late ready".to_string()),
+            blocked: None,
+        }),
+    );
+    assert!(
+        mux.apply_terminal_host_runtime_event(&ready)
+            .expect("apply stale ready event"),
+        "stale ready event should still be acknowledged"
+    );
+    assert!(matches!(
+        mux.get("worker-1").expect("worker pane").pane_state(),
+        Some(PaneState::Dead { .. })
+    ));
+
+    let busy = RuntimeEvent::new(
+        RuntimeEventMeta::new("session-1", "worker-1", 0, RuntimeSource::Headless, 103),
+        RuntimeEventKind::PaneStateChanged(PaneStateChangedEvent {
+            previous: Some(RuntimePaneState::Dead),
+            current: RuntimePaneState::Busy,
+            reason: Some("late busy".to_string()),
+            blocked: None,
+        }),
+    );
+    assert!(
+        mux.apply_terminal_host_runtime_event(&busy)
+            .expect("apply stale busy event"),
+        "stale busy event should still be acknowledged"
+    );
+    let pane = mux.get("worker-1").expect("worker pane");
+    assert!(matches!(pane.pane_state(), Some(PaneState::Dead { .. })));
+    assert!(pane.has_exited(), "dead pane should stay marked exited");
+    assert_eq!(pane.exit_code(), Some(1));
+}
+
+#[test]
 fn terminal_host_agent_factory_plan_from_config_is_plan_only() {
     let project_root = super::fresh_temp_dir("brehon-mux-terminal-host-plan-only");
     let supervisor_adapter = AgentAdapter::Custom(CustomAgentConfig {
@@ -1042,6 +1545,7 @@ fn terminal_host_agent_factory_plan_from_config_is_plan_only() {
             supports_teams: false,
             one_shot: false,
             uses_ink_prompt: false,
+            prompt_injection_strategy: PromptInjectionStrategy::ImmediateSubmit,
             tool_prefix: std::borrow::Cow::Borrowed("mcp_brehon_"),
             transport: HarnessTransport::InteractivePty,
             preferred_control_plane: HarnessControlPlane::PtyInjection,
@@ -1324,6 +1828,128 @@ fn test_factory_rejects_worker_cwd_that_points_at_shared_root() {
         err.to_string()
             .contains("worker 'worker-1' resolves to the shared repo root")
     );
+}
+
+fn assert_factory_rejects_shared_root_worker(worker_cli: AgentAdapter) {
+    let project_root = super::fresh_temp_dir("brehon-mux-shared-root");
+    let mut worker_cwds = HashMap::new();
+    worker_cwds.insert("worker-1".to_string(), project_root.clone());
+    let mut reviewer_cwds = HashMap::new();
+    reviewer_cwds.insert(
+        "reviewer-1".to_string(),
+        super::setup_fake_linked_worktree(&project_root, ".brehon/worktrees/reviewer/reviewer-1"),
+    );
+
+    let err = match Mux::factory(MuxConfig {
+        cwd: project_root.clone(),
+        worktree_isolation: true,
+        worker_cwds,
+        supervisor_cwd: Some(super::setup_fake_linked_worktree(
+            &project_root,
+            ".brehon/worktrees/supervisor/claude-code",
+        )),
+        reviewer_cwds,
+        workers: 1,
+        worker_names: vec!["worker-1".to_string()],
+        supervisor_name: "claude-code".to_string(),
+        supervisor_cli: AgentAdapter::BuiltIn(SupervisorCli::Claude),
+        worker_cli,
+        reviewer_names: vec!["reviewer-1".to_string()],
+        reviewer_cli: AgentAdapter::BuiltIn(SupervisorCli::Claude),
+        include_director: false,
+        rows: 24,
+        cols: 120,
+        ..Default::default()
+    }) {
+        Ok(_) => panic!("shared-root worker cwd should fail"),
+        Err(err) => err,
+    };
+
+    assert!(
+        err.to_string()
+            .contains("worker 'worker-1' resolves to the shared repo root")
+    );
+}
+
+#[test]
+fn test_factory_rejects_kimi_worker_cwd_at_shared_root() {
+    assert_factory_rejects_shared_root_worker(AgentAdapter::BuiltIn(SupervisorCli::Kimi));
+}
+
+#[test]
+fn test_factory_rejects_opencode_worker_cwd_at_shared_root() {
+    assert_factory_rejects_shared_root_worker(AgentAdapter::BuiltIn(SupervisorCli::OpenCode));
+}
+
+#[test]
+fn test_factory_rejects_grok_worker_cwd_at_shared_root() {
+    assert_factory_rejects_shared_root_worker(grok_adapter("grok-worker"));
+}
+
+#[test]
+fn test_factory_rejects_custom_acp_worker_cwd_at_shared_root() {
+    assert_factory_rejects_shared_root_worker(custom_acp_adapter("custom-worker"));
+}
+
+fn assert_factory_rejects_shared_root_reviewer(reviewer_cli: AgentAdapter) {
+    let project_root = super::fresh_temp_dir("brehon-mux-shared-root-reviewer");
+    let mut worker_cwds = HashMap::new();
+    worker_cwds.insert(
+        "worker-1".to_string(),
+        super::setup_fake_linked_worktree(&project_root, ".brehon/worktrees/worker/worker-1"),
+    );
+    let mut reviewer_cwds = HashMap::new();
+    reviewer_cwds.insert("reviewer-1".to_string(), project_root.clone());
+
+    let err = match Mux::factory(MuxConfig {
+        cwd: project_root.clone(),
+        worktree_isolation: true,
+        worker_cwds,
+        supervisor_cwd: Some(super::setup_fake_linked_worktree(
+            &project_root,
+            ".brehon/worktrees/supervisor/claude-code",
+        )),
+        reviewer_cwds,
+        workers: 1,
+        worker_names: vec!["worker-1".to_string()],
+        supervisor_name: "claude-code".to_string(),
+        supervisor_cli: AgentAdapter::BuiltIn(SupervisorCli::Claude),
+        worker_cli: AgentAdapter::BuiltIn(SupervisorCli::Claude),
+        reviewer_names: vec!["reviewer-1".to_string()],
+        reviewer_cli,
+        include_director: false,
+        rows: 24,
+        cols: 120,
+        ..Default::default()
+    }) {
+        Ok(_) => panic!("shared-root reviewer cwd should fail"),
+        Err(err) => err,
+    };
+
+    assert!(
+        err.to_string()
+            .contains("reviewer 'reviewer-1' resolves to the shared repo root")
+    );
+}
+
+#[test]
+fn test_factory_rejects_kimi_reviewer_cwd_at_shared_root() {
+    assert_factory_rejects_shared_root_reviewer(AgentAdapter::BuiltIn(SupervisorCli::Kimi));
+}
+
+#[test]
+fn test_factory_rejects_opencode_reviewer_cwd_at_shared_root() {
+    assert_factory_rejects_shared_root_reviewer(AgentAdapter::BuiltIn(SupervisorCli::OpenCode));
+}
+
+#[test]
+fn test_factory_rejects_grok_reviewer_cwd_at_shared_root() {
+    assert_factory_rejects_shared_root_reviewer(grok_adapter("grok-reviewer"));
+}
+
+#[test]
+fn test_factory_rejects_custom_acp_reviewer_cwd_at_shared_root() {
+    assert_factory_rejects_shared_root_reviewer(custom_acp_adapter("custom-reviewer"));
 }
 
 #[test]

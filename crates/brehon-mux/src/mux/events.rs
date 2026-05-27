@@ -10,13 +10,18 @@ use super::format::{
 };
 use super::types::{GATEWAY_PROMPT_RETRY_DELAY, MuxEvent, PromptDeliveryAttempt};
 use crate::pane::{
-    ActivityKind, DEFAULT_PANE_PROMPT_QUEUE_WAITING_CAP, Generation, PaneId, PaneState,
-    QueuedPrompt,
+    ActivityEntry, ActivityKind, DEFAULT_PANE_PROMPT_QUEUE_WAITING_CAP, Generation, PaneId,
+    PaneState, QueuedPrompt,
 };
 use crate::pty::PtyEvent;
-use brehon_types::{PromptId, RuntimePaneState};
+use brehon_types::{PromptId, RuntimePaneBlockInfo, RuntimePaneBlockKind, RuntimePaneState};
 
 impl Mux {
+    const TERMINAL_PROMPT_PREFILTER_TAIL_CHARS: usize = 64;
+    const TERMINAL_PROMPT_PREFILTER_TAIL_BYTES: usize =
+        Self::TERMINAL_PROMPT_PREFILTER_TAIL_CHARS * 4;
+    const TERMINAL_PROMPT_VIEWPORT_SCAN_LINES: usize = 6;
+
     pub(crate) fn clear_active_gateway_operations(&mut self, pane_id: &str) {
         self.active_gateway_operations.remove(pane_id);
     }
@@ -71,24 +76,32 @@ impl Mux {
                 let previous = pane.pane_state().map(Self::runtime_pane_state_for_state);
                 let generation = pane.current_generation();
                 pane.set_pane_ready(now);
-                if let Some((previous, current, reason)) = Self::runtime_state_change(
+                if let Some((previous, current, reason, blocked)) = Self::runtime_state_change(
                     previous,
                     pane.pane_state(),
                     "stale activity cleared",
                 ) {
-                    state_changes.push((pane_id.clone(), generation, previous, current, reason));
+                    state_changes.push((
+                        pane_id.clone(),
+                        generation,
+                        previous,
+                        current,
+                        reason,
+                        blocked,
+                    ));
                 }
             }
             cleared.push((pane_id, stale_tools, operation_stale, still_busy));
         }
 
-        for (pane_id, generation, previous, current, reason) in state_changes {
+        for (pane_id, generation, previous, current, reason, blocked) in state_changes {
             self.publish_runtime_pane_state_changed(
                 &pane_id,
                 generation,
                 previous,
                 current,
                 Some(reason),
+                blocked,
             );
         }
 
@@ -99,33 +112,499 @@ impl Mux {
         PromptId::new(format!("{prefix}:{pane_id}:{}", uuid::Uuid::new_v4()))
     }
 
-    pub fn mark_gateway_delivery_busy(
+    fn truncate_blocked_text(value: &str, max_chars: usize) -> String {
+        let mut out = String::new();
+        for (idx, ch) in value.chars().enumerate() {
+            if idx >= max_chars {
+                out.push('…');
+                break;
+            }
+            out.push(ch);
+        }
+        out
+    }
+
+    fn pane_prompt_id_for_blocked(pane: &crate::pane::Pane) -> Option<String> {
+        match pane.pane_state() {
+            Some(PaneState::Busy { prompt_id, .. }) => Some(prompt_id.to_string()),
+            Some(PaneState::Blocked { info, .. }) => info.request_id.clone(),
+            _ => None,
+        }
+    }
+
+    fn terminal_prompt_keywords() -> &'static [&'static str] {
+        &[
+            "permission request",
+            "requires approval",
+            "do you want to allow",
+            "approve this command",
+            "allow this command",
+            "grant access",
+            "grant permission",
+        ]
+    }
+
+    fn terminal_prompt_signal_tokens() -> &'static [&'static str] {
+        &[
+            "permission",
+            "request",
+            "requires",
+            "approval",
+            "approve",
+            "allow",
+            "grant",
+        ]
+    }
+
+    fn ascii_insensitive_contains(haystack: &[u8], needle: &[u8]) -> bool {
+        if needle.is_empty() {
+            return true;
+        }
+        haystack
+            .windows(needle.len())
+            .any(|window| window.eq_ignore_ascii_case(needle))
+    }
+
+    fn ascii_insensitive_window_contains(prefix: &str, suffix: &[u8], needle: &[u8]) -> bool {
+        if needle.is_empty() {
+            return true;
+        }
+        let prefix = prefix.as_bytes();
+        let total_len = prefix.len() + suffix.len();
+        if total_len < needle.len() {
+            return false;
+        }
+        (0..=total_len - needle.len()).any(|start| {
+            needle.iter().enumerate().all(|(offset, expected)| {
+                let idx = start + offset;
+                let byte = if idx < prefix.len() {
+                    prefix[idx]
+                } else {
+                    suffix[idx - prefix.len()]
+                };
+                byte.eq_ignore_ascii_case(expected)
+            })
+        })
+    }
+
+    fn ascii_insensitive_starts_with(text: &str, prefix: &str) -> bool {
+        text.as_bytes()
+            .get(..prefix.len())
+            .is_some_and(|candidate| candidate.eq_ignore_ascii_case(prefix.as_bytes()))
+    }
+
+    fn ascii_insensitive_suffix_after_prefix<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
+        if !Self::ascii_insensitive_starts_with(text, prefix) {
+            return None;
+        }
+        text.get(prefix.len()..)
+    }
+
+    fn terminal_prompt_prefilter_window(pane: &crate::pane::Pane, data: &[u8]) -> String {
+        let mut text =
+            String::with_capacity(pane.terminal_prompt_prefilter_tail.len() + data.len());
+        text.push_str(&pane.terminal_prompt_prefilter_tail);
+        text.push_str(&String::from_utf8_lossy(data));
+        text
+    }
+
+    fn update_terminal_prompt_prefilter_tail(tail: &mut String, data: &[u8]) {
+        tail.push_str(&String::from_utf8_lossy(
+            Self::terminal_prompt_prefilter_tail_data(data),
+        ));
+        if tail.chars().count() > Self::TERMINAL_PROMPT_PREFILTER_TAIL_CHARS {
+            *tail = Self::terminal_prompt_prefilter_tail(tail);
+        }
+    }
+
+    fn terminal_prompt_prefilter_tail_data(data: &[u8]) -> &[u8] {
+        if data.len() <= Self::TERMINAL_PROMPT_PREFILTER_TAIL_BYTES {
+            return data;
+        }
+        let mut start = data.len() - Self::TERMINAL_PROMPT_PREFILTER_TAIL_BYTES;
+        while start < data.len() && (data[start] & 0b1100_0000) == 0b1000_0000 {
+            start += 1;
+        }
+        &data[start..]
+    }
+
+    fn terminal_prompt_prefilter_tail(text: &str) -> String {
+        let mut tail = String::new();
+        for (idx, ch) in text.chars().rev().enumerate() {
+            if idx >= Self::TERMINAL_PROMPT_PREFILTER_TAIL_CHARS {
+                break;
+            }
+            tail.push(ch);
+        }
+        tail.chars().rev().collect()
+    }
+
+    fn terminal_prompt_signal_line<'a>(text: &'a str) -> Option<&'a str> {
+        text.lines().rev().map(str::trim).find(|line| {
+            !line.is_empty()
+                && !Self::terminal_prompt_status_line_is_informational(line)
+                && Self::terminal_prompt_keywords().iter().any(|needle| {
+                    Self::ascii_insensitive_contains(line.as_bytes(), needle.as_bytes())
+                })
+        })
+    }
+
+    fn terminal_prompt_informational_status_prefixes() -> &'static [&'static str] {
+        &[
+            "auto-approved gemini permission request",
+            "rejected gemini permission request",
+        ]
+    }
+
+    fn terminal_prompt_status_line_is_informational(line: &str) -> bool {
+        let stripped = Self::strip_ansi_escape_sequences(line);
+        let stripped = stripped.trim();
+        Self::terminal_prompt_informational_status_prefixes()
+            .iter()
+            .any(|prefix| {
+                Self::ascii_insensitive_suffix_after_prefix(stripped, prefix)
+                    .is_some_and(|suffix| suffix.is_empty() || suffix.trim_start().starts_with(':'))
+            })
+    }
+
+    fn strip_ansi_escape_sequences(text: &str) -> String {
+        let bytes = text.as_bytes();
+        let mut out = String::with_capacity(text.len());
+        let mut idx = 0;
+        while idx < bytes.len() {
+            if bytes[idx] == 0x1b {
+                idx += 1;
+                if idx >= bytes.len() {
+                    break;
+                }
+                match bytes[idx] {
+                    b'[' => {
+                        idx += 1;
+                        while idx < bytes.len() && !(0x40..=0x7e).contains(&bytes[idx]) {
+                            idx += 1;
+                        }
+                        idx += usize::from(idx < bytes.len());
+                    }
+                    b']' => {
+                        idx += 1;
+                        while idx < bytes.len() {
+                            if bytes[idx] == 0x07 {
+                                idx += 1;
+                                break;
+                            }
+                            if bytes[idx] == 0x1b
+                                && idx + 1 < bytes.len()
+                                && bytes[idx + 1] == b'\\'
+                            {
+                                idx += 2;
+                                break;
+                            }
+                            idx += 1;
+                        }
+                    }
+                    _ => idx += 1,
+                }
+                while idx < bytes.len() && !text.is_char_boundary(idx) {
+                    idx += 1;
+                }
+                continue;
+            }
+            let ch = text[idx..]
+                .chars()
+                .next()
+                .expect("valid utf-8 char boundary while stripping ANSI");
+            out.push(ch);
+            idx += ch.len_utf8();
+        }
+        out
+    }
+
+    fn terminal_prompt_excerpt(viewport: &str, signal_line: Option<&str>) -> Option<String> {
+        let mut tail = viewport
+            .lines()
+            .rev()
+            .map(str::trim)
+            .map(Self::strip_ansi_escape_sequences)
+            .map(|line| line.trim().to_string())
+            .filter(|line| !line.is_empty())
+            .take(6)
+            .collect::<Vec<_>>();
+        tail.reverse();
+        if let Some(signal_line) = signal_line
+            && !signal_line.is_empty()
+        {
+            let signal_line = Self::strip_ansi_escape_sequences(signal_line);
+            let signal_line = signal_line.trim();
+            if !signal_line.is_empty() && !tail.iter().any(|line| line == signal_line) {
+                tail.push(signal_line.to_string());
+            }
+        }
+        (!tail.is_empty()).then(|| Self::truncate_blocked_text(&tail.join("\n"), 512))
+    }
+
+    fn blocked_info_from_permission_entry(
+        pane: &crate::pane::Pane,
+        entry: &crate::pane::ActivityEntry,
+    ) -> Option<RuntimePaneBlockInfo> {
+        if entry.kind != ActivityKind::Permission || entry.status.is_some() {
+            return None;
+        }
+        let action = entry
+            .message
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())?;
+        Some(RuntimePaneBlockInfo {
+            kind: RuntimePaneBlockKind::PermissionRequest,
+            summary: format!(
+                "permission request blocked automatic recovery: {}",
+                Self::truncate_blocked_text(action, 160)
+            ),
+            command_or_tool: Some(Self::truncate_blocked_text(action, 240)),
+            request_id: entry.tool_id.clone(),
+            task_id: pane.assignment_task_id(),
+            excerpt: None,
+        })
+    }
+
+    fn pane_output_may_contain_blocking_prompt(prefix: &str, data: &[u8]) -> bool {
+        Self::terminal_prompt_signal_tokens()
+            .iter()
+            .any(|needle| Self::ascii_insensitive_window_contains(prefix, data, needle.as_bytes()))
+    }
+
+    fn terminal_prompt_recent_viewport_text(viewport: &str) -> String {
+        let mut tail = viewport
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .rev()
+            .take(Self::TERMINAL_PROMPT_VIEWPORT_SCAN_LINES)
+            .collect::<Vec<_>>();
+        tail.reverse();
+        tail.join("\n")
+    }
+
+    fn blocked_info_from_terminal_prompt_text(
+        pane: &crate::pane::Pane,
+        text: &str,
+        viewport: &str,
+    ) -> Option<RuntimePaneBlockInfo> {
+        let line = Self::terminal_prompt_signal_line(text)?;
+        if Self::ascii_insensitive_starts_with(line, "permission request:") {
+            let action = line
+                .split_once(':')
+                .map(|(_, action)| action.trim())
+                .filter(|value| !value.is_empty())
+                .map(|value| Self::truncate_blocked_text(value, 240));
+            return Some(RuntimePaneBlockInfo {
+                kind: RuntimePaneBlockKind::PermissionRequest,
+                summary: format!(
+                    "permission request blocked automatic recovery: {}",
+                    Self::truncate_blocked_text(action.as_deref().unwrap_or(line), 160)
+                ),
+                command_or_tool: action,
+                request_id: None,
+                task_id: pane.assignment_task_id(),
+                excerpt: Self::terminal_prompt_excerpt(viewport, Some(line)),
+            });
+        }
+
+        Some(RuntimePaneBlockInfo {
+            kind: RuntimePaneBlockKind::TerminalPrompt,
+            summary: format!(
+                "terminal prompt blocked automatic recovery: {}",
+                Self::truncate_blocked_text(line, 160)
+            ),
+            command_or_tool: Some(Self::truncate_blocked_text(line, 240)),
+            request_id: Self::pane_prompt_id_for_blocked(pane),
+            task_id: pane.assignment_task_id(),
+            excerpt: Self::terminal_prompt_excerpt(viewport, Some(line)),
+        })
+    }
+
+    fn blocked_info_from_terminal_prompt(
+        pane: &crate::pane::Pane,
+        prefilter_window: &str,
+    ) -> Option<RuntimePaneBlockInfo> {
+        let viewport = pane.dump_viewport().ok()?;
+        let recent_viewport = Self::terminal_prompt_recent_viewport_text(&viewport);
+        Self::blocked_info_from_terminal_prompt_text(pane, &recent_viewport, &viewport).or_else(
+            || Self::blocked_info_from_terminal_prompt_text(pane, prefilter_window, &viewport),
+        )
+    }
+
+    fn permission_resolution_matches_blocked_request(
+        pane: &crate::pane::Pane,
+        entry: &ActivityEntry,
+        now: Instant,
+    ) -> bool {
+        let resolution_message = entry
+            .message
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let blocked_command_matches_resolution = |command_or_tool: Option<&str>| {
+            let Some(message) = resolution_message else {
+                return false;
+            };
+            let Some(command_or_tool) = command_or_tool
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                return false;
+            };
+            command_or_tool == message || command_or_tool.ends_with(message)
+        };
+        let unresolved_fallback_matches = |command_or_tool: Option<&str>| {
+            resolution_message.is_none()
+                && pane.permission_resolution_fallback_pending(now)
+                && command_or_tool
+                    .map(str::trim)
+                    .is_some_and(|value| !value.is_empty())
+        };
+        match pane.pane_state() {
+            Some(PaneState::Blocked {
+                info:
+                    RuntimePaneBlockInfo {
+                        kind: RuntimePaneBlockKind::PermissionRequest,
+                        request_id: Some(blocked_request_id),
+                        ..
+                    },
+                ..
+            }) => entry
+                .tool_id
+                .as_deref()
+                .is_some_and(|request_id| blocked_request_id == request_id),
+            Some(PaneState::Blocked {
+                info:
+                    RuntimePaneBlockInfo {
+                        kind: RuntimePaneBlockKind::PermissionRequest,
+                        request_id: None,
+                        command_or_tool,
+                        ..
+                    },
+                ..
+            }) => {
+                blocked_command_matches_resolution(command_or_tool.as_deref())
+                    || unresolved_fallback_matches(command_or_tool.as_deref())
+            }
+            Some(PaneState::Blocked {
+                info:
+                    RuntimePaneBlockInfo {
+                        kind: RuntimePaneBlockKind::TerminalPrompt,
+                        command_or_tool,
+                        ..
+                    },
+                ..
+            }) => {
+                blocked_command_matches_resolution(command_or_tool.as_deref())
+                    || unresolved_fallback_matches(command_or_tool.as_deref())
+            }
+            _ => false,
+        }
+    }
+
+    fn refresh_blocked_permission_request(
+        pane: &crate::pane::Pane,
+        entry: &ActivityEntry,
+        now: Instant,
+    ) -> Option<RuntimePaneBlockInfo> {
+        let blocked = Self::blocked_info_from_permission_entry(pane, entry)?;
+        match pane.pane_state() {
+            Some(PaneState::Blocked { info, .. })
+                if matches!(info.kind, RuntimePaneBlockKind::PermissionRequest)
+                    && info.command_or_tool.as_deref() == blocked.command_or_tool.as_deref()
+                    && info.request_id.as_deref() != blocked.request_id.as_deref() =>
+            {
+                Some(blocked)
+            }
+            Some(PaneState::Blocked { info, .. })
+                if matches!(info.kind, RuntimePaneBlockKind::TerminalPrompt)
+                    && pane.permission_resolution_fallback_pending(now)
+                    && info.request_id.as_deref() != blocked.request_id.as_deref() =>
+            {
+                Some(blocked)
+            }
+            _ => None,
+        }
+    }
+
+    fn mark_pane_blocked(
         &mut self,
         pane_id: &str,
-        prompt_id: PromptId,
         generation: Generation,
+        blocked: RuntimePaneBlockInfo,
+        now: Instant,
     ) {
         let mut state_change = None;
-        let now = Instant::now();
         if let Some(pane) = self.panes.get_mut(pane_id) {
-            let previous = pane.pane_state().map(Self::runtime_pane_state_for_state);
-            pane.set_tool_executing(true);
-            if !matches!(pane.pane_state(), Some(PaneState::Busy { .. })) {
-                pane.set_pane_busy(prompt_id.clone(), generation, now);
-            }
-            state_change = Self::runtime_state_change(
-                previous,
+            if matches!(
                 pane.pane_state(),
-                "gateway reported active prompt",
-            );
+                Some(PaneState::Blocked { .. } | PaneState::Dead { .. })
+            ) {
+                tracing::debug!(
+                    pane = %pane_id,
+                    blocked = ?blocked,
+                    "Skipping mark_pane_blocked: pane already blocked or dead"
+                );
+                return;
+            }
+            let previous = pane.pane_state().map(Self::runtime_pane_state_for_state);
+            pane.set_tool_executing(false);
+            pane.set_last_output_at(now);
+            pane.set_pane_blocked(blocked.clone(), now);
+            state_change =
+                Self::runtime_state_change(previous, pane.pane_state(), &blocked.summary);
         }
-        if let Some((previous, current, reason)) = state_change {
+        self.active_gateway_operations.remove(pane_id);
+        super::stability::write_agent_prompt_blocked_marker(pane_id, &blocked);
+        if let Some((previous, current, reason, blocked)) = state_change {
             self.publish_runtime_pane_state_changed(
                 pane_id,
                 generation,
                 previous,
                 current,
                 Some(reason),
+                blocked,
+            );
+        }
+        tracing::warn!(pane = %pane_id, blocked = ?blocked, "Marked pane blocked");
+    }
+
+    pub fn mark_gateway_delivery_busy(
+        &mut self,
+        pane_id: &str,
+        prompt_id: PromptId,
+        generation: Generation,
+        now: Instant,
+    ) {
+        let mut state_change = None;
+        if let Some(pane) = self.panes.get_mut(pane_id) {
+            if !matches!(
+                pane.pane_state(),
+                Some(PaneState::Blocked { .. } | PaneState::Dead { .. })
+            ) {
+                let previous = pane.pane_state().map(Self::runtime_pane_state_for_state);
+                pane.set_tool_executing(true);
+                if !matches!(pane.pane_state(), Some(PaneState::Busy { .. })) {
+                    pane.set_pane_busy(prompt_id.clone(), generation, now);
+                }
+                state_change = Self::runtime_state_change(
+                    previous,
+                    pane.pane_state(),
+                    "gateway reported active prompt",
+                );
+            }
+        }
+        if let Some((previous, current, reason, blocked)) = state_change {
+            self.publish_runtime_pane_state_changed(
+                pane_id,
+                generation,
+                previous,
+                current,
+                Some(reason),
+                blocked,
             );
         }
         tracing::warn!(
@@ -171,7 +650,12 @@ impl Mux {
         busy: bool,
         synthetic_prompt_prefix: &str,
         completed_operation: bool,
-    ) -> Option<(Option<RuntimePaneState>, RuntimePaneState, String)> {
+    ) -> Option<(
+        Option<RuntimePaneState>,
+        RuntimePaneState,
+        String,
+        Option<RuntimePaneBlockInfo>,
+    )> {
         let previous = pane.pane_state().map(Self::runtime_pane_state_for_state);
         if busy {
             match pane.pane_state() {
@@ -210,14 +694,45 @@ impl Mux {
                 if !self.accept_generation_event(pane_id, *generation) {
                     return false;
                 }
-                if let Some(pane) = self.panes.get_mut(pane_id)
-                    && let Err(err) = pane.append_output(data)
-                {
-                    tracing::warn!(
-                        pane = %pane_id,
-                        error = %err,
-                        "Failed to append queued pane output"
-                    );
+                let now = Instant::now();
+                let mut blocked = None;
+                if let Some(pane) = self.panes.get_mut(pane_id) {
+                    if let Err(err) = pane.append_output(data) {
+                        tracing::warn!(
+                            pane = %pane_id,
+                            error = %err,
+                            "Failed to append queued pane output"
+                        );
+                    } else if !matches!(
+                        pane.pane_state(),
+                        Some(PaneState::Blocked { .. } | PaneState::Dead { .. })
+                    ) {
+                        let needs_prompt_scan = Self::pane_output_may_contain_blocking_prompt(
+                            &pane.terminal_prompt_prefilter_tail,
+                            data,
+                        );
+                        if needs_prompt_scan {
+                            let prefilter_window =
+                                Self::terminal_prompt_prefilter_window(pane, data);
+                            blocked =
+                                Self::blocked_info_from_terminal_prompt(pane, &prefilter_window);
+                            pane.terminal_prompt_prefilter_tail =
+                                Self::terminal_prompt_prefilter_tail(&prefilter_window);
+                        } else {
+                            Self::update_terminal_prompt_prefilter_tail(
+                                &mut pane.terminal_prompt_prefilter_tail,
+                                data,
+                            );
+                        }
+                    } else {
+                        Self::update_terminal_prompt_prefilter_tail(
+                            &mut pane.terminal_prompt_prefilter_tail,
+                            data,
+                        );
+                    }
+                }
+                if let Some(blocked) = blocked {
+                    self.mark_pane_blocked(pane_id, *generation, blocked, now);
                 }
                 true
             }
@@ -236,6 +751,18 @@ impl Mux {
                     status = ?entry.status.as_deref(),
                     "Applying activity event"
                 );
+                let permission_resolved = matches!(
+                    (entry.kind, entry.status.as_deref()),
+                    (
+                        ActivityKind::Permission,
+                        Some("approved" | "denied" | "resolved")
+                    )
+                );
+                let now = Instant::now();
+                let permission_resolution_matches_blocked = permission_resolved
+                    && self.panes.get(pane_id).is_some_and(|pane| {
+                        Self::permission_resolution_matches_blocked_request(pane, entry, now)
+                    });
                 let operations_active = match entry.kind {
                     ActivityKind::Operation => {
                         let count = self
@@ -266,10 +793,30 @@ impl Mux {
                     }
                 };
                 let mut state_change = None;
+                let mut permission_blocked = None;
+                let mut refreshed_blocked_permission = None;
+                let mut blocked_refresh_event = None;
+                let mut clear_prompt_blocked_health = false;
                 if let Some(pane) = self.panes.get_mut(pane_id) {
+                    if !matches!(
+                        pane.pane_state(),
+                        Some(PaneState::Blocked { .. } | PaneState::Dead { .. })
+                    ) {
+                        permission_blocked = Self::blocked_info_from_permission_entry(pane, entry);
+                    } else {
+                        refreshed_blocked_permission =
+                            Self::refresh_blocked_permission_request(pane, entry, now);
+                        if let Some(blocked) = refreshed_blocked_permission.as_ref() {
+                            pane.refresh_blocked_info(blocked.clone(), now);
+                            blocked_refresh_event = Some(blocked.clone());
+                        } else if pane.permission_resolution_fallback_expired(now)
+                            && !permission_resolution_matches_blocked
+                        {
+                            pane.clear_permission_resolution_fallback();
+                        }
+                    }
                     pane.record_output_activity();
                     pane.ensure_activity_buffer();
-                    let now = Instant::now();
                     let mut tools_active = false;
                     if let Some(buf) = pane.activity_buffer_mut() {
                         match entry.kind {
@@ -313,33 +860,71 @@ impl Mux {
                             }
                         }
                     }
-                    let busy = operations_active || tools_active;
-                    pane.set_tool_executing(busy);
-                    let completed = matches!(
-                        (entry.kind, entry.status.as_deref()),
-                        (
-                            ActivityKind::Operation,
-                            Some("completed" | "failed" | "cancelled" | "success" | "ok")
-                        )
-                    );
-                    state_change = Self::apply_busy_ready_transition(
-                        pane,
-                        pane_id,
-                        *generation,
-                        now,
-                        busy,
-                        "activity",
-                        completed,
-                    );
+                    if permission_blocked.is_none() {
+                        if permission_resolution_matches_blocked {
+                            let previous =
+                                pane.pane_state().map(Self::runtime_pane_state_for_state);
+                            pane.restore_after_blocked_permission_resolution(
+                                Self::synthetic_busy_prompt_id("permission-resolved", pane_id),
+                                *generation,
+                                now,
+                            );
+                            state_change = Self::runtime_state_change(
+                                previous,
+                                pane.pane_state(),
+                                "permission resolved",
+                            );
+                            clear_prompt_blocked_health = true;
+                        } else {
+                            let busy = operations_active || tools_active;
+                            pane.set_tool_executing(busy);
+                            let completed = matches!(
+                                (entry.kind, entry.status.as_deref()),
+                                (
+                                    ActivityKind::Operation,
+                                    Some("completed" | "failed" | "cancelled" | "success" | "ok")
+                                )
+                            );
+                            state_change = Self::apply_busy_ready_transition(
+                                pane,
+                                pane_id,
+                                *generation,
+                                now,
+                                busy,
+                                "activity",
+                                completed,
+                            );
+                        }
+                    }
                 }
-                if let Some((previous, current, reason)) = state_change {
+                if let Some((previous, current, reason, blocked)) = state_change {
                     self.publish_runtime_pane_state_changed(
                         pane_id,
                         *generation,
                         previous,
                         current,
                         Some(reason),
+                        blocked,
                     );
+                }
+                if let Some(blocked) = blocked_refresh_event {
+                    self.publish_runtime_pane_state_changed(
+                        pane_id,
+                        *generation,
+                        Some(RuntimePaneState::Blocked),
+                        RuntimePaneState::Blocked,
+                        Some("permission request details refreshed".to_string()),
+                        Some(blocked),
+                    );
+                }
+                if clear_prompt_blocked_health {
+                    super::stability::clear_agent_health_marker(pane_id);
+                }
+                if let Some(blocked) = refreshed_blocked_permission {
+                    super::stability::write_agent_prompt_blocked_marker(pane_id, &blocked);
+                }
+                if let Some(blocked) = permission_blocked {
+                    self.mark_pane_blocked(pane_id, *generation, blocked, now);
                 }
                 true
             }
@@ -353,6 +938,7 @@ impl Mux {
                 if !self.accept_generation_event(pane_id, *generation) {
                     return false;
                 }
+                let now = Instant::now();
                 let mut state_change = None;
                 match result {
                     Ok(PromptDeliveryAttempt::Delivered {
@@ -362,7 +948,6 @@ impl Mux {
                         if let Some(pane) = self.panes.get_mut(pane_id) {
                             let previous =
                                 pane.pane_state().map(Self::runtime_pane_state_for_state);
-                            let now = Instant::now();
                             pane.set_last_output_at(now);
                             pane.set_tool_executing(true);
                             pane.set_pane_busy(prompt_id.clone(), *delivered_generation, now);
@@ -383,8 +968,13 @@ impl Mux {
                         prompt_id,
                         ahead_of,
                     }) => {
-                        self.mark_gateway_delivery_busy(pane_id, prompt_id.clone(), *generation);
-                        let inject_after = Instant::now() + GATEWAY_PROMPT_RETRY_DELAY;
+                        self.mark_gateway_delivery_busy(
+                            pane_id,
+                            prompt_id.clone(),
+                            *generation,
+                            now,
+                        );
+                        let inject_after = now + GATEWAY_PROMPT_RETRY_DELAY;
                         match self.queue_delayed_prompt(
                             pane_id,
                             prompt.clone(),
@@ -443,7 +1033,7 @@ impl Mux {
                     }
                     Err(err) => {
                         if Self::is_busy_gateway_delivery_error(&err.error) {
-                            let inject_after = Instant::now() + GATEWAY_PROMPT_RETRY_DELAY;
+                            let inject_after = now + GATEWAY_PROMPT_RETRY_DELAY;
                             let retry_prompt_id =
                                 brehon_types::PromptId::new(uuid::Uuid::new_v4().to_string());
                             match self.queue_delayed_prompt(
@@ -489,13 +1079,14 @@ impl Mux {
                         );
                     }
                 }
-                if let Some((previous, current, reason)) = state_change {
+                if let Some((previous, current, reason, blocked)) = state_change {
                     self.publish_runtime_pane_state_changed(
                         pane_id,
                         *generation,
                         previous,
                         current,
                         Some(reason),
+                        blocked,
                     );
                 }
                 true
@@ -582,13 +1173,14 @@ impl Mux {
                         false,
                     );
                 }
-                if let Some((previous, current, reason)) = state_change {
+                if let Some((previous, current, reason, blocked)) = state_change {
                     self.publish_runtime_pane_state_changed(
                         pane_id,
                         *generation,
                         previous,
                         current,
                         Some(reason),
+                        blocked,
                     );
                 }
                 true
@@ -624,13 +1216,12 @@ impl Mux {
         self.tick_pane_state_machine_at(rt, Instant::now());
     }
 
-    #[cfg(test)]
-    pub(crate) fn tick_pane_state_machine_at(&mut self, rt: &tokio::runtime::Handle, now: Instant) {
-        self.tick_pane_state_machine_impl(rt, now);
-    }
-
-    #[cfg(not(test))]
-    fn tick_pane_state_machine_at(&mut self, rt: &tokio::runtime::Handle, now: Instant) {
+    /// Advance the pane state machine using a caller-provided clock instant.
+    ///
+    /// Primarily intended for deterministic test harnesses that need to drive
+    /// delayed startup-prompt delivery and Busy → Ready transitions without
+    /// sleeping in wall-clock time.
+    pub fn tick_pane_state_machine_at(&mut self, rt: &tokio::runtime::Handle, now: Instant) {
         self.tick_pane_state_machine_impl(rt, now);
     }
 
@@ -648,7 +1239,7 @@ impl Mux {
             } else {
                 None
             };
-            if let Some((previous, current, reason)) = state_change {
+            if let Some((previous, current, reason, blocked)) = state_change {
                 let generation = self.current_generation_or_default(&pane_id);
                 self.publish_runtime_pane_state_changed(
                     &pane_id,
@@ -656,6 +1247,7 @@ impl Mux {
                     previous,
                     current,
                     Some(reason),
+                    blocked,
                 );
             }
 
@@ -721,13 +1313,14 @@ impl Mux {
             state_change =
                 Self::runtime_state_change(previous, pane.pane_state(), "queued prompt dispatched");
         }
-        if let Some((previous, current, reason)) = state_change {
+        if let Some((previous, current, reason, blocked)) = state_change {
             self.publish_runtime_pane_state_changed(
                 pane_id,
                 generation,
                 previous,
                 current,
                 Some(reason),
+                blocked,
             );
         }
     }

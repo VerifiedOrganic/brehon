@@ -222,6 +222,7 @@ fn merge_orchestration(
         },
         spawn_workers: overlay.spawn_workers.or(base.spawn_workers),
         drain_timeout_secs: overlay.drain_timeout_secs.or(base.drain_timeout_secs),
+        worktree_root: overlay.worktree_root.or(base.worktree_root),
     }
 }
 
@@ -454,6 +455,7 @@ mod tests {
                 self_improve_tasks: vec!["run_tests".into()],
                 spawn_workers: None,
                 drain_timeout_secs: None,
+                worktree_root: None,
             },
             runtime: RuntimeConfig::default(),
             budget: BudgetConfig {

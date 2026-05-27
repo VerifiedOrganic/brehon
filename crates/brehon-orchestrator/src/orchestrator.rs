@@ -453,6 +453,52 @@ impl Orchestrator {
         self.running = false;
     }
 
+    /// Production shutdown path: stops the orchestrator and kills all worker
+    /// sessions through the gateway.
+    ///
+    /// Unlike `WorkerPool::shutdown()` (a best-effort internal helper that
+    /// marks workers dead regardless of kill result), this method **only**
+    /// marks successfully-killed workers dead and returns an error if any
+    /// session could not be terminated.  Callers should use this method
+    /// instead of manually enumerating and killing sessions.
+    ///
+    /// The write lock is acquired only for brief state updates; async
+    /// `gateway.kill_session` calls are performed without holding the lock so
+    /// other tokio tasks on the same runtime thread are not blocked.
+    pub async fn shutdown(&mut self) -> Result<()> {
+        self.stop();
+
+        let alive_sessions: Vec<SessionId> = {
+            let pool = self.worker_pool.read();
+            pool.alive_workers().map(|w| w.session_id.clone()).collect()
+        };
+
+        let mut errors = Vec::new();
+        let mut killed_sessions = Vec::new();
+        for session in &alive_sessions {
+            if let Err(e) = self.deps.gateway.kill_session(session).await {
+                errors.push(format!("{}: {}", session, e));
+            } else {
+                killed_sessions.push(session.clone());
+            }
+        }
+
+        if !killed_sessions.is_empty() {
+            let mut pool = self.worker_pool.write();
+            pool.mark_workers_dead_by_sessions(&killed_sessions);
+        }
+
+        if !errors.is_empty() {
+            return Err(OrchestratorError::WorkerPoolError(format!(
+                "Failed to kill {} worker session(s) during shutdown: {}",
+                errors.len(),
+                errors.join(", ")
+            )));
+        }
+
+        Ok(())
+    }
+
     pub fn is_running(&self) -> bool {
         self.running
     }
@@ -533,6 +579,8 @@ mod tests {
     use brehon_ports::{EventStore, PortError};
     use brehon_test_harness::{InMemoryEventStore, MockGateway};
     use brehon_types::{ClaimId, EventFilter, QueueClaim, TaskStatus, ViewUpdate};
+
+    use crate::test_support::{ShutdownTestGateway, INJECTED_KILL_FAILURE};
 
     #[allow(dead_code)]
     fn create_event(kind: EventKind, aggregate_id: &str) -> (Event, EventId) {
@@ -1388,6 +1436,158 @@ mod tests {
             store.len(),
             5,
             "sweep should run once sweep_interval_secs has elapsed"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_returns_error_when_kill_session_fails() {
+        let gateway = Arc::new(ShutdownTestGateway::always_fail_kill());
+        let store = Arc::new(InMemoryEventStore::new());
+        let config = OrchestratorConfig::default();
+        let deps = OrchestratorDeps {
+            event_store: store,
+            gateway: gateway.clone(),
+            git_ops: None,
+            decision_engine: None,
+        };
+        let mut orchestrator = Orchestrator::new(config, deps);
+
+        // Spawn at least one worker so there is a session to kill.
+        let worker_id = orchestrator.spawn_workers_to_min().await.unwrap()[0].clone();
+        assert!(orchestrator.worker_pool.read().alive_count() > 0);
+        let session_id = orchestrator
+            .worker_pool
+            .read()
+            .get_worker(&worker_id)
+            .unwrap()
+            .session_id
+            .clone();
+
+        let result = orchestrator.shutdown().await;
+        assert!(
+            result.is_err(),
+            "shutdown should return error when kill_session fails"
+        );
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains(INJECTED_KILL_FAILURE),
+            "error should contain the underlying kill failure reason: {}",
+            err_msg
+        );
+
+        // Workers should NOT be marked dead when kill fails.
+        let pool = orchestrator.worker_pool.read();
+        assert!(
+            pool.alive_count() > 0,
+            "workers should remain alive when kill_session fails"
+        );
+        assert!(
+            pool.get_worker(&worker_id).unwrap().is_alive,
+            "failed shutdown should keep the worker marked alive"
+        );
+        assert!(
+            gateway.is_session_alive(&session_id),
+            "failed shutdown should leave the underlying session alive"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_mixed_kill_results_marks_only_successful_dead() {
+        let gateway = Arc::new(ShutdownTestGateway::new());
+        let store = Arc::new(InMemoryEventStore::new());
+        let mut config = OrchestratorConfig::default();
+        config.worker_config.min_count = 2;
+        let deps = OrchestratorDeps {
+            event_store: store,
+            gateway: gateway.clone(),
+            git_ops: None,
+            decision_engine: None,
+        };
+        let mut orchestrator = Orchestrator::new(config, deps);
+
+        orchestrator.spawn_workers_to_min().await.unwrap();
+        assert_eq!(
+            orchestrator.worker_pool.read().alive_count(),
+            2,
+            "should have 2 alive workers"
+        );
+        let workers: Vec<_> = orchestrator
+            .worker_pool
+            .read()
+            .alive_workers()
+            .map(|worker| (worker.id.clone(), worker.session_id.clone()))
+            .collect();
+        assert_eq!(workers.len(), 2, "test setup should create two workers");
+        let (failed_worker_id, failed_session) = workers[0].clone();
+        let (successful_worker_id, successful_session) = workers[1].clone();
+        gateway.fail_kill_for_session(failed_session.clone());
+
+        let result = orchestrator.shutdown().await;
+        assert!(
+            result.is_err(),
+            "shutdown should return error when any kill_session fails"
+        );
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains(INJECTED_KILL_FAILURE),
+            "error should contain the underlying kill failure reason: {}",
+            err_msg
+        );
+
+        let pool = orchestrator.worker_pool.read();
+        assert_eq!(
+            pool.alive_count(),
+            1,
+            "exactly one worker should remain alive after partial kill failure"
+        );
+        assert!(
+            pool.get_worker(&failed_worker_id).unwrap().is_alive,
+            "failed session should stay marked alive in the worker pool"
+        );
+        assert!(
+            !pool.get_worker(&successful_worker_id).unwrap().is_alive,
+            "successful session should be marked dead in the worker pool"
+        );
+        assert!(
+            gateway.is_session_alive(&failed_session),
+            "failed session should remain alive in the gateway"
+        );
+        assert!(
+            !gateway.is_session_alive(&successful_session),
+            "successful session should be terminated in the gateway"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_all_success_clears_pool() {
+        let gateway = Arc::new(MockGateway::new());
+        let store = Arc::new(InMemoryEventStore::new());
+        let mut config = OrchestratorConfig::default();
+        config.worker_config.min_count = 2;
+        let deps = OrchestratorDeps {
+            event_store: store,
+            gateway,
+            git_ops: None,
+            decision_engine: None,
+        };
+        let mut orchestrator = Orchestrator::new(config, deps);
+
+        orchestrator.spawn_workers_to_min().await.unwrap();
+        assert_eq!(
+            orchestrator.worker_pool.read().alive_count(),
+            2,
+            "should have 2 alive workers"
+        );
+
+        let result = orchestrator.shutdown().await;
+        assert!(
+            result.is_ok(),
+            "shutdown should return Ok when all kill_session calls succeed"
+        );
+        assert_eq!(
+            orchestrator.worker_pool.read().alive_count(),
+            0,
+            "all workers should be marked dead after successful shutdown"
         );
     }
 

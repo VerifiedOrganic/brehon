@@ -1,14 +1,14 @@
-//! Prompt retry / dead letter, review staleness, worker recovery, and task context helpers.
+//! Prompt retry / dead letter, review staleness, worker recovery, and task
+//! context helpers.
 //!
-//! Several helpers here (`attempt_auto_recover_stalled_worker`,
-//! `inspect_worker_worktree_state`, `escalate_worker_unmerged_conflict`,
-//! prompt-queue sweep helpers, and their supporting fns) are staged
-//! infrastructure: unit-tested but not yet wired into the production event
-//! loop. The module-level `allow(dead_code)` below silences the noise until
-//! callers are connected; new additions should still be wired up.
+//! This module is shared by the live event loop, the stall handler, and
+//! focused tests. Some narrower helpers are still test-only, so the
+//! module-level `allow(dead_code)` below keeps the remaining local warning
+//! noise contained.
 
 #![allow(dead_code)]
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -20,8 +20,8 @@ use brehon_types::task::{
 };
 
 use brehon_mux::{
-    Mux, PaneKind, ReviewContextSnapshot, SessionScopedQueue, StoredScopedEntry, TaskBlockedReason,
-    TaskContextDetails, TaskContextSnapshot,
+    Mux, PaneKind, PaneState, ReviewContextSnapshot, SessionScopedQueue, StoredScopedEntry,
+    TaskBlockedReason, TaskContextDetails, TaskContextSnapshot,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -29,6 +29,26 @@ use serde_json::Value;
 use super::types::*;
 
 const LEGACY_RUNTIME_SESSION_NAME: &str = "_legacy";
+pub(crate) const PROMPT_BLOCKED_HEALTH_REASON: &str = "prompt_blocked";
+pub(crate) const PROMPT_BLOCKED_RECOVERY_FAILED_HEALTH_REASON: &str =
+    "prompt_blocked_recovery_failed";
+pub(crate) const PROMPT_BLOCKED_RECOVERY_FAILURE_ACTIVITY: &str = "prompt-blocked recovery failed";
+pub(crate) const STALLED_WORKER_MANUAL_RECOVERY_ACTIVITY: &str =
+    "stalled-worker manual recovery required";
+
+pub(crate) fn prompt_blocked_detail(blocked: &brehon_types::RuntimePaneBlockInfo) -> String {
+    let mut detail = blocked.summary.clone();
+    if let Some(task_id) = blocked.task_id.as_deref() {
+        let _ = write!(&mut detail, " (task {task_id})");
+    }
+    if let Some(command) = blocked.command_or_tool.as_deref() {
+        let _ = write!(&mut detail, " command/tool {command:?}");
+    }
+    if let Some(request_id) = blocked.request_id.as_deref() {
+        let _ = write!(&mut detail, " request_id {request_id}");
+    }
+    detail
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct DeadLetterEntry {
@@ -287,15 +307,51 @@ pub(crate) fn agent_health_path(brehon_root: &Path, agent_name: &str) -> PathBuf
         .join(format!("{file_name}.json"))
 }
 
-pub(crate) fn agent_is_quarantined_for_run(brehon_root: &Path, agent_name: &str) -> bool {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct AgentHealthMarker {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) agent: Option<String>,
+    #[serde(default)]
+    pub(crate) status: String,
+    #[serde(default)]
+    pub(crate) reason: Option<String>,
+    #[serde(default)]
+    pub(crate) error: Option<String>,
+    #[serde(default)]
+    pub(crate) blocked: Option<brehon_types::RuntimePaneBlockInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) updated_at: Option<String>,
+}
+
+pub(crate) fn read_agent_health_marker(
+    brehon_root: &Path,
+    agent_name: &str,
+) -> Option<AgentHealthMarker> {
     let path = agent_health_path(brehon_root, agent_name);
-    let Ok(content) = std::fs::read_to_string(path) else {
-        return false;
-    };
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) else {
-        return false;
-    };
-    value.get("status").and_then(|status| status.as_str()) == Some("unavailable")
+    let content = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+pub(crate) fn prompt_blocked_info(
+    brehon_root: &Path,
+    pane_id: &str,
+    pane: Option<&brehon_mux::Pane>,
+) -> Option<brehon_types::RuntimePaneBlockInfo> {
+    read_agent_health_marker(brehon_root, pane_id)
+        .and_then(|marker| marker.blocked)
+        .or_else(|| {
+            pane.and_then(|pane| match pane.pane_state() {
+                Some(PaneState::Blocked { info, .. }) => Some(info.clone()),
+                _ => None,
+            })
+        })
+}
+
+pub(crate) fn agent_is_quarantined_for_run(brehon_root: &Path, agent_name: &str) -> bool {
+    read_agent_health_marker(brehon_root, agent_name).is_some_and(|marker| {
+        marker.status == "unavailable"
+            && marker.reason.as_deref() != Some(PROMPT_BLOCKED_HEALTH_REASON)
+    })
 }
 
 pub(crate) fn agent_health_marker_reason(brehon_root: &Path, agent_name: &str) -> Option<String> {
@@ -312,7 +368,47 @@ pub(crate) fn agent_health_marker_reason(brehon_root: &Path, agent_name: &str) -
 }
 
 pub(crate) fn clear_agent_health_marker(brehon_root: &Path, agent_name: &str) {
+    brehon_mux::suppress_pending_agent_health_marker_writes(agent_name);
     let _ = std::fs::remove_file(agent_health_path(brehon_root, agent_name));
+}
+
+pub(crate) fn write_prompt_blocked_recovery_failed_marker(
+    brehon_root: &Path,
+    agent_name: &str,
+    error: &str,
+    blocked: Option<&brehon_types::RuntimePaneBlockInfo>,
+) -> Result<(), String> {
+    brehon_mux::suppress_pending_agent_health_marker_writes(agent_name);
+    let path = agent_health_path(brehon_root, agent_name);
+    let parent = path
+        .parent()
+        .ok_or_else(|| "agent health path missing parent".to_string())?;
+    std::fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+    let payload = AgentHealthMarker {
+        agent: Some(agent_name.to_string()),
+        status: "unavailable".to_string(),
+        reason: Some(PROMPT_BLOCKED_RECOVERY_FAILED_HEALTH_REASON.to_string()),
+        error: Some(error.to_string()),
+        blocked: blocked.cloned(),
+        updated_at: Some(chrono::Utc::now().to_rfc3339()),
+    };
+    let data = serde_json::to_string_pretty(&payload).map_err(|err| err.to_string())?;
+    std::fs::write(path, data).map_err(|err| err.to_string())
+}
+
+pub(crate) fn write_prompt_blocked_recovery_failed_marker_or_clear_stale_marker(
+    brehon_root: &Path,
+    agent_name: &str,
+    error: &str,
+    blocked: Option<&brehon_types::RuntimePaneBlockInfo>,
+) -> Result<(), String> {
+    match write_prompt_blocked_recovery_failed_marker(brehon_root, agent_name, error, blocked) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            clear_agent_health_marker(brehon_root, agent_name);
+            Err(err)
+        }
+    }
 }
 
 pub(crate) fn read_prompt_retry_attempts(path: &Path) -> u64 {
@@ -387,6 +483,43 @@ pub(crate) fn prompt_retry_not_due(path: &Path) -> bool {
         return false;
     };
     parsed.with_timezone(&chrono::Utc) > chrono::Utc::now()
+}
+
+pub(crate) fn force_prompt_retry_due(path: &Path) -> bool {
+    let meta_path = prompt_retry_meta_path(path);
+    let Ok(content) = std::fs::read_to_string(&meta_path) else {
+        return false;
+    };
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return false;
+    };
+    let Some(object) = value.as_object_mut() else {
+        return false;
+    };
+    object.insert(
+        "next_retry_at".to_string(),
+        serde_json::Value::String((chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339()),
+    );
+    let encoded = match serde_json::to_string_pretty(&value) {
+        Ok(encoded) => encoded,
+        Err(err) => {
+            tracing::error!(
+                path = %meta_path.display(),
+                error = %err,
+                "Failed to serialize prompt retry metadata while forcing retry due"
+            );
+            return false;
+        }
+    };
+    if let Err(err) = std::fs::write(&meta_path, encoded) {
+        tracing::warn!(
+            path = %meta_path.display(),
+            error = %err,
+            "Failed to rewrite prompt retry metadata while forcing retry due"
+        );
+        return false;
+    }
+    true
 }
 
 pub(crate) fn clear_prompt_retry_meta(path: &Path) {
@@ -970,6 +1103,156 @@ pub(crate) fn write_raw_task_file(
     std::fs::rename(&tmp, &path).map_err(|err| err.to_string())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum RecoveryTaskStatusLabel {
+    Pending,
+    Assigned,
+    InProgress,
+    ReviewReady,
+    InReview,
+    ChangesRequested,
+    Approved,
+    Merged,
+    Blocked,
+    Closed,
+}
+
+impl RecoveryTaskStatusLabel {
+    fn parse(raw_status: &str) -> Result<Self, String> {
+        match normalize_task_status(raw_status) {
+            Some("pending") => Ok(Self::Pending),
+            Some("assigned") => Ok(Self::Assigned),
+            Some("in_progress") => Ok(Self::InProgress),
+            Some("review_ready") => Ok(Self::ReviewReady),
+            Some("in_review") => Ok(Self::InReview),
+            Some("changes_requested") => Ok(Self::ChangesRequested),
+            Some("approved") => Ok(Self::Approved),
+            Some("merged") => Ok(Self::Merged),
+            Some("blocked") => Ok(Self::Blocked),
+            Some("closed") => Ok(Self::Closed),
+            _ => Err(format!("unknown task status '{raw_status}'")),
+        }
+    }
+
+    fn is_terminal(self) -> bool {
+        matches!(self, Self::Merged | Self::Closed)
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct PromptBlockedRecoveryFailureTaskUpdate {
+    status: RecoveryTaskStatusLabel,
+    blockers: String,
+    activity: &'static str,
+    recovery_note: String,
+    updated_at: String,
+}
+
+fn merge_serialized_task_update(
+    raw: &mut serde_json::Map<String, serde_json::Value>,
+    update: impl Serialize,
+) -> Result<(), String> {
+    let payload = serde_json::to_value(update).map_err(|err| err.to_string())?;
+    let update_fields = match payload {
+        Value::Object(fields) => fields,
+        _ => return Err("serialized task update was not an object".to_string()),
+    };
+    raw.extend(update_fields);
+    Ok(())
+}
+
+fn validate_prompt_blocked_recovery_failure_transition(
+    raw: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), String> {
+    validate_recovery_block_transition(raw, "prompt-blocked recovery failed")
+}
+
+fn validate_recovery_block_transition(
+    raw: &serde_json::Map<String, serde_json::Value>,
+    failure_label: &str,
+) -> Result<(), String> {
+    let task_id = raw
+        .get("task_id")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("unknown");
+    let current_status = raw
+        .get("status")
+        .and_then(|value| value.as_str())
+        .unwrap_or("pending");
+    let current = RecoveryTaskStatusLabel::parse(current_status)?;
+    if current.is_terminal() {
+        return Err(format!(
+            "cannot mark terminal task {task_id} as {failure_label} from status '{current_status}'"
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn block_task_for_prompt_block_recovery_failure(
+    brehon_root: &std::path::Path,
+    task_id: &str,
+    pane_name: &str,
+    reason: &str,
+) -> Result<(), String> {
+    let mut raw = read_raw_task_file(brehon_root, task_id)
+        .ok_or_else(|| "task file missing or invalid".to_string())?;
+    validate_prompt_blocked_recovery_failure_transition(&raw)?;
+    merge_serialized_task_update(
+        &mut raw,
+        PromptBlockedRecoveryFailureTaskUpdate {
+            status: RecoveryTaskStatusLabel::Blocked,
+            blockers: reason.to_string(),
+            activity: PROMPT_BLOCKED_RECOVERY_FAILURE_ACTIVITY,
+            recovery_note: format!(
+                "Automatic recovery could not reset blocked pane {pane_name}. {reason}"
+            ),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        },
+    )?;
+    write_raw_task_file(brehon_root, task_id, &raw)
+}
+
+pub(crate) fn block_task_for_stalled_worker_manual_recovery(
+    brehon_root: &std::path::Path,
+    task_id: &str,
+    worker_name: &str,
+    reason: &str,
+) -> Result<(), String> {
+    let mut raw = read_raw_task_file(brehon_root, task_id)
+        .ok_or_else(|| "task file missing or invalid".to_string())?;
+    validate_recovery_block_transition(&raw, "stalled-worker manual recovery")?;
+    raw.insert(
+        "status".into(),
+        serde_json::Value::String("blocked".to_string()),
+    );
+    raw.insert("assignee".into(), serde_json::Value::Null);
+    raw.insert("review_owner".into(), serde_json::Value::Null);
+    raw.insert(
+        "blockers".into(),
+        serde_json::Value::String(format!(
+            "Stalled worker {worker_name} requires supervisor/manual recovery: {reason}"
+        )),
+    );
+    raw.insert(
+        "activity".into(),
+        serde_json::Value::String(STALLED_WORKER_MANUAL_RECOVERY_ACTIVITY.to_string()),
+    );
+    raw.insert(
+        "recovery_note".into(),
+        serde_json::Value::String(format!(
+            "Automatic stalled-worker recovery stopped for {worker_name}. Cleared worker ownership and blocked the task for supervisor/manual recovery because {reason}"
+        )),
+    );
+    raw.insert(
+        "updated_at".into(),
+        serde_json::Value::String(chrono::Utc::now().to_rfc3339()),
+    );
+    write_raw_task_file(brehon_root, task_id, &raw)
+}
+
 pub(crate) fn promote_active_assigned_task(
     brehon_root: &std::path::Path,
     task_id: &str,
@@ -1130,7 +1413,14 @@ pub(crate) fn attempt_auto_recover_stalled_worker(
     let task_id = task.id.clone();
 
     match inspect_worker_worktree_state(brehon_root, worker_name) {
-        WorkerWorktreeInspection::Missing | WorkerWorktreeInspection::Clean => {}
+        WorkerWorktreeInspection::Missing => {
+            return Some(StalledRecoveryOutcome::ManualRecoveryRequired {
+                task_id,
+                worker: worker_name.to_string(),
+                reason: "worker worktree is missing; manual recovery is required".to_string(),
+            });
+        }
+        WorkerWorktreeInspection::Clean => {}
         WorkerWorktreeInspection::Dirty(reason) => {
             return Some(StalledRecoveryOutcome::Blocked {
                 task_id,
@@ -1576,7 +1866,18 @@ pub(crate) fn task_info_to_task(task: &TaskInfo) -> Task {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
     use tempfile::TempDir;
+
+    fn write_test_task(brehon_root: &Path, task_id: &str, task: serde_json::Value) {
+        let tasks_dir = brehon_root.join("runtime").join("tasks");
+        std::fs::create_dir_all(&tasks_dir).expect("tasks dir");
+        std::fs::write(
+            tasks_dir.join(format!("{task_id}.json")),
+            serde_json::to_string_pretty(&task).expect("task json"),
+        )
+        .expect("write task");
+    }
 
     fn sample_dead_letter(target: &str, message: &str) -> DeadLetterEntry {
         DeadLetterEntry {
@@ -1676,5 +1977,66 @@ mod tests {
         assert_eq!(visible[0].session_name, "session-a");
         assert_eq!(visible[0].entry.target, "worker-a");
         assert_eq!(visible[0].entry.message, "hello from previous session");
+    }
+
+    #[test]
+    fn prompt_blocked_recovery_failure_update_blocks_in_review_task() {
+        let temp = TempDir::new().expect("tempdir");
+        write_test_task(
+            temp.path(),
+            "T-review",
+            serde_json::json!({
+                "task_id": "T-review",
+                "title": "Review task",
+                "status": "in_review",
+                "task_type": "task",
+                "review_owner": "reviewer-1"
+            }),
+        );
+
+        block_task_for_prompt_block_recovery_failure(
+            temp.path(),
+            "T-review",
+            "reviewer-1",
+            "runtime command router unavailable",
+        )
+        .expect("block in-review task");
+
+        let saved = read_raw_task_file(temp.path(), "T-review").expect("saved task");
+        assert_eq!(saved["status"], "blocked");
+        assert_eq!(saved["activity"], PROMPT_BLOCKED_RECOVERY_FAILURE_ACTIVITY);
+        assert_eq!(saved["review_owner"], "reviewer-1");
+        assert!(saved["blockers"]
+            .as_str()
+            .is_some_and(|value| value.contains("runtime command router unavailable")));
+        assert!(saved["updated_at"].as_str().is_some());
+    }
+
+    #[test]
+    fn prompt_blocked_recovery_failure_update_rejects_terminal_task() {
+        let temp = TempDir::new().expect("tempdir");
+        write_test_task(
+            temp.path(),
+            "T-merged",
+            serde_json::json!({
+                "task_id": "T-merged",
+                "title": "Merged task",
+                "status": "merged",
+                "task_type": "task"
+            }),
+        );
+
+        let err = block_task_for_prompt_block_recovery_failure(
+            temp.path(),
+            "T-merged",
+            "worker-1",
+            "runtime command router unavailable",
+        )
+        .expect_err("terminal tasks should not be rewritten");
+
+        assert!(err.contains("terminal task T-merged"));
+        let saved = read_raw_task_file(temp.path(), "T-merged").expect("saved task");
+        assert_eq!(saved["status"], "merged");
+        assert!(saved.get("activity").is_none());
     }
 }

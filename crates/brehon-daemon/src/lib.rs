@@ -542,6 +542,8 @@ pub struct PaneRegistryEntry {
     pub exit_code: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked: Option<brehon_types::RuntimePaneBlockInfo>,
 }
 
 /// Point-in-time daemon pane registry.
@@ -1284,6 +1286,7 @@ impl RuntimeDaemon {
             last_output_ms: None,
             exit_code: None,
             exit_reason: None,
+            blocked: None,
         });
 
         if registry_event_is_mux_shadow_of_terminal_host(entry, event) {
@@ -1295,6 +1298,7 @@ impl RuntimeDaemon {
             entry.last_output_ms = None;
             entry.exit_code = None;
             entry.exit_reason = None;
+            entry.blocked = None;
         }
         entry.generation = event.meta.generation;
         if registry_event_updates_pane_source(&event.kind) {
@@ -1309,23 +1313,36 @@ impl RuntimeDaemon {
                 entry.state = RuntimePaneState::Ready;
                 entry.exit_code = None;
                 entry.exit_reason = None;
+                entry.blocked = None;
             }
             RuntimeEventKind::PaneStateChanged(changed) => {
                 entry.state = changed.current.clone();
+                entry.blocked = if matches!(changed.current, RuntimePaneState::Blocked) {
+                    changed.blocked.clone()
+                } else {
+                    None
+                };
             }
             RuntimeEventKind::PaneExited(PaneExitedEvent { exit_code, reason }) => {
                 entry.state = RuntimePaneState::Dead;
                 entry.exit_code = *exit_code;
                 entry.exit_reason = reason.clone();
+                entry.blocked = None;
             }
             RuntimeEventKind::PaneOutput(_) => {
                 entry.last_output_ms = Some(event.meta.timestamp_ms);
             }
             RuntimeEventKind::AgentTurnStarted(_) => {
-                entry.state = RuntimePaneState::Busy;
+                if !matches!(entry.state, RuntimePaneState::Blocked) && entry.blocked.is_none() {
+                    entry.state = RuntimePaneState::Busy;
+                    entry.blocked = None;
+                }
             }
             RuntimeEventKind::AgentTurnEnded(_) => {
-                entry.state = RuntimePaneState::Ready;
+                if !matches!(entry.state, RuntimePaneState::Blocked) && entry.blocked.is_none() {
+                    entry.state = RuntimePaneState::Ready;
+                    entry.blocked = None;
+                }
             }
             RuntimeEventKind::PromptQueued(_)
             | RuntimeEventKind::PromptDelivered(_)
@@ -1774,7 +1791,8 @@ mod tests {
     use brehon_ports::{RuntimeCommandPort, RuntimeEventSink, RuntimeEventStream};
     use brehon_types::{
         DetectionEvent, DetectionSeverity, PaneOutputEvent, PaneStateChangedEvent,
-        PromptDeliveryMode, RuntimeCommandKind, RuntimeCommandTarget, WorkflowActionStatus,
+        PromptDeliveryMode, RuntimeCommandKind, RuntimeCommandTarget, RuntimePaneBlockInfo,
+        RuntimePaneBlockKind, WorkflowActionStatus,
     };
 
     #[derive(Default)]
@@ -1915,6 +1933,7 @@ mod tests {
                     previous: None,
                     current: RuntimePaneState::Ready,
                     reason: Some("respawned".to_string()),
+                    blocked: None,
                 }),
             ))
             .await
@@ -1974,6 +1993,7 @@ mod tests {
                     previous: Some(RuntimePaneState::Ready),
                     current: RuntimePaneState::Busy,
                     reason: Some("activity started".to_string()),
+                    blocked: None,
                 }),
             ))
             .await
@@ -2068,6 +2088,7 @@ mod tests {
                     previous: Some(RuntimePaneState::Ready),
                     current: RuntimePaneState::Dead,
                     reason: Some("local placeholder dropped".to_string()),
+                    blocked: None,
                 }),
             ))
             .await
@@ -2203,6 +2224,7 @@ mod tests {
                     previous: None,
                     current: RuntimePaneState::Ready,
                     reason: Some("spawned".to_string()),
+                    blocked: None,
                 }),
             ))
             .await
@@ -2226,6 +2248,110 @@ mod tests {
                 .is_some_and(|message| message.contains("pane generation"))
         );
         assert!(command_port.commands.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn daemon_registry_tracks_blocked_pane_details() {
+        let daemon = RuntimeDaemon::new(RuntimeDaemonConfig::default());
+        let blocked = RuntimePaneBlockInfo {
+            kind: RuntimePaneBlockKind::PermissionRequest,
+            summary: "permission request blocked automatic recovery: allow bash ls".to_string(),
+            command_or_tool: Some("allow bash ls".to_string()),
+            request_id: Some("perm-1".to_string()),
+            task_id: Some("T-owned".to_string()),
+            excerpt: None,
+        };
+
+        daemon
+            .publish(RuntimeEvent::new(
+                meta("pane", 1),
+                RuntimeEventKind::PaneSpawned(PaneSpawnedEvent {
+                    kind: RuntimePaneKind::Worker,
+                    title: Some("worker".to_string()),
+                }),
+            ))
+            .await
+            .expect("publish spawn");
+        daemon
+            .publish(RuntimeEvent::new(
+                meta("pane", 1),
+                RuntimeEventKind::PaneStateChanged(PaneStateChangedEvent {
+                    previous: Some(RuntimePaneState::Ready),
+                    current: RuntimePaneState::Blocked,
+                    reason: Some("permission request blocked automatic recovery".to_string()),
+                    blocked: Some(blocked.clone()),
+                }),
+            ))
+            .await
+            .expect("publish blocked state");
+
+        let snapshot = daemon.pane_registry_snapshot().await;
+        assert_eq!(snapshot.panes.len(), 1);
+        let pane = &snapshot.panes[0];
+        assert_eq!(pane.state, RuntimePaneState::Blocked);
+        assert_eq!(pane.blocked.as_ref(), Some(&blocked));
+    }
+
+    #[tokio::test]
+    async fn daemon_registry_preserves_blocked_details_across_turn_shadow_events() {
+        let daemon = RuntimeDaemon::new(RuntimeDaemonConfig::default());
+        let blocked = RuntimePaneBlockInfo {
+            kind: RuntimePaneBlockKind::PermissionRequest,
+            summary: "permission request blocked automatic recovery: allow bash ls".to_string(),
+            command_or_tool: Some("allow bash ls".to_string()),
+            request_id: Some("perm-1".to_string()),
+            task_id: Some("T-owned".to_string()),
+            excerpt: None,
+        };
+
+        daemon
+            .publish(RuntimeEvent::new(
+                meta("pane", 1),
+                RuntimeEventKind::PaneSpawned(PaneSpawnedEvent {
+                    kind: RuntimePaneKind::Worker,
+                    title: Some("worker".to_string()),
+                }),
+            ))
+            .await
+            .expect("publish spawn");
+        daemon
+            .publish(RuntimeEvent::new(
+                meta("pane", 1),
+                RuntimeEventKind::PaneStateChanged(PaneStateChangedEvent {
+                    previous: Some(RuntimePaneState::Ready),
+                    current: RuntimePaneState::Blocked,
+                    reason: Some("permission request blocked automatic recovery".to_string()),
+                    blocked: Some(blocked.clone()),
+                }),
+            ))
+            .await
+            .expect("publish blocked state");
+        daemon
+            .publish(RuntimeEvent::new(
+                meta("pane", 1),
+                RuntimeEventKind::AgentTurnStarted(brehon_types::AgentTurnEvent {
+                    prompt_id: Some("perm-1".to_string()),
+                    reason: Some("shadow turn event".to_string()),
+                }),
+            ))
+            .await
+            .expect("publish turn-start shadow event");
+        daemon
+            .publish(RuntimeEvent::new(
+                meta("pane", 1),
+                RuntimeEventKind::AgentTurnEnded(brehon_types::AgentTurnEvent {
+                    prompt_id: Some("perm-1".to_string()),
+                    reason: Some("shadow turn end".to_string()),
+                }),
+            ))
+            .await
+            .expect("publish turn-end shadow event");
+
+        let snapshot = daemon.pane_registry_snapshot().await;
+        assert_eq!(snapshot.panes.len(), 1);
+        let pane = &snapshot.panes[0];
+        assert_eq!(pane.state, RuntimePaneState::Blocked);
+        assert_eq!(pane.blocked.as_ref(), Some(&blocked));
     }
 
     #[tokio::test]
@@ -3018,6 +3144,7 @@ mod tests {
                 last_output_ms: None,
                 exit_code: None,
                 exit_reason: Some("terminal host disappeared: pane list was empty".to_string()),
+                blocked: None,
             }],
         };
 
@@ -3147,6 +3274,7 @@ mod tests {
                     previous: None,
                     current: RuntimePaneState::Ready,
                     reason: Some("terminal host respawn".to_string()),
+                    blocked: None,
                 }),
             ),
             RuntimeEvent::new(

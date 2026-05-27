@@ -2,7 +2,40 @@
 
 use std::path::{Path, PathBuf};
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use super::paths::{project_root, workspace_root};
+use crate::tools::agent::current_runtime_session_name;
+
+use brehon_git::WORKTREE_AWARE_BREHON_IGNORE_PATTERNS;
+
+/// Test-only: counts invocations of `dirty_primary_checkout_terminal_blocker`
+/// within the current process. Reset via `reset_test_dirty_check_invocation`.
+#[cfg(test)]
+static TEST_DIRTY_CHECK_INVOCATION: AtomicUsize = AtomicUsize::new(0);
+
+/// Test-only: when set to a specific invocation number (0-indexed), that
+/// invocation of `dirty_primary_checkout_terminal_blocker` will artificially
+/// return a dirty-root error. This lets tests deterministically exercise the
+/// rollback path that runs after a submission has already been persisted.
+#[cfg(test)]
+static TEST_FORCE_DIRTY_ON_INVOCATION: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+#[cfg(test)]
+pub(crate) fn reset_test_dirty_check_invocation() {
+    TEST_DIRTY_CHECK_INVOCATION.store(0, Ordering::SeqCst);
+}
+
+#[cfg(test)]
+pub(crate) fn set_test_force_dirty_on_invocation(n: usize) {
+    TEST_FORCE_DIRTY_ON_INVOCATION.store(n, Ordering::SeqCst);
+}
+
+#[cfg(test)]
+pub(crate) fn clear_test_force_dirty_on_invocation() {
+    TEST_FORCE_DIRTY_ON_INVOCATION.store(usize::MAX, Ordering::SeqCst);
+}
 
 pub(super) fn git_stdout_in(cwd: &Path, args: &[&str]) -> Result<String, String> {
     let output = crate::git_exec::run_git(cwd, args)?;
@@ -198,7 +231,21 @@ pub(super) fn non_brehon_status_entries(status: &str) -> Vec<&str> {
         .collect()
 }
 
-pub(super) fn dirty_primary_checkout_terminal_blocker(action: &str) -> Option<String> {
+pub(crate) fn dirty_primary_checkout_terminal_blocker(action: &str) -> Option<String> {
+    #[cfg(test)]
+    {
+        let invocation = TEST_DIRTY_CHECK_INVOCATION.fetch_add(1, Ordering::SeqCst);
+        let target = TEST_FORCE_DIRTY_ON_INVOCATION.load(Ordering::SeqCst);
+        if invocation == target {
+            return Some(format!(
+                "Cannot {action}: shared repo root is dirty (forced by test hook on invocation {invocation}). \
+                 Refusing terminal transition while run integrity is compromised. \
+                 Recovery: inspect the dirty files with `git status` in the shared repo root, \
+                 then commit, stash, or discard the changes before retrying."
+            ));
+        }
+    }
+
     let project = project_root()?;
     if !project.join(".git").exists() {
         return None;
@@ -247,9 +294,16 @@ pub(super) fn dirty_primary_checkout_terminal_blocker(action: &str) -> Option<St
     } else {
         ""
     };
+    let session = current_runtime_session_name();
+    let session_line = match session {
+        Some(name) => format!(" Current runtime session: {name}."),
+        None => String::new(),
+    };
     Some(format!(
         "Cannot {action}: shared repo root '{}' is dirty outside .brehon/ ({}{}). \
-         Refusing to record closed/merged task state while run integrity is compromised.",
+         Refusing terminal transition while run integrity is compromised.{session_line} \
+         Recovery: inspect the dirty files with `git status` in the shared repo root, \
+         then commit, stash, or discard the changes before retrying.",
         project.display(),
         preview,
         suffix
@@ -433,55 +487,9 @@ pub(super) fn detect_default_branch_in(cwd: &Path) -> Result<String, String> {
     Ok("main".to_string())
 }
 
-fn resolve_git_info_dir(root: &Path) -> Result<PathBuf, String> {
-    let git_entry = root.join(".git");
-    if git_entry.is_file() {
-        let contents = std::fs::read_to_string(&git_entry).map_err(|err| {
-            format!(
-                "Failed to read .git file at '{}': {err}",
-                git_entry.display()
-            )
-        })?;
-        let gitdir = contents
-            .trim()
-            .strip_prefix("gitdir:")
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| {
-                format!(
-                    ".git file at '{}' does not contain a valid gitdir pointer",
-                    git_entry.display()
-                )
-            })?;
-        let gitdir_path = PathBuf::from(gitdir);
-        let resolved = if gitdir_path.is_absolute() {
-            gitdir_path
-        } else {
-            root.join(gitdir_path)
-        };
-        let commondir_line = std::fs::read_to_string(resolved.join("commondir"))
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
-        let info_base = if let Some(ref common) = commondir_line {
-            let common_path = PathBuf::from(common);
-            let common_resolved = if common_path.is_absolute() {
-                common_path
-            } else {
-                resolved.join(&common_path)
-            };
-            common_resolved.join("info")
-        } else {
-            resolved.join("info")
-        };
-        Ok(info_base)
-    } else {
-        Ok(git_entry.join("info"))
-    }
-}
-
 pub(super) fn ensure_brehon_ignored_in_repo(root: &Path) -> Result<(), String> {
-    let info_dir = resolve_git_info_dir(root)?;
+    let info_dir = brehon_git::resolve_git_info_dir(root)
+        .map_err(|err| format!("Failed to resolve git info directory: {err}"))?;
     let exclude_path = info_dir.join("exclude");
     let parent = exclude_path
         .parent()
@@ -494,18 +502,31 @@ pub(super) fn ensure_brehon_ignored_in_repo(root: &Path) -> Result<(), String> {
     })?;
 
     let existing = std::fs::read_to_string(&exclude_path).unwrap_or_default();
-    if existing
-        .lines()
-        .any(|line| matches!(line.trim(), ".brehon/" | ".brehon"))
-    {
+    let (mut updated, removed_legacy) = brehon_git::remove_legacy_brehon_dir_ignores(&existing);
+    let existing_patterns = updated.lines().map(str::trim).collect::<Vec<_>>();
+    let missing = WORKTREE_AWARE_BREHON_IGNORE_PATTERNS
+        .iter()
+        .filter(|pattern| !existing_patterns.contains(pattern))
+        .copied()
+        .collect::<Vec<_>>();
+
+    if missing.is_empty() && !removed_legacy {
         return Ok(());
     }
 
-    let mut updated = existing;
     if !updated.is_empty() && !updated.ends_with('\n') {
         updated.push('\n');
     }
-    updated.push_str("# Brehon orchestration data\n.brehon/\n");
+    if !updated
+        .lines()
+        .any(|l| l.trim() == "# Brehon orchestration data")
+    {
+        updated.push_str("# Brehon orchestration data\n");
+    }
+    for pattern in missing {
+        updated.push_str(pattern);
+        updated.push('\n');
+    }
     std::fs::write(&exclude_path, updated).map_err(|err| {
         format!(
             "Failed to update git exclude file '{}': {err}",
@@ -758,4 +779,112 @@ fn bytes_contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack
         .windows(needle.len())
         .any(|window| window == needle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run_git(path: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(path)
+            .output()
+            .unwrap_or_else(|err| panic!("failed to run git {}: {err}", args.join(" ")));
+        assert!(
+            output.status.success(),
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    fn init_git_repo(path: &Path) {
+        run_git(path, &["init", "-b", "main"]);
+        run_git(path, &["config", "user.email", "brehon@example.com"]);
+        run_git(path, &["config", "user.name", "Brehon Test"]);
+        std::fs::write(path.join("README.md"), "seed\n").unwrap();
+        run_git(path, &["add", "README.md"]);
+        run_git(path, &["commit", "-m", "seed"]);
+    }
+
+    #[test]
+    fn ensure_brehon_ignored_migrates_legacy_dir_ignore() {
+        let temp = tempfile::tempdir().unwrap();
+        init_git_repo(temp.path());
+        let exclude = temp.path().join(".git/info/exclude");
+        std::fs::create_dir_all(exclude.parent().unwrap()).unwrap();
+        std::fs::write(&exclude, ".brehon/\nuser-cache/\n").unwrap();
+
+        ensure_brehon_ignored_in_repo(temp.path()).unwrap();
+
+        let contents = std::fs::read_to_string(&exclude).unwrap();
+        let lines = contents.lines().map(str::trim).collect::<Vec<_>>();
+        assert!(!lines.contains(&".brehon/"));
+        assert!(!lines.contains(&".brehon"));
+        assert!(lines.contains(&"user-cache/"));
+        for pattern in WORKTREE_AWARE_BREHON_IGNORE_PATTERNS {
+            assert!(lines.contains(pattern), "{pattern} missing: {contents}");
+        }
+    }
+
+    #[test]
+    fn ensure_brehon_ignored_leaves_worktree_dirs_visible_but_files_ignored() {
+        let temp = tempfile::tempdir().unwrap();
+        init_git_repo(temp.path());
+
+        ensure_brehon_ignored_in_repo(temp.path()).unwrap();
+
+        let worktree_dir = temp
+            .path()
+            .join(".brehon/worktrees/runs/session-a/agy-worker");
+        std::fs::create_dir_all(&worktree_dir).unwrap();
+        std::fs::write(worktree_dir.join("work.txt"), "work\n").unwrap();
+
+        let visible_dir = run_git(
+            temp.path(),
+            &[
+                "check-ignore",
+                "-v",
+                ".brehon/worktrees/runs/session-a/agy-worker",
+            ],
+        );
+        assert!(visible_dir.contains("!/.brehon/worktrees/**/"));
+
+        let ignored_file = run_git(
+            temp.path(),
+            &[
+                "check-ignore",
+                "-v",
+                ".brehon/worktrees/runs/session-a/agy-worker/work.txt",
+            ],
+        );
+        assert!(ignored_file.contains("/.brehon/worktrees/**"));
+
+        let status = run_git(
+            temp.path(),
+            &["status", "--porcelain", "--untracked-files=all"],
+        );
+        assert!(!status.contains(".brehon"), "{status}");
+    }
+
+    #[test]
+    fn ensure_brehon_ignored_from_linked_worktree_updates_common_exclude() {
+        let temp = tempfile::tempdir().unwrap();
+        init_git_repo(temp.path());
+        let linked = temp.path().join("linked");
+        let linked_arg = linked.to_string_lossy().to_string();
+        run_git(
+            temp.path(),
+            &["worktree", "add", "-b", "linked", &linked_arg],
+        );
+
+        ensure_brehon_ignored_in_repo(&linked).unwrap();
+
+        let contents = std::fs::read_to_string(temp.path().join(".git/info/exclude")).unwrap();
+        for pattern in WORKTREE_AWARE_BREHON_IGNORE_PATTERNS {
+            assert!(contents.lines().any(|line| line.trim() == *pattern));
+        }
+    }
 }

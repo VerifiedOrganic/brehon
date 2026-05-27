@@ -186,6 +186,16 @@ fn format_status_text_at(status: &RuntimeDaemonStatus, now_ms: u64) -> String {
             if let Some(reason) = pane.exit_reason.as_deref() {
                 let _ = write!(output, " exit_reason={reason:?}");
             }
+            if let Some(blocked) = pane.blocked.as_ref() {
+                let _ = write!(output, " blocked_kind={:?}", blocked.kind);
+                let _ = write!(output, " blocked_summary={:?}", blocked.summary);
+                if let Some(task_id) = blocked.task_id.as_deref() {
+                    let _ = write!(output, " blocked_task={task_id}");
+                }
+                if let Some(command) = blocked.command_or_tool.as_deref() {
+                    let _ = write!(output, " blocked_command={command:?}");
+                }
+            }
             let _ = writeln!(output);
         }
     }
@@ -665,6 +675,7 @@ mod tests {
                     last_output_ms: Some(10),
                     exit_code: Some(1),
                     exit_reason: Some("done".to_string()),
+                    blocked: None,
                 }],
             },
             approvals: brehon_daemon::ApprovalRegistrySnapshot {

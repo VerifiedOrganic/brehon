@@ -42,13 +42,14 @@ pub use agent_config::AgentRegistry;
 pub use error::{Error, Result};
 pub use harness::{
     AgentAdapter, CustomAgentConfig, HarnessCapabilities, HarnessControlPlane, HarnessTransport,
-    SupervisorCli,
+    PromptInjectionStrategy, SupervisorCli, builtin_cli_from_launcher_shape,
 };
 pub use mux::{
     AgentPaneMaterialization, AsyncGatewayPromptDeliveryError, AsyncGatewayPromptDispatch, Mux,
     MuxConfig, MuxEvent, MuxRuntimeCommandPort, MuxRuntimeCommandReceiver, PaneBackendOwnership,
     PromptDeliveryAttempt, PromptQueuePosition, QuarantineOutcome,
     TerminalHostAgentFactoryBlockedPane, TerminalHostAgentFactoryPlan,
+    suppress_pending_agent_health_marker_writes,
 };
 pub use pane::TerminalSnapshot;
 pub use pane::{

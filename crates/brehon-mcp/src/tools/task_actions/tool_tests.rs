@@ -1,10 +1,12 @@
 use super::*;
 use crate::server::ContentBlock;
-use crate::tools::TEST_ENV_LOCK;
+use crate::tools::test_support::{
+    write_pane_assignment_context_fixture, write_prompt_delivery_fixture,
+};
+use crate::tools::{ScopedEnv, TEST_ENV_LOCK};
 use brehon_types::TaskCompletionMode;
 use proptest::prelude::*;
 use proptest::test_runner::{Config as ProptestConfig, TestCaseError, TestRunner};
-use std::ffi::OsString;
 use std::io::{self, Write};
 use std::path::Path;
 use std::process::Command;
@@ -27,12 +29,9 @@ use super::super::git_ops::{
 };
 use super::super::lifecycle::{is_container_task, validate_status_transition};
 use super::super::paths::{project_root, workspace_root};
+use crate::tools::task_actions::update_task_status_atomic;
 use crate::tools::verification::reviewed_commits;
 use std::path::PathBuf;
-
-struct ScopedEnv {
-    saved: Vec<(&'static str, Option<OsString>)>,
-}
 
 #[derive(Clone, Default)]
 struct SharedLogBuffer(Arc<Mutex<Vec<u8>>>);
@@ -61,41 +60,6 @@ impl Write for SharedLogWriter {
 
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
-    }
-}
-
-const DEFAULT_EMPTY_VARS: &[&str] = &[
-    "BREHON_WORKTREE_BRANCH",
-    "BREHON_WORKSPACE_ROOT",
-    "BREHON_PROJECT_ROOT",
-];
-
-impl ScopedEnv {
-    fn set(vars: &[(&'static str, &str)]) -> Self {
-        let mut all_vars: Vec<(&'static str, &str)> = vars.to_vec();
-        for key in DEFAULT_EMPTY_VARS {
-            if !all_vars.iter().any(|(existing, _)| existing == key) {
-                all_vars.push((key, ""));
-            }
-        }
-        let mut saved = Vec::with_capacity(all_vars.len());
-        for (key, value) in &all_vars {
-            saved.push((*key, std::env::var_os(key)));
-            std::env::set_var(key, value);
-        }
-        Self { saved }
-    }
-}
-
-impl Drop for ScopedEnv {
-    fn drop(&mut self) {
-        for (key, value) in self.saved.iter().rev() {
-            if let Some(value) = value {
-                std::env::set_var(key, value);
-            } else {
-                std::env::remove_var(key);
-            }
-        }
     }
 }
 
@@ -286,7 +250,7 @@ fn task_tool_startup_migrates_legacy_integration_conflicts_and_logs_once() {
         .unwrap();
     }
 
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", brehon_root.to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
         ("BREHON_AGENT_NAME", "sup-1"),
@@ -365,7 +329,7 @@ fn task_tool_startup_warns_when_migrated_task_write_fails() {
     .unwrap();
     std::fs::create_dir(tasks_dir.join(format!(".{task_id}.tmp"))).unwrap();
 
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", brehon_root.to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
         ("BREHON_AGENT_NAME", "sup-1"),
@@ -416,7 +380,7 @@ fn task_tool_startup_migration_matches_production_fixture_snapshot() {
     )
     .unwrap();
 
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", brehon_root.to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
         ("BREHON_AGENT_NAME", "sup-1"),
@@ -461,7 +425,7 @@ async fn test_integrate_action_resumes_and_completes_after_startup_migrates_lega
     let reviewed_commit = run_git(workspace.path(), &["rev-parse", "HEAD"]);
     run_git(workspace.path(), &["checkout", "main"]);
 
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", brehon_root.to_str().unwrap()),
         ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
@@ -714,7 +678,7 @@ fn ensure_test_project_repo() {
 fn project_root_ignores_blank_workspace_root() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = TempDir::new().unwrap();
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_WORKSPACE_ROOT", "   "),
     ]);
@@ -726,7 +690,7 @@ fn project_root_ignores_blank_workspace_root() {
 fn project_root_ignores_blank_project_root() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = TempDir::new().unwrap();
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_PROJECT_ROOT", "   "),
     ]);
@@ -739,7 +703,7 @@ fn project_root_trims_project_root_value() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = TempDir::new().unwrap();
     let wrapped = format!("  {}  ", root.path().display());
-    let _env = ScopedEnv::set(&[("BREHON_PROJECT_ROOT", &wrapped)]);
+    let _env = ScopedEnv::set_with_defaults(&[("BREHON_PROJECT_ROOT", &wrapped)]);
 
     assert_eq!(project_root().as_deref(), Some(root.path()));
 }
@@ -751,7 +715,7 @@ fn project_root_trims_workspace_root_value() {
     let workspace = TempDir::new().unwrap();
     std::fs::create_dir(workspace.path().join(".git")).unwrap();
     let wrapped = format!("  {}  ", workspace.path().display());
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", brehon_root.path().to_str().unwrap()),
         ("BREHON_WORKSPACE_ROOT", &wrapped),
     ]);
@@ -765,7 +729,7 @@ fn workspace_root_ignores_blank_workspace_root() {
     let temp = TempDir::new().unwrap();
     let brehon_root = temp.path().join(".brehon");
     std::fs::create_dir_all(&brehon_root).unwrap();
-    let _env = ScopedEnv::set(&[("BREHON_ROOT", brehon_root.to_str().unwrap())]);
+    let _env = ScopedEnv::set_with_defaults(&[("BREHON_ROOT", brehon_root.to_str().unwrap())]);
 
     assert_eq!(workspace_root().as_deref(), Some(temp.path()));
 }
@@ -775,7 +739,7 @@ fn workspace_root_trims_workspace_root_value() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let workspace = TempDir::new().unwrap();
     let wrapped = format!("  {}  ", workspace.path().display());
-    let _env = ScopedEnv::set(&[("BREHON_WORKSPACE_ROOT", &wrapped)]);
+    let _env = ScopedEnv::set_with_defaults(&[("BREHON_WORKSPACE_ROOT", &wrapped)]);
 
     assert_eq!(workspace_root().as_deref(), Some(workspace.path()));
 }
@@ -783,7 +747,7 @@ fn workspace_root_trims_workspace_root_value() {
 #[test]
 fn current_workspace_root_rejects_blank_workspace_root() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let _env = ScopedEnv::set(&[("BREHON_WORKSPACE_ROOT", "   ")]);
+    let _env = ScopedEnv::set_with_defaults(&[("BREHON_WORKSPACE_ROOT", "   ")]);
 
     assert_eq!(
         current_workspace_root().unwrap_err(),
@@ -801,7 +765,10 @@ fn checkpoint_cwd_guard_rejects_primary_project_checkout() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let workspace = TempDir::new().unwrap();
     init_git_workspace(workspace.path());
-    let _env = ScopedEnv::set(&[("BREHON_PROJECT_ROOT", workspace.path().to_str().unwrap())]);
+    let _env = ScopedEnv::set_with_defaults(&[(
+        "BREHON_PROJECT_ROOT",
+        workspace.path().to_str().unwrap(),
+    )]);
 
     let err = ensure_checkpoint_cwd_is_isolated(workspace.path()).unwrap_err();
     assert!(
@@ -831,7 +798,7 @@ fn checkpoint_cwd_guard_rejects_default_branch() {
     // check is skipped — we need the branch check to be the one that
     // catches this.
     let other_project = TempDir::new().unwrap();
-    let _env = ScopedEnv::set(&[(
+    let _env = ScopedEnv::set_with_defaults(&[(
         "BREHON_PROJECT_ROOT",
         other_project.path().to_str().unwrap(),
     )]);
@@ -851,7 +818,7 @@ fn checkpoint_cwd_guard_accepts_isolated_worker_worktree() {
     let workspace = TempDir::new().unwrap();
     init_git_workspace(workspace.path()); // leaves HEAD on worker/test
     let other_project = TempDir::new().unwrap();
-    let _env = ScopedEnv::set(&[(
+    let _env = ScopedEnv::set_with_defaults(&[(
         "BREHON_PROJECT_ROOT",
         other_project.path().to_str().unwrap(),
     )]);
@@ -865,7 +832,7 @@ fn current_workspace_root_trims_workspace_root_value() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let workspace = TempDir::new().unwrap();
     let wrapped = format!("  {}  ", workspace.path().display());
-    let _env = ScopedEnv::set(&[("BREHON_WORKSPACE_ROOT", &wrapped)]);
+    let _env = ScopedEnv::set_with_defaults(&[("BREHON_WORKSPACE_ROOT", &wrapped)]);
 
     assert_eq!(current_workspace_root().as_deref(), Ok(workspace.path()));
 }
@@ -1005,7 +972,7 @@ impl IntegrationSequenceFixture {
         let reviewed_commit = run_git(workspace.path(), &["rev-parse", "HEAD"]);
         run_git(workspace.path(), &["checkout", "main"]);
 
-        let env = ScopedEnv::set(&[
+        let env = ScopedEnv::set_with_defaults(&[
             ("BREHON_ROOT", brehon_root.to_str().unwrap()),
             ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
             ("BREHON_AGENT_ROLE", "supervisor"),
@@ -1334,7 +1301,7 @@ async fn create_standalone_task_for_test(tool: &TaskActionsTool, title: &str) ->
 async fn test_create_and_list() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
+    let _env = ScopedEnv::set_with_defaults(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
     let tool = TaskActionsTool::new();
     let args = serde_json::json!({
         "action": "create",
@@ -1389,7 +1356,7 @@ async fn test_create_initiative_and_phase_epic() {
     let brehon_root = workspace.path().join(".brehon");
     std::fs::create_dir_all(&brehon_root).unwrap();
     init_git_workspace(workspace.path());
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", brehon_root.to_str().unwrap()),
         ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
     ]);
@@ -1452,7 +1419,7 @@ async fn test_ensure_final_hardening_backfills_and_is_idempotent() {
     let brehon_root = workspace.path().join(".brehon");
     std::fs::create_dir_all(&brehon_root).unwrap();
     init_git_workspace(workspace.path());
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", brehon_root.to_str().unwrap()),
         ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
     ]);
@@ -1593,7 +1560,7 @@ async fn test_reject_phase_epic_direct_to_main_under_initiative() {
     let brehon_root = workspace.path().join(".brehon");
     std::fs::create_dir_all(&brehon_root).unwrap();
     init_git_workspace(workspace.path());
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", brehon_root.to_str().unwrap()),
         ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
     ]);
@@ -1631,7 +1598,7 @@ async fn test_reject_task_directly_under_initiative() {
     let brehon_root = root.path().join(".brehon");
     std::fs::create_dir_all(&brehon_root).unwrap();
     init_git_workspace(root.path());
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", brehon_root.to_str().unwrap()),
         ("BREHON_WORKSPACE_ROOT", root.path().to_str().unwrap()),
     ]);
@@ -1662,7 +1629,7 @@ async fn test_reject_task_directly_under_initiative() {
 async fn test_ready_excludes_tasks_under_closed_initiative() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
+    let _env = ScopedEnv::set_with_defaults(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
     let tool = TaskActionsTool::new();
 
     write_test_task(root.path(), "I-1", "closed", "initiative");
@@ -1698,7 +1665,7 @@ async fn test_ready_excludes_tasks_under_closed_initiative() {
 async fn test_ready_excludes_control_plane_tasks() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
+    let _env = ScopedEnv::set_with_defaults(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
     let tool = TaskActionsTool::new();
 
     write_test_task(root.path(), "T-worker", "pending", "task");
@@ -1726,7 +1693,7 @@ async fn test_ready_excludes_control_plane_tasks() {
 async fn test_conflicts_lists_supervisor_owned_integration_conflicts() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
+    let _env = ScopedEnv::set_with_defaults(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
     let tool = TaskActionsTool::new();
 
     write_test_task(root.path(), "T-conflict", "changes_requested", "task");
@@ -1767,7 +1734,7 @@ async fn test_conflicts_lists_supervisor_owned_integration_conflicts() {
 async fn test_ready_surfaces_supervisor_owned_integration_conflicts_separately() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
+    let _env = ScopedEnv::set_with_defaults(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
     let tool = TaskActionsTool::new();
 
     write_test_task(root.path(), "T-pending", "pending", "task");
@@ -1902,7 +1869,7 @@ async fn test_clear_supervisor_integration_conflict_restores_previous_worker() {
     // recycled when the task reaches a terminal state.
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
+    let _env = ScopedEnv::set_with_defaults(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
 
     write_test_task(root.path(), "T-conflict", "changes_requested", "task");
 
@@ -1958,7 +1925,7 @@ async fn test_clear_supervisor_integration_conflict_preserves_existing_assignee(
     // clear must not overwrite the new assignee with the stale previous_worker.
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
+    let _env = ScopedEnv::set_with_defaults(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
 
     write_test_task(root.path(), "T-conflict", "changes_requested", "task");
 
@@ -2001,7 +1968,7 @@ async fn test_clear_supervisor_integration_conflict_preserves_existing_assignee(
 async fn test_supervisor_can_recover_blocked_integration_conflict_to_review_ready() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
     ]);
@@ -2060,7 +2027,7 @@ async fn test_supervisor_can_recover_blocked_integration_conflict_to_review_read
 async fn test_blocked_without_integration_conflict_cannot_jump_to_review_ready() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
     ]);
@@ -2091,7 +2058,7 @@ async fn test_blocked_without_integration_conflict_cannot_jump_to_review_ready()
 async fn test_supervisor_can_recover_blocked_worker_handoff_to_review_ready() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
     ]);
@@ -2138,7 +2105,7 @@ async fn test_supervisor_can_recover_blocked_worker_handoff_to_review_ready() {
 async fn test_supervisor_cannot_recover_blocked_worker_handoff_without_commit() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
     ]);
@@ -2183,7 +2150,7 @@ async fn test_supervisor_cannot_recover_blocked_worker_handoff_without_commit() 
 async fn test_recover_handoff_action_repairs_blocked_worker_handoff() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
     ]);
@@ -2236,7 +2203,7 @@ async fn test_recover_handoff_action_repairs_blocked_worker_handoff() {
 async fn test_recover_handoff_action_repairs_legacy_completed_worker_handoff() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
     ]);
@@ -2280,7 +2247,7 @@ async fn test_recover_handoff_action_repairs_legacy_completed_worker_handoff() {
 async fn test_repair_frontier_repairs_all_safe_blocked_handoffs() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
     ]);
@@ -2329,7 +2296,7 @@ async fn test_repair_frontier_repairs_all_safe_blocked_handoffs() {
 async fn test_recover_handoff_returns_structured_error_without_commit() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
     ]);
@@ -2376,7 +2343,7 @@ async fn test_recover_handoff_returns_structured_error_without_commit() {
 async fn test_recover_handoff_rejects_non_blocked_task_with_structured_error() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
     ]);
@@ -2413,7 +2380,7 @@ async fn test_recover_handoff_rejects_non_blocked_task_with_structured_error() {
 async fn test_repair_frontier_requires_supervisor_with_structured_error() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "worker"),
         ("BREHON_AGENT_NAME", "worker-1"),
@@ -2439,7 +2406,7 @@ async fn test_recover_handoff_reports_structured_errors_for_unsafe_states() {
     let root = make_test_root();
 
     {
-        let _env = ScopedEnv::set(&[
+        let _env = ScopedEnv::set_with_defaults(&[
             ("BREHON_ROOT", root.path().to_str().unwrap()),
             ("BREHON_AGENT_ROLE", "worker"),
         ]);
@@ -2457,7 +2424,7 @@ async fn test_recover_handoff_reports_structured_errors_for_unsafe_states() {
         assert_eq!(payload["next_action"]["args"]["action"], "ready");
     }
 
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
     ]);
@@ -2600,7 +2567,7 @@ async fn test_live_runtime_ready_and_repair_frontier_without_manual_task_json_ed
     let workspace = tempfile::tempdir().unwrap();
     init_git_workspace(workspace.path());
 
-    let _supervisor_env = ScopedEnv::set(&[
+    let _supervisor_env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
         ("BREHON_AGENT_NAME", "supervisor-1"),
@@ -2632,7 +2599,7 @@ async fn test_live_runtime_ready_and_repair_frontier_without_manual_task_json_ed
     assert!(owned.is_error.is_none(), "{}", extract_text(&owned));
     drop(_supervisor_env);
 
-    let _worker_env = ScopedEnv::set(&[
+    let _worker_env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "worker"),
@@ -2657,7 +2624,7 @@ async fn test_live_runtime_ready_and_repair_frontier_without_manual_task_json_ed
     );
     drop(_worker_env);
 
-    let _supervisor_env = ScopedEnv::set(&[
+    let _supervisor_env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
         ("BREHON_AGENT_NAME", "supervisor-1"),
@@ -2708,7 +2675,7 @@ async fn test_live_runtime_ready_and_repair_frontier_without_manual_task_json_ed
 async fn test_ready_reconciles_dependency_states_before_listing() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
+    let _env = ScopedEnv::set_with_defaults(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
     let tool = TaskActionsTool::new();
 
     write_test_task(root.path(), "T-blocker", "closed", "task");
@@ -2747,7 +2714,7 @@ async fn test_ready_reconciles_dependency_states_before_listing() {
 async fn test_ready_surfaces_review_ready_tasks_separately() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
+    let _env = ScopedEnv::set_with_defaults(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
     let tool = TaskActionsTool::new();
 
     write_test_task(root.path(), "T-pending", "pending", "task");
@@ -2791,7 +2758,7 @@ async fn test_ready_surfaces_review_ready_tasks_separately() {
 async fn test_ready_surfaces_unassigned_changes_requested_tasks_separately() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
+    let _env = ScopedEnv::set_with_defaults(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
     let tool = TaskActionsTool::new();
 
     write_test_task(root.path(), "T-pending", "pending", "task");
@@ -2839,7 +2806,7 @@ async fn test_ready_surfaces_unassigned_changes_requested_tasks_separately() {
 async fn test_ready_surfaces_recoverable_blocked_worker_handoffs() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
+    let _env = ScopedEnv::set_with_defaults(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
     let tool = TaskActionsTool::new();
 
     write_test_task(root.path(), "T-handoff", "blocked", "task");
@@ -2899,7 +2866,7 @@ async fn test_ready_surfaces_recoverable_blocked_worker_handoffs() {
 async fn test_ready_surfaces_legacy_completed_handoff_without_commit() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
+    let _env = ScopedEnv::set_with_defaults(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
     let tool = TaskActionsTool::new();
 
     write_test_task(root.path(), "T-completed-no-commit", "completed", "task");
@@ -2948,7 +2915,7 @@ async fn test_ready_surfaces_legacy_completed_handoff_without_commit() {
 async fn test_ready_surfaces_approved_merge_tasks_separately() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
+    let _env = ScopedEnv::set_with_defaults(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
     let tool = TaskActionsTool::new();
 
     write_test_task(root.path(), "T-approved", "approved", "task");
@@ -2981,7 +2948,7 @@ async fn test_ready_surfaces_approved_merge_tasks_separately() {
 async fn test_ready_surfaces_open_followup_sources_separately() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
+    let _env = ScopedEnv::set_with_defaults(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
     let tool = TaskActionsTool::new();
 
     write_test_task(root.path(), "T-pending", "pending", "task");
@@ -3043,7 +3010,7 @@ async fn test_ready_surfaces_open_followup_sources_separately() {
 async fn test_ready_reconciles_started_blocked_task_back_to_in_progress_when_deps_clear() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
+    let _env = ScopedEnv::set_with_defaults(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
     let tool = TaskActionsTool::new();
 
     write_test_task(root.path(), "T-blocker", "closed", "task");
@@ -3082,7 +3049,7 @@ async fn test_ready_reconciles_started_blocked_task_back_to_in_progress_when_dep
 async fn test_ready_reconciles_dependency_blocker_text_with_dead_assignee_back_to_pending() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
+    let _env = ScopedEnv::set_with_defaults(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
     let tool = TaskActionsTool::new();
 
     write_test_task(root.path(), "T-blocker", "closed", "task");
@@ -3145,7 +3112,7 @@ async fn test_ready_reconciles_dependency_blocker_text_with_dead_assignee_back_t
 async fn test_ready_reconciles_worker_state_blocker_with_dead_assignee_back_to_pending() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
     ]);
@@ -3217,7 +3184,7 @@ async fn test_ready_reconciles_worker_state_blocker_with_dead_assignee_back_to_p
 async fn test_ready_reconciles_observed_worker_state_blocker_variants() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
     ]);
@@ -3305,7 +3272,7 @@ async fn test_ready_reconciles_observed_worker_state_blocker_variants() {
 async fn test_ready_recovers_dead_in_progress_assignee_without_worker_progress() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
+    let _env = ScopedEnv::set_with_defaults(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
     let tool = TaskActionsTool::new();
 
     let sessions_dir = root.path().join("runtime").join("sessions");
@@ -3355,7 +3322,7 @@ async fn test_ready_recovers_dead_in_progress_assignee_without_worker_progress()
 async fn test_ready_does_not_orphan_worker_with_unconsolidated_review_round() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
+    let _env = ScopedEnv::set_with_defaults(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
     let tool = TaskActionsTool::new();
 
     let sessions_dir = root.path().join("runtime").join("sessions");
@@ -3430,7 +3397,7 @@ async fn test_ready_does_not_orphan_worker_with_unconsolidated_review_round() {
 async fn test_ready_clears_stale_pending_assignee_without_worker_progress() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
+    let _env = ScopedEnv::set_with_defaults(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
     let tool = TaskActionsTool::new();
 
     write_test_task(root.path(), "T-pending", "pending", "task");
@@ -3467,7 +3434,7 @@ async fn test_ready_clears_stale_pending_assignee_without_worker_progress() {
 async fn test_children_defaults_to_compact_projection() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
+    let _env = ScopedEnv::set_with_defaults(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
     let tool = TaskActionsTool::new();
 
     write_test_task(root.path(), "E-1", "pending", "epic");
@@ -3503,7 +3470,7 @@ async fn test_children_defaults_to_compact_projection() {
 async fn test_children_verbose_returns_full_task_payload() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
+    let _env = ScopedEnv::set_with_defaults(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
     let tool = TaskActionsTool::new();
 
     write_test_task(root.path(), "E-1", "pending", "epic");
@@ -3537,7 +3504,7 @@ async fn test_children_verbose_returns_full_task_payload() {
 async fn test_archive_removes_task_and_strips_dependencies() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
         ("BREHON_AGENT_NAME", "sup-1"),
@@ -3603,7 +3570,7 @@ async fn test_archive_removes_task_and_strips_dependencies() {
 async fn test_archive_rejects_container_without_recursive() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
         ("BREHON_AGENT_NAME", "sup-1"),
@@ -3644,7 +3611,7 @@ async fn test_archive_rejects_container_without_recursive() {
 async fn test_archive_rejects_active_review_obligation() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
         ("BREHON_AGENT_NAME", "sup-1"),
@@ -3712,7 +3679,7 @@ async fn test_archive_rejects_active_review_obligation() {
 async fn test_archive_rejects_checkpointed_unreviewed_task() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
         ("BREHON_AGENT_NAME", "sup-1"),
@@ -3757,7 +3724,7 @@ async fn test_archive_rejects_checkpointed_unreviewed_task() {
 async fn test_archive_allows_duplicate_checkpoint_already_owned_by_terminal_task() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
         ("BREHON_AGENT_NAME", "sup-1"),
@@ -3838,7 +3805,7 @@ async fn test_archive_allows_duplicate_checkpoint_already_owned_by_terminal_task
 async fn test_archive_terminal_task_moves_review_state_and_releases_panel() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
         ("BREHON_AGENT_NAME", "sup-1"),
@@ -3914,7 +3881,7 @@ async fn test_archive_terminal_task_moves_review_state_and_releases_panel() {
 async fn test_archive_refreshes_runtime_stability_counters() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
         ("BREHON_AGENT_NAME", "sup-1"),
@@ -3956,7 +3923,7 @@ async fn test_archive_refreshes_runtime_stability_counters() {
 async fn test_container_close_rejects_archived_review_obligation_descendant() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
         ("BREHON_AGENT_NAME", "sup-1"),
@@ -4007,7 +3974,7 @@ async fn test_container_close_rejects_archived_review_obligation_descendant() {
 async fn test_mine_hides_import_source_file_from_workers() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_AGENT_NAME", "worker-1"),
         ("BREHON_AGENT_ROLE", "worker"),
@@ -4042,7 +4009,7 @@ async fn test_mine_hides_import_source_file_from_workers() {
 async fn test_mine_only_returns_worker_actionable_assignments() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_AGENT_NAME", "worker-1"),
         ("BREHON_AGENT_ROLE", "worker"),
@@ -4088,10 +4055,590 @@ async fn test_mine_only_returns_worker_actionable_assignments() {
 }
 
 #[tokio::test]
+async fn test_list_surfaces_assigned_without_delivery_observability() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let root = make_test_root();
+    let _env = ScopedEnv::set_with_defaults(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
+    let tool = TaskActionsTool::new();
+
+    write_test_task(root.path(), "T-assigned", "assigned", "task");
+    let mut task = read_test_task(root.path(), "T-assigned");
+    task["assignment_propagation"] = serde_json::json!({
+        "owner": "worker-1",
+        "assignment_kind": "task",
+        "assigned_at": "2026-05-24T01:00:00Z",
+        "prompt_id": null,
+        "delivery_method": "queued"
+    });
+    std::fs::write(
+        root.path()
+            .join("runtime")
+            .join("tasks")
+            .join("T-assigned.json"),
+        serde_json::to_string_pretty(&task).unwrap(),
+    )
+    .unwrap();
+
+    let list = tool
+        .execute(serde_json::json!({
+            "action": "list",
+            "status": "assigned",
+            "include_assignment_observability": true
+        }))
+        .await
+        .unwrap();
+    let payload: Value = serde_json::from_str(&extract_text(&list)).unwrap();
+    let observability = &payload["tasks"][0]["assignment_observability"];
+    assert_eq!(observability["overall"], "assigned_without_delivery");
+    assert_eq!(observability["delivery"]["state"], "not_enqueued");
+}
+
+#[tokio::test]
+async fn test_list_omits_assignment_observability_by_default() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let root = make_test_root();
+    let _env = ScopedEnv::set_with_defaults(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
+    let tool = TaskActionsTool::new();
+
+    write_test_task(root.path(), "T-assigned", "assigned", "task");
+    let list = tool
+        .execute(serde_json::json!({"action": "list", "status": "assigned"}))
+        .await
+        .unwrap();
+    let payload: Value = serde_json::from_str(&extract_text(&list)).unwrap();
+    assert!(payload["tasks"][0]
+        .get("assignment_observability")
+        .is_none());
+}
+
+#[tokio::test]
+async fn test_list_ignores_stale_propagation_owner_for_reassigned_task() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let root = make_test_root();
+    let _env = ScopedEnv::set_with_defaults(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
+    let tool = TaskActionsTool::new();
+
+    write_test_task(root.path(), "T-reassigned-stale", "assigned", "task");
+    let mut task = read_test_task(root.path(), "T-reassigned-stale");
+    task["assignee"] = serde_json::json!("worker-2");
+    task["assignment_propagation"] = serde_json::json!({
+        "owner": "worker-1",
+        "assignment_kind": "task",
+        "assigned_at": "2026-05-24T01:00:00Z",
+        "prompt_id": "prompt-worker-1",
+        "delivery_method": "queued",
+        "acknowledged_at": "2026-05-24T01:00:05Z",
+        "acknowledged_by": "worker-1",
+        "acknowledged_via": "task action=mine",
+        "progress_started_at": "2026-05-24T01:00:10Z",
+        "progress_started_by": "worker-1",
+        "progress_started_via": "task action=progress"
+    });
+    std::fs::write(
+        root.path()
+            .join("runtime")
+            .join("tasks")
+            .join("T-reassigned-stale.json"),
+        serde_json::to_string_pretty(&task).unwrap(),
+    )
+    .unwrap();
+    write_prompt_delivery_fixture(root.path(), "prompt-worker-1", "worker-1", true);
+    write_pane_assignment_context_fixture(
+        root.path(),
+        "worker-2",
+        "task",
+        "T-reassigned-stale",
+        None,
+        None,
+    );
+
+    let list = tool
+        .execute(serde_json::json!({
+            "action": "list",
+            "status": "assigned",
+            "include_assignment_observability": true
+        }))
+        .await
+        .unwrap();
+    let payload: Value = serde_json::from_str(&extract_text(&list)).unwrap();
+    let observability = &payload["tasks"][0]["assignment_observability"];
+    assert_eq!(observability["owner"], "worker-2");
+    assert_eq!(observability["overall"], "assigned_without_delivery");
+    assert_eq!(observability["delivery"]["state"], "not_enqueued");
+}
+
+#[tokio::test]
+async fn test_list_surfaces_delivered_without_ack_observability() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let root = make_test_root();
+    let _env = ScopedEnv::set_with_defaults(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
+    let tool = TaskActionsTool::new();
+
+    write_test_task(root.path(), "T-delivered", "assigned", "task");
+    let mut task = read_test_task(root.path(), "T-delivered");
+    task["assignment_propagation"] = serde_json::json!({
+        "owner": "worker-1",
+        "assignment_kind": "task",
+        "assigned_at": "2026-05-24T01:00:00Z",
+        "prompt_id": "prompt-delivered",
+        "delivery_method": "queued"
+    });
+    std::fs::write(
+        root.path()
+            .join("runtime")
+            .join("tasks")
+            .join("T-delivered.json"),
+        serde_json::to_string_pretty(&task).unwrap(),
+    )
+    .unwrap();
+    write_prompt_delivery_fixture(root.path(), "prompt-delivered", "worker-1", true);
+    write_pane_assignment_context_fixture(
+        root.path(),
+        "worker-1",
+        "task",
+        "T-delivered",
+        None,
+        None,
+    );
+
+    let list = tool
+        .execute(serde_json::json!({
+            "action": "list",
+            "status": "assigned",
+            "include_assignment_observability": true
+        }))
+        .await
+        .unwrap();
+    let payload: Value = serde_json::from_str(&extract_text(&list)).unwrap();
+    let observability = &payload["tasks"][0]["assignment_observability"];
+    assert_eq!(observability["overall"], "delivered_without_ack");
+    assert_eq!(observability["delivery"]["state"], "injected");
+    assert_eq!(observability["active_context"]["matches"], true);
+    assert!(observability["acknowledged_at"].is_null());
+}
+
+#[tokio::test]
+async fn test_mine_acknowledges_assignment_and_surfaces_acked_without_progress() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let root = make_test_root();
+    let _env = ScopedEnv::set_with_defaults(&[
+        ("BREHON_ROOT", root.path().to_str().unwrap()),
+        ("BREHON_AGENT_NAME", "worker-1"),
+        ("BREHON_AGENT_ROLE", "worker"),
+    ]);
+    let tool = TaskActionsTool::new();
+
+    write_test_task(root.path(), "T-acked", "assigned", "task");
+    let mut task = read_test_task(root.path(), "T-acked");
+    task["assignment_propagation"] = serde_json::json!({
+        "owner": "worker-1",
+        "assignment_kind": "task",
+        "assigned_at": "2026-05-24T01:00:00Z",
+        "prompt_id": "prompt-acked",
+        "delivery_method": "queued"
+    });
+    std::fs::write(
+        root.path()
+            .join("runtime")
+            .join("tasks")
+            .join("T-acked.json"),
+        serde_json::to_string_pretty(&task).unwrap(),
+    )
+    .unwrap();
+    write_prompt_delivery_fixture(root.path(), "prompt-acked", "worker-1", true);
+    write_pane_assignment_context_fixture(root.path(), "worker-1", "task", "T-acked", None, None);
+
+    let mine = tool
+        .execute(serde_json::json!({"action": "mine"}))
+        .await
+        .unwrap();
+    let payload: Value = serde_json::from_str(&extract_text(&mine)).unwrap();
+    let observability = &payload["tasks"][0]["assignment_observability"];
+    assert_eq!(observability["overall"], "acked_without_progress");
+    assert_eq!(observability["acknowledged_by"], "worker-1");
+    assert_eq!(observability["acknowledged_via"], "task action=mine");
+    assert_eq!(observability["active_context"]["matches"], true);
+
+    let stored = read_test_task(root.path(), "T-acked");
+    assert_eq!(
+        stored["assignment_propagation"]["acknowledged_via"],
+        "task action=mine"
+    );
+}
+
+#[tokio::test]
+async fn test_mine_surfaces_persisted_not_enqueued_delivery_method() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let root = make_test_root();
+    let _env = ScopedEnv::set_with_defaults(&[
+        ("BREHON_ROOT", root.path().to_str().unwrap()),
+        ("BREHON_AGENT_NAME", "worker-1"),
+        ("BREHON_AGENT_ROLE", "worker"),
+    ]);
+    let tool = TaskActionsTool::new();
+
+    write_test_task(root.path(), "T-not-enqueued", "assigned", "task");
+    let mut task = read_test_task(root.path(), "T-not-enqueued");
+    task["assignment_propagation"] = serde_json::json!({
+        "owner": "worker-1",
+        "assignment_kind": "task",
+        "assigned_at": "2026-05-24T01:00:00Z",
+        "prompt_id": "prompt-never-queued",
+        "delivery_method": "persisted_not_enqueued",
+        "acknowledged_at": "2026-05-24T01:00:10Z",
+        "acknowledged_by": "worker-1",
+        "acknowledged_via": "task action=mine"
+    });
+    std::fs::write(
+        root.path()
+            .join("runtime")
+            .join("tasks")
+            .join("T-not-enqueued.json"),
+        serde_json::to_string_pretty(&task).unwrap(),
+    )
+    .unwrap();
+    write_pane_assignment_context_fixture(
+        root.path(),
+        "worker-1",
+        "task",
+        "T-not-enqueued",
+        None,
+        None,
+    );
+
+    let mine = tool
+        .execute(serde_json::json!({"action": "mine"}))
+        .await
+        .unwrap();
+    let payload: Value = serde_json::from_str(&extract_text(&mine)).unwrap();
+    let observability = &payload["tasks"][0]["assignment_observability"];
+    // When the prompt was never enqueued, delivery is false so the overall
+    // state is "assigned_without_delivery" even though the assignment is
+    // acknowledged in the propagation.
+    assert_eq!(observability["overall"], "assigned_without_delivery");
+    let delivery = &observability["delivery"];
+    assert_eq!(delivery["state"], "unknown");
+    assert_eq!(delivery["enqueued"], false);
+    assert_eq!(delivery["queued"], false);
+    assert_eq!(delivery["injected"], false);
+}
+
+#[tokio::test]
+async fn test_mine_observability_finds_sanitized_prompt_id_with_special_chars() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let root = make_test_root();
+    let _env = ScopedEnv::set_with_defaults(&[
+        ("BREHON_ROOT", root.path().to_str().unwrap()),
+        ("BREHON_AGENT_NAME", "worker-1"),
+        ("BREHON_AGENT_ROLE", "worker"),
+    ]);
+    let tool = TaskActionsTool::new();
+
+    write_test_task(root.path(), "T-sanitized-prompt", "assigned", "task");
+    let mut task = read_test_task(root.path(), "T-sanitized-prompt");
+    let prompt_id = "prompt:review/1";
+    task["assignment_propagation"] = serde_json::json!({
+        "owner": "worker-1",
+        "assignment_kind": "task",
+        "assigned_at": "2026-05-24T01:00:00Z",
+        "prompt_id": prompt_id,
+        "delivery_method": "queued",
+        "acknowledged_at": "2026-05-24T01:00:10Z",
+        "acknowledged_by": "worker-1",
+        "acknowledged_via": "task action=mine"
+    });
+    std::fs::write(
+        root.path()
+            .join("runtime")
+            .join("tasks")
+            .join("T-sanitized-prompt.json"),
+        serde_json::to_string_pretty(&task).unwrap(),
+    )
+    .unwrap();
+    write_prompt_delivery_fixture(root.path(), prompt_id, "worker-1", true);
+    write_pane_assignment_context_fixture(
+        root.path(),
+        "worker-1",
+        "task",
+        "T-sanitized-prompt",
+        None,
+        None,
+    );
+
+    let mine = tool
+        .execute(serde_json::json!({"action": "mine"}))
+        .await
+        .unwrap();
+    let payload: Value = serde_json::from_str(&extract_text(&mine)).unwrap();
+    let observability = &payload["tasks"][0]["assignment_observability"];
+    assert_eq!(observability["overall"], "acked_without_progress");
+    let delivery = &observability["delivery"];
+    assert_eq!(delivery["state"], "injected");
+    assert_eq!(delivery["enqueued"], true);
+    assert_eq!(delivery["injected"], true);
+}
+
+#[tokio::test]
+async fn test_list_surfaces_acked_without_context_when_snapshot_mismatches() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let root = make_test_root();
+    let _env = ScopedEnv::set_with_defaults(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
+    let tool = TaskActionsTool::new();
+
+    write_test_task(root.path(), "T-context-mismatch", "assigned", "task");
+    let mut task = read_test_task(root.path(), "T-context-mismatch");
+    task["assignment_propagation"] = serde_json::json!({
+        "owner": "worker-1",
+        "assignment_kind": "task",
+        "assigned_at": "2026-05-24T01:00:00Z",
+        "prompt_id": "prompt-context-mismatch",
+        "delivery_method": "queued",
+        "acknowledged_at": "2026-05-24T01:00:10Z",
+        "acknowledged_by": "worker-1",
+        "acknowledged_via": "task action=mine"
+    });
+    std::fs::write(
+        root.path()
+            .join("runtime")
+            .join("tasks")
+            .join("T-context-mismatch.json"),
+        serde_json::to_string_pretty(&task).unwrap(),
+    )
+    .unwrap();
+    write_prompt_delivery_fixture(root.path(), "prompt-context-mismatch", "worker-1", true);
+    write_pane_assignment_context_fixture(root.path(), "worker-1", "task", "T-other", None, None);
+
+    let list = tool
+        .execute(serde_json::json!({
+            "action": "list",
+            "status": "assigned",
+            "include_assignment_observability": true
+        }))
+        .await
+        .unwrap();
+    let payload: Value = serde_json::from_str(&extract_text(&list)).unwrap();
+    let observability = &payload["tasks"][0]["assignment_observability"];
+    assert_eq!(observability["overall"], "acked_without_context");
+    assert_eq!(observability["active_context"]["present"], true);
+    assert_eq!(observability["active_context"]["matches"], false);
+}
+
+#[tokio::test]
+async fn test_mine_does_not_treat_stale_reassigned_progress_as_current_assignment_progress() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let root = make_test_root();
+    let _env = ScopedEnv::set_with_defaults(&[
+        ("BREHON_ROOT", root.path().to_str().unwrap()),
+        ("BREHON_AGENT_NAME", "worker-2"),
+        ("BREHON_AGENT_ROLE", "worker"),
+    ]);
+    let tool = TaskActionsTool::new();
+
+    write_test_task(root.path(), "T-reassigned", "assigned", "task");
+    let mut task = read_test_task(root.path(), "T-reassigned");
+    task["assignee"] = serde_json::json!("worker-2");
+    task["percent"] = serde_json::json!(75);
+    task["latest_commit"] = serde_json::json!("deadbeef");
+    task["assignment_propagation"] = serde_json::json!({
+        "owner": "worker-2",
+        "assignment_kind": "task",
+        "assigned_at": "2026-05-24T01:00:00Z",
+        "prompt_id": "prompt-reassigned",
+        "delivery_method": "queued"
+    });
+    std::fs::write(
+        root.path()
+            .join("runtime")
+            .join("tasks")
+            .join("T-reassigned.json"),
+        serde_json::to_string_pretty(&task).unwrap(),
+    )
+    .unwrap();
+    write_prompt_delivery_fixture(root.path(), "prompt-reassigned", "worker-2", true);
+    write_pane_assignment_context_fixture(
+        root.path(),
+        "worker-2",
+        "task",
+        "T-reassigned",
+        None,
+        None,
+    );
+
+    let mine = tool
+        .execute(serde_json::json!({"action": "mine"}))
+        .await
+        .unwrap();
+    let payload: Value = serde_json::from_str(&extract_text(&mine)).unwrap();
+    let observability = &payload["tasks"][0]["assignment_observability"];
+    assert_eq!(observability["overall"], "acked_without_progress");
+    assert_eq!(observability["progress_started"], false);
+    assert!(observability["progress_started_at"].is_null());
+
+    let stored = read_test_task(root.path(), "T-reassigned");
+    assert!(
+        stored["assignment_propagation"]["progress_started_at"].is_null(),
+        "stale task-level percent/latest_commit must not count as progress for the new assignment"
+    );
+}
+
+#[tokio::test]
+async fn test_progress_acknowledges_assignment_without_prior_mine() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let root = make_test_root();
+    let workspace = tempfile::tempdir().unwrap();
+    init_git_workspace(workspace.path());
+    let _env = ScopedEnv::set_with_defaults(&[
+        ("BREHON_ROOT", root.path().to_str().unwrap()),
+        ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
+        ("BREHON_AGENT_ROLE", "worker"),
+        ("BREHON_AGENT_NAME", "worker-1"),
+    ]);
+    let tool = TaskActionsTool::new();
+
+    write_test_task(root.path(), "T-progress-ack", "assigned", "task");
+    let mut task = read_test_task(root.path(), "T-progress-ack");
+    task["assignment_propagation"] = serde_json::json!({
+        "owner": "worker-1",
+        "assignment_kind": "task",
+        "assigned_at": "2026-05-24T01:00:00Z",
+        "prompt_id": "prompt-progress-ack",
+        "delivery_method": "queued"
+    });
+    std::fs::write(
+        root.path()
+            .join("runtime")
+            .join("tasks")
+            .join("T-progress-ack.json"),
+        serde_json::to_string_pretty(&task).unwrap(),
+    )
+    .unwrap();
+    write_prompt_delivery_fixture(root.path(), "prompt-progress-ack", "worker-1", true);
+    write_pane_assignment_context_fixture(
+        root.path(),
+        "worker-1",
+        "task",
+        "T-progress-ack",
+        None,
+        None,
+    );
+
+    let result = tool
+        .execute(serde_json::json!({
+            "action": "progress",
+            "id": "T-progress-ack",
+            "percent": 35,
+            "notes": "editing assignment",
+            "activity": "editing"
+        }))
+        .await
+        .unwrap();
+    assert!(result.is_error.is_none(), "{}", extract_text(&result));
+
+    let stored = read_test_task(root.path(), "T-progress-ack");
+    assert_eq!(
+        stored["assignment_propagation"]["acknowledged_by"],
+        "worker-1"
+    );
+    assert_eq!(
+        stored["assignment_propagation"]["acknowledged_via"],
+        "task action=progress"
+    );
+    assert_eq!(
+        stored["assignment_propagation"]["progress_started_via"],
+        "task action=progress"
+    );
+
+    let list = tool
+        .execute(serde_json::json!({
+            "action": "list",
+            "status": "in_progress",
+            "include_assignment_observability": true
+        }))
+        .await
+        .unwrap();
+    let payload: Value = serde_json::from_str(&extract_text(&list)).unwrap();
+    let observability = &payload["tasks"][0]["assignment_observability"];
+    assert_eq!(observability["overall"], "active");
+}
+
+#[tokio::test]
+async fn test_complete_acknowledges_assignment_without_prior_mine() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let root = make_test_root();
+    let project = tempfile::tempdir().unwrap();
+    init_git_workspace(project.path());
+    let workspace = tempfile::tempdir().unwrap();
+    init_git_workspace(workspace.path());
+    std::fs::write(workspace.path().join("feature.txt"), "completed\n").unwrap();
+    let _env = ScopedEnv::set_with_defaults(&[
+        ("BREHON_ROOT", root.path().to_str().unwrap()),
+        ("BREHON_PROJECT_ROOT", project.path().to_str().unwrap()),
+        ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
+        ("BREHON_AGENT_ROLE", "worker"),
+        ("BREHON_AGENT_NAME", "worker-1"),
+        ("BREHON_SUPERVISOR_NAME", "sup-1"),
+    ]);
+    let tool = TaskActionsTool::new();
+
+    write_test_task(root.path(), "T-complete-ack", "in_progress", "task");
+    let mut task = read_test_task(root.path(), "T-complete-ack");
+    task["assignment_propagation"] = serde_json::json!({
+        "owner": "worker-1",
+        "assignment_kind": "task",
+        "assigned_at": "2026-05-24T01:00:00Z",
+        "prompt_id": "prompt-complete-ack",
+        "delivery_method": "queued"
+    });
+    std::fs::write(
+        root.path()
+            .join("runtime")
+            .join("tasks")
+            .join("T-complete-ack.json"),
+        serde_json::to_string_pretty(&task).unwrap(),
+    )
+    .unwrap();
+    write_prompt_delivery_fixture(root.path(), "prompt-complete-ack", "worker-1", true);
+    write_pane_assignment_context_fixture(
+        root.path(),
+        "worker-1",
+        "task",
+        "T-complete-ack",
+        None,
+        None,
+    );
+
+    let result = tool
+        .execute(serde_json::json!({
+            "action": "complete",
+            "id": "T-complete-ack",
+            "notes": "finished without prior mine"
+        }))
+        .await
+        .unwrap();
+    assert!(result.is_error.is_none(), "{}", extract_text(&result));
+
+    let stored = read_test_task(root.path(), "T-complete-ack");
+    assert_eq!(
+        stored["assignment_propagation"]["acknowledged_by"],
+        "worker-1"
+    );
+    assert_eq!(
+        stored["assignment_propagation"]["acknowledged_via"],
+        "task action=progress"
+    );
+    assert_eq!(
+        stored["assignment_propagation"]["progress_started_via"],
+        "task action=progress"
+    );
+    assert!(stored["assignment_propagation"]["acknowledged_at"].is_string());
+    assert!(stored["assignment_propagation"]["progress_started_at"].is_string());
+}
+
+#[tokio::test]
 async fn test_mine_surfaces_review_obligations_even_when_role_env_is_lane_name() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_AGENT_NAME", "reviewer-b"),
         ("BREHON_AGENT_ROLE", "gemini-reviewer"),
@@ -4114,6 +4661,15 @@ async fn test_mine_surfaces_review_obligations_even_when_role_env_is_lane_name()
             "panel_mode": "configured_panel",
             "panel": ["reviewer-a", "reviewer-b", "reviewer-c"],
             "submissions_received": ["reviewer-a"],
+            "reviewer_assignments": {
+                "reviewer-b": {
+                    "owner": "reviewer-b",
+                    "assignment_kind": "review",
+                    "assigned_at": "2026-05-23T00:00:00Z",
+                    "prompt_id": "prompt-review-b",
+                    "delivery_method": "queued"
+                }
+            },
             "created_at": "2026-05-23T00:00:00Z",
             "updated_at": "2026-05-23T00:01:00Z"
         }))
@@ -4135,6 +4691,15 @@ async fn test_mine_surfaces_review_obligations_even_when_role_env_is_lane_name()
         .unwrap(),
     )
     .unwrap();
+    write_prompt_delivery_fixture(root.path(), "prompt-review-b", "reviewer-b", true);
+    write_pane_assignment_context_fixture(
+        root.path(),
+        "reviewer-b",
+        "review",
+        "T-review",
+        Some("REV-live"),
+        Some(2),
+    );
 
     let mine = tool
         .execute(serde_json::json!({"action": "mine"}))
@@ -4157,14 +4722,30 @@ async fn test_mine_surfaces_review_obligations_even_when_role_env_is_lane_name()
         payload["review_obligations"][0]["next_action"]["args"]["action"],
         "submit_review"
     );
+    assert_eq!(
+        payload["review_obligations"][0]["assignment_observability"]["overall"],
+        "acked_without_progress"
+    );
+    assert_eq!(
+        payload["review_obligations"][0]["assignment_observability"]["acknowledged_via"],
+        "task action=mine"
+    );
     assert_eq!(payload["assignments"][0]["assignment_kind"], "review");
+
+    let state: Value =
+        serde_json::from_str(&std::fs::read_to_string(review_dir.join("state.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        state["reviewer_assignments"]["reviewer-b"]["acknowledged_via"],
+        "task action=mine"
+    );
 }
 
 #[tokio::test]
 async fn test_close_initiative_requires_child_epics_closed() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
+    let _env = ScopedEnv::set_with_defaults(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
     let tool = TaskActionsTool::new();
 
     write_test_task(root.path(), "I-1", "pending", "initiative");
@@ -4195,7 +4776,7 @@ async fn test_close_initiative_requires_child_epics_closed() {
 async fn test_create_infers_close_mode_for_audit_work() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
+    let _env = ScopedEnv::set_with_defaults(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
     let tool = TaskActionsTool::new();
     let result = tool
         .execute(serde_json::json!({
@@ -4217,7 +4798,7 @@ async fn test_create_infers_close_mode_for_audit_work() {
 async fn test_create_rejects_thin_merge_task() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
+    let _env = ScopedEnv::set_with_defaults(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
     let tool = TaskActionsTool::new();
     let result = tool
         .execute(serde_json::json!({
@@ -4239,7 +4820,7 @@ async fn test_create_rejects_thin_merge_task() {
 async fn test_create_rejects_control_plane_worker_task_scope() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
+    let _env = ScopedEnv::set_with_defaults(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
     let tool = TaskActionsTool::new();
     let result = tool
         .execute(serde_json::json!({
@@ -4265,7 +4846,7 @@ async fn test_create_rejects_control_plane_worker_task_scope() {
 async fn test_create_epic_requires_plan_detail() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
+    let _env = ScopedEnv::set_with_defaults(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
     let tool = TaskActionsTool::new();
     let result = tool
         .execute(serde_json::json!({
@@ -4288,7 +4869,7 @@ async fn test_create_epic_requires_plan_detail() {
 async fn test_create_epic_recovers_structured_sections_from_description() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
+    let _env = ScopedEnv::set_with_defaults(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
     let tool = TaskActionsTool::new();
     let result = tool
             .execute(serde_json::json!({
@@ -4319,7 +4900,7 @@ async fn test_create_epic_recovers_structured_sections_from_description() {
 async fn test_create_merge_task_recovers_structured_sections_from_description() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
+    let _env = ScopedEnv::set_with_defaults(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
     let tool = TaskActionsTool::new();
     let result = tool
             .execute(serde_json::json!({
@@ -4342,7 +4923,7 @@ async fn test_create_merge_task_recovers_structured_sections_from_description() 
 async fn test_create_prefers_top_level_structured_fields_over_description_sections() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
+    let _env = ScopedEnv::set_with_defaults(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
     let tool = TaskActionsTool::new();
     let result = tool
             .execute(serde_json::json!({
@@ -4754,7 +5335,7 @@ fn test_unknown_statuses_are_rejected() {
 async fn test_progress_rejects_review_and_terminal_states() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "worker"),
         ("BREHON_AGENT_NAME", "worker-1"),
@@ -4790,7 +5371,7 @@ async fn test_progress_rejects_review_and_terminal_states() {
 async fn test_progress_rejects_non_assignee_worker() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "worker"),
         ("BREHON_AGENT_NAME", "worker-2"),
@@ -4826,7 +5407,7 @@ async fn test_progress_rejects_non_assignee_worker() {
 async fn test_progress_100_from_changes_requested_auto_marks_review_ready() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "worker"),
         ("BREHON_AGENT_NAME", "worker-1"),
@@ -4877,7 +5458,7 @@ async fn test_progress_100_from_changes_requested_auto_marks_review_ready() {
 async fn test_progress_100_on_review_ready_is_idempotent() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "worker"),
         ("BREHON_AGENT_NAME", "worker-1"),
@@ -4910,7 +5491,7 @@ async fn test_progress_100_on_review_ready_is_idempotent() {
 async fn test_progress_100_from_changes_requested_clears_obsolete_review_state() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "worker"),
         ("BREHON_AGENT_NAME", "worker-1"),
@@ -4953,7 +5534,7 @@ async fn test_progress_100_from_changes_requested_clears_obsolete_review_state()
 async fn test_progress_100_resolves_live_supervisor_session_when_env_missing() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "worker"),
         ("BREHON_AGENT_NAME", "worker-1"),
@@ -5004,7 +5585,7 @@ async fn test_progress_100_records_worker_commit_from_workspace_root() {
     let root = make_test_root();
     let workspace = tempfile::tempdir().unwrap();
     let head_commit = init_git_workspace(workspace.path());
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "worker"),
@@ -5057,7 +5638,7 @@ async fn test_checkpoint_commits_worker_workspace_and_records_latest_commit() {
     let workspace = tempfile::tempdir().unwrap();
     let initial_commit = init_git_workspace(workspace.path());
     std::fs::write(workspace.path().join("feature.txt"), "checkpointed\n").unwrap();
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_PROJECT_ROOT", project.path().to_str().unwrap()),
         ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
@@ -5101,7 +5682,7 @@ async fn test_checkpoint_rejects_hallucinated_completion_message() {
     let root = make_test_root();
     let workspace = tempfile::tempdir().unwrap();
     let _initial_commit = init_git_workspace(workspace.path());
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "worker"),
@@ -5154,7 +5735,7 @@ async fn test_checkpoint_accepts_neutral_mid_task_message() {
     let workspace = tempfile::tempdir().unwrap();
     let _initial_commit = init_git_workspace(workspace.path());
     std::fs::write(workspace.path().join("wip.txt"), "wip\n").unwrap();
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_PROJECT_ROOT", project.path().to_str().unwrap()),
         ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
@@ -5189,7 +5770,7 @@ async fn test_complete_commits_worker_workspace_and_marks_review_ready() {
     let workspace = tempfile::tempdir().unwrap();
     let initial_commit = init_git_workspace(workspace.path());
     std::fs::write(workspace.path().join("feature.txt"), "completed\n").unwrap();
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_PROJECT_ROOT", project.path().to_str().unwrap()),
         ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
@@ -5250,7 +5831,7 @@ async fn test_complete_recovers_blocked_handoff_after_checkpoint_succeeds() {
         "completed from blocked\n",
     )
     .unwrap();
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_PROJECT_ROOT", project.path().to_str().unwrap()),
         ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
@@ -5317,7 +5898,7 @@ async fn test_complete_recovers_legacy_completed_handoff_after_checkpoint_succee
         "completed from legacy state\n",
     )
     .unwrap();
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_PROJECT_ROOT", project.path().to_str().unwrap()),
         ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
@@ -5362,71 +5943,6 @@ async fn test_complete_recovers_legacy_completed_handoff_after_checkpoint_succee
 }
 
 #[tokio::test]
-async fn test_complete_ignores_dirty_shared_root_when_worker_worktree_has_changes() {
-    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let root = make_test_root();
-    let project = tempfile::tempdir().unwrap();
-    init_git_workspace(project.path());
-    run_git(project.path(), &["checkout", "main"]);
-    std::fs::write(project.path().join("leaked.txt"), "wrong tree\n").unwrap();
-
-    let workspace = tempfile::tempdir().unwrap();
-    let initial_commit = init_git_workspace(workspace.path());
-    std::fs::write(workspace.path().join("feature.txt"), "worker tree\n").unwrap();
-    let _env = ScopedEnv::set(&[
-        ("BREHON_ROOT", root.path().to_str().unwrap()),
-        ("BREHON_PROJECT_ROOT", project.path().to_str().unwrap()),
-        ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
-        ("BREHON_AGENT_ROLE", "worker"),
-        ("BREHON_AGENT_NAME", "worker-1"),
-        ("BREHON_SUPERVISOR_NAME", "sup-1"),
-    ]);
-    let tool = TaskActionsTool::new();
-    write_test_task(root.path(), "T-shared-dirty", "in_progress", "task");
-
-    let result = tool
-        .execute(serde_json::json!({
-            "action": "complete",
-            "id": "T-shared-dirty",
-            "notes": "implementation complete"
-        }))
-        .await
-        .unwrap();
-
-    assert!(result.is_error.is_none(), "{}", extract_text(&result));
-    let result_json: Value = serde_json::from_str(&extract_text(&result)).unwrap();
-    let commit = result_json["latest_commit"].as_str().unwrap();
-    assert_ne!(commit, initial_commit);
-    assert_eq!(result_json["created_commit"], true);
-    assert_eq!(result_json["task_status"], "review_ready");
-    assert_eq!(
-        result_json["warning"]["kind"],
-        "primary_project_checkout_dirty"
-    );
-    assert_eq!(result_json["warning"]["branch"], "main");
-    assert_eq!(result_json["warning"]["entries"][0], "?? leaked.txt");
-    assert_eq!(run_git(workspace.path(), &["rev-parse", "HEAD"]), commit);
-    assert_eq!(run_git(workspace.path(), &["status", "--porcelain"]), "");
-    assert_eq!(
-        run_git(project.path(), &["status", "--porcelain"]),
-        "?? leaked.txt"
-    );
-
-    let task = read_test_task(root.path(), "T-shared-dirty");
-    assert_eq!(task["status"], "review_ready");
-    assert_eq!(task["latest_commit"], commit);
-    assert_eq!(
-        task["checkpoint_warnings"][0]["kind"],
-        "primary_project_checkout_dirty"
-    );
-    assert_eq!(task["checkpoint_warnings"][0]["branch"], "main");
-    assert_eq!(
-        task["checkpoint_warnings"][0]["entries"][0],
-        "?? leaked.txt"
-    );
-}
-
-#[tokio::test]
 async fn test_close_rejects_dirty_shared_root_before_terminal_status() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
@@ -5435,7 +5951,7 @@ async fn test_close_rejects_dirty_shared_root_before_terminal_status() {
     run_git(project.path(), &["checkout", "main"]);
     std::fs::write(project.path().join("leaked.txt"), "wrong tree\n").unwrap();
 
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_PROJECT_ROOT", project.path().to_str().unwrap()),
         ("BREHON_WORKSPACE_ROOT", project.path().to_str().unwrap()),
@@ -5464,7 +5980,9 @@ async fn test_close_rejects_dirty_shared_root_before_terminal_status() {
     assert_eq!(result.is_error, Some(true));
     let text = extract_text(&result);
     assert!(text.contains("shared repo root"), "{text}");
-    assert!(text.contains("Refusing to record closed/merged"), "{text}");
+    assert!(text.contains("Refusing terminal transition"), "{text}");
+    assert!(text.contains("leaked.txt"), "{text}");
+    assert!(text.contains("Recovery:"), "{text}");
 
     let task = read_test_task(root.path(), "T-dirty-terminal-close");
     assert_eq!(task["status"], "approved");
@@ -5479,7 +5997,7 @@ async fn test_update_rejects_terminal_status_when_shared_root_is_dirty() {
     run_git(project.path(), &["checkout", "main"]);
     std::fs::write(project.path().join("leaked.txt"), "wrong tree\n").unwrap();
 
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_PROJECT_ROOT", project.path().to_str().unwrap()),
         ("BREHON_WORKSPACE_ROOT", project.path().to_str().unwrap()),
@@ -5509,23 +6027,103 @@ async fn test_update_rejects_terminal_status_when_shared_root_is_dirty() {
     assert_eq!(result.is_error, Some(true));
     let text = extract_text(&result);
     assert!(text.contains("shared repo root"), "{text}");
-    assert!(text.contains("Refusing to record closed/merged"), "{text}");
+    assert!(text.contains("Refusing terminal transition"), "{text}");
+    assert!(text.contains("leaked.txt"), "{text}");
+    assert!(text.contains("Recovery:"), "{text}");
 
     let task = read_test_task(root.path(), "T-dirty-terminal-update");
     assert_eq!(task["status"], "approved");
 }
 
 #[tokio::test]
-async fn test_complete_rejects_empty_worker_handoff_even_when_shared_root_is_dirty() {
+async fn test_close_epic_rejects_dirty_shared_root() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
     let project = tempfile::tempdir().unwrap();
     init_git_workspace(project.path());
+    run_git(project.path(), &["checkout", "main"]);
     std::fs::write(project.path().join("leaked.txt"), "wrong tree\n").unwrap();
+
+    let _env = ScopedEnv::set_with_defaults(&[
+        ("BREHON_ROOT", root.path().to_str().unwrap()),
+        ("BREHON_PROJECT_ROOT", project.path().to_str().unwrap()),
+        ("BREHON_WORKSPACE_ROOT", project.path().to_str().unwrap()),
+        ("BREHON_AGENT_ROLE", "supervisor"),
+        ("BREHON_AGENT_NAME", "sup-1"),
+        ("BREHON_SUPERVISOR_NAME", "sup-1"),
+    ]);
+    let tool = TaskActionsTool::new();
+    write_test_task(root.path(), "E-dirty-epic-close", "approved", "epic");
+
+    let result = tool
+        .execute(serde_json::json!({
+            "action": "close",
+            "id": "E-dirty-epic-close"
+        }))
+        .await
+        .unwrap();
+
+    assert_eq!(result.is_error, Some(true));
+    let text = extract_text(&result);
+    assert!(text.contains("shared repo root"), "{text}");
+    assert!(text.contains("leaked.txt"), "{text}");
+
+    let task = read_test_task(root.path(), "E-dirty-epic-close");
+    assert_eq!(task["status"], "approved");
+}
+
+#[tokio::test]
+async fn test_close_initiative_rejects_dirty_shared_root() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let root = make_test_root();
+    let project = tempfile::tempdir().unwrap();
+    init_git_workspace(project.path());
+    run_git(project.path(), &["checkout", "main"]);
+    std::fs::write(project.path().join("leaked.txt"), "wrong tree\n").unwrap();
+
+    let _env = ScopedEnv::set_with_defaults(&[
+        ("BREHON_ROOT", root.path().to_str().unwrap()),
+        ("BREHON_PROJECT_ROOT", project.path().to_str().unwrap()),
+        ("BREHON_WORKSPACE_ROOT", project.path().to_str().unwrap()),
+        ("BREHON_AGENT_ROLE", "supervisor"),
+        ("BREHON_AGENT_NAME", "sup-1"),
+        ("BREHON_SUPERVISOR_NAME", "sup-1"),
+    ]);
+    let tool = TaskActionsTool::new();
+    write_test_task(
+        root.path(),
+        "I-dirty-initiative-close",
+        "approved",
+        "initiative",
+    );
+
+    let result = tool
+        .execute(serde_json::json!({
+            "action": "close",
+            "id": "I-dirty-initiative-close"
+        }))
+        .await
+        .unwrap();
+
+    assert_eq!(result.is_error, Some(true));
+    let text = extract_text(&result);
+    assert!(text.contains("shared repo root"), "{text}");
+    assert!(text.contains("leaked.txt"), "{text}");
+
+    let task = read_test_task(root.path(), "I-dirty-initiative-close");
+    assert_eq!(task["status"], "approved");
+}
+
+#[tokio::test]
+async fn test_complete_rejects_empty_worker_handoff() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let root = make_test_root();
+    let project = tempfile::tempdir().unwrap();
+    init_git_workspace(project.path());
 
     let workspace = tempfile::tempdir().unwrap();
     let initial_commit = init_git_workspace(workspace.path());
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_PROJECT_ROOT", project.path().to_str().unwrap()),
         ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
@@ -5566,14 +6164,200 @@ async fn test_complete_rejects_empty_worker_handoff_even_when_shared_root_is_dir
 }
 
 #[tokio::test]
+async fn test_complete_rejects_dirty_shared_root() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let root = make_test_root();
+    let project = tempfile::tempdir().unwrap();
+    init_git_workspace(project.path());
+    std::fs::write(project.path().join("leaked.txt"), "wrong tree\n").unwrap();
+
+    let workspace = tempfile::tempdir().unwrap();
+    init_git_workspace(workspace.path());
+    std::fs::write(workspace.path().join("feature.txt"), "done\n").unwrap();
+    run_git(workspace.path(), &["add", "feature.txt"]);
+    run_git(workspace.path(), &["commit", "-m", "feature done"]);
+
+    let _env = ScopedEnv::set_with_defaults(&[
+        ("BREHON_ROOT", root.path().to_str().unwrap()),
+        ("BREHON_PROJECT_ROOT", project.path().to_str().unwrap()),
+        ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
+        ("BREHON_AGENT_ROLE", "worker"),
+        ("BREHON_AGENT_NAME", "worker-1"),
+        ("BREHON_SUPERVISOR_NAME", "sup-1"),
+    ]);
+    let tool = TaskActionsTool::new();
+    write_test_task(root.path(), "T-dirty-complete", "in_progress", "task");
+
+    let result = tool
+        .execute(serde_json::json!({
+            "action": "complete",
+            "id": "T-dirty-complete",
+            "notes": "implementation complete"
+        }))
+        .await
+        .unwrap();
+
+    assert_eq!(result.is_error, Some(true));
+    let text = extract_text(&result);
+    assert!(text.contains("shared repo root"), "{text}");
+    assert!(text.contains("leaked.txt"), "{text}");
+    assert!(text.contains("Recovery:"), "{text}");
+
+    let task = read_test_task(root.path(), "T-dirty-complete");
+    assert_eq!(task["status"], "in_progress");
+}
+
+#[tokio::test]
+async fn test_update_task_status_atomic_rejects_dirty_shared_root_on_approval() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let root = make_test_root();
+    let project = tempfile::tempdir().unwrap();
+    init_git_workspace(project.path());
+    std::fs::write(project.path().join("leaked.txt"), "wrong tree\n").unwrap();
+
+    let _env = ScopedEnv::set_with_defaults(&[
+        ("BREHON_ROOT", root.path().to_str().unwrap()),
+        ("BREHON_PROJECT_ROOT", project.path().to_str().unwrap()),
+        ("BREHON_WORKSPACE_ROOT", project.path().to_str().unwrap()),
+    ]);
+
+    let tasks_dir = root.path().join("runtime").join("tasks");
+    std::fs::create_dir_all(&tasks_dir).unwrap();
+    std::fs::write(
+        tasks_dir.join("T-dirty-approve.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "task_id": "T-dirty-approve",
+            "title": "Dirty approve fixture",
+            "description": "Fixture",
+            "status": "in_review",
+            "task_type": "task",
+            "completion_mode": "merge",
+            "assignee": "worker-1"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let err = update_task_status_atomic("T-dirty-approve", "approved")
+        .await
+        .unwrap_err();
+    assert!(err.contains("shared repo root"), "{err}");
+    assert!(err.contains("leaked.txt"), "{err}");
+    assert!(err.contains("Recovery:"), "{err}");
+
+    let task = read_test_task(root.path(), "T-dirty-approve");
+    assert_eq!(task["status"], "in_review");
+}
+
+#[tokio::test]
+async fn test_update_task_status_atomic_allows_changes_requested_on_dirty_root() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let root = make_test_root();
+    let project = tempfile::tempdir().unwrap();
+    init_git_workspace(project.path());
+    std::fs::write(project.path().join("leaked.txt"), "wrong tree\n").unwrap();
+
+    let _env = ScopedEnv::set_with_defaults(&[
+        ("BREHON_ROOT", root.path().to_str().unwrap()),
+        ("BREHON_PROJECT_ROOT", project.path().to_str().unwrap()),
+        ("BREHON_WORKSPACE_ROOT", project.path().to_str().unwrap()),
+    ]);
+
+    let tasks_dir = root.path().join("runtime").join("tasks");
+    std::fs::create_dir_all(&tasks_dir).unwrap();
+    std::fs::write(
+        tasks_dir.join("T-dirty-changes.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "task_id": "T-dirty-changes",
+            "title": "Dirty changes_requested fixture",
+            "description": "Fixture",
+            "status": "in_review",
+            "task_type": "task",
+            "completion_mode": "merge",
+            "assignee": "worker-1"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    // changes_requested should NOT be blocked by dirty root (only approved is)
+    update_task_status_atomic("T-dirty-changes", "changes_requested")
+        .await
+        .expect("changes_requested should succeed even when shared root is dirty");
+
+    let task = read_test_task(root.path(), "T-dirty-changes");
+    assert_eq!(task["status"], "changes_requested");
+}
+
+#[tokio::test]
+async fn test_dirty_root_blocker_includes_current_runtime_session_when_known() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let root = make_test_root();
+    let project = tempfile::tempdir().unwrap();
+    init_git_workspace(project.path());
+    std::fs::write(project.path().join("leaked.txt"), "wrong tree\n").unwrap();
+
+    // Create current-session.json so current runtime session is known
+    let runtime_dir = root.path().join("runtime");
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+    std::fs::write(
+        runtime_dir.join("current-session.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "session_name": "test-run-42"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let _env = ScopedEnv::set_with_defaults(&[
+        ("BREHON_ROOT", root.path().to_str().unwrap()),
+        ("BREHON_PROJECT_ROOT", project.path().to_str().unwrap()),
+        ("BREHON_WORKSPACE_ROOT", project.path().to_str().unwrap()),
+    ]);
+
+    let tasks_dir = root.path().join("runtime").join("tasks");
+    std::fs::create_dir_all(&tasks_dir).unwrap();
+    std::fs::write(
+        tasks_dir.join("T-dirty-runtime-session.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "task_id": "T-dirty-runtime-session",
+            "title": "Current runtime session fixture",
+            "description": "Fixture",
+            "status": "in_review",
+            "task_type": "task",
+            "completion_mode": "merge",
+            "assignee": "worker-1"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let err = update_task_status_atomic("T-dirty-runtime-session", "approved")
+        .await
+        .unwrap_err();
+    assert!(err.contains("shared repo root"), "{err}");
+    assert!(
+        err.contains("Current runtime session: test-run-42."),
+        "{err}"
+    );
+    assert!(err.contains("Recovery:"), "{err}");
+
+    let task = read_test_task(root.path(), "T-dirty-runtime-session");
+    assert_eq!(task["status"], "in_review");
+}
+
+#[tokio::test]
 async fn test_complete_allows_completion_language_in_notes() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
+    let project = tempfile::tempdir().unwrap();
+    init_git_workspace(project.path());
     let workspace = tempfile::tempdir().unwrap();
     init_git_workspace(workspace.path());
     std::fs::write(workspace.path().join("feature.txt"), "completed\n").unwrap();
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
+        ("BREHON_PROJECT_ROOT", project.path().to_str().unwrap()),
         ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "worker"),
         ("BREHON_AGENT_NAME", "worker-1"),
@@ -5604,11 +6388,14 @@ async fn test_complete_allows_completion_language_in_notes() {
 async fn test_complete_recovers_started_pending_task_for_same_worker() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
+    let project = tempfile::tempdir().unwrap();
+    init_git_workspace(project.path());
     let workspace = tempfile::tempdir().unwrap();
     init_git_workspace(workspace.path());
     std::fs::write(workspace.path().join("feature.txt"), "completed\n").unwrap();
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
+        ("BREHON_PROJECT_ROOT", project.path().to_str().unwrap()),
         ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "worker"),
         ("BREHON_AGENT_NAME", "worker-1"),
@@ -5652,7 +6439,7 @@ async fn test_complete_is_idempotent_when_task_already_review_ready() {
     let root = make_test_root();
     let workspace = tempfile::tempdir().unwrap();
     let initial_commit = init_git_workspace(workspace.path());
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "worker"),
@@ -5688,7 +6475,7 @@ async fn test_complete_is_idempotent_when_task_already_in_review() {
     let root = make_test_root();
     let workspace = tempfile::tempdir().unwrap();
     let initial_commit = init_git_workspace(workspace.path());
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "worker"),
@@ -5728,7 +6515,7 @@ async fn test_complete_defaults_to_existing_worker_commit_and_default_notes() {
     run_git(workspace.path(), &["add", "manual.txt"]);
     run_git(workspace.path(), &["commit", "-m", "manual worker commit"]);
     let existing_commit = run_git(workspace.path(), &["rev-parse", "HEAD"]);
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "worker"),
@@ -5762,7 +6549,7 @@ async fn test_complete_defaults_to_existing_worker_commit_and_default_notes() {
 async fn test_complete_rejects_non_worker() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
     ]);
@@ -5788,7 +6575,7 @@ async fn test_checkpoint_rejects_non_assignee() {
     let workspace = tempfile::tempdir().unwrap();
     init_git_workspace(workspace.path());
     std::fs::write(workspace.path().join("feature.txt"), "checkpointed\n").unwrap();
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "worker"),
@@ -5817,7 +6604,7 @@ async fn test_progress_rejects_worker_on_merge_target_branch() {
     let workspace = tempfile::tempdir().unwrap();
     init_git_workspace(workspace.path());
     run_git(workspace.path(), &["checkout", "-b", "epic/test-feature"]);
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
         ("BREHON_WORKTREE_BRANCH", "brehon/worker-1"),
@@ -5866,7 +6653,7 @@ async fn test_progress_rejects_worker_on_merge_target_branch() {
 async fn test_progress_rejects_control_plane_task_scope() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "worker"),
         ("BREHON_AGENT_NAME", "worker-1"),
@@ -5904,7 +6691,7 @@ async fn test_checkpoint_rejects_control_plane_task_scope() {
     let workspace = tempfile::tempdir().unwrap();
     init_git_workspace(workspace.path());
     std::fs::write(workspace.path().join("feature.txt"), "checkpointed\n").unwrap();
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "worker"),
@@ -5940,7 +6727,7 @@ async fn test_checkpoint_rejects_control_plane_task_scope() {
 async fn test_progress_100_warns_when_no_supervisor_can_be_resolved() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "worker"),
         ("BREHON_AGENT_NAME", "worker-1"),
@@ -5986,7 +6773,7 @@ async fn test_progress_100_warns_when_no_supervisor_can_be_resolved() {
 async fn test_close_rejects_worker_merge_of_approved_task() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_AGENT_NAME", "worker-1"),
         ("BREHON_AGENT_ROLE", "worker"),
@@ -6018,7 +6805,7 @@ async fn test_close_by_supervisor_does_not_echo_notification() {
     let brehon_root = workspace.path().join(".brehon");
     std::fs::create_dir_all(&brehon_root).unwrap();
     let head_commit = init_git_workspace(workspace.path());
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", brehon_root.to_str().unwrap()),
         ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
@@ -6095,7 +6882,7 @@ async fn test_close_by_supervisor_invalidates_stale_direct_merge_approval() {
     run_git(workspace.path(), &["commit", "-m", "unreviewed followup"]);
     let latest_commit = run_git(workspace.path(), &["rev-parse", "HEAD"]);
 
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", brehon_root.to_str().unwrap()),
         ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
@@ -6157,7 +6944,7 @@ async fn test_close_by_supervisor_rejects_merge_when_reviewed_commit_not_on_main
     let feature_commit = run_git(workspace.path(), &["rev-parse", "HEAD"]);
     run_git(workspace.path(), &["checkout", "main"]);
 
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", brehon_root.to_str().unwrap()),
         ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
@@ -6218,7 +7005,7 @@ async fn test_close_by_supervisor_uses_last_reviewed_commit_when_request_tip_is_
     assert_ne!(empty_tip_commit, reviewed_commit);
     run_git(workspace.path(), &["checkout", "main"]);
 
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", brehon_root.to_str().unwrap()),
         ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
@@ -6264,7 +7051,7 @@ async fn test_close_by_supervisor_uses_last_reviewed_commit_when_request_tip_is_
 async fn test_close_by_supervisor_closes_approved_close_mode_task() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
         ("BREHON_AGENT_NAME", "sup-1"),
@@ -6313,7 +7100,7 @@ async fn test_close_by_supervisor_closes_approved_close_mode_task() {
 async fn test_close_rejects_corrupted_close_mode_phase_gate_with_merge_state() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
         ("BREHON_AGENT_NAME", "sup-1"),
@@ -6368,7 +7155,7 @@ async fn test_close_rejects_corrupted_close_mode_phase_gate_with_merge_state() {
 async fn test_update_rejects_worker_merge_and_close_of_approved_task() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "worker"),
         ("BREHON_AGENT_NAME", "worker-1"),
@@ -6404,7 +7191,7 @@ async fn test_update_rejects_worker_merge_and_close_of_approved_task() {
 async fn test_update_rejects_non_assignee_worker() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "worker"),
         ("BREHON_AGENT_NAME", "worker-2"),
@@ -6438,7 +7225,7 @@ async fn test_update_rejects_non_assignee_worker() {
 async fn test_update_allows_supervisor_to_set_close_mode_and_close_after_approval() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
     ]);
@@ -6482,7 +7269,7 @@ async fn test_update_allows_supervisor_to_set_close_mode_and_close_after_approva
 async fn test_update_rejects_supervisor_setting_merged_on_merge_flow_task() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
     ]);
@@ -6528,7 +7315,7 @@ async fn test_update_rejects_supervisor_setting_merged_on_merge_flow_task() {
 async fn test_update_rejects_switching_merge_flow_task_to_close_mode() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
     ]);
@@ -6573,7 +7360,7 @@ async fn test_update_rejects_switching_merge_flow_task_to_close_mode() {
 async fn test_update_rejects_direct_approved_for_concrete_task() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
     ]);
@@ -6604,7 +7391,7 @@ async fn test_update_rejects_direct_approved_for_concrete_task() {
 async fn test_update_rejects_review_obligation_reset_to_pending() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
     ]);
@@ -6635,7 +7422,7 @@ async fn test_update_rejects_review_obligation_reset_to_pending() {
 async fn test_update_rejects_direct_in_review_for_task() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
     ]);
@@ -6671,7 +7458,7 @@ async fn test_update_rejects_direct_in_review_for_task() {
 async fn test_update_normalizes_pascal_case_status_for_storage() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "worker"),
         ("BREHON_AGENT_NAME", "worker-1"),
@@ -6697,7 +7484,7 @@ async fn test_update_normalizes_pascal_case_status_for_storage() {
 async fn test_update_rejects_direct_assigned_transition() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
     ]);
@@ -6728,7 +7515,7 @@ async fn test_update_rejects_direct_assigned_transition() {
 async fn test_update_ignores_task_type_changes() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
     ]);
@@ -6758,7 +7545,7 @@ async fn test_update_ignores_task_type_changes() {
 fn test_epic_completion_requires_terminal_subtasks() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
+    let _env = ScopedEnv::set_with_defaults(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
 
     write_test_task(root.path(), "EPIC-1", "pending", "epic");
     write_test_task(root.path(), "T-merged", "merged", "task");
@@ -6796,7 +7583,10 @@ fn test_epic_completion_requires_terminal_subtasks() {
 fn test_detect_default_branch_from_remote_head() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let workspace = tempfile::tempdir().unwrap();
-    let _env = ScopedEnv::set(&[("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap())]);
+    let _env = ScopedEnv::set_with_defaults(&[(
+        "BREHON_WORKSPACE_ROOT",
+        workspace.path().to_str().unwrap(),
+    )]);
 
     run_git(workspace.path(), &["init", "-b", "feature"]);
     run_git(
@@ -6932,7 +7722,10 @@ fn test_patch_equivalence_rejects_non_equivalent_commit() {
 fn test_detect_default_branch_fallback_to_main() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let workspace = tempfile::tempdir().unwrap();
-    let _env = ScopedEnv::set(&[("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap())]);
+    let _env = ScopedEnv::set_with_defaults(&[(
+        "BREHON_WORKSPACE_ROOT",
+        workspace.path().to_str().unwrap(),
+    )]);
 
     run_git(workspace.path(), &["init", "-b", "main"]);
     run_git(
@@ -6952,7 +7745,10 @@ fn test_detect_default_branch_fallback_to_main() {
 fn test_detect_default_branch_fallback_to_master() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let workspace = tempfile::tempdir().unwrap();
-    let _env = ScopedEnv::set(&[("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap())]);
+    let _env = ScopedEnv::set_with_defaults(&[(
+        "BREHON_WORKSPACE_ROOT",
+        workspace.path().to_str().unwrap(),
+    )]);
 
     run_git(workspace.path(), &["init", "-b", "master"]);
     run_git(
@@ -6972,7 +7768,10 @@ fn test_detect_default_branch_fallback_to_master() {
 fn test_detect_default_branch_fallback_to_develop() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let workspace = tempfile::tempdir().unwrap();
-    let _env = ScopedEnv::set(&[("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap())]);
+    let _env = ScopedEnv::set_with_defaults(&[(
+        "BREHON_WORKSPACE_ROOT",
+        workspace.path().to_str().unwrap(),
+    )]);
 
     run_git(workspace.path(), &["init"]);
     run_git(
@@ -7020,7 +7819,7 @@ async fn test_verify_merge_ready_uses_detected_branch() {
     run_git(workspace.path(), &["commit", "-m", "seed"]);
     let head_commit = run_git(workspace.path(), &["rev-parse", "HEAD"]);
 
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", brehon_root.to_str().unwrap()),
         ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
@@ -7051,7 +7850,7 @@ async fn test_verify_merge_ready_uses_detected_branch() {
 async fn test_subtask_merge_target_from_epic() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
+    let _env = ScopedEnv::set_with_defaults(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
     let tool = TaskActionsTool::new();
 
     // Create epic with integration_branch
@@ -7075,7 +7874,10 @@ async fn test_subtask_merge_target_from_epic() {
 fn test_remote_status_unknown_when_no_remote() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let workspace = tempfile::tempdir().unwrap();
-    let _env = ScopedEnv::set(&[("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap())]);
+    let _env = ScopedEnv::set_with_defaults(&[(
+        "BREHON_WORKSPACE_ROOT",
+        workspace.path().to_str().unwrap(),
+    )]);
 
     run_git(workspace.path(), &["init", "-b", "main"]);
     run_git(
@@ -7096,7 +7898,10 @@ fn test_remote_status_unknown_when_no_remote() {
 fn test_remote_merge_status_unknown_when_remote_has_no_ref() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let workspace = tempfile::tempdir().unwrap();
-    let _env = ScopedEnv::set(&[("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap())]);
+    let _env = ScopedEnv::set_with_defaults(&[(
+        "BREHON_WORKSPACE_ROOT",
+        workspace.path().to_str().unwrap(),
+    )]);
 
     run_git(workspace.path(), &["init", "-b", "main"]);
     run_git(
@@ -7127,7 +7932,10 @@ fn test_remote_merge_status_unknown_when_remote_has_no_ref() {
 fn test_merged_locally_when_commit_not_on_remote() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let workspace = tempfile::tempdir().unwrap();
-    let _env = ScopedEnv::set(&[("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap())]);
+    let _env = ScopedEnv::set_with_defaults(&[(
+        "BREHON_WORKSPACE_ROOT",
+        workspace.path().to_str().unwrap(),
+    )]);
 
     run_git(workspace.path(), &["init", "-b", "main"]);
     run_git(
@@ -7164,7 +7972,10 @@ fn test_merged_remotely_when_commit_on_remote() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let workspace = tempfile::tempdir().unwrap();
     let remote = tempfile::tempdir().unwrap();
-    let _env = ScopedEnv::set(&[("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap())]);
+    let _env = ScopedEnv::set_with_defaults(&[(
+        "BREHON_WORKSPACE_ROOT",
+        workspace.path().to_str().unwrap(),
+    )]);
 
     run_git(workspace.path(), &["init", "-b", "main"]);
     run_git(
@@ -7225,7 +8036,7 @@ async fn test_close_includes_merge_status_in_result() {
     let brehon_root = workspace.path().join(".brehon");
     std::fs::create_dir_all(&brehon_root).unwrap();
     let head_commit = init_git_workspace(workspace.path());
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", brehon_root.to_str().unwrap()),
         ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
@@ -7297,7 +8108,7 @@ fn test_close_result_message_uses_distinct_merge_status_strings() {
 async fn test_epic_with_integration_branch() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
+    let _env = ScopedEnv::set_with_defaults(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
     let tool = TaskActionsTool::new();
 
     let v = create_epic_for_test(&tool, "Feature Epic", Some("epic/T-abc123")).await;
@@ -7328,7 +8139,7 @@ async fn test_epic_with_integration_branch() {
 async fn test_implementation_epic_without_integration_branch_auto_gets_branch() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
+    let _env = ScopedEnv::set_with_defaults(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
     let tool = TaskActionsTool::new();
 
     let v = create_epic_for_test(&tool, "Regular Epic", None).await;
@@ -7349,7 +8160,7 @@ async fn test_implementation_epic_without_integration_branch_auto_gets_branch() 
 async fn test_audit_epic_without_integration_branch_stays_plain() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
+    let _env = ScopedEnv::set_with_defaults(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
     let tool = TaskActionsTool::new();
 
     let v = create_plain_epic_for_test(&tool, "Audit Epic").await;
@@ -7360,7 +8171,7 @@ async fn test_audit_epic_without_integration_branch_stays_plain() {
 async fn test_implementation_epic_can_explicitly_opt_into_direct_to_main() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
+    let _env = ScopedEnv::set_with_defaults(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
     let tool = TaskActionsTool::new();
 
     let result = tool
@@ -7391,7 +8202,7 @@ async fn test_implementation_epic_can_explicitly_opt_into_direct_to_main() {
 async fn test_subtask_inherits_merge_target_from_feature_epic() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
+    let _env = ScopedEnv::set_with_defaults(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
     let tool = TaskActionsTool::new();
 
     let epic = create_epic_for_test(&tool, "Feature Epic", Some("epic/feature-auth")).await;
@@ -7411,7 +8222,7 @@ async fn test_subtask_inherits_merge_target_from_feature_epic() {
 async fn test_merge_subtask_under_plain_epic_requires_direct_to_main_opt_in() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
+    let _env = ScopedEnv::set_with_defaults(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
     let tool = TaskActionsTool::new();
 
     let epic = create_plain_epic_for_test(&tool, "Audit Epic").await;
@@ -7443,7 +8254,7 @@ async fn test_merge_subtask_under_plain_epic_requires_direct_to_main_opt_in() {
 async fn test_merge_subtask_under_plain_epic_allows_explicit_direct_to_main() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
+    let _env = ScopedEnv::set_with_defaults(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
     let tool = TaskActionsTool::new();
 
     let epic = create_plain_epic_for_test(&tool, "Audit Epic").await;
@@ -7465,7 +8276,7 @@ async fn test_update_integration_branch_on_epic() {
     std::fs::write(root.path().join(".gitignore"), ".brehon/\n").unwrap();
     run_git(root.path(), &["add", ".gitignore"]);
     run_git(root.path(), &["commit", "-m", "ignore brehon runtime"]);
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", brehon_root.to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
     ]);
@@ -7499,7 +8310,7 @@ async fn test_update_integration_branch_on_epic() {
 async fn test_update_integration_status_on_subtask() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
     ]);
@@ -7530,7 +8341,7 @@ async fn test_update_integration_status_on_subtask() {
 async fn test_epic_with_empty_integration_branch_auto_generates_for_implementation_epic() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
+    let _env = ScopedEnv::set_with_defaults(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
     let tool = TaskActionsTool::new();
 
     let v = create_epic_for_test(&tool, "Epic with empty branch", Some("")).await;
@@ -7542,7 +8353,7 @@ async fn test_epic_with_empty_integration_branch_auto_generates_for_implementati
 async fn test_subtask_under_epic_with_cleared_integration_branch_requires_direct_to_main() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
+    let _env = ScopedEnv::set_with_defaults(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
     let tool = TaskActionsTool::new();
 
     // Create epic with integration_branch
@@ -7606,7 +8417,7 @@ async fn test_subtask_under_epic_with_cleared_integration_branch_requires_direct
 async fn test_integration_status_invalid_value_rejected() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
     ]);
@@ -7648,7 +8459,7 @@ async fn test_integration_status_invalid_value_rejected() {
 async fn test_integration_branch_only_settable_on_containers() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
     ]);
@@ -7682,7 +8493,7 @@ async fn test_update_integration_branch_on_initiative() {
     std::fs::write(root.path().join(".gitignore"), ".brehon/\n").unwrap();
     run_git(root.path(), &["add", ".gitignore"]);
     run_git(root.path(), &["commit", "-m", "ignore brehon runtime"]);
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", brehon_root.to_str().unwrap()),
         ("BREHON_WORKSPACE_ROOT", root.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
@@ -7718,7 +8529,7 @@ async fn test_update_integration_branch_on_initiative() {
 async fn test_merge_target_only_settable_on_subtasks() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
     ]);
@@ -7746,7 +8557,7 @@ async fn test_merge_target_only_settable_on_subtasks() {
 async fn test_integration_status_only_settable_on_valid_subtasks() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
     ]);
@@ -7774,7 +8585,7 @@ async fn test_integration_status_only_settable_on_valid_subtasks() {
 async fn test_integration_fields_rejected_on_task_with_empty_parent_id() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
     ]);
@@ -7836,7 +8647,7 @@ async fn test_integration_fields_rejected_on_task_with_empty_parent_id() {
 async fn test_integration_fields_rejected_on_task_with_nonexistent_parent() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
     ]);
@@ -7881,7 +8692,7 @@ async fn test_integration_fields_rejected_on_task_with_nonexistent_parent() {
 async fn test_direct_update_merge_target_on_subtask() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
     ]);
@@ -7921,7 +8732,7 @@ async fn test_direct_update_merge_target_on_subtask() {
 async fn test_standalone_task_has_no_merge_target_nor_integration_status() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
+    let _env = ScopedEnv::set_with_defaults(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
     let tool = TaskActionsTool::new();
 
     let v = create_standalone_task_for_test(&tool, "Standalone task (no parent)").await;
@@ -7945,7 +8756,7 @@ async fn test_standalone_task_has_no_merge_target_nor_integration_status() {
 async fn test_epic_close_rejects_when_subtask_not_integrated() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
         ("BREHON_SUPERVISOR_NAME", "sup-1"),
@@ -7983,7 +8794,7 @@ async fn test_feature_epic_close_rejects_when_subtask_not_integrated() {
     let workspace = tempfile::tempdir().unwrap();
     init_git_workspace(workspace.path());
 
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
@@ -8036,7 +8847,7 @@ async fn test_guard_rail_blocks_direct_to_main_for_epic_subtask() {
     let workspace = tempfile::tempdir().unwrap();
     init_git_workspace(workspace.path());
 
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
@@ -8108,7 +8919,7 @@ async fn test_integrate_action_cherry_picks_reviewed_commit_into_epic_branch_and
     let reviewed_commit = run_git(workspace.path(), &["rev-parse", "HEAD"]);
     run_git(workspace.path(), &["checkout", "main"]);
 
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", brehon_root.to_str().unwrap()),
         ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
@@ -8275,7 +9086,7 @@ async fn test_integrate_action_invalidates_stale_approval_when_latest_commit_cha
     let latest_commit = run_git(workspace.path(), &["rev-parse", "HEAD"]);
     run_git(workspace.path(), &["checkout", "main"]);
 
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", brehon_root.to_str().unwrap()),
         ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
@@ -8378,7 +9189,7 @@ async fn test_integrate_action_complete_phase_is_idempotent_without_git_side_eff
     let reviewed_commit = run_git(workspace.path(), &["rev-parse", "HEAD"]);
     run_git(workspace.path(), &["checkout", "main"]);
 
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", brehon_root.to_str().unwrap()),
         ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
@@ -8503,7 +9314,7 @@ async fn test_integrate_action_cherry_picks_full_reviewed_commit_set() {
     let reviewed_commit = run_git(workspace.path(), &["rev-parse", "HEAD"]);
     run_git(workspace.path(), &["checkout", "main"]);
 
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", brehon_root.to_str().unwrap()),
         ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
@@ -8605,7 +9416,7 @@ async fn test_integrate_action_treats_resolved_empty_reviewed_set_as_noop() {
     let reviewed_commit = run_git(workspace.path(), &["rev-parse", "HEAD"]);
     run_git(workspace.path(), &["checkout", "main"]);
 
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", brehon_root.to_str().unwrap()),
         ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
@@ -8699,7 +9510,7 @@ async fn test_integrate_action_rejects_resolved_empty_reviewed_set_when_task_not
     let reviewed_commit = run_git(workspace.path(), &["rev-parse", "HEAD"]);
     run_git(workspace.path(), &["checkout", "main"]);
 
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", brehon_root.to_str().unwrap()),
         ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
@@ -8803,7 +9614,7 @@ async fn test_integrate_action_skips_already_applied_prior_reviewed_commit() {
     let followup_commit = run_git(workspace.path(), &["rev-parse", "HEAD"]);
     run_git(workspace.path(), &["checkout", "main"]);
 
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", brehon_root.to_str().unwrap()),
         ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
@@ -8936,7 +9747,7 @@ async fn test_integrate_action_long_lived_epic_still_picks_followup_after_patch_
     let followup_commit = run_git(workspace.path(), &["rev-parse", "HEAD"]);
     run_git(workspace.path(), &["checkout", "main"]);
 
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", brehon_root.to_str().unwrap()),
         ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
@@ -9034,7 +9845,7 @@ async fn test_integrate_action_escalates_conflict_to_supervisor_owned_state() {
     let reviewed_commit = run_git(workspace.path(), &["rev-parse", "HEAD"]);
     run_git(workspace.path(), &["checkout", "main"]);
 
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", brehon_root.to_str().unwrap()),
         ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
@@ -9137,7 +9948,7 @@ async fn test_integration_continue_via_cherry_pick_continue_succeeds() {
     let reviewed_commit = run_git(workspace.path(), &["rev-parse", "HEAD"]);
     run_git(workspace.path(), &["checkout", "main"]);
 
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", brehon_root.to_str().unwrap()),
         ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
@@ -9338,7 +10149,7 @@ async fn test_integrate_action_accepts_mixed_patch_equivalent_and_trailer_proofs
     let followup_commit = run_git(workspace.path(), &["rev-parse", "HEAD"]);
     run_git(workspace.path(), &["checkout", "main"]);
 
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", brehon_root.to_str().unwrap()),
         ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
@@ -9489,7 +10300,7 @@ async fn test_integrate_action_rejects_cleared_conflict_after_cherry_pick_abort(
     let reviewed_commit = run_git(workspace.path(), &["rev-parse", "HEAD"]);
     run_git(workspace.path(), &["checkout", "main"]);
 
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", brehon_root.to_str().unwrap()),
         ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
@@ -9602,7 +10413,7 @@ async fn test_integrate_action_force_retries_from_aborted_state() {
     let reviewed_commit = run_git(workspace.path(), &["rev-parse", "HEAD"]);
     run_git(workspace.path(), &["checkout", "main"]);
 
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", brehon_root.to_str().unwrap()),
         ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
@@ -9703,7 +10514,7 @@ async fn test_abort_integration_requires_force_before_retrying_integrate() {
     let reviewed_commit = run_git(workspace.path(), &["rev-parse", "HEAD"]);
     run_git(workspace.path(), &["checkout", "main"]);
 
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", brehon_root.to_str().unwrap()),
         ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
@@ -9909,7 +10720,7 @@ async fn test_integrate_action_force_retries_irrecoverable_cherry_pick_state_des
     let reviewed_commit = run_git(workspace.path(), &["rev-parse", "HEAD"]);
     run_git(workspace.path(), &["checkout", "main"]);
 
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", brehon_root.to_str().unwrap()),
         ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
@@ -10047,7 +10858,7 @@ async fn test_stale_worktree_rejection_can_be_cleaned_and_force_retried_from_nul
     let stale_seed_commit = run_git(workspace.path(), &["rev-parse", "HEAD"]);
     run_git(workspace.path(), &["checkout", "main"]);
 
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", brehon_root.to_str().unwrap()),
         ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
@@ -10208,7 +11019,7 @@ async fn test_integrate_action_force_rejects_completed_integration() {
     run_git(workspace.path(), &["checkout", "-b", "epic/test-feature"]);
     run_git(workspace.path(), &["checkout", "main"]);
 
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", brehon_root.to_str().unwrap()),
         ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
@@ -10284,7 +11095,7 @@ async fn test_integrate_action_rejects_non_supervisor_and_notifies_supervisor() 
     run_git(workspace.path(), &["checkout", "-b", "epic/test-feature"]);
     run_git(workspace.path(), &["checkout", "main"]);
 
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", root.path().to_str().unwrap()),
         ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "worker"),
@@ -10382,7 +11193,7 @@ async fn test_integrate_action_rejects_non_supervisor_and_notifies_supervisor() 
 async fn test_list_output_includes_merge_target_for_subtasks() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
+    let _env = ScopedEnv::set_with_defaults(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
     let tool = TaskActionsTool::new();
 
     // Create feature epic
@@ -10412,7 +11223,7 @@ async fn test_list_output_includes_merge_target_for_subtasks() {
 async fn test_epic_list_shows_integration_progress() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
-    let _env = ScopedEnv::set(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
+    let _env = ScopedEnv::set_with_defaults(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
     let tool = TaskActionsTool::new();
 
     // Create feature epic
@@ -10470,7 +11281,7 @@ async fn test_feature_epic_close_merges_branch_to_main() {
     let epic_commit = run_git(workspace.path(), &["rev-parse", "HEAD"]);
     run_git(workspace.path(), &["checkout", "main"]);
 
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", brehon_root.to_str().unwrap()),
         ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
@@ -10581,7 +11392,7 @@ async fn test_child_epic_close_integrates_into_initiative_branch() {
     let brehon_root = workspace.path().join(".brehon");
     std::fs::create_dir_all(&brehon_root).unwrap();
     init_git_workspace(workspace.path());
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", brehon_root.to_str().unwrap()),
         ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
@@ -10704,7 +11515,7 @@ async fn test_initiative_close_merges_initiative_branch_to_main() {
     let brehon_root = workspace.path().join(".brehon");
     std::fs::create_dir_all(&brehon_root).unwrap();
     init_git_workspace(workspace.path());
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", brehon_root.to_str().unwrap()),
         ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
@@ -10842,7 +11653,7 @@ async fn test_initiative_squash_close_rejects_dirty_default_branch_worktree_with
     let brehon_root = workspace.path().join(".brehon");
     std::fs::create_dir_all(&brehon_root).unwrap();
     init_git_workspace(workspace.path());
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", brehon_root.to_str().unwrap()),
         ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
@@ -10944,7 +11755,7 @@ async fn test_promote_followups_creates_child_task_and_marks_followups_tasked() 
     let brehon_root = workspace.path().join(".brehon");
     std::fs::create_dir_all(&brehon_root).unwrap();
     init_git_workspace(workspace.path());
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", brehon_root.to_str().unwrap()),
         ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
@@ -11020,7 +11831,7 @@ async fn test_close_marks_promoted_followups_done_on_source_task() {
     let brehon_root = workspace.path().join(".brehon");
     std::fs::create_dir_all(&brehon_root).unwrap();
     init_git_workspace(workspace.path());
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", brehon_root.to_str().unwrap()),
         ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
@@ -11146,7 +11957,7 @@ async fn test_integrate_marks_promoted_followups_done_on_source_task() {
     let reviewed_commit = run_git(workspace.path(), &["rev-parse", "HEAD"]);
     run_git(workspace.path(), &["checkout", "main"]);
 
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", brehon_root.to_str().unwrap()),
         ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
@@ -11240,7 +12051,7 @@ async fn test_epic_close_rejects_open_followups_until_waived() {
     let brehon_root = workspace.path().join(".brehon");
     std::fs::create_dir_all(&brehon_root).unwrap();
     init_git_workspace(workspace.path());
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", brehon_root.to_str().unwrap()),
         ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
@@ -11319,7 +12130,7 @@ async fn test_waive_followups_requires_explicit_ids_or_waive_all_for_multiple_op
     let brehon_root = workspace.path().join(".brehon");
     std::fs::create_dir_all(&brehon_root).unwrap();
     init_git_workspace(workspace.path());
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", brehon_root.to_str().unwrap()),
         ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
@@ -11431,7 +12242,7 @@ async fn test_abort_integration_aborts_cherry_pick_and_restores_approved_state()
     let reviewed_commit = run_git(workspace.path(), &["rev-parse", "HEAD"]);
     run_git(workspace.path(), &["checkout", "main"]);
 
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", brehon_root.to_str().unwrap()),
         ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
@@ -11527,7 +12338,7 @@ async fn test_abort_integration_resets_dirty_resolved_worktree_to_epic_tip() {
     run_git(workspace.path(), &["checkout", "-b", "epic/test-feature"]);
     run_git(workspace.path(), &["checkout", "main"]);
 
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", brehon_root.to_str().unwrap()),
         ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
@@ -11621,7 +12432,7 @@ async fn test_abort_integration_noops_when_phase_is_null() {
     run_git(workspace.path(), &["checkout", "-b", "epic/test-feature"]);
     run_git(workspace.path(), &["checkout", "main"]);
 
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", brehon_root.to_str().unwrap()),
         ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
@@ -11675,7 +12486,7 @@ async fn test_abort_integration_rejects_worker_role() {
     let brehon_root = root.path().join(".brehon");
     std::fs::create_dir_all(&brehon_root).unwrap();
 
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", brehon_root.to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "worker"),
         ("BREHON_AGENT_NAME", "worker-1"),
@@ -11733,7 +12544,7 @@ async fn test_abort_integration_requires_reason() {
     let brehon_root = root.path().join(".brehon");
     std::fs::create_dir_all(&brehon_root).unwrap();
 
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", brehon_root.to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
         ("BREHON_AGENT_NAME", "sup-1"),
@@ -11775,7 +12586,7 @@ async fn test_abort_integration_rejects_unsupported_phase() {
     let brehon_root = root.path().join(".brehon");
     std::fs::create_dir_all(&brehon_root).unwrap();
 
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", brehon_root.to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
         ("BREHON_AGENT_NAME", "sup-1"),
@@ -11820,7 +12631,7 @@ async fn test_abort_integration_noops_when_phase_is_complete() {
     let brehon_root = root.path().join(".brehon");
     std::fs::create_dir_all(&brehon_root).unwrap();
 
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", brehon_root.to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
         ("BREHON_AGENT_NAME", "sup-1"),
@@ -11871,7 +12682,7 @@ async fn test_abort_integration_noops_when_phase_is_aborted() {
     let brehon_root = root.path().join(".brehon");
     std::fs::create_dir_all(&brehon_root).unwrap();
 
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", brehon_root.to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
         ("BREHON_AGENT_NAME", "sup-1"),
@@ -11953,7 +12764,7 @@ async fn test_integration_detects_patch_equivalent_after_rebase() {
     let reviewed_commit = run_git(workspace.path(), &["rev-parse", "HEAD"]);
     run_git(workspace.path(), &["checkout", "main"]);
 
-    let _env = ScopedEnv::set(&[
+    let _env = ScopedEnv::set_with_defaults(&[
         ("BREHON_ROOT", brehon_root.to_str().unwrap()),
         ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),

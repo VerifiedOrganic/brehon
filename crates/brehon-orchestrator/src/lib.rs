@@ -27,6 +27,8 @@ mod orchestrator_reconciliation_tests;
 #[cfg(test)]
 mod reconciler_tests;
 #[cfg(test)]
+pub(crate) mod test_support;
+#[cfg(test)]
 mod worker_pool_tests;
 
 pub use assignment::AssignmentEngine;

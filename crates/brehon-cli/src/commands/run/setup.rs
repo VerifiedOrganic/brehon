@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use brehon_ports::GitOperations;
-use brehon_types::{is_terminal_task_status, normalize_task_status, BrehonConfig};
+use brehon_types::{is_terminal_task_status, normalize_task_status, BrehonConfig, OrchestrationConfig};
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -259,55 +259,51 @@ pub(crate) fn ensure_codex_instruction_files(cwd: &Path, config: &BrehonConfig) 
     Ok(())
 }
 
-pub(crate) fn detect_builtin_cli(
-    agent_name: &str,
-    config: &BrehonConfig,
-) -> Option<brehon_mux::SupervisorCli> {
+fn launcher_has_capability_overrides(agent_config: &brehon_types::AgentConnectionConfig) -> bool {
+    agent_config
+        .transport_str()
+        .is_some_and(|value| !value.trim().is_empty())
+        || agent_config
+            .control_plane_str()
+            .is_some_and(|value| !value.trim().is_empty())
+}
+
+fn builtin_cli_alias(agent_name: &str) -> Option<brehon_mux::SupervisorCli> {
     use brehon_mux::SupervisorCli;
 
     match agent_name {
-        "claude-code" | "claude" => return Some(SupervisorCli::Claude),
-        "codex" => return Some(SupervisorCli::Codex),
-        "gemini" => return Some(SupervisorCli::Gemini),
-        "kimi" => return Some(SupervisorCli::Kimi),
-        "opencode" => return Some(SupervisorCli::OpenCode),
-        "junie" => return Some(SupervisorCli::Junie),
-        "copilot" => return Some(SupervisorCli::Copilot),
-        "agy" => return Some(SupervisorCli::Agy),
-        _ => {}
-    }
-
-    let agent_config = config.lane_launcher(agent_name)?;
-    match agent_config.adapter {
-        brehon_types::agent::AdapterKind::Junie => return Some(SupervisorCli::Junie),
-        brehon_types::agent::AdapterKind::Agy => return Some(SupervisorCli::Agy),
-        brehon_types::agent::AdapterKind::Acp => {}
-        _ => return None,
-    }
-    let args = agent_config
-        .args
-        .iter()
-        .map(String::as_str)
-        .collect::<Vec<_>>();
-    match (
-        agent_config.command_str().unwrap_or_default(),
-        args.as_slice(),
-    ) {
-        ("claude", []) => Some(SupervisorCli::Claude),
-        ("codex", args) if args == vec!["app-server"] => Some(SupervisorCli::Codex),
-        ("gemini", ["--acp"]) | ("gemini", ["--experimental-acp"]) => Some(SupervisorCli::Gemini),
-        ("kimi", args) if args == vec!["acp"] => Some(SupervisorCli::Kimi),
-        ("opencode", [])
-        | ("opencode", ["acp"])
-        | ("opencode", ["acp", "--cwd", "."])
-        | ("opencode", ["serve"])
-        | ("opencode", ["serve", "--pure"]) => Some(SupervisorCli::OpenCode),
-        ("junie", []) => Some(SupervisorCli::Junie),
-        ("copilot", args) if args.is_empty() || args.contains(&"--acp") => {
-            Some(SupervisorCli::Copilot)
-        }
+        "claude-code" | "claude" => Some(SupervisorCli::Claude),
+        "codex" => Some(SupervisorCli::Codex),
+        "gemini" => Some(SupervisorCli::Gemini),
+        "kimi" => Some(SupervisorCli::Kimi),
+        "opencode" => Some(SupervisorCli::OpenCode),
+        "junie" => Some(SupervisorCli::Junie),
+        "copilot" => Some(SupervisorCli::Copilot),
+        "agy" => Some(SupervisorCli::Agy),
         _ => None,
     }
+}
+
+fn builtin_cli_from_launcher_config(
+    agent_config: &brehon_types::AgentConnectionConfig,
+) -> Option<brehon_mux::SupervisorCli> {
+    brehon_mux::builtin_cli_from_launcher_shape(
+        agent_config.adapter,
+        agent_config.command_str(),
+        &agent_config.args,
+    )
+}
+
+fn resolved_builtin_cli(
+    agent_name: &str,
+    config: &BrehonConfig,
+) -> Option<(brehon_mux::SupervisorCli, bool)> {
+    if let Some(agent_config) = config.lane_launcher(agent_name) {
+        return builtin_cli_from_launcher_config(agent_config)
+            .map(|cli| (cli, launcher_has_capability_overrides(agent_config)));
+    }
+
+    builtin_cli_alias(agent_name).map(|cli| (cli, false))
 }
 
 fn launches_codex_app_server(command: &str, args: &[String]) -> bool {
@@ -442,15 +438,57 @@ fn push_repeated_option_arg(args: &mut Vec<String>, option: &str, value: &str) {
     args.push(value.to_string());
 }
 
+fn apply_capability_overrides(
+    capabilities: &mut brehon_mux::HarnessCapabilities,
+    agent_config: &brehon_types::AgentConnectionConfig,
+) {
+    use brehon_mux::{HarnessControlPlane, HarnessTransport};
+
+    let transport_override = agent_config
+        .transport_str()
+        .and_then(|value| value.parse::<HarnessTransport>().ok());
+    let control_plane_override = agent_config
+        .control_plane_str()
+        .and_then(|value| value.parse::<HarnessControlPlane>().ok());
+
+    if let Some(control_plane) = control_plane_override {
+        capabilities.preferred_control_plane = control_plane;
+        if let Some(transport) = transport_override {
+            if transport.supports_control_plane(control_plane) {
+                capabilities.transport = transport;
+            } else {
+                capabilities.transport = control_plane.canonical_transport();
+            }
+        } else {
+            capabilities.transport = control_plane.canonical_transport();
+        }
+    } else if let Some(transport) = transport_override {
+        if transport.supports_control_plane(capabilities.preferred_control_plane) {
+            capabilities.transport = transport;
+        }
+    }
+
+    capabilities.one_shot =
+        capabilities.transport.is_one_shot() || capabilities.preferred_control_plane.is_one_shot();
+}
+
 pub(crate) fn agent_to_adapter(name: &str, config: &BrehonConfig) -> brehon_mux::AgentAdapter {
     use brehon_mux::{
         AgentAdapter, CustomAgentConfig, HarnessCapabilities, HarnessControlPlane,
-        HarnessTransport, SupervisorCli,
+        HarnessTransport, PromptInjectionStrategy, SupervisorCli,
     };
     use brehon_types::agent::AdapterKind;
 
-    if let Some(cli) = detect_builtin_cli(name, config) {
-        return AgentAdapter::BuiltIn(cli);
+    if let Some((cli, has_capability_overrides)) = resolved_builtin_cli(name, config) {
+        if !has_capability_overrides {
+            return AgentAdapter::BuiltIn(cli);
+        }
+
+        if let Some(agent_config) = config.lane_launcher(name) {
+            let mut capabilities = cli.capabilities();
+            apply_capability_overrides(&mut capabilities, agent_config);
+            return AgentAdapter::built_in_with_capabilities(cli, capabilities);
+        }
     }
 
     if let Some(agent_config) = config.lane_launcher(name) {
@@ -468,6 +506,7 @@ pub(crate) fn agent_to_adapter(name: &str, config: &BrehonConfig) -> brehon_mux:
                     supports_teams: false,
                     one_shot: false,
                     uses_ink_prompt: false,
+                    prompt_injection_strategy: PromptInjectionStrategy::ImmediateSubmit,
                     tool_prefix: std::borrow::Cow::Borrowed("mcp__brehon__"),
                     transport: HarnessTransport::AppServer,
                     preferred_control_plane: HarnessControlPlane::Acp,
@@ -486,6 +525,7 @@ pub(crate) fn agent_to_adapter(name: &str, config: &BrehonConfig) -> brehon_mux:
                     supports_teams: false,
                     one_shot: false,
                     uses_ink_prompt: false,
+                    prompt_injection_strategy: PromptInjectionStrategy::ImmediateSubmit,
                     tool_prefix: std::borrow::Cow::Borrowed("brehon__"),
                     transport: HarnessTransport::AppServer,
                     preferred_control_plane: HarnessControlPlane::Acp,
@@ -498,6 +538,7 @@ pub(crate) fn agent_to_adapter(name: &str, config: &BrehonConfig) -> brehon_mux:
                 supports_teams: false,
                 one_shot: false,
                 uses_ink_prompt: false,
+                prompt_injection_strategy: PromptInjectionStrategy::ImmediateSubmit,
                 tool_prefix: std::borrow::Cow::Borrowed("mcp_brehon_"),
                 transport: HarnessTransport::AppServer,
                 preferred_control_plane: HarnessControlPlane::Acp,
@@ -509,6 +550,7 @@ pub(crate) fn agent_to_adapter(name: &str, config: &BrehonConfig) -> brehon_mux:
                 supports_teams: false,
                 one_shot: false,
                 uses_ink_prompt: false,
+                prompt_injection_strategy: PromptInjectionStrategy::ImmediateSubmit,
                 tool_prefix: std::borrow::Cow::Borrowed("mcp_brehon_"),
                 transport: HarnessTransport::ManagedApi,
                 preferred_control_plane: HarnessControlPlane::OpenAiCompatible,
@@ -520,6 +562,7 @@ pub(crate) fn agent_to_adapter(name: &str, config: &BrehonConfig) -> brehon_mux:
                 supports_teams: false,
                 one_shot: false,
                 uses_ink_prompt: false,
+                prompt_injection_strategy: PromptInjectionStrategy::ImmediateSubmit,
                 tool_prefix: std::borrow::Cow::Borrowed("mcp_brehon_"),
                 transport: HarnessTransport::AppServer,
                 preferred_control_plane: HarnessControlPlane::Acp,
@@ -531,6 +574,7 @@ pub(crate) fn agent_to_adapter(name: &str, config: &BrehonConfig) -> brehon_mux:
                 supports_teams: false,
                 one_shot: false,
                 uses_ink_prompt: true,
+                prompt_injection_strategy: PromptInjectionStrategy::InkEcho,
                 tool_prefix: std::borrow::Cow::Borrowed("mcp__brehon__"),
                 transport: HarnessTransport::AppServer,
                 preferred_control_plane: HarnessControlPlane::Acp,
@@ -542,6 +586,7 @@ pub(crate) fn agent_to_adapter(name: &str, config: &BrehonConfig) -> brehon_mux:
                 supports_teams: false,
                 one_shot: false,
                 uses_ink_prompt: false,
+                prompt_injection_strategy: PromptInjectionStrategy::ImmediateSubmit,
                 tool_prefix: std::borrow::Cow::Borrowed("mcp_brehon_"),
                 transport: HarnessTransport::InteractivePty,
                 preferred_control_plane: HarnessControlPlane::PtyInjection,
@@ -553,6 +598,7 @@ pub(crate) fn agent_to_adapter(name: &str, config: &BrehonConfig) -> brehon_mux:
                 supports_teams: false,
                 one_shot: false,
                 uses_ink_prompt: false,
+                prompt_injection_strategy: PromptInjectionStrategy::ImmediateSubmit,
                 tool_prefix: std::borrow::Cow::Borrowed("mcp_brehon_"),
                 transport: HarnessTransport::AppServer,
                 preferred_control_plane: HarnessControlPlane::Acp,
@@ -564,6 +610,7 @@ pub(crate) fn agent_to_adapter(name: &str, config: &BrehonConfig) -> brehon_mux:
                 supports_teams: false,
                 one_shot: false,
                 uses_ink_prompt: true,
+                prompt_injection_strategy: PromptInjectionStrategy::InkEcho,
                 tool_prefix: std::borrow::Cow::Borrowed("mcp_brehon_"),
                 transport: HarnessTransport::InteractivePty,
                 preferred_control_plane: HarnessControlPlane::PtyInjection,
@@ -575,6 +622,7 @@ pub(crate) fn agent_to_adapter(name: &str, config: &BrehonConfig) -> brehon_mux:
                 supports_teams: false,
                 one_shot: false,
                 uses_ink_prompt: false,
+                prompt_injection_strategy: PromptInjectionStrategy::ImmediateSubmit,
                 tool_prefix: std::borrow::Cow::Borrowed("mcp_brehon_"),
                 transport: HarnessTransport::AppServer,
                 preferred_control_plane: HarnessControlPlane::Acp,
@@ -582,18 +630,7 @@ pub(crate) fn agent_to_adapter(name: &str, config: &BrehonConfig) -> brehon_mux:
             AdapterKind::Agy => SupervisorCli::Agy.capabilities(),
             AdapterKind::PtyHooks => SupervisorCli::Claude.capabilities(),
         };
-        if let Some(transport) = agent_config
-            .transport_str()
-            .and_then(|value| value.parse::<HarnessTransport>().ok())
-        {
-            capabilities.transport = transport;
-        }
-        if let Some(control_plane) = agent_config
-            .control_plane_str()
-            .and_then(|value| value.parse::<HarnessControlPlane>().ok())
-        {
-            capabilities.preferred_control_plane = control_plane;
-        }
+        apply_capability_overrides(&mut capabilities, agent_config);
         let command = if agent_config.adapter == AdapterKind::NativeAgent {
             Some(native_agent_command(agent_config.command_str()))
         } else {
@@ -724,8 +761,10 @@ pub(crate) fn default_initiative_integration_worktree(
 /// shared repo root. All of these are machine-local — committing them
 /// poisons teammate checkouts:
 ///
-/// * `.brehon/` — entire runtime/state tree (sessions, worktrees, tasks,
-///   factory caches). Per-developer; never portable.
+/// * `/.brehon/*` plus the worktree exceptions below — runtime/state files stay
+///   ignored, while worktree directory paths remain visible to git-aware CLIs
+///   such as Antigravity CLI. Files inside those worktrees are still ignored
+///   from the shared checkout, so the main repo does not become dirty.
 /// * `.mcp.json` — Claude Code MCP discovery file. Written with an
 ///   absolute path to the current machine's brehon binary (see
 ///   [`ensure_mcp_config`]); the path won't resolve on any other host.
@@ -741,13 +780,20 @@ pub(crate) fn default_initiative_integration_worktree(
 /// than the committed `.gitignore` so the rule follows each clone
 /// without requiring a team-wide .gitignore update. This is the same
 /// pattern most tooling uses for auto-generated dev scaffolding.
-const BREHON_LOCAL_GITIGNORE_PATTERNS: &[&str] = &[
-    ".brehon/",
+const BREHON_LOCAL_EXTRA_GITIGNORE_PATTERNS: &[&str] = &[
     ".mcp.json",
     ".agents/mcp_config.json",
     ".antigravitycli",
     ".claude/settings.local.json",
 ];
+
+/// Stable prefix for the auto-managed header written into `.git/info/exclude`.
+///
+/// The full header text is "# Brehon local scaffolding (auto-managed; safe to edit)".
+/// We intentionally match only on this prefix so that users may edit the
+/// parenthetical note without breaking idempotence — reruns will recognise the
+/// existing block and skip appending a duplicate header.
+const BREHON_GITIGNORE_HEADER_PREFIX: &str = "# Brehon local scaffolding";
 
 /// Ensure all Brehon-generated machine-local files are git-ignored
 /// via `.git/info/exclude`.
@@ -756,40 +802,44 @@ const BREHON_LOCAL_GITIGNORE_PATTERNS: &[&str] = &[
 /// we'd rather skip than pollute a non-git dir with a spurious
 /// `.git/info/exclude` file.
 pub(crate) fn ensure_brehon_ignored_in_repo(repo_root: &Path) -> Result<()> {
-    let git_dir = repo_root.join(".git");
-    if !git_dir.exists() {
+    if !repo_root.join(".git").exists() {
         // `brehon run` can be invoked from a non-git directory; that's
         // legal and shouldn't trigger filesystem writes just to set up
         // a gitignore rule that has no home.
         return Ok(());
     }
 
-    let info_dir = git_dir.join("info");
+    let info_dir = brehon_git::resolve_git_info_dir(repo_root)
+        .map_err(|err| anyhow::anyhow!("Failed to resolve git info directory: {err}"))?;
     std::fs::create_dir_all(&info_dir)?;
     let exclude_path = info_dir.join("exclude");
     let existing = std::fs::read_to_string(&exclude_path).unwrap_or_default();
+    let (mut updated, removed_legacy) = brehon_git::remove_legacy_brehon_dir_ignores(&existing);
 
     // Collect the trimmed set of lines already present so we only write
     // patterns that are genuinely missing — and preserve anything else
     // the developer has put in their exclude file (custom tool caches,
     // editor scratch files, etc.).
     let already_present: std::collections::HashSet<&str> =
-        existing.lines().map(|line| line.trim()).collect();
+        updated.lines().map(|line| line.trim()).collect();
 
-    let missing: Vec<&&str> = BREHON_LOCAL_GITIGNORE_PATTERNS
+    let missing: Vec<&&str> = brehon_git::WORKTREE_AWARE_BREHON_IGNORE_PATTERNS
         .iter()
+        .chain(BREHON_LOCAL_EXTRA_GITIGNORE_PATTERNS.iter())
         .filter(|pattern| !already_present.contains(**pattern))
         .collect();
 
-    if missing.is_empty() {
+    if missing.is_empty() && !removed_legacy {
         return Ok(());
     }
 
-    let mut updated = existing;
     if !updated.is_empty() && !updated.ends_with('\n') {
         updated.push('\n');
     }
-    if !updated.contains("# Brehon local scaffolding") {
+    if !updated
+        .lines()
+        .any(|l| l.trim().starts_with(BREHON_GITIGNORE_HEADER_PREFIX))
+    {
         updated.push_str("# Brehon local scaffolding (auto-managed; safe to edit)\n");
     }
     for pattern in missing {
@@ -1011,6 +1061,122 @@ fn open_git_repo(cwd: &Path, operation: &str) -> Result<git2::Repository> {
             cwd.display()
         )
     })
+}
+
+/// Compute a deterministic repo identity for external worktree root scoping.
+///
+/// Normalize a potentially `.brehon`-suffixed path back to the actual
+/// project root.  Brehon accepts `.brehon` as a project path (e.g.
+/// `brehon run --config .brehon`), so callers must normalize before
+/// deriving repo identity or resolving relative paths.
+pub(crate) fn normalize_project_root(cwd: &Path) -> PathBuf {
+    // If the supplied path ends with `.brehon`, its parent is the real root.
+    if cwd.file_name() == Some(std::ffi::OsStr::new(".brehon")) {
+        return cwd
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+    }
+    cwd.to_path_buf()
+}
+
+const REPO_IDENTITY_CACHE_FILE: &str = "runtime/repo-identity-cache.json";
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct RepoIdentityCache {
+    repo_name: String,
+    identity: String,
+}
+
+fn read_repo_identity_cache(brehon_root: &Path, repo_name: &str) -> Option<String> {
+    let path = brehon_root.join(REPO_IDENTITY_CACHE_FILE);
+    let content = std::fs::read_to_string(&path).ok()?;
+    let cache: RepoIdentityCache = serde_json::from_str(&content).ok()?;
+    if cache.repo_name == repo_name {
+        Some(cache.identity)
+    } else {
+        None
+    }
+}
+
+fn write_repo_identity_cache(brehon_root: &Path, repo_name: &str, identity: &str) {
+    if !brehon_root.exists() {
+        return;
+    }
+    let path = brehon_root.join(REPO_IDENTITY_CACHE_FILE);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let doc = RepoIdentityCache {
+        repo_name: repo_name.to_string(),
+        identity: identity.to_string(),
+    };
+    if let Ok(body) = serde_json::to_string_pretty(&doc) {
+        let _ = std::fs::write(&path, body);
+    }
+}
+
+/// Returns `{repo_name}-{short_hash}` where `repo_name` is the project
+/// directory basename and `short_hash` is the first 8 hex chars of a
+/// deterministic hash derived from the repository's origin remote URL.
+/// Using the remote URL ensures the identity stays stable across clones
+/// (including shallow clones) and does not change as new commits are made.
+///
+/// Falls back to a hash of the canonical path when git is unavailable,
+/// the repository has no origin remote, or the remote has no URL.
+/// **Note:** the fallback uses `std::collections::hash_map::DefaultHasher`,
+/// whose algorithm is not guaranteed stable across Rust compiler versions.
+/// In practice the value is stable for a given toolchain, but pinning the
+/// identity explicitly via `orchestration.worktree_root` is recommended for
+/// environments where reproducibility across compiler upgrades matters.
+///
+/// The resolved identity is cached in `.brehon/runtime/repo-identity-cache.json`.
+/// Delete that file (or run `brehon clean`) to invalidate the cache.
+///
+/// **Callers must pass a normalized project root.** This function does
+/// NOT call `normalize_project_root` internally; callers are responsible
+/// for stripping any trailing `.brehon` segment before passing `cwd`.
+pub(crate) fn compute_repo_identity(cwd: &Path) -> String {
+    let root = cwd.to_path_buf();
+    let repo_name = root
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown")
+        .to_lowercase();
+
+    let brehon_root = root.join(".brehon");
+    if let Some(cached) = read_repo_identity_cache(&brehon_root, &repo_name) {
+        return cached;
+    }
+
+    let hash = git2::Repository::discover(&root)
+        .ok()
+        .and_then(|repo| {
+            repo.find_remote("origin")
+                .ok()
+                .and_then(|remote| remote.url().map(String::from))
+        })
+        .map(|url| {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut hasher = DefaultHasher::new();
+            url.hash(&mut hasher);
+            format!("{:016x}", hasher.finish())
+        })
+        .unwrap_or_else(|| {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let canonical = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
+            let mut hasher = DefaultHasher::new();
+            canonical.hash(&mut hasher);
+            format!("{:016x}", hasher.finish())
+        });
+    let hash = hash.get(..8).map(String::from).unwrap_or(hash);
+
+    let identity = format!("{repo_name}-{hash}");
+    write_repo_identity_cache(&brehon_root, &repo_name, &identity);
+    identity
 }
 
 pub(crate) fn detect_default_branch(cwd: &Path) -> Result<String> {
@@ -1958,7 +2124,8 @@ where
         )
     })?;
 
-    let worktrees_dir = cwd.join(".brehon").join("worktrees");
+    let project_root = normalize_project_root(cwd);
+    let worktrees_dir = OrchestrationConfig::legacy_worktree_root(&project_root);
     std::fs::create_dir_all(&worktrees_dir).with_context(|| {
         format!(
             "Failed to create worktree directory '{}'",
@@ -2035,7 +2202,7 @@ where
                 worktree_path.display()
             )
         })?;
-        sync_local_agent_scaffolding_to_worktree(cwd, &worktree_path)?;
+        sync_local_agent_scaffolding_to_worktree(&project_root, &worktree_path)?;
         report(format!(
             "{scope_label} {name} ready at {}",
             worktree_path.display()
@@ -2123,7 +2290,7 @@ mod tests {
         std::fs::write(path.join("README.md"), "seed\n").unwrap();
         std::fs::write(
             path.join(".gitignore"),
-            ".brehon/\n.claude/settings.local.json\n",
+            "!/.brehon/\n/.brehon/*\n!/.brehon/worktrees/\n/.brehon/worktrees/**\n!/.brehon/worktrees/**/\n.claude/settings.local.json\n",
         )
         .unwrap();
         run_git(path, &["add", "README.md", ".gitignore"]);
@@ -2438,6 +2605,306 @@ mod tests {
     }
 
     #[test]
+    fn test_agent_to_adapter_keeps_builtin_gemini_shape_when_overrides_are_present() {
+        let mut config = brehon_config::parse_defaults().unwrap();
+        config.launchers.insert(
+            "gemini".to_string(),
+            brehon_types::AgentConnectionConfig {
+                adapter: brehon_types::agent::AdapterKind::Acp,
+                command: Some("gemini".to_string()),
+                args: vec!["--acp".to_string()],
+                provider: None,
+                transport: Some("interactive_pty".to_string()),
+                control_plane: Some("pty_injection".to_string()),
+                base_url: None,
+                api_key_env: None,
+                permission_mode: None,
+                profile: None,
+                max_parallel_tool_calls: None,
+                assistant_message_passthrough_fields: Vec::new(),
+                reasoning_effort_param: None,
+                extra_body: None,
+                env: std::collections::HashMap::new(),
+                headers: std::collections::HashMap::new(),
+            },
+        );
+
+        let adapter = agent_to_adapter("gemini", &config);
+        assert_eq!(
+            adapter.as_builtin(),
+            Some(brehon_mux::SupervisorCli::Gemini)
+        );
+        assert_eq!(adapter.capabilities().tool_prefix.as_ref(), "mcp_brehon_");
+        assert!(adapter.capabilities().supports_hooks);
+        assert!(!adapter.capabilities().uses_ink_prompt);
+        assert_eq!(
+            adapter.capabilities().prompt_injection_strategy,
+            brehon_mux::PromptInjectionStrategy::DelayedSubmit
+        );
+        assert_eq!(
+            adapter.capabilities().transport,
+            brehon_mux::HarnessTransport::InteractivePty
+        );
+        assert_eq!(
+            adapter.capabilities().preferred_control_plane,
+            brehon_mux::HarnessControlPlane::PtyInjection
+        );
+    }
+
+    #[test]
+    fn test_agent_to_adapter_keeps_builtin_codex_shape_for_alias_lane_overrides() {
+        let mut config = brehon_config::parse_defaults().unwrap();
+        config.launchers.insert(
+            "codex".to_string(),
+            brehon_types::AgentConnectionConfig {
+                adapter: brehon_types::agent::AdapterKind::Acp,
+                command: Some("codex".to_string()),
+                args: vec!["app-server".to_string()],
+                provider: None,
+                transport: Some("interactive_pty".to_string()),
+                control_plane: Some("pty_injection".to_string()),
+                base_url: None,
+                api_key_env: None,
+                permission_mode: None,
+                profile: None,
+                max_parallel_tool_calls: None,
+                assistant_message_passthrough_fields: Vec::new(),
+                reasoning_effort_param: None,
+                extra_body: None,
+                env: std::collections::HashMap::new(),
+                headers: std::collections::HashMap::new(),
+            },
+        );
+        config.lanes.insert(
+            "codex-reviewer".to_string(),
+            brehon_types::LaneConfig {
+                launcher: "codex".to_string(),
+                model: None,
+                reasoning_effort: None,
+                system_prompt: None,
+                profile: None,
+            },
+        );
+
+        let adapter = agent_to_adapter("codex-reviewer", &config);
+        assert_eq!(adapter.as_builtin(), Some(brehon_mux::SupervisorCli::Codex));
+        assert_eq!(adapter.capabilities().tool_prefix.as_ref(), "mcp__brehon__");
+        assert!(adapter.capabilities().uses_ink_prompt);
+        assert_eq!(
+            adapter.capabilities().prompt_injection_strategy,
+            brehon_mux::PromptInjectionStrategy::InkEcho
+        );
+        assert!(!adapter.capabilities().supports_hooks);
+        assert_eq!(
+            adapter.capabilities().transport,
+            brehon_mux::HarnessTransport::InteractivePty
+        );
+        assert_eq!(
+            adapter.capabilities().preferred_control_plane,
+            brehon_mux::HarnessControlPlane::PtyInjection
+        );
+    }
+
+    #[test]
+    fn test_agent_to_adapter_normalizes_builtin_pty_control_plane_to_pty_transport() {
+        let mut config = brehon_config::parse_defaults().unwrap();
+        config.launchers.insert(
+            "gemini".to_string(),
+            brehon_types::AgentConnectionConfig {
+                adapter: brehon_types::agent::AdapterKind::Acp,
+                command: Some("gemini".to_string()),
+                args: vec!["--acp".to_string()],
+                provider: None,
+                transport: None,
+                control_plane: Some("pty_injection".to_string()),
+                base_url: None,
+                api_key_env: None,
+                permission_mode: None,
+                profile: None,
+                max_parallel_tool_calls: None,
+                assistant_message_passthrough_fields: Vec::new(),
+                reasoning_effort_param: None,
+                extra_body: None,
+                env: std::collections::HashMap::new(),
+                headers: std::collections::HashMap::new(),
+            },
+        );
+
+        let adapter = agent_to_adapter("gemini", &config);
+
+        assert_eq!(
+            adapter.as_builtin(),
+            Some(brehon_mux::SupervisorCli::Gemini)
+        );
+        assert_eq!(
+            adapter.capabilities().transport,
+            brehon_mux::HarnessTransport::InteractivePty
+        );
+        assert_eq!(
+            adapter.capabilities().preferred_control_plane,
+            brehon_mux::HarnessControlPlane::PtyInjection
+        );
+    }
+
+    #[test]
+    fn test_agent_to_adapter_ignores_incompatible_transport_override_for_builtin_gateway_lane() {
+        let mut config = brehon_config::parse_defaults().unwrap();
+        config.launchers.insert(
+            "gemini".to_string(),
+            brehon_types::AgentConnectionConfig {
+                adapter: brehon_types::agent::AdapterKind::Acp,
+                command: Some("gemini".to_string()),
+                args: vec!["--acp".to_string()],
+                provider: None,
+                transport: Some("interactive_pty".to_string()),
+                control_plane: Some("acp".to_string()),
+                base_url: None,
+                api_key_env: None,
+                permission_mode: None,
+                profile: None,
+                max_parallel_tool_calls: None,
+                assistant_message_passthrough_fields: Vec::new(),
+                reasoning_effort_param: None,
+                extra_body: None,
+                env: std::collections::HashMap::new(),
+                headers: std::collections::HashMap::new(),
+            },
+        );
+
+        let adapter = agent_to_adapter("gemini", &config);
+
+        assert_eq!(
+            adapter.as_builtin(),
+            Some(brehon_mux::SupervisorCli::Gemini)
+        );
+        assert_eq!(
+            adapter.capabilities().transport,
+            brehon_mux::HarnessTransport::AppServer
+        );
+        assert_eq!(
+            adapter.capabilities().preferred_control_plane,
+            brehon_mux::HarnessControlPlane::Acp
+        );
+        assert!(!adapter.capabilities().one_shot);
+    }
+
+    #[test]
+    fn test_agent_to_adapter_normalizes_incompatible_transport_override_for_builtin_pty_lane() {
+        let mut config = brehon_config::parse_defaults().unwrap();
+        config.launchers.insert(
+            "gemini".to_string(),
+            brehon_types::AgentConnectionConfig {
+                adapter: brehon_types::agent::AdapterKind::Acp,
+                command: Some("gemini".to_string()),
+                args: vec!["--acp".to_string()],
+                provider: None,
+                transport: Some("app_server".to_string()),
+                control_plane: Some("pty_injection".to_string()),
+                base_url: None,
+                api_key_env: None,
+                permission_mode: None,
+                profile: None,
+                max_parallel_tool_calls: None,
+                assistant_message_passthrough_fields: Vec::new(),
+                reasoning_effort_param: None,
+                extra_body: None,
+                env: std::collections::HashMap::new(),
+                headers: std::collections::HashMap::new(),
+            },
+        );
+
+        let adapter = agent_to_adapter("gemini", &config);
+
+        assert_eq!(
+            adapter.as_builtin(),
+            Some(brehon_mux::SupervisorCli::Gemini)
+        );
+        assert_eq!(
+            adapter.capabilities().transport,
+            brehon_mux::HarnessTransport::InteractivePty
+        );
+        assert_eq!(
+            adapter.capabilities().preferred_control_plane,
+            brehon_mux::HarnessControlPlane::PtyInjection
+        );
+        assert!(!adapter.capabilities().one_shot);
+    }
+
+    #[test]
+    fn test_agent_to_adapter_normalizes_unsupported_claude_gateway_override_back_to_builtin() {
+        let mut config = brehon_config::parse_defaults().unwrap();
+        config.launchers.insert(
+            "claude-code".to_string(),
+            brehon_types::AgentConnectionConfig {
+                adapter: brehon_types::agent::AdapterKind::Acp,
+                command: Some("claude".to_string()),
+                args: vec![],
+                provider: None,
+                transport: Some("app_server".to_string()),
+                control_plane: Some("acp".to_string()),
+                base_url: None,
+                api_key_env: None,
+                permission_mode: None,
+                profile: None,
+                max_parallel_tool_calls: None,
+                assistant_message_passthrough_fields: Vec::new(),
+                reasoning_effort_param: None,
+                extra_body: None,
+                env: std::collections::HashMap::new(),
+                headers: std::collections::HashMap::new(),
+            },
+        );
+
+        let adapter = agent_to_adapter("claude-code", &config);
+
+        assert_eq!(
+            adapter,
+            brehon_mux::AgentAdapter::BuiltIn(brehon_mux::SupervisorCli::Claude)
+        );
+        assert_eq!(
+            adapter.capabilities(),
+            brehon_mux::SupervisorCli::Claude.capabilities()
+        );
+    }
+
+    #[test]
+    fn test_agent_to_adapter_normalizes_unsupported_builtin_managed_api_override_back_to_builtin() {
+        let mut config = brehon_config::parse_defaults().unwrap();
+        config.launchers.insert(
+            "gemini".to_string(),
+            brehon_types::AgentConnectionConfig {
+                adapter: brehon_types::agent::AdapterKind::Acp,
+                command: Some("gemini".to_string()),
+                args: vec!["--acp".to_string()],
+                provider: None,
+                transport: Some("managed_api".to_string()),
+                control_plane: Some("openai_compatible".to_string()),
+                base_url: None,
+                api_key_env: None,
+                permission_mode: None,
+                profile: None,
+                max_parallel_tool_calls: None,
+                assistant_message_passthrough_fields: Vec::new(),
+                reasoning_effort_param: None,
+                extra_body: None,
+                env: std::collections::HashMap::new(),
+                headers: std::collections::HashMap::new(),
+            },
+        );
+
+        let adapter = agent_to_adapter("gemini", &config);
+
+        assert_eq!(
+            adapter,
+            brehon_mux::AgentAdapter::BuiltIn(brehon_mux::SupervisorCli::Gemini)
+        );
+        assert_eq!(
+            adapter.capabilities(),
+            brehon_mux::SupervisorCli::Gemini.capabilities()
+        );
+    }
+
+    #[test]
     fn test_agent_to_adapter_maps_plain_opencode_to_builtin() {
         let mut config = brehon_config::parse_defaults().unwrap();
         config.launchers.insert(
@@ -2594,6 +3061,44 @@ mod tests {
 
         let adapter = agent_to_adapter("agy-worker", &config);
         assert_eq!(adapter.as_builtin(), Some(brehon_mux::SupervisorCli::Agy));
+    }
+
+    #[test]
+    fn test_agent_to_adapter_keeps_acp_agy_one_shot_launcher_custom() {
+        let mut config = brehon_config::parse_defaults().unwrap();
+        config.launchers.insert(
+            "agy-reviewer".to_string(),
+            brehon_types::AgentConnectionConfig {
+                adapter: brehon_types::agent::AdapterKind::Acp,
+                command: Some("agy".to_string()),
+                args: vec!["--prompt-interactive".to_string()],
+                provider: None,
+                transport: None,
+                control_plane: Some("one_shot".to_string()),
+                base_url: None,
+                api_key_env: None,
+                permission_mode: None,
+                profile: None,
+                max_parallel_tool_calls: None,
+                assistant_message_passthrough_fields: Vec::new(),
+                reasoning_effort_param: None,
+                extra_body: None,
+                env: std::collections::HashMap::new(),
+                headers: std::collections::HashMap::new(),
+            },
+        );
+
+        let adapter = agent_to_adapter("agy-reviewer", &config);
+        assert!(adapter.as_builtin().is_none());
+        assert_eq!(
+            adapter.capabilities().transport,
+            brehon_mux::HarnessTransport::OneShotPty
+        );
+        assert_eq!(
+            adapter.capabilities().preferred_control_plane,
+            brehon_mux::HarnessControlPlane::OneShot
+        );
+        assert!(adapter.capabilities().one_shot);
     }
 
     #[test]
@@ -3471,6 +3976,222 @@ mod tests {
     }
 
     #[test]
+    fn test_normalize_project_root_strips_dotbrehon_suffix() {
+        let temp = tempfile::tempdir().unwrap();
+        init_git_repo(temp.path());
+        let brehon_dir = temp.path().join(".brehon");
+        std::fs::create_dir_all(&brehon_dir).unwrap();
+
+        let normalized = normalize_project_root(&brehon_dir);
+        assert_eq!(normalized, temp.path());
+    }
+
+    #[test]
+    fn test_normalize_project_root_leaves_non_brehon_path_unchanged() {
+        let temp = tempfile::tempdir().unwrap();
+        init_git_repo(temp.path());
+        let sub_dir = temp.path().join("src").join("components");
+        std::fs::create_dir_all(&sub_dir).unwrap();
+
+        let normalized = normalize_project_root(&sub_dir);
+        assert_eq!(normalized, sub_dir);
+    }
+
+    #[test]
+    fn test_normalize_project_root_falls_back_to_input_when_no_git() {
+        let temp = tempfile::tempdir().unwrap();
+        // No git repo initialized.
+        let normalized = normalize_project_root(temp.path());
+        assert_eq!(normalized, temp.path());
+    }
+
+    #[test]
+    fn test_normalize_project_root_relative_dotbrehon_returns_dot() {
+        // Regression: a relative `.brehon` path has an empty parent, which
+        // used to resolve to an empty PathBuf and poisoned env vars.
+        let normalized = normalize_project_root(Path::new(".brehon"));
+        assert_eq!(normalized, Path::new("."));
+    }
+
+    #[test]
+    fn test_compute_repo_identity_includes_name_and_hash() {
+        let temp = tempfile::tempdir().unwrap();
+        init_git_repo(temp.path());
+
+        let identity = compute_repo_identity(temp.path());
+        let parts: Vec<&str> = identity.split('-').collect();
+        // Expected format: <repo-name>-<8-char-hex-hash>
+        assert!(
+            parts.len() >= 2,
+            "identity should be '<name>-<hash>' format, got: {identity}"
+        );
+        let hash_part = parts.last().unwrap();
+        assert_eq!(
+            hash_part.len(),
+            8,
+            "hash part should be 8 hex chars, got: {hash_part}"
+        );
+        assert!(
+            hash_part.chars().all(|c| c.is_ascii_hexdigit()),
+            "hash part should be hex digits, got: {hash_part}"
+        );
+    }
+
+    #[test]
+    fn test_compute_repo_identity_fallback_without_git() {
+        let temp = tempfile::tempdir().unwrap();
+        // Do NOT init a git repo — force the DefaultHasher fallback path.
+
+        let identity = compute_repo_identity(temp.path());
+        let parts: Vec<&str> = identity.split('-').collect();
+        assert!(
+            parts.len() >= 2,
+            "identity should be '<name>-<hash>' format, got: {identity}"
+        );
+        let hash_part = parts.last().unwrap();
+        assert_eq!(
+            hash_part.len(),
+            8,
+            "fallback hash part should be 8 hex chars, got: {hash_part}"
+        );
+        assert!(
+            hash_part.chars().all(|c| c.is_ascii_hexdigit()),
+            "fallback hash part should be hex digits, got: {hash_part}"
+        );
+    }
+
+    #[test]
+    fn test_compute_repo_identity_uses_cache_on_subsequent_calls() {
+        let temp = tempfile::tempdir().unwrap();
+        init_git_repo(temp.path());
+        std::fs::create_dir_all(temp.path().join(".brehon")).unwrap();
+
+        // First call computes identity and writes the cache.
+        let identity1 = compute_repo_identity(temp.path());
+        let cache_path = temp.path().join(".brehon/runtime/repo-identity-cache.json");
+        assert!(cache_path.exists(), "cache file should be created after first call");
+
+        // Second call should read from cache and return the same identity.
+        let identity2 = compute_repo_identity(temp.path());
+        assert_eq!(identity1, identity2, "cached identity should match computed identity");
+
+        // Verify the cache contains the repo name for invalidation.
+        let content = std::fs::read_to_string(&cache_path).unwrap();
+        let cache: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(
+            cache["repo_name"].as_str().unwrap(),
+            temp.path().file_name().unwrap().to_str().unwrap().to_lowercase()
+        );
+        assert_eq!(cache["identity"].as_str().unwrap(), identity1);
+    }
+
+    #[test]
+    fn test_compute_repo_identity_uses_remote_url_when_available() {
+        let temp1 = tempfile::tempdir().unwrap();
+        init_git_repo(temp1.path());
+        run_git(
+            temp1.path(),
+            &["remote", "add", "origin", "https://example.com/repo.git"],
+        );
+
+        let temp2 = tempfile::tempdir().unwrap();
+        init_git_repo(temp2.path());
+        run_git(
+            temp2.path(),
+            &["remote", "add", "origin", "https://example.com/repo.git"],
+        );
+
+        let identity1 = compute_repo_identity(temp1.path());
+        let identity2 = compute_repo_identity(temp2.path());
+
+        let parts1: Vec<&str> = identity1.split('-').collect();
+        let parts2: Vec<&str> = identity2.split('-').collect();
+
+        // Both should have valid 8-char hex hashes.
+        assert_eq!(parts1.last().unwrap().len(), 8);
+        assert_eq!(parts2.last().unwrap().len(), 8);
+
+        // Same remote URL should produce the same hash even in different dirs.
+        assert_eq!(
+            parts1.last(),
+            parts2.last(),
+            "same remote URL should produce identical hash part"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_prepare_worker_worktrees_with_dotbrehon_cwd_syncs_from_project_root() {
+        let temp = tempfile::tempdir().unwrap();
+        init_git_repo(temp.path());
+        std::fs::create_dir_all(temp.path().join(".brehon")).unwrap();
+        std::fs::create_dir_all(temp.path().join(".claude")).unwrap();
+        std::fs::write(
+            temp.path().join(".claude/settings.local.json"),
+            r#"{"permissions":{"allow":["mcp__brehon__*"]}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join(".mcp.json"),
+            r#"{"mcpServers":{"brehon":{"command":"/tmp/brehon","args":["serve"]}}}"#,
+        )
+        .unwrap();
+        run_git(temp.path(), &["add", ".mcp.json"]);
+        run_git(temp.path(), &["commit", "-m", "add mcp config"]);
+
+        let mut config = brehon_config::parse_defaults().unwrap();
+        config.orchestration.worktree_isolation = true;
+        config.orchestration.auto_cleanup_worktrees = true;
+        config.orchestration.branch_prefix = "brehon/".to_string();
+
+        // Invoke with the `.brehon` directory as cwd — this is a supported form.
+        let brehon_dir = temp.path().join(".brehon");
+        let worker_names = vec!["worker-dotbrehon".to_string()];
+        let worker_cwds = prepare_scoped_worktrees(
+            &brehon_dir,
+            &config,
+            Some("session-dotbrehon"),
+            None,
+            &worker_names,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(worker_cwds.len(), 1);
+        let worktree_path = worker_cwds.get("worker-dotbrehon").unwrap();
+        assert!(worktree_path.exists());
+
+        // Worktree must be under <repo>/.brehon/worktrees/, not
+        // <repo>/.brehon/.brehon/worktrees/ (cwd was the .brehon dir).
+        let expected_base = temp.path().join(".brehon").join("worktrees");
+        assert!(
+            worktree_path.starts_with(&expected_base),
+            "worktree should start with '{}', got: {}",
+            expected_base.display(),
+            worktree_path.display()
+        );
+
+        // Scaffolding files must be synced from the project root, not from .brehon/.
+        assert_eq!(
+            std::fs::read_to_string(worktree_path.join(".claude/settings.local.json")).unwrap(),
+            r#"{"permissions":{"allow":["mcp__brehon__*"]}}"#
+        );
+        assert_eq!(
+            std::fs::read_to_string(worktree_path.join(".mcp.json")).unwrap(),
+            r#"{"mcpServers":{"brehon":{"command":"/tmp/brehon","args":["serve"]}}}"#
+        );
+
+        // Identity must be derived from the repo name, not `.brehon`.
+        let normalized_root = normalize_project_root(&brehon_dir);
+        let repo_identity = compute_repo_identity(&normalized_root);
+        assert!(
+            !repo_identity.starts_with(".brehon-"),
+            "identity should not start with '.brehon-', got: {repo_identity}"
+        );
+
+        cleanup_scoped_worktrees(&brehon_dir, &worker_cwds).await;
+    }
+
+    #[test]
     fn test_ensure_shared_root_on_default_branch_restores_clean_role_branch() {
         let temp = tempfile::tempdir().unwrap();
         init_git_repo(temp.path());
@@ -3820,26 +4541,18 @@ mod tests {
         ensure_brehon_ignored_in_repo(temp.path()).unwrap();
 
         let lines = exclude_lines(temp.path());
-        assert!(
-            lines.iter().any(|l| l == ".brehon/"),
-            ".brehon/ missing: {lines:?}"
-        );
-        assert!(
-            lines.iter().any(|l| l == ".mcp.json"),
-            ".mcp.json missing: {lines:?}"
-        );
-        assert!(
-            lines.iter().any(|l| l == ".agents/mcp_config.json"),
-            ".agents/mcp_config.json missing: {lines:?}"
-        );
-        assert!(
-            lines.iter().any(|l| l == ".antigravitycli"),
-            ".antigravitycli missing: {lines:?}"
-        );
-        assert!(
-            lines.iter().any(|l| l == ".claude/settings.local.json"),
-            ".claude/settings.local.json missing: {lines:?}"
-        );
+        for pattern in brehon_git::WORKTREE_AWARE_BREHON_IGNORE_PATTERNS {
+            assert!(
+                lines.iter().any(|l| l.as_str() == *pattern),
+                "{pattern} missing: {lines:?}"
+            );
+        }
+        for pattern in BREHON_LOCAL_EXTRA_GITIGNORE_PATTERNS {
+            assert!(
+                lines.iter().any(|l| l == *pattern),
+                "{pattern} missing: {lines:?}"
+            );
+        }
     }
 
     #[test]
@@ -3861,7 +4574,11 @@ mod tests {
         assert!(contents.contains(".my-editor-scratch/"));
         assert!(contents.contains("build-local/"));
         // Brehon patterns get appended.
-        assert!(contents.contains(".brehon/"));
+        assert!(contents.contains("!/.brehon/"));
+        assert!(contents.contains("/.brehon/*"));
+        assert!(contents.contains("!/.brehon/worktrees/"));
+        assert!(contents.contains("/.brehon/worktrees/**"));
+        assert!(contents.contains("!/.brehon/worktrees/**/"));
         assert!(contents.contains(".mcp.json"));
         assert!(contents.contains(".agents/mcp_config.json"));
         assert!(contents.contains(".antigravitycli"));
@@ -3892,23 +4609,113 @@ mod tests {
         init_git_repo(temp.path());
         let exclude = temp.path().join(".git/info/exclude");
         std::fs::create_dir_all(exclude.parent().unwrap()).unwrap();
-        // Pre-populate with only one of the brehon patterns.
-        std::fs::write(&exclude, ".brehon/\n").unwrap();
+        // Pre-populate with a legacy Brehon pattern and one current pattern.
+        std::fs::write(&exclude, ".brehon/\n.mcp.json\n").unwrap();
 
         ensure_brehon_ignored_in_repo(temp.path()).unwrap();
 
         let lines = exclude_lines(temp.path());
-        // .brehon/ should appear exactly once — we don't re-add.
+        assert!(!lines.iter().any(|l| l == ".brehon/"));
+        assert!(!lines.iter().any(|l| l == ".brehon"));
+        for pattern in brehon_git::WORKTREE_AWARE_BREHON_IGNORE_PATTERNS {
+            assert!(
+                lines.iter().any(|l| l.as_str() == *pattern),
+                "{pattern} missing: {lines:?}"
+            );
+        }
+        for pattern in BREHON_LOCAL_EXTRA_GITIGNORE_PATTERNS {
+            assert!(
+                lines.iter().any(|l| l == *pattern),
+                "{pattern} missing: {lines:?}"
+            );
+        }
         assert_eq!(
-            lines.iter().filter(|l| **l == ".brehon/").count(),
+            lines.iter().filter(|l| **l == ".mcp.json").count(),
             1,
-            ".brehon/ was duplicated: {lines:?}"
+            ".mcp.json was duplicated: {lines:?}"
         );
-        // The other patterns should have been added.
-        assert!(lines.iter().any(|l| l == ".mcp.json"));
-        assert!(lines.iter().any(|l| l == ".agents/mcp_config.json"));
-        assert!(lines.iter().any(|l| l == ".antigravitycli"));
-        assert!(lines.iter().any(|l| l == ".claude/settings.local.json"));
+    }
+
+    #[test]
+    fn ensure_brehon_ignored_in_repo_no_duplicate_header_when_partially_present() {
+        let temp = tempfile::tempdir().unwrap();
+        init_git_repo(temp.path());
+        let exclude = temp.path().join(".git/info/exclude");
+        std::fs::create_dir_all(exclude.parent().unwrap()).unwrap();
+        // Pre-populate with the full header and one worktree-aware pattern.
+        std::fs::write(
+            &exclude,
+            "# Brehon local scaffolding (auto-managed; safe to edit)\n!/.brehon/\n",
+        )
+        .unwrap();
+
+        ensure_brehon_ignored_in_repo(temp.path()).unwrap();
+
+        let contents = std::fs::read_to_string(&exclude).unwrap();
+        let header_count = contents
+            .lines()
+            .filter(|l| l.trim() == "# Brehon local scaffolding (auto-managed; safe to edit)")
+            .count();
+        assert_eq!(header_count, 1, "duplicate header found:\n{contents}");
+
+        // Patterns should land contiguously under the existing header.
+        let all_lines: Vec<_> = contents.lines().collect();
+        let header_idx = all_lines
+            .iter()
+            .position(|l| l.trim() == "# Brehon local scaffolding (auto-managed; safe to edit)")
+            .expect("header exists");
+        let brehon_block = &all_lines[header_idx..];
+        let blank_inside_block = brehon_block
+            .windows(2)
+            .any(|w| w[0].trim().starts_with("!/.brehon/") && w[1].trim().is_empty());
+        assert!(
+            !blank_inside_block,
+            "blank line inside Brehon block:\n{contents}"
+        );
+
+        // All patterns should now be present.
+        let lines: std::collections::HashSet<_> = contents.lines().map(str::trim).collect();
+        for pattern in brehon_git::WORKTREE_AWARE_BREHON_IGNORE_PATTERNS {
+            assert!(lines.contains(*pattern), "{pattern} missing: {contents}");
+        }
+        for pattern in BREHON_LOCAL_EXTRA_GITIGNORE_PATTERNS {
+            assert!(lines.contains(*pattern), "{pattern} missing: {contents}");
+        }
+    }
+
+    #[test]
+    fn ensure_brehon_ignored_in_repo_no_duplicate_header_when_header_text_edited() {
+        let temp = tempfile::tempdir().unwrap();
+        init_git_repo(temp.path());
+        let exclude = temp.path().join(".git/info/exclude");
+        std::fs::create_dir_all(exclude.parent().unwrap()).unwrap();
+        // User edited the parenthetical note — this is advertised as safe to do.
+        std::fs::write(
+            &exclude,
+            "# Brehon local scaffolding (safe to edit — modified by user)\n!/.brehon/\n",
+        )
+        .unwrap();
+
+        ensure_brehon_ignored_in_repo(temp.path()).unwrap();
+
+        let contents = std::fs::read_to_string(&exclude).unwrap();
+        let header_count = contents
+            .lines()
+            .filter(|l| l.trim().starts_with(BREHON_GITIGNORE_HEADER_PREFIX))
+            .count();
+        assert_eq!(
+            header_count, 1,
+            "duplicate header found after user edit:\n{contents}"
+        );
+
+        // All patterns should still be present under the existing edited header.
+        let lines: std::collections::HashSet<_> = contents.lines().map(str::trim).collect();
+        for pattern in brehon_git::WORKTREE_AWARE_BREHON_IGNORE_PATTERNS {
+            assert!(lines.contains(*pattern), "{pattern} missing: {contents}");
+        }
+        for pattern in BREHON_LOCAL_EXTRA_GITIGNORE_PATTERNS {
+            assert!(lines.contains(*pattern), "{pattern} missing: {contents}");
+        }
     }
 
     #[test]
@@ -3940,10 +4747,65 @@ mod tests {
         // The user's line must survive, and brehon's entries must be on
         // their own lines (no concatenation).
         assert!(contents.contains("existing-no-newline\n"));
-        assert!(contents.contains("\n.brehon/\n"));
+        assert!(contents.contains("\n!/.brehon/\n"));
+        assert!(contents.contains("\n/.brehon/*\n"));
+        assert!(contents.contains("\n!/.brehon/worktrees/\n"));
+        assert!(contents.contains("\n/.brehon/worktrees/**\n"));
+        assert!(contents.contains("\n!/.brehon/worktrees/**/\n"));
         assert!(contents.contains("\n.mcp.json\n"));
         assert!(contents.contains("\n.agents/mcp_config.json\n"));
         assert!(contents.contains("\n.antigravitycli\n"));
+    }
+
+    #[test]
+    fn ensure_brehon_ignored_in_repo_keeps_worktree_dirs_visible_without_dirtying_root() {
+        let temp = tempfile::tempdir().unwrap();
+        init_git_repo(temp.path());
+
+        ensure_brehon_ignored_in_repo(temp.path()).unwrap();
+
+        let worktree_dir = temp
+            .path()
+            .join(".brehon/worktrees/runs/session-a/agy-worker");
+        std::fs::create_dir_all(worktree_dir.join(".agents")).unwrap();
+        std::fs::write(worktree_dir.join(".git"), "gitdir: /tmp/not-used\n").unwrap();
+        std::fs::write(worktree_dir.join(".agents/mcp_config.json"), "{}\n").unwrap();
+        std::fs::write(worktree_dir.join("src.txt"), "work\n").unwrap();
+
+        let visible_dir = run_git(
+            temp.path(),
+            &[
+                "check-ignore",
+                "-v",
+                ".brehon/worktrees/runs/session-a/agy-worker",
+            ],
+        );
+        assert!(
+            visible_dir.contains("!/.brehon/worktrees/**/"),
+            "worktree directory should be unignored for git-aware CLIs: {visible_dir}"
+        );
+
+        let ignored_file = run_git(
+            temp.path(),
+            &[
+                "check-ignore",
+                "-v",
+                ".brehon/worktrees/runs/session-a/agy-worker/src.txt",
+            ],
+        );
+        assert!(
+            ignored_file.contains("/.brehon/worktrees/**"),
+            "worktree files should stay ignored from the shared root: {ignored_file}"
+        );
+
+        let status = run_git(
+            temp.path(),
+            &["status", "--porcelain", "--untracked-files=all"],
+        );
+        assert!(
+            !status.contains(".brehon"),
+            "worktree contents dirtied shared root status:\n{status}"
+        );
     }
 
     #[test]

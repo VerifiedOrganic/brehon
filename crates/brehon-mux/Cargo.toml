@@ -32,6 +32,7 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
+strum = { workspace = true }
 dirs = "6"
 
 indexmap = { workspace = true }
@@ -41,6 +42,7 @@ unicode-width = { workspace = true }
 brehon-daemon = { path = "../brehon-daemon" }
 brehon-policy = { path = "../brehon-policy" }
 brehon-runtime = { path = "../brehon-runtime" }
+brehon-test-harness = { path = "../brehon-test-harness" }
 tokio-test = "0.4"
 tracing-subscriber = { workspace = true }
 tempfile = "3"

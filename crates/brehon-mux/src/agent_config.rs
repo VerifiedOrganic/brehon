@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 use crate::harness::{
     AgentAdapter, CustomAgentConfig, HarnessCapabilities, HarnessControlPlane, HarnessTransport,
-    SupervisorCli,
+    PromptInjectionStrategy, SupervisorCli,
 };
 
 /// Registry that resolves agent names to `AgentAdapter` instances.
@@ -66,8 +66,9 @@ impl Default for AgentRegistry {
 /// Build a `CustomAgentConfig` from TOML-like key-value fields.
 ///
 /// Expected fields: name, command, args (comma-separated), transport,
-/// control_plane, tool_prefix. Missing capability fields default to
-/// conservative values (all false, PtyInjection control plane).
+/// control_plane, prompt_injection_strategy, tool_prefix. Missing capability
+/// fields default to conservative values (all false, PtyInjection control
+/// plane, immediate submit).
 pub fn custom_agent_from_fields(fields: &HashMap<String, String>) -> Option<CustomAgentConfig> {
     let name = fields.get("name")?.clone();
     let command = fields.get("command")?.clone();
@@ -92,6 +93,20 @@ pub fn custom_agent_from_fields(fields: &HashMap<String, String>) -> Option<Cust
         .unwrap_or_else(|| "mcp_brehon_".to_string());
 
     let one_shot = fields.get("one_shot").map(|v| v == "true").unwrap_or(false);
+    let prompt_injection_strategy = match fields.get("prompt_injection_strategy") {
+        Some(value) => match value.parse::<PromptInjectionStrategy>() {
+            Ok(strategy) => strategy,
+            Err(error) => {
+                tracing::warn!(
+                    prompt_injection_strategy = value,
+                    error = %error,
+                    "invalid prompt_injection_strategy; defaulting to immediate_submit"
+                );
+                PromptInjectionStrategy::ImmediateSubmit
+            }
+        },
+        None => PromptInjectionStrategy::ImmediateSubmit,
+    };
 
     Some(CustomAgentConfig {
         name,
@@ -113,6 +128,7 @@ pub fn custom_agent_from_fields(fields: &HashMap<String, String>) -> Option<Cust
                 .get("uses_ink_prompt")
                 .map(|v| v == "true")
                 .unwrap_or(false),
+            prompt_injection_strategy,
             tool_prefix: Cow::Owned(tool_prefix),
             transport,
             preferred_control_plane: control_plane,
@@ -149,6 +165,7 @@ mod tests {
                 supports_teams: false,
                 one_shot: false,
                 uses_ink_prompt: false,
+                prompt_injection_strategy: PromptInjectionStrategy::ImmediateSubmit,
                 tool_prefix: Cow::Owned("mcp_brehon_".to_string()),
                 transport: HarnessTransport::InteractivePty,
                 preferred_control_plane: HarnessControlPlane::PtyInjection,
@@ -183,6 +200,7 @@ mod tests {
                 supports_teams: false,
                 one_shot: false,
                 uses_ink_prompt: false,
+                prompt_injection_strategy: PromptInjectionStrategy::ImmediateSubmit,
                 tool_prefix: Cow::Borrowed("custom_"),
                 transport: HarnessTransport::InteractivePty,
                 preferred_control_plane: HarnessControlPlane::PtyInjection,
@@ -225,6 +243,42 @@ mod tests {
         assert_eq!(
             config.capabilities.preferred_control_plane,
             HarnessControlPlane::AcpSidecar
+        );
+    }
+
+    #[test]
+    fn custom_agent_from_fields_accepts_prompt_injection_strategy() {
+        let mut fields = HashMap::new();
+        fields.insert("name".to_string(), "junie-like".to_string());
+        fields.insert("command".to_string(), "junie-like".to_string());
+        fields.insert("transport".to_string(), "interactive_pty".to_string());
+        fields.insert("control_plane".to_string(), "pty_injection".to_string());
+        fields.insert(
+            "prompt_injection_strategy".to_string(),
+            "ink_echo".to_string(),
+        );
+
+        let config = custom_agent_from_fields(&fields).unwrap();
+        assert_eq!(
+            config.capabilities.prompt_injection_strategy,
+            PromptInjectionStrategy::InkEcho
+        );
+    }
+
+    #[test]
+    fn custom_agent_from_fields_invalid_prompt_injection_strategy_defaults_to_immediate_submit() {
+        let mut fields = HashMap::new();
+        fields.insert("name".to_string(), "junie-like".to_string());
+        fields.insert("command".to_string(), "junie-like".to_string());
+        fields.insert(
+            "prompt_injection_strategy".to_string(),
+            "ink-echo".to_string(),
+        );
+
+        let config = custom_agent_from_fields(&fields).unwrap();
+        assert_eq!(
+            config.capabilities.prompt_injection_strategy,
+            PromptInjectionStrategy::ImmediateSubmit
         );
     }
 }

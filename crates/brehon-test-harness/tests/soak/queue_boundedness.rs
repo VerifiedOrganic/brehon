@@ -14,18 +14,18 @@ use brehon_test_harness::InMemoryEventStore;
 use brehon_types::{Event, EventKind};
 use chrono::Utc;
 
-const CYCLES: usize = 500;
 const ITEMS_PER_CYCLE: usize = 10;
 const CONSUMERS_PER_CYCLE: usize = 3;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn soak_queue_claim_ack_cycles_bounded() {
     let store = Arc::new(InMemoryEventStore::new());
+    let cycles = crate::soak_cycles_locked(500);
 
     let mut total_enqueued = 0usize;
     let mut total_claimed = 0usize;
 
-    for cycle in 0..CYCLES {
+    for cycle in 0..cycles {
         let queue_name = format!("queue-{}", cycle % 5);
 
         // Enqueue items
@@ -96,8 +96,9 @@ async fn soak_queue_claim_ack_cycles_bounded() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn soak_queue_event_store_bounded_with_appends() {
     let store = Arc::new(InMemoryEventStore::new());
+    let cycles = crate::soak_cycles_locked(500);
 
-    for cycle in 0..CYCLES {
+    for cycle in 0..cycles {
         let queue_name = format!("work-{}", cycle % 3);
 
         // Append events AND enqueue in the same cycle
@@ -137,9 +138,10 @@ async fn soak_queue_event_store_bounded_with_appends() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn soak_queue_lease_renewal_no_leak() {
     let store = Arc::new(InMemoryEventStore::new());
+    let cycles = crate::soak_cycles_locked(200);
     store.enqueue("renewal-queue", "item-1", "data");
 
-    for cycle in 0..200 {
+    for cycle in 0..cycles {
         let claim = store
             .claim_next("renewal-queue", "consumer", Duration::from_millis(50))
             .await

@@ -1,42 +1,21 @@
 use super::*;
 use crate::server::{ContentBlock, ToolResult};
 use crate::tools::agent::prompt_queue_root;
+use crate::tools::test_support::{
+    write_pane_assignment_context_fixture, write_prompt_delivery_fixture,
+};
 use crate::tools::verification::helpers::workspace_root;
 use crate::tools::verification::{panel, state};
-use crate::tools::TEST_ENV_LOCK;
+use crate::tools::{ScopedEnv, TEST_ENV_LOCK};
 use brehon_mux::{PromptQueueEntry, SessionScopedQueue};
-use std::ffi::OsString;
+use brehon_ports::ProofStore;
+use brehon_store_fjall::FjallEventStore;
+use brehon_types::{EventFilter, EventKind, TaskId};
 use std::path::Path;
+use std::sync::Arc;
 
 fn make_tool() -> VerificationTool {
     VerificationTool::new()
-}
-
-struct ScopedEnv {
-    saved: Vec<(&'static str, Option<OsString>)>,
-}
-
-impl ScopedEnv {
-    fn set(vars: &[(&'static str, &str)]) -> Self {
-        let mut saved = Vec::with_capacity(vars.len());
-        for (key, value) in vars {
-            saved.push((*key, std::env::var_os(key)));
-            std::env::set_var(key, value);
-        }
-        Self { saved }
-    }
-}
-
-impl Drop for ScopedEnv {
-    fn drop(&mut self) {
-        for (key, value) in self.saved.iter().rev() {
-            if let Some(value) = value {
-                std::env::set_var(key, value);
-            } else {
-                std::env::remove_var(key);
-            }
-        }
-    }
 }
 
 fn run_git(workspace: &Path, args: &[&str]) -> String {
@@ -105,6 +84,7 @@ fn review_request_fixture(task_id: &str, review_id: &str) -> ReviewRequestFile {
         commits: Vec::new(),
         resolved_empty_commit_set: false,
         review_fingerprint: serde_json::json!({}),
+        reviewer_prompts: std::collections::BTreeMap::new(),
         context: "Review context".to_string(),
     }
 }
@@ -126,6 +106,7 @@ fn review_state_fixture(task_id: &str, review_id: &str, status: &str) -> ReviewS
         panel_mode: "full_council".to_string(),
         panel: vec!["reviewer-1".to_string()],
         submissions_received: Vec::new(),
+        reviewer_assignments: std::collections::BTreeMap::new(),
         created_at: chrono::Utc::now().to_rfc3339(),
         updated_at: chrono::Utc::now().to_rfc3339(),
     }
@@ -1060,6 +1041,13 @@ async fn test_request_review_defaults_merge_mode_commit_to_head() {
     assert_eq!(request.base_commit, head_commit);
     assert_eq!(request.merge_target_head, head_commit);
     assert!(request.commits.is_empty());
+    let reviewer_prompt = request
+        .reviewer_prompts
+        .get("reviewer-1")
+        .expect("canonical prompt should be persisted per reviewer");
+    assert!(reviewer_prompt.contains("Review fingerprint:"));
+    assert!(reviewer_prompt.contains("Path interpretation:"));
+    assert!(reviewer_prompt.contains("git log"));
 }
 
 #[tokio::test]
@@ -1624,6 +1612,7 @@ async fn test_request_review_conflict_releases_stale_panel_lease() {
             panel_mode: "full_council".to_string(),
             panel: vec!["reviewer-1".to_string()],
             submissions_received: Vec::new(),
+            reviewer_assignments: std::collections::BTreeMap::new(),
             created_at: chrono::Utc::now().to_rfc3339(),
             updated_at: chrono::Utc::now().to_rfc3339(),
         },
@@ -2159,6 +2148,153 @@ async fn test_override_missing_params() {
 }
 
 #[tokio::test]
+async fn test_review_status_surfaces_reviewer_assignment_observability() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let root = tempfile::tempdir().unwrap();
+    let brehon_root = root.path().join(".brehon");
+    std::fs::create_dir_all(brehon_root.join("runtime").join("tasks")).unwrap();
+    let _env = ScopedEnv::set(&[("BREHON_ROOT", brehon_root.to_str().unwrap())]);
+
+    write_task_with_status(&brehon_root, "T-review-observe", "in_review");
+    let mut state = review_state_fixture("T-review-observe", "REV-observe", "collecting");
+    state.panel = vec!["reviewer-1".to_string()];
+    state.reviewer_assignments.insert(
+        "reviewer-1".to_string(),
+        crate::tools::assignment_observability::AssignmentPropagation::new(
+            "reviewer-1",
+            "review",
+            Some("prompt-reviewer-1".to_string()),
+            Some("queued".to_string()),
+        ),
+    );
+    state::write_review_state("T-review-observe", &state).unwrap();
+    write_review_request_fixture("T-review-observe", "REV-observe");
+    write_prompt_delivery_fixture(&brehon_root, "prompt-reviewer-1", "reviewer-1", true);
+    write_pane_assignment_context_fixture(
+        &brehon_root,
+        "reviewer-1",
+        "review",
+        "T-review-observe",
+        Some("REV-observe"),
+        Some(1),
+    );
+
+    let tool = make_tool();
+    let result = tool
+        .execute(serde_json::json!({
+            "action": "review_status",
+            "task_id": "T-review-observe"
+        }))
+        .await
+        .unwrap();
+    let payload = result_payload(&result);
+    assert_eq!(
+        payload["reviewer_assignments"][0]["assignment_observability"]["overall"],
+        "delivered_without_ack"
+    );
+    assert_eq!(
+        payload["reviewer_assignments"][0]["assignment_observability"]["active_context"]["matches"],
+        true
+    );
+}
+
+#[tokio::test]
+async fn test_submit_review_acknowledges_reviewer_assignment_without_task_mine() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let root = tempfile::tempdir().unwrap();
+    let brehon_root = root.path().join(".brehon");
+    std::fs::create_dir_all(brehon_root.join("runtime").join("tasks")).unwrap();
+    let _env = ScopedEnv::set(&[("BREHON_ROOT", brehon_root.to_str().unwrap())]);
+
+    write_task_with_status(&brehon_root, "T-submit-ack", "in_review");
+    let mut state = review_state_fixture("T-submit-ack", "REV-submit-ack", "collecting");
+    state.panel = vec!["reviewer-1".to_string(), "reviewer-2".to_string()];
+    state.reviewer_assignments.insert(
+        "reviewer-1".to_string(),
+        crate::tools::assignment_observability::AssignmentPropagation::new(
+            "reviewer-1",
+            "review",
+            Some("prompt-reviewer-1".to_string()),
+            Some("queued".to_string()),
+        ),
+    );
+    state.reviewer_assignments.insert(
+        "reviewer-2".to_string(),
+        crate::tools::assignment_observability::AssignmentPropagation::new(
+            "reviewer-2",
+            "review",
+            Some("prompt-reviewer-2".to_string()),
+            Some("queued".to_string()),
+        ),
+    );
+    state::write_review_state("T-submit-ack", &state).unwrap();
+    write_review_request_fixture("T-submit-ack", "REV-submit-ack");
+    write_prompt_delivery_fixture(&brehon_root, "prompt-reviewer-1", "reviewer-1", true);
+    write_pane_assignment_context_fixture(
+        &brehon_root,
+        "reviewer-1",
+        "review",
+        "T-submit-ack",
+        Some("REV-submit-ack"),
+        Some(1),
+    );
+
+    let tool = make_tool();
+    let submit = tool
+        .execute(serde_json::json!({
+            "action": "submit_review",
+            "review_id": "REV-submit-ack",
+            "reviewer": "reviewer-1",
+            "verdict": "approved",
+            "score": 8,
+            "summary": "Looks good"
+        }))
+        .await
+        .unwrap();
+    assert!(submit.is_error.is_none(), "{}", result_payload(&submit));
+
+    let state = state::read_review_state("T-submit-ack").expect("review state should persist");
+    let propagation = state
+        .reviewer_assignments
+        .get("reviewer-1")
+        .expect("reviewer assignment should exist");
+    assert_eq!(
+        propagation.acknowledged_via.as_deref(),
+        Some("verification action=submit_review")
+    );
+    assert_eq!(
+        propagation.progress_started_via.as_deref(),
+        Some("verification action=submit_review")
+    );
+    assert!(propagation.progress_started_at.is_some());
+
+    let status = tool
+        .execute(serde_json::json!({
+            "action": "review_status",
+            "task_id": "T-submit-ack"
+        }))
+        .await
+        .unwrap();
+    let payload = result_payload(&status);
+    assert_eq!(
+        payload["reviewer_assignments"][0]["assignment_observability"]["overall"],
+        "active"
+    );
+    assert_eq!(
+        payload["reviewer_assignments"][0]["assignment_observability"]["acknowledged_via"],
+        "verification action=submit_review"
+    );
+    assert_eq!(
+        payload["reviewer_assignments"][0]["assignment_observability"]["progress_started_via"],
+        "verification action=submit_review"
+    );
+    assert_eq!(
+        payload["reviewer_assignments"][0]["assignment_observability"]["progress_started"],
+        true
+    );
+}
+
+#[tokio::test]
 async fn test_unknown_action() {
     let tool = make_tool();
     let args = serde_json::json!({ "action": "bogus" });
@@ -2229,6 +2365,7 @@ fn test_evaluate_round_approved() {
         panel_mode: "full_council".to_string(),
         panel: vec!["r1".to_string(), "r2".to_string()],
         submissions_received: vec!["r1".to_string(), "r2".to_string()],
+        reviewer_assignments: std::collections::BTreeMap::new(),
         created_at: String::new(),
         updated_at: String::new(),
     };
@@ -2274,6 +2411,7 @@ fn test_evaluate_round_changes_requested_blocking() {
         panel_mode: "full_council".to_string(),
         panel: vec!["r1".to_string(), "r2".to_string()],
         submissions_received: vec!["r1".to_string(), "r2".to_string()],
+        reviewer_assignments: std::collections::BTreeMap::new(),
         created_at: String::new(),
         updated_at: String::new(),
     };
@@ -2325,6 +2463,7 @@ fn test_evaluate_round_rejected() {
         panel_mode: "full_council".to_string(),
         panel: vec!["r1".to_string(), "r2".to_string()],
         submissions_received: vec!["r1".to_string(), "r2".to_string()],
+        reviewer_assignments: std::collections::BTreeMap::new(),
         created_at: String::new(),
         updated_at: String::new(),
     };
@@ -2375,6 +2514,7 @@ fn test_evaluate_round_escalated_at_max_rounds() {
         panel_mode: "full_council".to_string(),
         panel: vec!["r1".to_string(), "r2".to_string()],
         submissions_received: vec!["r1".to_string(), "r2".to_string()],
+        reviewer_assignments: std::collections::BTreeMap::new(),
         created_at: String::new(),
         updated_at: String::new(),
     };
@@ -2409,6 +2549,368 @@ fn test_evaluate_round_escalated_at_max_rounds() {
     let report = tool.evaluate_round("T-001", "REV-003", &state, &submissions);
     assert_eq!(report.outcome, "escalated");
     assert!(report.threshold_reason.contains("Max review rounds"));
+}
+
+#[tokio::test]
+async fn test_submit_review_approval_preflight_rejects_dirty_shared_root_and_allows_retry_after_cleanup(
+) {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let root = tempfile::tempdir().unwrap();
+    init_git_workspace(root.path());
+    std::fs::write(root.path().join("leaked.txt"), "wrong tree\n").unwrap();
+
+    let brehon_root = root.path().join(".brehon");
+    std::fs::create_dir_all(brehon_root.join("runtime").join("tasks")).unwrap();
+    let _env = ScopedEnv::set_with_defaults(&[
+        ("BREHON_ROOT", brehon_root.to_str().unwrap()),
+        ("BREHON_PROJECT_ROOT", root.path().to_str().unwrap()),
+    ]);
+
+    write_task_with_status(&brehon_root, "T-dirty-approve", "in_review");
+    let mut state = review_state_fixture("T-dirty-approve", "REV-dirty-approve", "collecting");
+    state.panel = vec!["reviewer-1".to_string(), "reviewer-2".to_string()];
+    state::write_review_state("T-dirty-approve", &state).unwrap();
+    write_review_request_fixture("T-dirty-approve", "REV-dirty-approve");
+
+    let tool = make_tool();
+
+    // reviewer-1 submits first — panel not yet complete, so no dirty check
+    let r1 = tool
+        .execute(serde_json::json!({
+            "action": "submit_review",
+            "review_id": "REV-dirty-approve",
+            "reviewer": "reviewer-1",
+            "verdict": "approved",
+            "score": 8,
+            "summary": "Looks good"
+        }))
+        .await
+        .unwrap();
+    assert!(r1.is_error.is_none(), "{}", result_payload(&r1));
+
+    // reviewer-2 submits approval — this would complete the panel, so dirty
+    // root preflight should reject BEFORE persisting the submission.
+    let r2 = tool
+        .execute(serde_json::json!({
+            "action": "submit_review",
+            "review_id": "REV-dirty-approve",
+            "reviewer": "reviewer-2",
+            "verdict": "approved",
+            "score": 9,
+            "summary": "Also looks good"
+        }))
+        .await
+        .unwrap();
+    assert_eq!(r2.is_error, Some(true));
+    let text = match &r2.content[0] {
+        ContentBlock::Text { text } => text.clone(),
+        _ => panic!("expected text content"),
+    };
+    assert!(
+        text.contains("shared repo root"),
+        "expected dirty-root error, got: {text}"
+    );
+    assert!(
+        text.contains("leaked.txt"),
+        "expected leaked.txt in error, got: {text}"
+    );
+    assert!(
+        text.contains("Recovery:"),
+        "expected recovery hint, got: {text}"
+    );
+
+    // reviewer-2 must NOT have been recorded as submitted
+    let state_after =
+        state::read_review_state("T-dirty-approve").expect("review state should exist");
+    assert!(
+        !state_after
+            .submissions_received
+            .iter()
+            .any(|s| s == "reviewer-2"),
+        "reviewer-2 should not be recorded after dirty-root rejection"
+    );
+
+    // Task must still be in_review
+    let task = read_task("T-dirty-approve").expect("task should exist");
+    assert_eq!(task["status"], "in_review");
+
+    // Clean the dirty root
+    std::fs::remove_file(root.path().join("leaked.txt")).unwrap();
+
+    // reviewer-2 retries — should now succeed and approve the task
+    let r2_retry = tool
+        .execute(serde_json::json!({
+            "action": "submit_review",
+            "review_id": "REV-dirty-approve",
+            "reviewer": "reviewer-2",
+            "verdict": "approved",
+            "score": 9,
+            "summary": "Also looks good"
+        }))
+        .await
+        .unwrap();
+    assert!(r2_retry.is_error.is_none(), "{}", result_payload(&r2_retry));
+
+    let task_after = read_task("T-dirty-approve").expect("task should exist");
+    assert_eq!(task_after["status"], "approved");
+}
+
+#[tokio::test]
+async fn test_rollback_review_submission() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let root = tempfile::tempdir().unwrap();
+    let brehon_root = root.path().join(".brehon");
+    std::fs::create_dir_all(brehon_root.join("runtime").join("tasks")).unwrap();
+    let _env = ScopedEnv::set(&[("BREHON_ROOT", brehon_root.to_str().unwrap())]);
+
+    let task_id = "T-rollback-unit";
+    write_task_with_status(&brehon_root, task_id, "in_review");
+
+    let mut state = review_state_fixture(task_id, "REV-rollback-unit", "collecting");
+    state.panel = vec!["reviewer-1".to_string(), "reviewer-2".to_string()];
+    state.submissions_received.push("reviewer-1".to_string());
+    state::write_review_state(task_id, &state).unwrap();
+    write_review_request_fixture(task_id, "REV-rollback-unit");
+
+    // Persist reviewer-2's submission file and state entries
+    let submission = StoredSubmission {
+        review_id: "REV-rollback-unit".to_string(),
+        reviewer: "reviewer-2".to_string(),
+        round: 1,
+        score: 9,
+        verdict: "approved".to_string(),
+        summary: "Looks good".to_string(),
+        findings: vec![],
+        submitted_at: chrono::Utc::now().to_rfc3339(),
+    };
+    state::write_submission(task_id, 1, "reviewer-2", &submission).unwrap();
+    state.submissions_received.push("reviewer-2".to_string());
+    state.reviewer_assignments.insert(
+        "reviewer-2".to_string(),
+        crate::tools::assignment_observability::AssignmentPropagation::new(
+            "reviewer-2",
+            "review",
+            Some("prompt-2".to_string()),
+            Some("delivered".to_string()),
+        ),
+    );
+    state::write_review_state(task_id, &state).unwrap();
+
+    let round_dir = brehon_root
+        .join("runtime")
+        .join("reviews")
+        .join(task_id)
+        .join("round-1");
+
+    // Preconditions
+    let pre = state::read_review_state(task_id).unwrap();
+    assert!(pre.submissions_received.contains(&"reviewer-2".to_string()));
+    assert!(pre.reviewer_assignments.contains_key("reviewer-2"));
+    assert!(round_dir.join("reviewer-2.json").exists());
+
+    // Roll back reviewer-2
+    let mut rollback_state = pre.clone();
+    let _ = state::rollback_review_submission(task_id, 1, "reviewer-2", &mut rollback_state);
+
+    // Postconditions
+    let post = state::read_review_state(task_id).unwrap();
+    assert!(
+        !post
+            .submissions_received
+            .contains(&"reviewer-2".to_string()),
+        "reviewer-2 should be removed from submissions_received"
+    );
+    assert!(
+        !post.reviewer_assignments.contains_key("reviewer-2"),
+        "reviewer-2 assignment should be removed"
+    );
+    assert!(
+        post.submissions_received
+            .contains(&"reviewer-1".to_string()),
+        "reviewer-1 should remain"
+    );
+    assert!(
+        !round_dir.join("reviewer-2.json").exists(),
+        "reviewer-2 submission file should be deleted"
+    );
+}
+
+#[tokio::test]
+async fn test_submit_review_rolls_back_when_status_update_rejects_dirty_root() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let root = tempfile::tempdir().unwrap();
+    init_git_workspace(root.path());
+
+    let brehon_root = root.path().join(".brehon");
+    std::fs::create_dir_all(brehon_root.join("runtime").join("tasks")).unwrap();
+    let _env = ScopedEnv::set_with_defaults(&[
+        ("BREHON_ROOT", brehon_root.to_str().unwrap()),
+        ("BREHON_PROJECT_ROOT", root.path().to_str().unwrap()),
+    ]);
+
+    write_task_with_status(&brehon_root, "T-dirty-post-persist", "in_review");
+    let mut state = review_state_fixture(
+        "T-dirty-post-persist",
+        "REV-dirty-post-persist",
+        "collecting",
+    );
+    state.panel = vec!["reviewer-1".to_string(), "reviewer-2".to_string()];
+    state::write_review_state("T-dirty-post-persist", &state).unwrap();
+    write_review_request_fixture("T-dirty-post-persist", "REV-dirty-post-persist");
+
+    // Attach a real proof store so we can verify no duplicate entries on retry.
+    let fjall = Arc::new(FjallEventStore::new(brehon_root.join("fjall")).unwrap());
+    let proof_store: Arc<dyn ProofStore + Send + Sync> = fjall.clone();
+    let tool = make_tool()
+        .with_event_store(fjall.clone())
+        .with_proof_store(proof_store.clone());
+
+    // reviewer-1 submits first — panel not yet complete
+    let r1 = tool
+        .execute(serde_json::json!({
+            "action": "submit_review",
+            "review_id": "REV-dirty-post-persist",
+            "reviewer": "reviewer-1",
+            "verdict": "approved",
+            "score": 8,
+            "summary": "Looks good"
+        }))
+        .await
+        .unwrap();
+    assert!(r1.is_error.is_none(), "{}", result_payload(&r1));
+
+    // Force the dirty-root check inside update_task_status_atomic to fail.
+    // Invocation sequence for reviewer-2 (2-person panel, approved):
+    //   0 = preflight in handle_submit_review
+    //   1 = second check in handle_submit_review
+    //   2 = check inside update_task_status_atomic
+    crate::tools::task_actions::reset_test_dirty_check_invocation();
+    crate::tools::task_actions::set_test_force_dirty_on_invocation(2);
+
+    // reviewer-2 submits approval — this would complete the panel, but the
+    // dirty check inside update_task_status_atomic fails, so the submission
+    // must be rolled back.
+    let r2 = tool
+        .execute(serde_json::json!({
+            "action": "submit_review",
+            "review_id": "REV-dirty-post-persist",
+            "reviewer": "reviewer-2",
+            "verdict": "approved",
+            "score": 9,
+            "summary": "Also looks good"
+        }))
+        .await
+        .unwrap();
+
+    // Clean up the test hook immediately so it doesn't leak to other tests
+    crate::tools::task_actions::clear_test_force_dirty_on_invocation();
+
+    assert_eq!(r2.is_error, Some(true));
+    let text = match &r2.content[0] {
+        ContentBlock::Text { text } => text.clone(),
+        _ => panic!("expected text content"),
+    };
+    assert!(
+        text.contains("forced by test hook") || text.contains("Failed to update task"),
+        "expected dirty-root rejection inside status update, got: {text}"
+    );
+
+    // reviewer-2 must NOT have been recorded as submitted after rollback
+    let state_after =
+        state::read_review_state("T-dirty-post-persist").expect("review state should exist");
+    assert!(
+        !state_after
+            .submissions_received
+            .iter()
+            .any(|s| s == "reviewer-2"),
+        "reviewer-2 should not be recorded after rollback"
+    );
+
+    // reviewer-2's submission file must be gone
+    let round_dir = brehon_root
+        .join("runtime")
+        .join("reviews")
+        .join("T-dirty-post-persist")
+        .join("round-1");
+    assert!(
+        !round_dir.join("reviewer-2.json").exists(),
+        "reviewer-2 submission file should be deleted after rollback"
+    );
+    assert!(
+        !round_dir.join("consolidated.json").exists(),
+        "consolidated report should be deleted after rollback"
+    );
+
+    // Task must still be in_review
+    let task = read_task("T-dirty-post-persist").expect("task should exist");
+    assert_eq!(task["status"], "in_review");
+
+    // Proof bundle must NOT exist after rollback — record_consolidation is now
+    // deferred until after update_task_status_atomic succeeds.
+    let bundle_after_rollback = proof_store
+        .proof_bundle_for_task(&TaskId::new("T-dirty-post-persist"))
+        .await
+        .unwrap();
+    assert!(
+        bundle_after_rollback.is_none(),
+        "proof bundle should not exist after rollback"
+    );
+
+    // reviewer-2 retries (without the test hook) — should now succeed and approve the task
+    let r2_retry = tool
+        .execute(serde_json::json!({
+            "action": "submit_review",
+            "review_id": "REV-dirty-post-persist",
+            "reviewer": "reviewer-2",
+            "verdict": "approved",
+            "score": 9,
+            "summary": "Also looks good"
+        }))
+        .await
+        .unwrap();
+    assert!(r2_retry.is_error.is_none(), "{}", result_payload(&r2_retry));
+
+    let task_after = read_task("T-dirty-post-persist").expect("task should exist");
+    assert_eq!(task_after["status"], "approved");
+
+    // Proof bundle must exist after successful retry and contain exactly the
+    // two reviewers' scores — no duplicates from the rolled-back attempt.
+    let bundle = proof_store
+        .proof_bundle_for_task(&TaskId::new("T-dirty-post-persist"))
+        .await
+        .unwrap()
+        .expect("proof bundle should exist after successful retry");
+    assert_eq!(
+        bundle.review_scores.len(),
+        2,
+        "proof bundle should contain exactly 2 review scores, not duplicates from rollback: {:?}",
+        bundle.review_scores
+    );
+    let reviewer_ids: Vec<String> = bundle
+        .review_scores
+        .iter()
+        .filter_map(|review| review.reviewer_id.clone())
+        .collect();
+    assert!(reviewer_ids.contains(&"reviewer-1".to_string()));
+    assert!(reviewer_ids.contains(&"reviewer-2".to_string()));
+
+    // ReviewScoreReceived must have been emitted exactly twice overall
+    // (once for reviewer-1 on incomplete panel, once for reviewer-2 after
+    // successful completion), with no duplicate from the rolled-back attempt.
+    let all_events = fjall
+        .query(EventFilter::new().aggregate("REV-dirty-post-persist"))
+        .await
+        .unwrap();
+    let score_events: Vec<_> = all_events
+        .into_iter()
+        .filter(|e| matches!(e.kind, EventKind::ReviewScoreReceived { .. }))
+        .collect();
+    assert_eq!(
+        score_events.len(),
+        2,
+        "expected exactly 2 ReviewScoreReceived events, got {:?}",
+        score_events
+    );
 }
 
 #[test]
