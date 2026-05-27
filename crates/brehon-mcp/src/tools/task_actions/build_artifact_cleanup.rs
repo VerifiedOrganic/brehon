@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use super::paths::brehon_root_dir;
+use super::paths::brehon_worktrees_root;
 
 const CLEANUP_DIRS: &[&str] = &["target"];
 
@@ -142,9 +142,9 @@ fn validate_worker_workspace(workspace: &Path) -> Result<PathBuf, String> {
         }
     }
 
-    let brehon_root = brehon_root_dir()
-        .ok_or_else(|| "No BREHON_ROOT available for build-artifact cleanup.".to_string())?;
-    let worktrees_root = brehon_root.join("worktrees");
+    let worktrees_root = brehon_worktrees_root().ok_or_else(|| {
+        "No BREHON_WORKTREE_ROOT or BREHON_ROOT available for build-artifact cleanup.".to_string()
+    })?;
     let canonical_worktrees = worktrees_root.canonicalize().map_err(|err| {
         format!(
             "Cannot canonicalize Brehon worktrees root '{}': {err}",

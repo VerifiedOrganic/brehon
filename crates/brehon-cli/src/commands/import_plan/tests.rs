@@ -1279,6 +1279,68 @@ fn git_worktrees(cwd: &std::path::Path) -> Vec<String> {
 }
 
 #[tokio::test]
+async fn import_plan_honors_configured_worktree_root_for_container_worktrees() {
+    let _lock = IMPORT_PLAN_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let dir = TempDir::new().unwrap();
+    let external = TempDir::new().unwrap();
+    init_git_repo(dir.path()).unwrap();
+    fs::create_dir_all(dir.path().join(".brehon")).unwrap();
+    fs::write(
+        dir.path().join(".brehon/config.yaml"),
+        format!(
+            "version: 1\norchestration:\n  worktree_root: {}\n",
+            external.path().display()
+        ),
+    )
+    .unwrap();
+    let plan_path = dir.path().join("plan.md");
+    fs::write(&plan_path, sample_plan()).unwrap();
+    std::process::Command::new("git")
+        .args(["add", "plan.md"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    std::process::Command::new("git")
+        .args(["-c", "commit.gpgsign=false", "commit", "-m", "add plan"])
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    execute(dir.path(), &plan_path, false, ExtractMode::Direct)
+        .await
+        .unwrap();
+
+    let tasks_dir = dir.path().join(".brehon/runtime/tasks");
+    let mut container_worktrees = Vec::new();
+    for entry in fs::read_dir(tasks_dir).unwrap().flatten() {
+        let content = fs::read_to_string(entry.path()).unwrap();
+        let task: Value = serde_json::from_str(&content).unwrap();
+        if let Some(worktree) = task.get("integration_worktree").and_then(|v| v.as_str()) {
+            container_worktrees.push(worktree.to_string());
+        }
+    }
+
+    assert!(
+        !container_worktrees.is_empty(),
+        "import should create initiative/epic worktrees"
+    );
+    assert!(
+        container_worktrees
+            .iter()
+            .all(|path| Path::new(path).starts_with(external.path())),
+        "all container worktrees should be under {}: {:?}",
+        external.path().display(),
+        container_worktrees
+    );
+}
+
+#[tokio::test]
 async fn import_normalized_plan_can_be_rerun_without_epic_branch_conflicts() {
     let _lock = IMPORT_PLAN_TEST_LOCK
         .lock()
@@ -1403,7 +1465,7 @@ async fn import_plan_fails_from_different_relative_path_spelling() {
 }
 
 #[tokio::test]
-async fn import_plan_fails_when_commit_31f95d9_is_ancestor() {
+async fn import_plan_fails_when_landed_commit_is_ancestor() {
     let _lock = IMPORT_PLAN_TEST_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -1427,16 +1489,19 @@ async fn import_plan_fails_when_commit_31f95d9_is_ancestor() {
         .current_dir(dir.path());
     commit.output().unwrap();
 
-    // Tag the first commit as 31f95d9 so git merge-base resolves it
-    std::process::Command::new("git")
-        .args(["tag", "31f95d9", "HEAD~1"])
+    let first_commit = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD~1"])
         .current_dir(dir.path())
         .output()
         .unwrap();
+    let first_commit = String::from_utf8_lossy(&first_commit.stdout)
+        .trim()
+        .to_string();
+    assert!(!first_commit.is_empty());
 
     let plan_path = dir.path().join("plan.json");
     let mut plan_value: Value = serde_json::from_str(&normalized_plan_json()).unwrap();
-    plan_value["already_landed_commit"] = json!("31f95d9");
+    plan_value["already_landed_commit"] = json!(first_commit);
     fs::write(&plan_path, serde_json::to_string(&plan_value).unwrap()).unwrap();
 
     let initial_branches = git_branches(dir.path());
@@ -1447,8 +1512,8 @@ async fn import_plan_fails_when_commit_31f95d9_is_ancestor() {
         .unwrap_err();
     let message = format!("{err:#}");
     assert!(
-        message.contains("31f95d9"),
-        "expected 31f95d9 ancestor refusal, got: {message}"
+        message.contains(&first_commit),
+        "expected landed commit ancestor refusal, got: {message}"
     );
     assert!(
         message.contains("residual follow-up plan is required"),

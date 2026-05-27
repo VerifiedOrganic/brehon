@@ -10,6 +10,8 @@ use brehon_mcp::tools::task_actions::{
 use brehon_mcp::tools::Tool;
 use serde_json::{json, Value};
 
+use crate::commands::run::{effective_worktree_root, normalize_project_root};
+
 use super::extraction::*;
 use super::parsing::*;
 use super::types::*;
@@ -401,8 +403,16 @@ pub async fn execute(
     dry_run: bool,
     mode: ExtractMode,
 ) -> Result<()> {
-    ensure_git_repo(project_root)?;
-    let mut plan = load_plan_document(project_root, plan_path, mode).await?;
+    let project_root = normalize_project_root(project_root);
+    ensure_git_repo(&project_root)?;
+    let config = brehon_config::load_config(Some(&project_root)).with_context(|| {
+        format!(
+            "Failed to load Brehon config for '{}'",
+            project_root.display()
+        )
+    })?;
+    let worktree_root = effective_worktree_root(&project_root, &config);
+    let mut plan = load_plan_document(&project_root, plan_path, mode).await?;
 
     // Normalize the plan path to an absolute/canonical path so that
     // plan_import.source_file comparisons are independent of CLI spelling or CWD.
@@ -452,7 +462,7 @@ pub async fn execute(
 
     // Detection B: plan-specific landed-commit guard
     if let Some(landed_commit) = plan.already_landed_commit.as_deref() {
-        if git_commit_is_ancestor(project_root, landed_commit).await? {
+        if git_commit_is_ancestor(&project_root, landed_commit).await? {
             bail!(
                 "Cannot import '{}': commit {} is already \
                  on this branch. A residual follow-up plan is required for additional changes.",
@@ -467,6 +477,8 @@ pub async fn execute(
     let _env = ScopedEnv::set(&[
         ("BREHON_ROOT", brehon_root.display().to_string()),
         ("BREHON_PROJECT_ROOT", project_root.display().to_string()),
+        ("BREHON_WORKSPACE_ROOT", project_root.display().to_string()),
+        ("BREHON_WORKTREE_ROOT", worktree_root.display().to_string()),
     ]);
     let tool = TaskActionsTool::new();
 
@@ -495,7 +507,7 @@ pub async fn execute(
         .to_string();
 
     patch_task_file(
-        project_root,
+        &project_root,
         &initiative_id,
         json!({
             "plan_import": {
@@ -565,7 +577,7 @@ pub async fn execute(
             .ok_or_else(|| anyhow!("Task tool did not return phase epic task_id"))?
             .to_string();
         patch_task_file(
-            project_root,
+            &project_root,
             &epic_id,
             json!({
                 "plan_import": {
@@ -746,11 +758,11 @@ pub async fn execute(
         let _ = call_task_tool(&tool, update_args).await?;
 
         if mapped_status == "closed" {
-            seed_imported_terminal_task_state(project_root, &record.brehon_task_id)?;
+            seed_imported_terminal_task_state(&project_root, &record.brehon_task_id)?;
         }
 
         patch_task_file(
-            project_root,
+            &project_root,
             &record.brehon_task_id,
             json!({
                 "plan_import": {

@@ -1413,6 +1413,30 @@ async fn test_create_initiative_and_phase_epic() {
 }
 
 #[tokio::test]
+async fn test_create_container_worktree_honors_external_worktree_root() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let workspace = make_test_root();
+    let external = make_test_root();
+    let brehon_root = workspace.path().join(".brehon");
+    std::fs::create_dir_all(&brehon_root).unwrap();
+    init_git_workspace(workspace.path());
+    let _env = ScopedEnv::set_with_defaults(&[
+        ("BREHON_ROOT", brehon_root.to_str().unwrap()),
+        ("BREHON_PROJECT_ROOT", workspace.path().to_str().unwrap()),
+        ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
+        ("BREHON_WORKTREE_ROOT", external.path().to_str().unwrap()),
+    ]);
+    let tool = TaskActionsTool::new();
+
+    let initiative = create_initiative_for_test(&tool, "External Worktree Plan").await;
+    let worktree = Path::new(initiative["integration_worktree"].as_str().unwrap());
+
+    assert!(worktree.starts_with(external.path()));
+    assert!(!worktree.starts_with(&brehon_root));
+    assert!(worktree.exists());
+}
+
+#[tokio::test]
 async fn test_ensure_final_hardening_backfills_and_is_idempotent() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let workspace = make_test_root();

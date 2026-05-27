@@ -16,7 +16,8 @@ use super::git_ops::{
 use super::lifecycle::{is_epic, is_initiative, reconcile_dependency_states_with_task_lock};
 use super::locking::acquire_task_lock;
 use super::paths::{
-    brehon_root_dir, ensure_brehon_worktree_path, project_root, resolve_project_path,
+    brehon_root_dir, brehon_worktrees_root, ensure_brehon_worktree_path, project_root,
+    resolve_project_path,
 };
 use super::persistence::{read_all_tasks, read_task, write_task};
 use crate::tools::verification::{
@@ -525,11 +526,11 @@ pub(super) fn default_container_integration_worktree(
     task_id: &str,
     task_type: &str,
 ) -> Result<PathBuf, String> {
-    let brehon_root = brehon_root_dir().ok_or_else(|| {
-        "No BREHON_ROOT available to allocate container integration worktree.".to_string()
+    let worktrees_root = brehon_worktrees_root().ok_or_else(|| {
+        "No BREHON_WORKTREE_ROOT or BREHON_ROOT available to allocate container integration worktree."
+            .to_string()
     })?;
-    Ok(brehon_root
-        .join("worktrees")
+    Ok(worktrees_root
         .join(container_branch_prefix(task_type))
         .join(task_id))
 }

@@ -10,6 +10,17 @@ pub(super) fn brehon_root_dir() -> Option<PathBuf> {
         .or_else(|| std::env::current_dir().ok().map(|cwd| cwd.join(".brehon")))
 }
 
+pub(super) fn brehon_worktrees_root() -> Option<PathBuf> {
+    if let Ok(root) = std::env::var("BREHON_WORKTREE_ROOT") {
+        let root = root.trim();
+        if !root.is_empty() {
+            return Some(PathBuf::from(root));
+        }
+    }
+
+    brehon_root_dir().map(|root| root.join("worktrees"))
+}
+
 pub(super) fn project_root() -> Option<PathBuf> {
     if let Ok(root) = std::env::var("BREHON_PROJECT_ROOT") {
         let root = root.trim();
@@ -65,7 +76,7 @@ pub(super) fn ensure_brehon_worktree_path(path: &Path, context: &str) -> Result<
     }
 
     let worktrees_root = candidate_brehon_worktrees_root(&resolved)
-        .or_else(|| brehon_root_dir().map(|root| root.join("worktrees")))
+        .or_else(brehon_worktrees_root)
         .ok_or_else(|| format!("No BREHON_ROOT available for {context} path guard."))?;
     std::fs::create_dir_all(&worktrees_root).map_err(|err| {
         format!(

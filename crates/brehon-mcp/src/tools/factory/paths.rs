@@ -14,6 +14,17 @@ pub(crate) fn brehon_root() -> Option<PathBuf> {
         .or_else(|| std::env::current_dir().ok().map(|cwd| cwd.join(".brehon")))
 }
 
+pub(crate) fn worktrees_root() -> Option<PathBuf> {
+    if let Ok(root) = std::env::var("BREHON_WORKTREE_ROOT") {
+        let root = root.trim();
+        if !root.is_empty() {
+            return Some(PathBuf::from(root));
+        }
+    }
+
+    brehon_root().map(|root| root.join("worktrees"))
+}
+
 pub(crate) fn tasks_dir() -> Option<PathBuf> {
     let dir = brehon_root()?.join("runtime").join("tasks");
     std::fs::create_dir_all(&dir).ok()?;
