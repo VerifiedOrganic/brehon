@@ -3,7 +3,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use brehon_ports::GitOperations;
-use brehon_types::{is_terminal_task_status, normalize_task_status, BrehonConfig, OrchestrationConfig};
+use brehon_types::{
+    is_terminal_task_status, normalize_task_status, BrehonConfig, OrchestrationConfig,
+};
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -761,10 +763,10 @@ pub(crate) fn default_initiative_integration_worktree(
 /// shared repo root. All of these are machine-local — committing them
 /// poisons teammate checkouts:
 ///
-/// * `/.brehon/*` plus the worktree exceptions below — runtime/state files stay
-///   ignored, while worktree directory paths remain visible to git-aware CLIs
-///   such as Antigravity CLI. Files inside those worktrees are still ignored
-///   from the shared checkout, so the main repo does not become dirty.
+/// * `.brehon/` — runtime/state files and nested worktrees stay fully ignored
+///   from the shared checkout. Brehon worktrees are complete repositories with
+///   their own `.gitignore` files, so exposing their directories can re-expose
+///   files in the shared root.
 /// * `.mcp.json` — Claude Code MCP discovery file. Written with an
 ///   absolute path to the current machine's brehon binary (see
 ///   [`ensure_mcp_config`]); the path won't resolve on any other host.
@@ -1081,14 +1083,17 @@ pub(crate) fn normalize_project_root(cwd: &Path) -> PathBuf {
     cwd.to_path_buf()
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 const REPO_IDENTITY_CACHE_FILE: &str = "runtime/repo-identity-cache.json";
 
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(serde::Serialize, serde::Deserialize)]
 struct RepoIdentityCache {
     repo_name: String,
     identity: String,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn read_repo_identity_cache(brehon_root: &Path, repo_name: &str) -> Option<String> {
     let path = brehon_root.join(REPO_IDENTITY_CACHE_FILE);
     let content = std::fs::read_to_string(&path).ok()?;
@@ -1100,6 +1105,7 @@ fn read_repo_identity_cache(brehon_root: &Path, repo_name: &str) -> Option<Strin
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn write_repo_identity_cache(brehon_root: &Path, repo_name: &str, identity: &str) {
     if !brehon_root.exists() {
         return;
@@ -1137,6 +1143,7 @@ fn write_repo_identity_cache(brehon_root: &Path, repo_name: &str, identity: &str
 /// **Callers must pass a normalized project root.** This function does
 /// NOT call `normalize_project_root` internally; callers are responsible
 /// for stripping any trailing `.brehon` segment before passing `cwd`.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn compute_repo_identity(cwd: &Path) -> String {
     let root = cwd.to_path_buf();
     let repo_name = root
@@ -2290,7 +2297,7 @@ mod tests {
         std::fs::write(path.join("README.md"), "seed\n").unwrap();
         std::fs::write(
             path.join(".gitignore"),
-            "!/.brehon/\n/.brehon/*\n!/.brehon/worktrees/\n/.brehon/worktrees/**\n!/.brehon/worktrees/**/\n.claude/settings.local.json\n",
+            ".brehon/\n.claude/settings.local.json\n",
         )
         .unwrap();
         run_git(path, &["add", "README.md", ".gitignore"]);
@@ -4069,18 +4076,29 @@ mod tests {
         // First call computes identity and writes the cache.
         let identity1 = compute_repo_identity(temp.path());
         let cache_path = temp.path().join(".brehon/runtime/repo-identity-cache.json");
-        assert!(cache_path.exists(), "cache file should be created after first call");
+        assert!(
+            cache_path.exists(),
+            "cache file should be created after first call"
+        );
 
         // Second call should read from cache and return the same identity.
         let identity2 = compute_repo_identity(temp.path());
-        assert_eq!(identity1, identity2, "cached identity should match computed identity");
+        assert_eq!(
+            identity1, identity2,
+            "cached identity should match computed identity"
+        );
 
         // Verify the cache contains the repo name for invalidation.
         let content = std::fs::read_to_string(&cache_path).unwrap();
         let cache: serde_json::Value = serde_json::from_str(&content).unwrap();
         assert_eq!(
             cache["repo_name"].as_str().unwrap(),
-            temp.path().file_name().unwrap().to_str().unwrap().to_lowercase()
+            temp.path()
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_lowercase()
         );
         assert_eq!(cache["identity"].as_str().unwrap(), identity1);
     }
@@ -4574,11 +4592,7 @@ mod tests {
         assert!(contents.contains(".my-editor-scratch/"));
         assert!(contents.contains("build-local/"));
         // Brehon patterns get appended.
-        assert!(contents.contains("!/.brehon/"));
-        assert!(contents.contains("/.brehon/*"));
-        assert!(contents.contains("!/.brehon/worktrees/"));
-        assert!(contents.contains("/.brehon/worktrees/**"));
-        assert!(contents.contains("!/.brehon/worktrees/**/"));
+        assert!(contents.contains(".brehon/"));
         assert!(contents.contains(".mcp.json"));
         assert!(contents.contains(".agents/mcp_config.json"));
         assert!(contents.contains(".antigravitycli"));
@@ -4610,13 +4624,13 @@ mod tests {
         let exclude = temp.path().join(".git/info/exclude");
         std::fs::create_dir_all(exclude.parent().unwrap()).unwrap();
         // Pre-populate with a legacy Brehon pattern and one current pattern.
-        std::fs::write(&exclude, ".brehon/\n.mcp.json\n").unwrap();
+        std::fs::write(&exclude, "!/.brehon/\n.mcp.json\n").unwrap();
 
         ensure_brehon_ignored_in_repo(temp.path()).unwrap();
 
         let lines = exclude_lines(temp.path());
-        assert!(!lines.iter().any(|l| l == ".brehon/"));
         assert!(!lines.iter().any(|l| l == ".brehon"));
+        assert!(!lines.iter().any(|l| l == "!/.brehon/"));
         for pattern in brehon_git::WORKTREE_AWARE_BREHON_IGNORE_PATTERNS {
             assert!(
                 lines.iter().any(|l| l.as_str() == *pattern),
@@ -4642,10 +4656,10 @@ mod tests {
         init_git_repo(temp.path());
         let exclude = temp.path().join(".git/info/exclude");
         std::fs::create_dir_all(exclude.parent().unwrap()).unwrap();
-        // Pre-populate with the full header and one worktree-aware pattern.
+        // Pre-populate with the full header and one Brehon pattern.
         std::fs::write(
             &exclude,
-            "# Brehon local scaffolding (auto-managed; safe to edit)\n!/.brehon/\n",
+            "# Brehon local scaffolding (auto-managed; safe to edit)\n.brehon/\n",
         )
         .unwrap();
 
@@ -4667,7 +4681,7 @@ mod tests {
         let brehon_block = &all_lines[header_idx..];
         let blank_inside_block = brehon_block
             .windows(2)
-            .any(|w| w[0].trim().starts_with("!/.brehon/") && w[1].trim().is_empty());
+            .any(|w| w[0].trim() == ".brehon/" && w[1].trim().is_empty());
         assert!(
             !blank_inside_block,
             "blank line inside Brehon block:\n{contents}"
@@ -4692,7 +4706,7 @@ mod tests {
         // User edited the parenthetical note — this is advertised as safe to do.
         std::fs::write(
             &exclude,
-            "# Brehon local scaffolding (safe to edit — modified by user)\n!/.brehon/\n",
+            "# Brehon local scaffolding (safe to edit — modified by user)\n.brehon/\n",
         )
         .unwrap();
 
@@ -4747,18 +4761,14 @@ mod tests {
         // The user's line must survive, and brehon's entries must be on
         // their own lines (no concatenation).
         assert!(contents.contains("existing-no-newline\n"));
-        assert!(contents.contains("\n!/.brehon/\n"));
-        assert!(contents.contains("\n/.brehon/*\n"));
-        assert!(contents.contains("\n!/.brehon/worktrees/\n"));
-        assert!(contents.contains("\n/.brehon/worktrees/**\n"));
-        assert!(contents.contains("\n!/.brehon/worktrees/**/\n"));
+        assert!(contents.contains("\n.brehon/\n"));
         assert!(contents.contains("\n.mcp.json\n"));
         assert!(contents.contains("\n.agents/mcp_config.json\n"));
         assert!(contents.contains("\n.antigravitycli\n"));
     }
 
     #[test]
-    fn ensure_brehon_ignored_in_repo_keeps_worktree_dirs_visible_without_dirtying_root() {
+    fn ensure_brehon_ignored_in_repo_hides_nested_worktree_gitignore_rules() {
         let temp = tempfile::tempdir().unwrap();
         init_git_repo(temp.path());
 
@@ -4769,10 +4779,12 @@ mod tests {
             .join(".brehon/worktrees/runs/session-a/agy-worker");
         std::fs::create_dir_all(worktree_dir.join(".agents")).unwrap();
         std::fs::write(worktree_dir.join(".git"), "gitdir: /tmp/not-used\n").unwrap();
+        std::fs::write(worktree_dir.join(".gitignore"), "!.mcp.json.example\n").unwrap();
         std::fs::write(worktree_dir.join(".agents/mcp_config.json"), "{}\n").unwrap();
+        std::fs::write(worktree_dir.join(".mcp.json.example"), "{}\n").unwrap();
         std::fs::write(worktree_dir.join("src.txt"), "work\n").unwrap();
 
-        let visible_dir = run_git(
+        let ignored_dir = run_git(
             temp.path(),
             &[
                 "check-ignore",
@@ -4781,8 +4793,8 @@ mod tests {
             ],
         );
         assert!(
-            visible_dir.contains("!/.brehon/worktrees/**/"),
-            "worktree directory should be unignored for git-aware CLIs: {visible_dir}"
+            ignored_dir.contains(".brehon/"),
+            "worktree directory should stay ignored from the shared root: {ignored_dir}"
         );
 
         let ignored_file = run_git(
@@ -4794,7 +4806,7 @@ mod tests {
             ],
         );
         assert!(
-            ignored_file.contains("/.brehon/worktrees/**"),
+            ignored_file.contains(".brehon/"),
             "worktree files should stay ignored from the shared root: {ignored_file}"
         );
 

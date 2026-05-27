@@ -826,18 +826,14 @@ fn validate_worktree_root(config: &BrehonConfig) -> Vec<ValidationWarning> {
     {
         warnings.push(ValidationWarning::new(
             ValidationWarningKind::InvalidWorktreeRoot,
-            format!(
-                "orchestration.worktree_root '{root}' contains path traversal ('..')"
-            ),
+            format!("orchestration.worktree_root '{root}' contains path traversal ('..')"),
         ));
     }
 
     if root.contains('\0') {
         warnings.push(ValidationWarning::new(
             ValidationWarningKind::InvalidWorktreeRoot,
-            format!(
-                "orchestration.worktree_root '{root}' contains invalid null bytes"
-            ),
+            format!("orchestration.worktree_root '{root}' contains invalid null bytes"),
         ));
     }
 
@@ -845,9 +841,7 @@ fn validate_worktree_root(config: &BrehonConfig) -> Vec<ValidationWarning> {
     if !path.is_absolute() {
         warnings.push(ValidationWarning::new(
             ValidationWarningKind::InvalidWorktreeRoot,
-            format!(
-                "orchestration.worktree_root '{root}' must be an absolute path"
-            ),
+            format!("orchestration.worktree_root '{root}' must be an absolute path"),
         ));
     }
 
@@ -4043,7 +4037,9 @@ rooms:
     fn worktree_root_validation_accepts_none() {
         let config = minimal_valid_config();
         let warnings = validate(&config);
-        assert!(!warnings.iter().any(|w| w.kind == ValidationWarningKind::InvalidWorktreeRoot));
+        assert!(!warnings
+            .iter()
+            .any(|w| w.kind == ValidationWarningKind::InvalidWorktreeRoot));
     }
 
     #[test]
@@ -4051,7 +4047,9 @@ rooms:
         let mut config = minimal_valid_config();
         config.orchestration.worktree_root = Some("/tmp/brehon-worktrees".into());
         let warnings = validate(&config);
-        assert!(!warnings.iter().any(|w| w.kind == ValidationWarningKind::InvalidWorktreeRoot));
+        assert!(!warnings
+            .iter()
+            .any(|w| w.kind == ValidationWarningKind::InvalidWorktreeRoot));
     }
 
     #[test]
@@ -4119,6 +4117,8 @@ rooms:
         let mut config = minimal_valid_config();
         config.orchestration.worktree_root = Some("/tmp/..cache/build".into());
         let warnings = validate(&config);
-        assert!(!warnings.iter().any(|w| w.kind == ValidationWarningKind::InvalidWorktreeRoot));
+        assert!(!warnings
+            .iter()
+            .any(|w| w.kind == ValidationWarningKind::InvalidWorktreeRoot));
     }
 }

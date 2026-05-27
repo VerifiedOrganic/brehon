@@ -101,11 +101,7 @@ logs/
 .pantheon/
 
 # Brehon orchestration data
-!/.brehon/
-/.brehon/*
-!/.brehon/worktrees/
-/.brehon/worktrees/**
-!/.brehon/worktrees/**/
+.brehon/
 
 # Test gate output transcripts
 *_gate_output.txt

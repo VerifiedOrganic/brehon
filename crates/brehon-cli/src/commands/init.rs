@@ -1516,7 +1516,7 @@ mod tests {
 
         assert!(gitignore.contains("target/"));
         assert!(!lines.contains(".brehon"), "{gitignore}");
-        assert!(!lines.contains(".brehon/"), "{gitignore}");
+        assert!(lines.contains(".brehon/"), "{gitignore}");
         for pattern in brehon_git::WORKTREE_AWARE_BREHON_IGNORE_PATTERNS {
             assert!(lines.contains(*pattern), "{pattern} missing: {gitignore}");
         }
@@ -1530,10 +1530,10 @@ mod tests {
     #[test]
     fn init_gitignore_no_duplicate_header_when_partially_present() {
         let temp = tempfile::tempdir().expect("tempdir");
-        // Pre-populate with one worktree-aware pattern and the header already present.
+        // Pre-populate with one Brehon pattern and the header already present.
         std::fs::write(
             temp.path().join(".gitignore"),
-            "target/\n# Brehon orchestration data\n!/.brehon/\n",
+            "target/\n# Brehon orchestration data\n.brehon/\n",
         )
         .expect("write gitignore");
 
@@ -1548,7 +1548,7 @@ mod tests {
         assert_eq!(header_count, 1, "duplicate header found:\n{gitignore}");
 
         // Patterns should land contiguously under the existing header — no blank
-        // line gap between the already-present `!/.brehon/` and newly appended lines.
+        // line gap between the already-present `.brehon/` and newly appended lines.
         let all_lines: Vec<_> = gitignore.lines().collect();
         let header_idx = all_lines
             .iter()
@@ -1557,7 +1557,7 @@ mod tests {
         let brehon_block = &all_lines[header_idx..];
         let blank_inside_block = brehon_block
             .windows(2)
-            .any(|w| w[0].trim().starts_with("!/.brehon/") && w[1].trim().is_empty());
+            .any(|w| w[0].trim() == ".brehon/" && w[1].trim().is_empty());
         assert!(
             !blank_inside_block,
             "blank line inside Brehon block:\n{gitignore}"

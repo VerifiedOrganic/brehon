@@ -836,9 +836,11 @@ pub(super) fn deliver_pending_prompts(ctx: &mut EventLoopCtx, brehon_root: &std:
                                 "target supervisor quarantined for current run",
                             );
                             if pane_needs_post_spawn_prompt(&ctx.mux, &target) {
-                                if let Some(startup_prompt) =
-                                    build_supervisor_reset_startup_prompt(&ctx.mux, &target, ctx.runtime_agent_factory_host_owned)
-                                {
+                                if let Some(startup_prompt) = build_supervisor_reset_startup_prompt(
+                                    &ctx.mux,
+                                    &target,
+                                    ctx.runtime_agent_factory_host_owned,
+                                ) {
                                     if ctx.runtime_agent_factory_host_owned {
                                         let _ = enqueue_terminal_host_startup_prompt(
                                             ctx,

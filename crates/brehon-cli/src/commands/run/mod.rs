@@ -1,7 +1,7 @@
 mod direct_tools;
 mod review;
 mod setup;
-pub(crate) use setup::{compute_repo_identity, normalize_project_root};
+pub(crate) use setup::normalize_project_root;
 #[cfg(test)]
 mod startup_reconciliation_tests;
 mod workers;
@@ -4170,8 +4170,8 @@ mod tests {
         );
 
         // BREHON_WORKSPACE_ROOT must point to the repo root, not .brehon/.
-        let workspace_root = std::env::var("BREHON_WORKSPACE_ROOT")
-            .expect("BREHON_WORKSPACE_ROOT should be set");
+        let workspace_root =
+            std::env::var("BREHON_WORKSPACE_ROOT").expect("BREHON_WORKSPACE_ROOT should be set");
         assert_eq!(
             workspace_root,
             repo_root.to_string_lossy().to_string(),

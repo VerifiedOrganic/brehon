@@ -810,19 +810,20 @@ mod tests {
     }
 
     #[test]
-    fn ensure_brehon_ignored_migrates_legacy_dir_ignore() {
+    fn ensure_brehon_ignored_migrates_legacy_worktree_aware_ignores() {
         let temp = tempfile::tempdir().unwrap();
         init_git_repo(temp.path());
         let exclude = temp.path().join(".git/info/exclude");
         std::fs::create_dir_all(exclude.parent().unwrap()).unwrap();
-        std::fs::write(&exclude, ".brehon/\nuser-cache/\n").unwrap();
+        std::fs::write(&exclude, "!/.brehon/\n/.brehon/worktrees/**\nuser-cache/\n").unwrap();
 
         ensure_brehon_ignored_in_repo(temp.path()).unwrap();
 
         let contents = std::fs::read_to_string(&exclude).unwrap();
         let lines = contents.lines().map(str::trim).collect::<Vec<_>>();
-        assert!(!lines.contains(&".brehon/"));
-        assert!(!lines.contains(&".brehon"));
+        assert!(lines.contains(&".brehon/"));
+        assert!(!lines.contains(&"!/.brehon/"));
+        assert!(!lines.contains(&"/.brehon/worktrees/**"));
         assert!(lines.contains(&"user-cache/"));
         for pattern in WORKTREE_AWARE_BREHON_IGNORE_PATTERNS {
             assert!(lines.contains(pattern), "{pattern} missing: {contents}");
@@ -830,7 +831,7 @@ mod tests {
     }
 
     #[test]
-    fn ensure_brehon_ignored_leaves_worktree_dirs_visible_but_files_ignored() {
+    fn ensure_brehon_ignored_hides_nested_worktree_gitignore_rules() {
         let temp = tempfile::tempdir().unwrap();
         init_git_repo(temp.path());
 
@@ -840,9 +841,11 @@ mod tests {
             .path()
             .join(".brehon/worktrees/runs/session-a/agy-worker");
         std::fs::create_dir_all(&worktree_dir).unwrap();
+        std::fs::write(worktree_dir.join(".gitignore"), "!.mcp.json.example\n").unwrap();
+        std::fs::write(worktree_dir.join(".mcp.json.example"), "{}\n").unwrap();
         std::fs::write(worktree_dir.join("work.txt"), "work\n").unwrap();
 
-        let visible_dir = run_git(
+        let ignored_dir = run_git(
             temp.path(),
             &[
                 "check-ignore",
@@ -850,7 +853,7 @@ mod tests {
                 ".brehon/worktrees/runs/session-a/agy-worker",
             ],
         );
-        assert!(visible_dir.contains("!/.brehon/worktrees/**/"));
+        assert!(ignored_dir.contains(".brehon/"));
 
         let ignored_file = run_git(
             temp.path(),
@@ -860,7 +863,7 @@ mod tests {
                 ".brehon/worktrees/runs/session-a/agy-worker/work.txt",
             ],
         );
-        assert!(ignored_file.contains("/.brehon/worktrees/**"));
+        assert!(ignored_file.contains(".brehon/"));
 
         let status = run_git(
             temp.path(),

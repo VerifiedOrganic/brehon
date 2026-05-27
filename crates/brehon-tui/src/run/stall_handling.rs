@@ -25,10 +25,9 @@ use super::recovery::{
     active_worker_task, agent_health_marker_reason, agent_is_quarantined_for_run,
     attempt_auto_recover_stalled_worker, block_task_for_prompt_block_recovery_failure,
     block_task_for_stalled_worker_manual_recovery, clear_agent_health_marker,
-    prompt_blocked_detail, prompt_blocked_info, push_dashboard_event,
-    quarantined_supervisor_names, quarantined_worker_names, read_agent_health_marker,
-    read_prompt_retry_deferral_snapshot, sync_worker_task_contexts,
-    write_prompt_blocked_recovery_failed_marker_or_clear_stale_marker,
+    prompt_blocked_detail, prompt_blocked_info, push_dashboard_event, quarantined_supervisor_names,
+    quarantined_worker_names, read_agent_health_marker, read_prompt_retry_deferral_snapshot,
+    sync_worker_task_contexts, write_prompt_blocked_recovery_failed_marker_or_clear_stale_marker,
     PROMPT_BLOCKED_HEALTH_REASON, PROMPT_BLOCKED_RECOVERY_FAILED_HEALTH_REASON,
     PROMPT_BLOCKED_RECOVERY_FAILURE_ACTIVITY, STALLED_WORKER_MANUAL_RECOVERY_ACTIVITY,
 };
@@ -1440,7 +1439,11 @@ fn queue_supervisor_context_reset(
         return false;
     }
     let startup_prompt = if pane_needs_post_spawn_prompt(&ctx.mux, pane_id) {
-        build_supervisor_reset_startup_prompt(&ctx.mux, pane_id, ctx.runtime_agent_factory_host_owned)
+        build_supervisor_reset_startup_prompt(
+            &ctx.mux,
+            pane_id,
+            ctx.runtime_agent_factory_host_owned,
+        )
     } else {
         None
     };
@@ -2125,7 +2128,11 @@ pub(super) fn detect_and_handle_stalls(ctx: &mut EventLoopCtx) {
                 continue;
             }
             let startup_prompt = if pane_needs_post_spawn_prompt(&ctx.mux, &supervisor_id) {
-                build_supervisor_reset_startup_prompt(&ctx.mux, &supervisor_id, ctx.runtime_agent_factory_host_owned)
+                build_supervisor_reset_startup_prompt(
+                    &ctx.mux,
+                    &supervisor_id,
+                    ctx.runtime_agent_factory_host_owned,
+                )
             } else {
                 None
             };

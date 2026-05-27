@@ -4,25 +4,14 @@ use std::path::{Path, PathBuf};
 
 use crate::error::GitError;
 
-/// Worktree-aware gitignore patterns for the `.brehon` directory.
+/// Gitignore patterns for Brehon's machine-local `.brehon` directory.
 ///
-/// These patterns keep runtime/state files ignored while allowing worktree
-/// directory paths to remain visible to git-aware CLIs such as Antigravity
-/// CLI. Files inside those worktrees are still ignored from the shared
-/// checkout, so the main repo does not become dirty.
-///
-/// The patterns use a root-relative glob (`!/.brehon/` etc.) because they are
-/// intended for a `.gitignore` or `.git/info/exclude` at the repository root.
-/// For nested directories (e.g. inside crate workspaces) a different glob
-/// (`**/*/.brehon/`) is needed because gitignore rules are relative to the
-/// file they appear in.
-pub const WORKTREE_AWARE_BREHON_IGNORE_PATTERNS: &[&str] = &[
-    "!/.brehon/",
-    "/.brehon/*",
-    "!/.brehon/worktrees/",
-    "/.brehon/worktrees/**",
-    "!/.brehon/worktrees/**/",
-];
+/// The constant name is retained for API compatibility with callers that were
+/// introduced during the Antigravity worktree experiment. The actual contract
+/// is intentionally a blanket ignore: worktrees nested under `.brehon/` are
+/// full checkouts with their own `.gitignore` files, and unignoring their
+/// directories lets those nested rules re-expose files in the shared root.
+pub const WORKTREE_AWARE_BREHON_IGNORE_PATTERNS: &[&str] = &[".brehon/"];
 
 /// Resolve the actual `.git/info` directory for a repository root.
 ///
@@ -76,13 +65,21 @@ pub fn resolve_git_info_dir(root: &Path) -> Result<PathBuf, GitError> {
     }
 }
 
-/// Whether a gitignore/exclude line is a legacy blanket `.brehon` ignore
-/// that should be migrated to worktree-aware patterns.
+/// Whether a gitignore/exclude line is a legacy Brehon ignore pattern that
+/// should be migrated to the current blanket `.brehon/` rule.
 pub fn is_legacy_brehon_dir_ignore(line: &str) -> bool {
-    matches!(line.trim(), ".brehon" | ".brehon/")
+    matches!(
+        line.trim(),
+        ".brehon"
+            | "!/.brehon/"
+            | "/.brehon/*"
+            | "!/.brehon/worktrees/"
+            | "/.brehon/worktrees/**"
+            | "!/.brehon/worktrees/**/"
+    )
 }
 
-/// Strip legacy blanket `.brehon` ignores from gitignore/exclude content.
+/// Strip legacy Brehon ignore patterns from gitignore/exclude content.
 ///
 /// Returns the cleaned content and whether any legacy lines were removed.
 pub fn remove_legacy_brehon_dir_ignores(content: &str) -> (String, bool) {
@@ -111,35 +108,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn gitignore_worktree_aware_patterns_has_five_entries() {
-        assert_eq!(WORKTREE_AWARE_BREHON_IGNORE_PATTERNS.len(), 5);
-        assert!(WORKTREE_AWARE_BREHON_IGNORE_PATTERNS.contains(&"!/.brehon/"));
-        assert!(WORKTREE_AWARE_BREHON_IGNORE_PATTERNS.contains(&"/.brehon/*"));
-        assert!(WORKTREE_AWARE_BREHON_IGNORE_PATTERNS.contains(&"!/.brehon/worktrees/"));
-        assert!(WORKTREE_AWARE_BREHON_IGNORE_PATTERNS.contains(&"/.brehon/worktrees/**"));
-        assert!(WORKTREE_AWARE_BREHON_IGNORE_PATTERNS.contains(&"!/.brehon/worktrees/**/"));
+    fn gitignore_brehon_patterns_use_blanket_ignore() {
+        assert_eq!(WORKTREE_AWARE_BREHON_IGNORE_PATTERNS, &[".brehon/"]);
     }
 
     #[test]
     fn gitignore_legacy_dir_ignore_detection() {
         assert!(is_legacy_brehon_dir_ignore(".brehon"));
-        assert!(is_legacy_brehon_dir_ignore(".brehon/"));
+        assert!(is_legacy_brehon_dir_ignore("!/.brehon/"));
+        assert!(is_legacy_brehon_dir_ignore("/.brehon/*"));
+        assert!(is_legacy_brehon_dir_ignore("!/.brehon/worktrees/"));
+        assert!(is_legacy_brehon_dir_ignore("/.brehon/worktrees/**"));
+        assert!(is_legacy_brehon_dir_ignore("!/.brehon/worktrees/**/"));
         assert!(is_legacy_brehon_dir_ignore("  .brehon  "));
-        assert!(!is_legacy_brehon_dir_ignore("!/.brehon/"));
-        assert!(!is_legacy_brehon_dir_ignore("/.brehon/*"));
+        assert!(!is_legacy_brehon_dir_ignore(".brehon/"));
         assert!(!is_legacy_brehon_dir_ignore(".brehon/config.yaml"));
     }
 
     #[test]
     fn gitignore_remove_legacy_ignores_strips_blanket_patterns() {
-        let content = "target/\n.brehon\n*.log\n.brehon/\n";
+        let content = "target/\n.brehon\n*.log\n.brehon/\n!/.brehon/\n/.brehon/worktrees/**\n";
         let (updated, removed) = remove_legacy_brehon_dir_ignores(content);
         assert!(removed);
         let lines: Vec<_> = updated.lines().collect();
         assert!(lines.contains(&"target/"));
         assert!(lines.contains(&"*.log"));
+        assert!(lines.contains(&".brehon/"));
         assert!(!lines.iter().any(|l| l.trim() == ".brehon"));
-        assert!(!lines.iter().any(|l| l.trim() == ".brehon/"));
+        assert!(!lines.iter().any(|l| l.trim() == "!/.brehon/"));
+        assert!(!lines.iter().any(|l| l.trim() == "/.brehon/worktrees/**"));
     }
 
     #[test]
@@ -152,7 +149,7 @@ mod tests {
 
     #[test]
     fn gitignore_remove_legacy_ignores_noop_when_no_legacy() {
-        let content = "target/\n!/.brehon/\n/.brehon/*\n";
+        let content = "target/\n.brehon/\n";
         let (updated, removed) = remove_legacy_brehon_dir_ignores(content);
         assert!(!removed);
         assert_eq!(updated, content);

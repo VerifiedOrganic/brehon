@@ -377,6 +377,7 @@ pub(crate) fn prompt_enqueue_ack_dir(root: &Path) -> PathBuf {
     root.join("runtime").join("prompt-enqueue-acks")
 }
 
+#[allow(dead_code)]
 pub(crate) fn prompt_delivery_ack_dir(root: &Path) -> PathBuf {
     root.join("runtime").join("prompt-delivery-acks")
 }
