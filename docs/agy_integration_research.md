@@ -135,6 +135,18 @@ If you prefer to make **`agy` the primary driver** of the development process (r
 1. **Brehon MCP Server**: Brehon provides `brehon serve` which launches an MCP server over stdio exposing its underlying events, task directory, memories, and rules.
 2. **Setup the MCP Configuration**: Brehon (via the Agy adapter and `brehon run` scaffolding) writes/updates a project-local `.agents/mcp_config.json` inside the workspace (or each worker worktree), which is Antigravity CLI's dedicated workspace MCP config path. This is distinct from Claude Code's `.mcp.json`. The file is machine-local (absolute `brehon` path + `cwd`), so Brehon auto-ignores it and copies it into isolated worktrees. The `agy` adapter always preserves any pre-existing `mcpServers` entries (e.g. other tools) while adding the `brehon` server entry:
 
+   For `agy`, prefer Brehon's default external worktree root instead of
+   storing agent worktrees under `.brehon/worktrees/`. External roots prevent
+   Antigravity's git-aware workspace discovery from treating the whole checkout
+   as hidden or ignored. The default paths are:
+
+   - macOS: `~/Library/Application Support/brehon/worktrees/<repo-name-hash>/`
+   - Linux: `$XDG_DATA_HOME/brehon/worktrees/<repo-name-hash>/` or
+     `~/.local/share/brehon/worktrees/<repo-name-hash>/`
+
+   Set `orchestration.worktree_root` to an absolute path only when you need a
+   fixed location.
+
 ```json
 {
   "mcpServers": {

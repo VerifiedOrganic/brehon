@@ -98,6 +98,15 @@ pub fn execute() -> ExitCode {
 /// Claude Code launches the hook from the worker's worktree, so the marker
 /// lives at `<worktree-or-project>/.brehon/runtime/claude-hook-active`.
 fn marker_present() -> bool {
+    if let Ok(root) = std::env::var("BREHON_ROOT") {
+        let root = PathBuf::from(root);
+        if root.join("runtime/claude-hook-active").exists()
+            || root.join(ACTIVE_MARKER_RELATIVE).exists()
+        {
+            return true;
+        }
+    }
+
     let cwd = match std::env::current_dir() {
         Ok(c) => c,
         Err(_) => return false,
@@ -133,6 +142,8 @@ struct PolicyContext {
     agent_role: Option<String>,
     /// Brehon runtime root. Used to identify Brehon-owned integration worktrees.
     brehon_root: Option<PathBuf>,
+    /// Effective Brehon worktree root. Defaults outside the repo for new runs.
+    worktree_root_base: Option<PathBuf>,
     /// Extra protected branch from the task's merge_target, if any.
     merge_target: Option<String>,
 }
@@ -159,6 +170,9 @@ impl PolicyContext {
                 .ok()
                 .filter(|s| !s.is_empty()),
             brehon_root,
+            worktree_root_base: std::env::var("BREHON_WORKTREE_ROOT")
+                .ok()
+                .map(PathBuf::from),
             merge_target: std::env::var("BREHON_MERGE_TARGET")
                 .ok()
                 .filter(|s| !s.is_empty()),
@@ -597,18 +611,27 @@ fn is_supervisor_integration_worktree(path: &Path, ctx: &PolicyContext) -> bool 
     if ctx.agent_role.as_deref() != Some("supervisor") {
         return false;
     }
-    let Some(brehon_root) = ctx.brehon_root.as_deref() else {
-        return false;
-    };
 
-    let worktrees_root = lexical_normalize(&brehon_root.join("worktrees"));
-    let integration_roots = [
-        worktrees_root.join("epic"),
-        worktrees_root.join("initiative"),
-    ];
-    integration_roots
-        .iter()
-        .any(|integration_root| path.starts_with(integration_root))
+    let mut worktrees_roots = Vec::new();
+    if let Some(root) = ctx.worktree_root_base.as_deref() {
+        worktrees_roots.push(lexical_normalize(root));
+    }
+    if let Some(project_root) = ctx.project_root.as_deref() {
+        if let Ok(config) = brehon_config::load_config(Some(project_root)) {
+            worktrees_roots.push(lexical_normalize(&super::run::effective_worktree_root(
+                project_root,
+                &config,
+            )));
+        }
+    }
+    if let Some(brehon_root) = ctx.brehon_root.as_deref() {
+        worktrees_roots.push(lexical_normalize(&brehon_root.join("worktrees")));
+    }
+
+    worktrees_roots.into_iter().any(|worktrees_root| {
+        path.starts_with(worktrees_root.join("epic"))
+            || path.starts_with(worktrees_root.join("initiative"))
+    })
 }
 
 /// Resolve `.` and `..` components without touching the filesystem.
@@ -667,6 +690,31 @@ fn split_segments(cmd: &str) -> Vec<&str> {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::ffi::OsString;
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &Path) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
 
     fn ctx_with(worktree: &str, merge_target: Option<&str>) -> PolicyContext {
         PolicyContext {
@@ -675,6 +723,7 @@ mod tests {
             project_root: None,
             agent_role: None,
             brehon_root: None,
+            worktree_root_base: None,
             merge_target: merge_target.map(str::to_string),
         }
     }
@@ -686,6 +735,7 @@ mod tests {
             project_root: Some(PathBuf::from(project_root)),
             agent_role: None,
             brehon_root: Some(PathBuf::from(format!("{project_root}/.brehon"))),
+            worktree_root_base: None,
             merge_target: None,
         }
     }
@@ -697,12 +747,26 @@ mod tests {
             project_root: Path::new(brehon_root).parent().map(Path::to_path_buf),
             agent_role: Some("supervisor".to_string()),
             brehon_root: Some(PathBuf::from(brehon_root)),
+            worktree_root_base: None,
             merge_target: None,
         }
     }
 
     fn bash(cmd: &str) -> Value {
         json!({ "command": cmd })
+    }
+
+    #[test]
+    fn marker_present_uses_brehon_root_env_for_external_worktrees() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let brehon_root = temp.path().join(".brehon");
+        let marker = brehon_root.join("runtime").join("claude-hook-active");
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, "active\n").unwrap();
+        let _env = EnvVarGuard::set("BREHON_ROOT", &brehon_root);
+
+        assert!(marker_present());
     }
 
     #[test]
@@ -804,6 +868,37 @@ mod tests {
     }
 
     #[test]
+    fn supervisor_can_cd_to_external_integration_worktree() {
+        let ctx = PolicyContext {
+            worktree_root: Some(PathBuf::from(
+                "/external/brehon/worktrees/repo-123/runs/session/supervisor/claude-supervisor",
+            )),
+            current_dir: Some(PathBuf::from(
+                "/external/brehon/worktrees/repo-123/runs/session/supervisor/claude-supervisor",
+            )),
+            project_root: Some(PathBuf::from("/repo")),
+            agent_role: Some("supervisor".to_string()),
+            brehon_root: Some(PathBuf::from("/repo/.brehon")),
+            worktree_root_base: Some(PathBuf::from("/external/brehon/worktrees/repo-123")),
+            merge_target: None,
+        };
+
+        let decision = evaluate(
+            "Bash",
+            &bash("cd /external/brehon/worktrees/repo-123/initiative/T-init"),
+            &ctx,
+        );
+        assert_eq!(decision, Decision::Allow);
+
+        let decision = evaluate(
+            "Bash",
+            &bash("cd /external/brehon/worktrees/repo-123/runs/session/worker-1"),
+            &ctx,
+        );
+        assert!(matches!(decision, Decision::Block(_)));
+    }
+
+    #[test]
     fn supervisor_cannot_cd_to_worker_worktree() {
         let ctx = supervisor_ctx(
             "/repo/.brehon/worktrees/runs/session/supervisor/claude-supervisor",
@@ -829,6 +924,7 @@ mod tests {
             project_root: Some(PathBuf::from("/repo")),
             agent_role: Some("worker".to_string()),
             brehon_root: Some(PathBuf::from("/repo/.brehon")),
+            worktree_root_base: None,
             merge_target: None,
         };
         let decision = evaluate("Bash", &bash("cd /repo/.brehon/worktrees/epic/T-123"), &ctx);
@@ -917,6 +1013,7 @@ mod tests {
             project_root: Some(PathBuf::from("/repo")),
             agent_role: Some("worker".to_string()),
             brehon_root: Some(PathBuf::from("/repo/.brehon")),
+            worktree_root_base: None,
             merge_target: None,
         };
         let decision = evaluate("Write", &json!({ "file_path": "src/lib.rs" }), &ctx);
@@ -986,6 +1083,7 @@ mod tests {
             project_root: None,
             agent_role: None,
             brehon_root: None,
+            worktree_root_base: None,
             merge_target: None,
         };
         assert_eq!(evaluate("Bash", &bash("cd .."), &ctx), Decision::Allow);

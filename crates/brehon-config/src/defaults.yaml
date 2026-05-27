@@ -289,6 +289,13 @@ orchestration:
   worktree_isolation: true
   branch_prefix: "brehon/"
   auto_cleanup_worktrees: true
+  # Agent worktrees default outside the repo so git-aware tools do not treat
+  # hidden `.brehon/worktrees` paths as ignored workspaces.
+  # macOS: ~/Library/Application Support/brehon/worktrees/<repo-name-hash>/
+  # Linux: $XDG_DATA_HOME/brehon/worktrees/<repo-name-hash>/ or
+  #        ~/.local/share/brehon/worktrees/<repo-name-hash>/
+  # Override with an absolute path when you need a fixed location:
+  # worktree_root: /absolute/path/to/brehon-worktrees
   worker_idle_behavior: SelfImprove
   allow_mutating_idle_work: false
   self_improve_tasks:

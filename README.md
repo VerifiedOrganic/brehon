@@ -78,8 +78,11 @@ choice.
    in-flight state from the previous session.
 2. The orchestrator computes the task DAG and assigns ready tasks to workers
    based on lane configuration.
-3. Each worker gets its own git worktree under `.brehon/worktrees/<worker-id>/`.
-   No two workers can step on each other.
+3. Each worker gets its own git worktree under the configured external
+   worktree root. By default this is outside the repository under the user's
+   platform data directory, scoped by repo name and hash. No two workers can
+   step on each other, and git-aware tools do not see hidden `.brehon/`
+   workspaces as ignored checkouts.
 4. Workers are spawned as PTY processes inside the mux. The TUI shows their
    live terminals; agents talk to the MCP server for shared context.
 5. When a worker reports a task ready, the verification tool spawns a

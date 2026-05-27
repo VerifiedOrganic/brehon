@@ -407,7 +407,9 @@ fn apply_configured_agent_type(config: &mut PtyConfig, configured_agent_type: Op
 
 fn merge_launcher_env(target_env: &mut Vec<(String, String)>, launcher_env: &[(String, String)]) {
     for (key, value) in launcher_env {
-        if (key.starts_with("BREHON_") && key != "BREHON_ROLE_SYSTEM_PROMPT")
+        if (key.starts_with("BREHON_")
+            && key != "BREHON_ROLE_SYSTEM_PROMPT"
+            && key != "BREHON_WORKTREE_ROOT")
             || key == "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"
         {
             continue;
@@ -2928,6 +2930,10 @@ mod tests {
                     "Review for correctness.".to_string(),
                 ),
                 (
+                    "BREHON_WORKTREE_ROOT".to_string(),
+                    "/tmp/brehon-worktrees".to_string(),
+                ),
+                (
                     "ANTHROPIC_BASE_URL".to_string(),
                     "http://localhost:11434".to_string(),
                 ),
@@ -2943,6 +2949,9 @@ mod tests {
         }));
         assert!(env.iter().any(|(key, value)| {
             key == "BREHON_ROLE_SYSTEM_PROMPT" && value == "Review for correctness."
+        }));
+        assert!(env.iter().any(|(key, value)| {
+            key == "BREHON_WORKTREE_ROOT" && value == "/tmp/brehon-worktrees"
         }));
         assert!(env.iter().any(|(key, value)| {
             key == "ANTHROPIC_BASE_URL" && value == "http://localhost:11434"

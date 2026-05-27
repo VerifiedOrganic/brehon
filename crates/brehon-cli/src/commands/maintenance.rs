@@ -24,6 +24,7 @@ use std::process::Command;
 use anyhow::{Context, Result};
 use serde_json::Value;
 
+use super::run::effective_worktree_root;
 use crate::ui;
 
 /// Parsed state of a single Brehon task loaded from `.brehon/runtime/tasks/`.
@@ -178,7 +179,10 @@ fn load_task_states(brehon_dir: &Path) -> Result<Vec<TaskState>> {
 /// or a `worktrees/` directory.
 fn resolve_brehon_dir(project_path: &Path) -> Option<PathBuf> {
     let local = project_path.join(".brehon");
-    if local.join("runtime").is_dir() || local.join("worktrees").is_dir() {
+    if local.join("config.yaml").is_file()
+        || local.join("runtime").is_dir()
+        || local.join("worktrees").is_dir()
+    {
         return Some(local);
     }
 
@@ -200,11 +204,44 @@ fn resolve_brehon_dir(project_path: &Path) -> Option<PathBuf> {
         .find_map(|l| l.strip_prefix("worktree "))?;
 
     let candidate = PathBuf::from(first_path).join(".brehon");
-    if candidate.join("runtime").is_dir() || candidate.join("worktrees").is_dir() {
+    if candidate.join("config.yaml").is_file()
+        || candidate.join("runtime").is_dir()
+        || candidate.join("worktrees").is_dir()
+    {
         Some(candidate)
     } else {
         None
     }
+}
+
+fn brehon_worktree_roots(
+    project_path: &Path,
+    brehon_dir: &Path,
+    config: &brehon_types::BrehonConfig,
+) -> Vec<PathBuf> {
+    let project_root = brehon_dir
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or(project_path);
+    let project_root = super::run::normalize_project_root(project_root);
+    let mut roots = Vec::new();
+    roots.push(effective_worktree_root(&project_root, config));
+    roots.push(brehon_types::OrchestrationConfig::legacy_worktree_root(
+        &project_root,
+    ));
+
+    let mut seen = HashSet::new();
+    roots
+        .into_iter()
+        .filter(|root| {
+            let key = root
+                .canonicalize()
+                .unwrap_or_else(|_| root.clone())
+                .to_string_lossy()
+                .to_string();
+            seen.insert(key)
+        })
+        .collect()
 }
 
 /// Normalize a branch prefix so it matches the rules used by `worker_branch_name()`.
@@ -509,7 +546,7 @@ fn analyze_branches(
 
 fn analyze_worktrees(
     project_path: &Path,
-    brehon_dir: &Path,
+    worktree_roots: &[PathBuf],
     session: &Option<CurrentSession>,
     tasks: &[TaskState],
 ) -> Vec<ReportItem> {
@@ -526,13 +563,13 @@ fn analyze_worktrees(
         .collect();
     let current_session_name = session.as_ref().map(|s| s.session_name.as_str());
 
-    // Only consider worktrees under the project's .brehon directory.
-    // Canonicalize the root so the comparison survives macOS /private
-    // prefix differences in git porcelain output.
-    let brehon_worktrees_root = brehon_dir.join("worktrees");
-    let canonical_brehon_root = brehon_worktrees_root
-        .canonicalize()
-        .unwrap_or_else(|_| brehon_worktrees_root.clone());
+    // Only consider worktrees under Brehon-owned roots. This includes the
+    // effective external root and the legacy in-repo `.brehon/worktrees`
+    // root so old runs remain visible and prunable.
+    let canonical_roots = worktree_roots
+        .iter()
+        .map(|root| root.canonicalize().unwrap_or_else(|_| root.clone()))
+        .collect::<Vec<_>>();
 
     for (path, branch) in worktrees {
         // Skip the primary worktree. Use the resolved primary checkout rather
@@ -543,16 +580,19 @@ fn analyze_worktrees(
         }
 
         let canonical_path = path.canonicalize().unwrap_or_else(|_| path.clone());
-        if !canonical_path.starts_with(&canonical_brehon_root) {
+        let Some(canonical_root) = canonical_roots
+            .iter()
+            .find(|root| canonical_path.starts_with(root))
+        else {
             continue;
-        }
+        };
 
         let is_cwd = canonical_cwd
             .as_ref()
             .map(|cwd| cwd.starts_with(&canonical_path))
             .unwrap_or(false);
 
-        let relative = match canonical_path.strip_prefix(&canonical_brehon_root) {
+        let relative = match canonical_path.strip_prefix(canonical_root) {
             Ok(r) => r,
             Err(_) => continue,
         };
@@ -1091,11 +1131,20 @@ pub fn execute(project_path: &Path, prune: bool, force: bool, json: bool) -> Res
         }
     };
 
-    // Load config to discover the configured branch prefix (defaults to "brehon/").
-    let configured_prefix = brehon_config::load_config(Some(project_path))
-        .map(|c| c.orchestration.branch_prefix)
-        .unwrap_or_else(|_| "brehon/".to_string());
-    let normalized_prefix = normalize_branch_prefix(&configured_prefix);
+    // Load config to discover the configured branch prefix and effective
+    // external worktree root.
+    let config_project_path = brehon_dir
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or(project_path);
+    let config = brehon_config::load_config(Some(config_project_path)).unwrap_or_else(|_| {
+        let mut config = brehon_config::parse_defaults()
+            .expect("baked-in Brehon defaults should parse for maintenance fallback");
+        config.orchestration.branch_prefix = "brehon/".to_string();
+        config
+    });
+    let normalized_prefix = normalize_branch_prefix(&config.orchestration.branch_prefix);
+    let worktree_roots = brehon_worktree_roots(project_path, &brehon_dir, &config);
 
     let session = load_current_session(&brehon_dir);
     let tasks = load_task_states(&brehon_dir)?;
@@ -1109,7 +1158,7 @@ pub fn execute(project_path: &Path, prune: bool, force: bool, json: bool) -> Res
     ));
     report.items.extend(analyze_worktrees(
         project_path,
-        &brehon_dir,
+        &worktree_roots,
         &session,
         &tasks,
     ));
@@ -1685,8 +1734,8 @@ mod tests {
         let _cwd_guard = CwdGuard::new(&linked_path);
 
         // Simulate runtime state: no current session, no active tasks.
-        let brehon_dir = project_path.join(".brehon");
-        let items = analyze_worktrees(project_path, &brehon_dir, &None, &[]);
+        let roots = vec![project_path.join(".brehon").join("worktrees")];
+        let items = analyze_worktrees(project_path, &roots, &None, &[]);
 
         // The linked worktree should be reported as Active because it is the CWD.
         let linked_item = items
@@ -1705,6 +1754,64 @@ mod tests {
             ),
             "linked worktree should be active (current directory), got {:?}",
             linked_item.state
+        );
+    }
+
+    #[test]
+    fn analyze_worktrees_reports_external_root_worktrees() {
+        let temp = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let project_path = temp.path();
+
+        let run_git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(project_path)
+                .status()
+                .expect("git command failed");
+            assert!(status.success(), "git {:?} failed", args);
+        };
+
+        run_git(&["init", "--quiet"]);
+        run_git(&["config", "user.email", "test@example.com"]);
+        run_git(&["config", "user.name", "Test"]);
+
+        std::fs::write(project_path.join("file.txt"), "hello").unwrap();
+        run_git(&["add", "file.txt"]);
+        run_git(&["commit", "--quiet", "-m", "initial"]);
+
+        let external_root = external.path().join("brehon-worktrees");
+        let external_path = external_root.join("runs/old-session/worker-1");
+        std::fs::create_dir_all(external_path.parent().unwrap()).unwrap();
+        run_git(&[
+            "worktree",
+            "add",
+            "--quiet",
+            "-b",
+            "brehon/runs/old-session/worker-1",
+            external_path.to_str().unwrap(),
+            "HEAD",
+        ]);
+
+        let roots = vec![external_root];
+        let items = analyze_worktrees(project_path, &roots, &None, &[]);
+
+        let external_item = items
+            .iter()
+            .find(|i| {
+                i.path
+                    .as_ref()
+                    .map(|p| p.canonicalize().unwrap_or_else(|_| p.clone()))
+                    == external_path.canonicalize().ok()
+            })
+            .expect("external Brehon worktree should appear in report");
+        assert!(
+            matches!(
+                &external_item.state,
+                RuntimeState::Stale { reason } if reason.contains("old-session")
+            ),
+            "external worktree should be stale by session, got {:?}",
+            external_item.state
         );
     }
 
@@ -2084,8 +2191,8 @@ mod tests {
         // Change CWD into the nested subdirectory.
         let _cwd_guard = CwdGuard::new(&nested_path);
 
-        let brehon_dir = project_path.join(".brehon");
-        let items = analyze_worktrees(project_path, &brehon_dir, &None, &[]);
+        let roots = vec![project_path.join(".brehon").join("worktrees")];
+        let items = analyze_worktrees(project_path, &roots, &None, &[]);
 
         // The linked worktree should still be reported as Active because the
         // CWD is a subdirectory inside it.

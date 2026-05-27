@@ -3,9 +3,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use brehon_ports::GitOperations;
-use brehon_types::{
-    is_terminal_task_status, normalize_task_status, BrehonConfig, OrchestrationConfig,
-};
+use brehon_types::{is_terminal_task_status, normalize_task_status, BrehonConfig};
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -750,13 +748,10 @@ pub(crate) fn default_initiative_integration_branch(task_id: &str, title: &str) 
 }
 
 pub(crate) fn default_initiative_integration_worktree(
-    brehon_root: &Path,
+    worktrees_root: &Path,
     task_id: &str,
 ) -> PathBuf {
-    brehon_root
-        .join("worktrees")
-        .join("initiative")
-        .join(task_id)
+    worktrees_root.join("initiative").join(task_id)
 }
 
 /// Gitignore patterns that cover every file `brehon run` generates in the
@@ -1184,6 +1179,14 @@ pub(crate) fn compute_repo_identity(cwd: &Path) -> String {
     let identity = format!("{repo_name}-{hash}");
     write_repo_identity_cache(&brehon_root, &repo_name, &identity);
     identity
+}
+
+pub(crate) fn effective_worktree_root(project_root: &Path, config: &BrehonConfig) -> PathBuf {
+    let project_root = normalize_project_root(project_root);
+    let repo_identity = compute_repo_identity(&project_root);
+    config
+        .orchestration
+        .resolve_worktree_root(&project_root, &repo_identity)
 }
 
 pub(crate) fn detect_default_branch(cwd: &Path) -> Result<String> {
@@ -1973,6 +1976,7 @@ pub(crate) fn restore_shared_root_branch(cwd: &Path, default_branch: &str) -> Re
 pub(crate) async fn reconcile_initiative_hierarchy_for_run(
     cwd: &Path,
     brehon_root: &Path,
+    config: &BrehonConfig,
 ) -> Result<Vec<String>> {
     let tasks_dir = brehon_root.join("runtime").join("tasks");
     if !tasks_dir.is_dir() {
@@ -1987,6 +1991,8 @@ pub(crate) async fn reconcile_initiative_hierarchy_for_run(
         )
     })?;
     let default_branch = detect_default_branch(cwd)?;
+    let project_root = normalize_project_root(cwd);
+    let worktrees_root = effective_worktree_root(&project_root, config);
 
     let mut repaired = Vec::new();
     let entries = std::fs::read_dir(&tasks_dir)?;
@@ -2033,7 +2039,7 @@ pub(crate) async fn reconcile_initiative_hierarchy_for_run(
             .and_then(|value| value.as_str())
             .filter(|value| !value.is_empty())
             .map(PathBuf::from)
-            .unwrap_or_else(|| default_initiative_integration_worktree(brehon_root, &task_id));
+            .unwrap_or_else(|| default_initiative_integration_worktree(&worktrees_root, &task_id));
 
         if !git_branch_exists(cwd, &branch) {
             git.create_branch(&branch, Some(&default_branch))
@@ -2132,7 +2138,7 @@ where
     })?;
 
     let project_root = normalize_project_root(cwd);
-    let worktrees_dir = OrchestrationConfig::legacy_worktree_root(&project_root);
+    let worktrees_dir = effective_worktree_root(&project_root, config);
     std::fs::create_dir_all(&worktrees_dir).with_context(|| {
         format!(
             "Failed to create worktree directory '{}'",
@@ -2270,6 +2276,7 @@ pub(crate) async fn cleanup_scoped_worktrees(cwd: &Path, role_cwds: &HashMap<Str
 #[cfg(test)]
 mod tests {
     use super::*;
+    use brehon_types::OrchestrationConfig;
 
     fn default_security() -> brehon_types::config::SecurityConfig {
         brehon_config::parse_defaults().unwrap().security
@@ -2302,6 +2309,12 @@ mod tests {
         .unwrap();
         run_git(path, &["add", "README.md", ".gitignore"]);
         run_git(path, &["commit", "-m", "seed"]);
+    }
+
+    fn configure_test_external_worktree_root(config: &mut BrehonConfig, root: &Path) -> PathBuf {
+        let root = root.join("brehon-worktrees");
+        config.orchestration.worktree_root = Some(root.to_string_lossy().to_string());
+        root
     }
 
     #[test]
@@ -3527,7 +3540,10 @@ mod tests {
         )
         .unwrap();
 
-        let repaired = reconcile_initiative_hierarchy_for_run(temp.path(), &brehon_root)
+        let mut config = brehon_config::parse_defaults().unwrap();
+        let external_root = configure_test_external_worktree_root(&mut config, temp.path());
+
+        let repaired = reconcile_initiative_hierarchy_for_run(temp.path(), &brehon_root, &config)
             .await
             .unwrap();
         assert_eq!(repaired.len(), 1);
@@ -3545,11 +3561,13 @@ mod tests {
 
         let branch = initiative["integration_branch"].as_str().unwrap();
         let worktree = initiative["integration_worktree"].as_str().unwrap();
+        let worktree_path = Path::new(worktree);
         assert!(branch.starts_with("initiative/"));
-        assert!(worktree.contains(".brehon/worktrees/initiative/T-init"));
-        assert!(Path::new(worktree).exists());
+        assert!(worktree_path.starts_with(external_root.join("initiative").join("T-init")));
+        assert!(!worktree_path.starts_with(brehon_root.join("worktrees")));
+        assert!(worktree_path.exists());
         assert_eq!(
-            run_git(Path::new(worktree), &["branch", "--show-current"]),
+            run_git(worktree_path, &["branch", "--show-current"]),
             branch
         );
         assert_eq!(
@@ -3557,7 +3575,7 @@ mod tests {
                 temp.path(),
                 &["rev-parse", "--verify", &format!("refs/heads/{branch}")]
             ),
-            run_git(Path::new(worktree), &["rev-parse", "HEAD"])
+            run_git(worktree_path, &["rev-parse", "HEAD"])
         );
     }
 
@@ -3717,6 +3735,8 @@ mod tests {
         config.orchestration.worktree_isolation = true;
         config.orchestration.auto_cleanup_worktrees = true;
         config.orchestration.branch_prefix = "brehon/".to_string();
+        let external = tempfile::tempdir().unwrap();
+        let external_root = configure_test_external_worktree_root(&mut config, external.path());
 
         let worker_names = vec!["worker-1".to_string(), "worker-2".to_string()];
         let worker_cwds =
@@ -3728,7 +3748,8 @@ mod tests {
         for worker_name in &worker_names {
             let worktree_path = worker_cwds.get(worker_name).unwrap();
             assert!(worktree_path.exists());
-            assert!(worktree_path.starts_with(temp.path().join(".brehon/worktrees/runs/session-a")));
+            assert!(worktree_path.starts_with(external_root.join("runs/session-a")));
+            assert!(!worktree_path.starts_with(temp.path().join(".brehon/worktrees")));
             let branch = run_git(worktree_path, &["rev-parse", "--abbrev-ref", "HEAD"]);
             assert_eq!(branch, format!("brehon/runs/session-a/{worker_name}"));
         }
@@ -3742,6 +3763,133 @@ mod tests {
                 worktree_path.display()
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_prepare_worker_worktrees_default_root_is_external_to_repo() {
+        let temp = tempfile::tempdir().unwrap();
+        init_git_repo(temp.path());
+        std::fs::create_dir_all(temp.path().join(".brehon")).unwrap();
+
+        let mut config = brehon_config::parse_defaults().unwrap();
+        config.orchestration.worktree_isolation = true;
+        config.orchestration.auto_cleanup_worktrees = true;
+        config.orchestration.branch_prefix = "brehon/".to_string();
+        config.orchestration.worktree_root = None;
+        let external_root = effective_worktree_root(temp.path(), &config);
+        let repo_identity = external_root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("default external root should end with repo identity")
+            .to_string();
+
+        let worker_cwds = prepare_scoped_worktrees(
+            temp.path(),
+            &config,
+            Some("session-default-external"),
+            None,
+            &["worker-default".to_string()],
+        )
+        .await
+        .unwrap();
+
+        let worktree_path = worker_cwds.get("worker-default").unwrap();
+        assert!(worktree_path.exists());
+        assert!(worktree_path.starts_with(external_root.join("runs/session-default-external")));
+        assert!(
+            !worktree_path.starts_with(temp.path()),
+            "default worktree root should be outside repo: {}",
+            worktree_path.display()
+        );
+        assert!(
+            worktree_path.to_string_lossy().contains(&repo_identity),
+            "default path should include repo identity: {}",
+            worktree_path.display()
+        );
+        let status = run_git(
+            temp.path(),
+            &["status", "--porcelain", "--untracked-files=all"],
+        );
+        assert!(
+            status.is_empty(),
+            "external worktree preparation should not dirty shared root:\n{status}"
+        );
+
+        cleanup_scoped_worktrees(temp.path(), &worker_cwds).await;
+        let _ = std::fs::remove_dir_all(external_root);
+    }
+
+    #[tokio::test]
+    async fn test_prepare_worker_worktrees_honors_explicit_absolute_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        init_git_repo(temp.path());
+        std::fs::create_dir_all(temp.path().join(".brehon")).unwrap();
+
+        let mut config = brehon_config::parse_defaults().unwrap();
+        config.orchestration.worktree_isolation = true;
+        config.orchestration.auto_cleanup_worktrees = true;
+        config.orchestration.branch_prefix = "brehon/".to_string();
+        let external_root = configure_test_external_worktree_root(&mut config, external.path());
+
+        let worker_cwds = prepare_scoped_worktrees(
+            temp.path(),
+            &config,
+            Some("session-explicit-root"),
+            None,
+            &["worker-explicit".to_string()],
+        )
+        .await
+        .unwrap();
+
+        let worktree_path = worker_cwds.get("worker-explicit").unwrap();
+        assert!(worktree_path.starts_with(external_root.join("runs/session-explicit-root")));
+        assert!(!worktree_path.starts_with(temp.path().join(".brehon")));
+        let status = run_git(
+            temp.path(),
+            &["status", "--porcelain", "--untracked-files=all"],
+        );
+        assert!(
+            status.is_empty(),
+            "explicit external root should not dirty shared root:\n{status}"
+        );
+
+        cleanup_scoped_worktrees(temp.path(), &worker_cwds).await;
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_scoped_worktrees_removes_legacy_in_repo_worktree() {
+        let temp = tempfile::tempdir().unwrap();
+        init_git_repo(temp.path());
+        let legacy_root = OrchestrationConfig::legacy_worktree_root(temp.path());
+        let legacy_path = legacy_root.join("runs/session-legacy/worker-legacy");
+        let legacy_path_arg = legacy_path.to_string_lossy().to_string();
+        std::fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
+        run_git(
+            temp.path(),
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "brehon/runs/session-legacy/worker-legacy",
+                &legacy_path_arg,
+            ],
+        );
+
+        let role_cwds = HashMap::from([("worker-legacy".to_string(), legacy_path.clone())]);
+        cleanup_scoped_worktrees(temp.path(), &role_cwds).await;
+
+        let worktree_list = run_git(temp.path(), &["worktree", "list", "--porcelain"]);
+        assert!(
+            !worktree_list.contains(&legacy_path.to_string_lossy().to_string()),
+            "legacy worktree should be unregistered: {}",
+            legacy_path.display()
+        );
+        assert!(
+            !legacy_path.exists(),
+            "legacy worktree directory should be removed: {}",
+            legacy_path.display()
+        );
     }
 
     #[tokio::test]
@@ -3800,6 +3948,8 @@ mod tests {
         config.orchestration.worktree_isolation = true;
         config.orchestration.auto_cleanup_worktrees = true;
         config.orchestration.branch_prefix = "brehon/".to_string();
+        let external = tempfile::tempdir().unwrap();
+        let external_root = configure_test_external_worktree_root(&mut config, external.path());
 
         let supervisor_names = vec!["claude-code".to_string()];
         let reviewer_names = vec!["reviewer-a".to_string(), "reviewer-b".to_string()];
@@ -3824,6 +3974,7 @@ mod tests {
 
         let supervisor_path = supervisor_cwds.get("claude-code").unwrap();
         assert!(supervisor_path.exists());
+        assert!(supervisor_path.starts_with(&external_root));
         assert!(supervisor_path.ends_with("runs/session-role/supervisor/claude-code"));
         assert_eq!(
             run_git(supervisor_path, &["rev-parse", "--abbrev-ref", "HEAD"]),
@@ -3832,6 +3983,7 @@ mod tests {
 
         let reviewer_path = reviewer_cwds.get("reviewer-a").unwrap();
         assert!(reviewer_path.exists());
+        assert!(reviewer_path.starts_with(&external_root));
         assert!(reviewer_path.ends_with("runs/session-role/reviewer/reviewer-a"));
         assert_eq!(
             run_git(reviewer_path, &["rev-parse", "--abbrev-ref", "HEAD"]),
@@ -3876,6 +4028,8 @@ mod tests {
         config.orchestration.worktree_isolation = true;
         config.orchestration.auto_cleanup_worktrees = true;
         config.orchestration.branch_prefix = "brehon/".to_string();
+        let external = tempfile::tempdir().unwrap();
+        let external_root = configure_test_external_worktree_root(&mut config, external.path());
 
         run_git(
             temp.path(),
@@ -3895,6 +4049,7 @@ mod tests {
 
         let supervisor_path = supervisor_cwds.get("claude-code").unwrap();
         assert!(supervisor_path.exists());
+        assert!(supervisor_path.starts_with(&external_root));
         assert_eq!(
             run_git(supervisor_path, &["rev-parse", "--abbrev-ref", "HEAD"]),
             "brehon/runs/session-reuse/supervisor/claude-code"
@@ -3913,6 +4068,8 @@ mod tests {
         config.orchestration.worktree_isolation = true;
         config.orchestration.auto_cleanup_worktrees = true;
         config.orchestration.branch_prefix = "brehon/".to_string();
+        let external = tempfile::tempdir().unwrap();
+        let external_root = configure_test_external_worktree_root(&mut config, external.path());
 
         let supervisor_names = vec!["claude-code".to_string()];
         let first = prepare_scoped_worktrees(
@@ -3937,6 +4094,8 @@ mod tests {
         let first_path = first.get("claude-code").unwrap();
         let second_path = second.get("claude-code").unwrap();
         assert_ne!(first_path, second_path);
+        assert!(first_path.starts_with(&external_root));
+        assert!(second_path.starts_with(&external_root));
         assert_eq!(
             run_git(first_path, &["rev-parse", "--abbrev-ref", "HEAD"]),
             "brehon/runs/session-one/supervisor/claude-code"
@@ -3960,6 +4119,8 @@ mod tests {
         config.orchestration.worktree_isolation = true;
         config.orchestration.auto_cleanup_worktrees = true;
         config.orchestration.branch_prefix = "brehon/".to_string();
+        let external = tempfile::tempdir().unwrap();
+        let external_root = configure_test_external_worktree_root(&mut config, external.path());
 
         let names = vec!["worker-1".to_string()];
         let session_a =
@@ -3978,6 +4139,8 @@ mod tests {
             session_a_path, session_b_path,
             "worker worktrees must not be reused across runs"
         );
+        assert!(session_a_path.starts_with(&external_root));
+        assert!(session_b_path.starts_with(&external_root));
 
         cleanup_scoped_worktrees(temp.path(), &session_b).await;
     }
@@ -4160,6 +4323,8 @@ mod tests {
         config.orchestration.worktree_isolation = true;
         config.orchestration.auto_cleanup_worktrees = true;
         config.orchestration.branch_prefix = "brehon/".to_string();
+        let external = tempfile::tempdir().unwrap();
+        let external_root = configure_test_external_worktree_root(&mut config, external.path());
 
         // Invoke with the `.brehon` directory as cwd — this is a supported form.
         let brehon_dir = temp.path().join(".brehon");
@@ -4178,15 +4343,15 @@ mod tests {
         let worktree_path = worker_cwds.get("worker-dotbrehon").unwrap();
         assert!(worktree_path.exists());
 
-        // Worktree must be under <repo>/.brehon/worktrees/, not
+        // Worktree must be under the configured external root, not under
         // <repo>/.brehon/.brehon/worktrees/ (cwd was the .brehon dir).
-        let expected_base = temp.path().join(".brehon").join("worktrees");
         assert!(
-            worktree_path.starts_with(&expected_base),
+            worktree_path.starts_with(&external_root),
             "worktree should start with '{}', got: {}",
-            expected_base.display(),
+            external_root.display(),
             worktree_path.display()
         );
+        assert!(!worktree_path.starts_with(temp.path().join(".brehon")));
 
         // Scaffolding files must be synced from the project root, not from .brehon/.
         assert_eq!(

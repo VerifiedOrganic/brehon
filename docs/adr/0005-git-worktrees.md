@@ -45,9 +45,12 @@ The options:
 
 ## Decision
 
-**Each worker runs in its own `git worktree` under
-`.brehon/worktrees/<worker-id>/`. The `brehon-git` crate owns
-creation, cleanup, integration, and crash recovery.**
+**Each worker runs in its own `git worktree` under Brehon's effective
+`orchestration.worktree_root`. The default root lives outside the shared
+repo and is scoped by repo name/hash; `.brehon/worktrees/` remains a
+legacy location that cleanup and maintenance can read/prune. The
+`brehon-git` crate owns creation, cleanup, integration, and crash
+recovery.**
 
 Concretely:
 
@@ -82,7 +85,8 @@ Concretely:
   (rare, but possible).
 - The host filesystem must support multiple working trees of the
   project. For 5 workers on a 1GB repo, this is ~5GB of working-tree
-  state in `.brehon/worktrees/` (objects shared, source duplicated).
+  state under the effective worktree root (objects shared, source
+  duplicated).
 - Crash recovery code is non-trivial. The `brehon-git` crate has
   62 tests covering stale lockfiles, mid-rebase states, partial
   cherry-picks. This is real complexity.

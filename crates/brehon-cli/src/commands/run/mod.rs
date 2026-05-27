@@ -1,7 +1,7 @@
 mod direct_tools;
 mod review;
 mod setup;
-pub(crate) use setup::normalize_project_root;
+pub(crate) use setup::{effective_worktree_root, normalize_project_root};
 #[cfg(test)]
 mod startup_reconciliation_tests;
 mod workers;
@@ -1377,7 +1377,7 @@ pub async fn execute(
     ensure_codex_instruction_files(&cwd, &config)?;
 
     splash.record("Reconciling initiative hierarchy".to_string());
-    match reconcile_initiative_hierarchy_for_run(&cwd, &cwd.join(".brehon")).await {
+    match reconcile_initiative_hierarchy_for_run(&cwd, &cwd.join(".brehon"), &config).await {
         Ok(repaired) => {
             for message in repaired {
                 tracing::info!(message = %message, "Reconciled initiative hierarchy during startup");
@@ -1461,6 +1461,9 @@ pub async fn execute(
             model_name.to_string()
         }
     };
+    let worktree_root_env_value = effective_worktree_root(&cwd, &config)
+        .to_string_lossy()
+        .to_string();
     let launcher_env_pairs = |lane: &str| -> Vec<(String, String)> {
         let mut pairs = config
             .lane_launcher(lane)
@@ -1472,6 +1475,11 @@ pub async fn execute(
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
+        pairs.retain(|(key, _)| key != "BREHON_WORKTREE_ROOT");
+        pairs.push((
+            "BREHON_WORKTREE_ROOT".to_string(),
+            worktree_root_env_value.clone(),
+        ));
         pairs.sort_by(|left, right| left.0.cmp(&right.0));
         pairs
     };

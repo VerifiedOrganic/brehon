@@ -88,8 +88,10 @@ sequence:
    layered overrides, validates against the schema in
    `brehon-config/src/validate/`.
 4. **Prepare worktrees** — `setup::prepare_scoped_worktrees_with_progress()`
-   calls `brehon_git::Git2Operations::create_worktree()` to create
-   `.brehon/worktrees/<worker-id>/` per worker.
+   calls `brehon_git::Git2Operations::create_worktree()` to create each
+   scoped worker, reviewer, supervisor, advisor, and research checkout under
+   `orchestration.worktree_root`. When unset, Brehon uses the platform data
+   directory, scoped by repo name and hash, instead of `.brehon/worktrees/`.
 5. **Open event store** — `FjallEventStore::new(.brehon/store)` opens or
    creates the LSM-tree. On startup, a recovery scan reconstructs in-memory
    indexes and detects orphaned leases.
@@ -395,8 +397,15 @@ See [ADR-0007](adr/0007-in-process-multiplexer.md).
 
 ## 11. Worker isolation
 
-Each worker runs in its own git worktree under `.brehon/worktrees/<id>/`.
-`brehon-git`'s `Git2Operations` (built on libgit2) handles creation,
+Each worker runs in its own git worktree under the effective Brehon worktree
+root. By default, that root is external to the repository:
+
+- macOS: `~/Library/Application Support/brehon/worktrees/<repo-name-hash>/`
+- Linux: `$XDG_DATA_HOME/brehon/worktrees/<repo-name-hash>/` or
+  `~/.local/share/brehon/worktrees/<repo-name-hash>/`
+
+Operators can override this with an absolute `orchestration.worktree_root`
+path. `brehon-git`'s `Git2Operations` (built on libgit2) handles creation,
 cleanup, and recovery. The PTY spawn step sets the worker's `cwd` to its
 worktree, so any git operations the agent performs are scoped.
 
