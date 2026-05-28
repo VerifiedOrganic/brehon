@@ -17,7 +17,9 @@ use crate::tools::verification::{
 use crate::tools::{error_result, text_result};
 
 use super::dependencies::{
+    task_has_final_review_feedback, task_has_integrated_record,
     task_has_legacy_completed_worker_status, task_has_recoverable_worker_state_blocker_text,
+    task_review_feedback_outcome,
 };
 use super::epic::{
     check_child_completion, check_epic_integration_status, task_has_supervisor_integration_conflict,
@@ -501,7 +503,13 @@ fn blocked_handoff_context(
     let has_commit = task_has_recorded_handoff_commit(task);
     let closed_parent = ancestor_chain_has_closed_parent(all_tasks, task);
     let scope_issue = control_plane_scope_issue_for_task(task);
-    let safe_repair = has_commit && !closed_parent && scope_issue.is_none();
+    let integrated_record = task_has_integrated_record(task);
+    let final_review_feedback = task_has_final_review_feedback(task);
+    let safe_repair = has_commit
+        && !closed_parent
+        && scope_issue.is_none()
+        && !integrated_record
+        && !final_review_feedback;
     let mut value = ready_queue_task(task, config);
     let task_id = queued_task_id(&value).unwrap_or("").to_string();
     value["safe_repair"] = Value::Bool(safe_repair);
@@ -536,6 +544,15 @@ fn blocked_handoff_context(
         Value::Null
     } else if !has_commit {
         Value::String("latest_commit is missing".to_string())
+    } else if integrated_record {
+        Value::String(
+            "task already records integration_status=integrated; reconcile closure instead of re-reviewing"
+                .to_string(),
+        )
+    } else if let Some(outcome) = task_review_feedback_outcome(task) {
+        Value::String(format!(
+            "task has final review_feedback outcome={outcome}; do not requeue the same commit"
+        ))
     } else if legacy_completed {
         Value::String("legacy completed handoff state is not safe to repair".to_string())
     } else if closed_parent {

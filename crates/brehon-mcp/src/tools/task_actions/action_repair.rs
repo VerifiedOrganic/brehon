@@ -9,7 +9,9 @@ use crate::server::ToolResult;
 use crate::tools::{structured_error_result, text_result};
 
 use super::dependencies::{
+    task_has_final_review_feedback, task_has_integrated_record,
     task_has_legacy_completed_worker_status, task_has_recoverable_worker_state_blocker_text,
+    task_review_feedback_outcome,
 };
 use super::lifecycle::{ancestor_chain_has_closed_parent, caller_role};
 use super::locking::acquire_task_lock;
@@ -56,6 +58,10 @@ fn repair_current_state(id: &str, task: Option<&serde_json::Map<String, Value>>)
         "assignee": task.get("assignee").cloned().unwrap_or(Value::Null),
         "review_owner": task.get("review_owner").cloned().unwrap_or(Value::Null),
         "latest_commit": task.get("latest_commit").cloned().unwrap_or(Value::Null),
+        "integration_status": task.get("integration_status").cloned().unwrap_or(Value::Null),
+        "review_feedback_outcome": task_review_feedback_outcome(task)
+            .map(Value::String)
+            .unwrap_or(Value::Null),
         "blockers": task.get("blockers").cloned().unwrap_or(Value::Null),
     })
 }
@@ -116,6 +122,8 @@ fn task_is_safe_handoff_repair_candidate(
         .unwrap_or("task");
     task_type == "task"
         && latest_commit(task).is_some()
+        && !task_has_integrated_record(task)
+        && !task_has_final_review_feedback(task)
         && (normalize_task_status(status) == Some("blocked")
             && task_has_recoverable_worker_state_blocker_text(task)
             || task_has_legacy_completed_worker_status(task))
@@ -208,6 +216,34 @@ async fn recover_handoff_by_id(id: &str) -> Result<RecoverOutcome, ToolResult> {
             ready_next_action(),
         ));
     };
+
+    if task_has_integrated_record(&task) {
+        return Err(structured_repair_error(
+            "handoff_already_integrated",
+            format!(
+                "Task {id} already records integration_status=integrated; recover_handoff must not move it back to review_ready."
+            ),
+            false,
+            repair_current_state(id, Some(&task)),
+            vec![ready_next_action()],
+            ready_next_action(),
+        ));
+    }
+
+    if let Some(outcome) = task_review_feedback_outcome(&task) {
+        if matches!(outcome.as_str(), "approved" | "rejected") {
+            return Err(structured_repair_error(
+                "handoff_final_review_state",
+                format!(
+                    "Task {id} has final review_feedback outcome={outcome}; recover_handoff must not requeue the recorded latest_commit as a worker handoff."
+                ),
+                false,
+                repair_current_state(id, Some(&task)),
+                vec![ready_next_action()],
+                ready_next_action(),
+            ));
+        }
+    }
 
     if !legacy_completed && matches!(normalized_status, Some("review_ready" | "in_review")) {
         return Ok(RecoverOutcome {

@@ -167,6 +167,33 @@ pub(super) fn task_has_recoverable_worker_state_blocker_text(
             && blockers_lower.contains("in_progress"))
 }
 
+pub(super) fn task_has_integrated_record(task: &serde_json::Map<String, Value>) -> bool {
+    task.get("integration_status")
+        .and_then(|value| value.as_str())
+        .is_some_and(|value| value.trim() == "integrated")
+        || task
+            .get("merged_commit")
+            .and_then(|value| value.as_str())
+            .is_some_and(|value| !value.trim().is_empty())
+}
+
+pub(super) fn task_review_feedback_outcome(
+    task: &serde_json::Map<String, Value>,
+) -> Option<String> {
+    task.get("review_feedback")
+        .and_then(|value| value.get("outcome"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_ascii_lowercase())
+}
+
+pub(super) fn task_has_final_review_feedback(task: &serde_json::Map<String, Value>) -> bool {
+    task_review_feedback_outcome(task)
+        .as_deref()
+        .is_some_and(|outcome| matches!(outcome, "approved" | "rejected"))
+}
+
 pub(super) fn task_has_legacy_completed_worker_status(
     task: &serde_json::Map<String, Value>,
 ) -> bool {

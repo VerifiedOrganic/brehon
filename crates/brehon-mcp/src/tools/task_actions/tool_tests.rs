@@ -2532,6 +2532,59 @@ async fn test_recover_handoff_reports_structured_errors_for_unsafe_states() {
         .unwrap();
     assert_error_code(not_recoverable_result, "handoff_not_recoverable");
 
+    write_test_task(root.path(), "T-already-integrated", "blocked", "task");
+    let mut already_integrated = read_test_task(root.path(), "T-already-integrated");
+    already_integrated["latest_commit"] = Value::String("abc123".to_string());
+    already_integrated["integration_status"] = Value::String("integrated".to_string());
+    already_integrated["blockers"] = Value::String(
+        "State deadlock: checkpoint created during pending state, need reassignment to complete"
+            .to_string(),
+    );
+    std::fs::write(
+        root.path()
+            .join("runtime")
+            .join("tasks")
+            .join("T-already-integrated.json"),
+        serde_json::to_string_pretty(&already_integrated).unwrap(),
+    )
+    .unwrap();
+    let already_integrated_result = tool
+        .execute(serde_json::json!({
+            "action": "recover_handoff",
+            "id": "T-already-integrated"
+        }))
+        .await
+        .unwrap();
+    assert_error_code(already_integrated_result, "handoff_already_integrated");
+
+    write_test_task(root.path(), "T-rejected-review", "blocked", "task");
+    let mut rejected_review = read_test_task(root.path(), "T-rejected-review");
+    rejected_review["latest_commit"] = Value::String("def456".to_string());
+    rejected_review["review_feedback"] = serde_json::json!({
+        "outcome": "rejected",
+        "review_id": "REV-wrong-commit"
+    });
+    rejected_review["blockers"] = Value::String(
+        "State deadlock: checkpoint created during pending state, need reassignment to complete"
+            .to_string(),
+    );
+    std::fs::write(
+        root.path()
+            .join("runtime")
+            .join("tasks")
+            .join("T-rejected-review.json"),
+        serde_json::to_string_pretty(&rejected_review).unwrap(),
+    )
+    .unwrap();
+    let rejected_review_result = tool
+        .execute(serde_json::json!({
+            "action": "recover_handoff",
+            "id": "T-rejected-review"
+        }))
+        .await
+        .unwrap();
+    assert_error_code(rejected_review_result, "handoff_final_review_state");
+
     write_test_task(root.path(), "T-closed-parent", "closed", "epic");
     write_test_task(root.path(), "T-child-closed-parent", "blocked", "task");
     let mut child = read_test_task(root.path(), "T-child-closed-parent");
@@ -2923,6 +2976,79 @@ async fn test_ready_surfaces_recoverable_blocked_worker_handoffs() {
     assert_eq!(
         payload["blocked_handoff_tasks"][0]["liveness"]["state"],
         "missing_session"
+    );
+}
+
+#[tokio::test]
+async fn test_ready_does_not_mark_integrated_or_final_review_handoffs_safe() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let root = make_test_root();
+    let _env = ScopedEnv::set_with_defaults(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
+    let tool = TaskActionsTool::new();
+
+    for (task_id, extra) in [
+        (
+            "T-integrated-handoff",
+            serde_json::json!({ "integration_status": "integrated" }),
+        ),
+        (
+            "T-rejected-handoff",
+            serde_json::json!({ "review_feedback": { "outcome": "rejected" } }),
+        ),
+    ] {
+        write_test_task(root.path(), task_id, "blocked", "task");
+        let mut task = read_test_task(root.path(), task_id);
+        task["latest_commit"] = Value::String(format!("{task_id}-commit"));
+        task["blockers"] = Value::String(
+            "State deadlock: checkpoint created during pending state, need reassignment to complete"
+                .to_string(),
+        );
+        if let Some(map) = extra.as_object() {
+            for (key, value) in map {
+                task[key] = value.clone();
+            }
+        }
+        std::fs::write(
+            root.path()
+                .join("runtime")
+                .join("tasks")
+                .join(format!("{task_id}.json")),
+            serde_json::to_string_pretty(&task).unwrap(),
+        )
+        .unwrap();
+    }
+
+    let ready = tool
+        .execute(serde_json::json!({"action": "ready"}))
+        .await
+        .unwrap();
+    let payload: Value = serde_json::from_str(&extract_text(&ready)).unwrap();
+    assert_eq!(payload["blocked_handoff_count"], 2, "{payload}");
+    assert_eq!(payload["recoverable_blocked_count"], 0, "{payload}");
+    assert_eq!(
+        payload["blocked_handoff_tasks"][0]["safe_repair"],
+        Value::Bool(false),
+        "{payload}"
+    );
+    assert_eq!(
+        payload["blocked_handoff_tasks"][1]["safe_repair"],
+        Value::Bool(false),
+        "{payload}"
+    );
+    let blockers = payload["blocked_handoff_tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|task| task["repair_blocker"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        blockers.contains("integration_status=integrated"),
+        "{payload}"
+    );
+    assert!(
+        blockers.contains("review_feedback outcome=rejected"),
+        "{payload}"
     );
 }
 
