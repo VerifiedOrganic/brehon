@@ -957,8 +957,36 @@ fn validate_launcher_capability_overrides(config: &BrehonConfig) -> Vec<Validati
                 }
             }
         }
+
+        if launcher_uses_deepseek_anthropic_through_claude(launcher) {
+            warnings.push(ValidationWarning::new(
+                ValidationWarningKind::LauncherCapabilityConflict,
+                format!(
+                    "launcher '{name}' routes Claude Code through DeepSeek's Anthropic-compatible endpoint; DeepSeek rejects Claude Code system-role messages in this mode. Use a NativeAgent/OpenAI-compatible DeepSeek launcher instead."
+                ),
+            ));
+        }
     }
     warnings
+}
+
+fn launcher_uses_deepseek_anthropic_through_claude(
+    launcher: &brehon_types::AgentConnectionConfig,
+) -> bool {
+    let command_is_claude = launcher
+        .command
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|command| command.eq_ignore_ascii_case("claude"));
+    if !command_is_claude {
+        return false;
+    }
+
+    launcher
+        .env
+        .get("ANTHROPIC_BASE_URL")
+        .map(|value| value.trim().to_ascii_lowercase())
+        .is_some_and(|value| value.contains("deepseek") && value.contains("/anthropic"))
 }
 
 fn validate_runtime_workflows(config: &BrehonConfig) -> Vec<ValidationWarning> {
@@ -2479,6 +2507,26 @@ rooms:
                 && warning.message.contains(
                     "requests built-in 'codex' with unsupported transport/control_plane overrides",
                 )
+        }));
+    }
+
+    #[test]
+    fn launcher_capability_validation_rejects_deepseek_anthropic_via_claude() {
+        let mut config = minimal_valid_config();
+        let launcher = config.launchers.get_mut("claude-code").unwrap();
+        launcher.env.insert(
+            "ANTHROPIC_BASE_URL".into(),
+            "https://api.deepseek.com/anthropic".into(),
+        );
+
+        let warnings = validate(&config);
+
+        assert!(warnings.iter().any(|warning| {
+            warning.kind == ValidationWarningKind::LauncherCapabilityConflict
+                && warning.is_fatal
+                && warning
+                    .message
+                    .contains("DeepSeek's Anthropic-compatible endpoint")
         }));
     }
 
