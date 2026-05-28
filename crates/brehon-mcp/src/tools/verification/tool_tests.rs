@@ -613,7 +613,6 @@ async fn test_request_review_recovers_blocked_integration_conflict_task() {
         ("BREHON_AGENT_NAME", "supervisor-1"),
         ("BREHON_AGENT_ROLE", "supervisor"),
     ]);
-    crate::tools::agent::write_session_file("reviewer-1", "reviewer", "sess-1", Some("codex"));
     std::fs::write(
         brehon_root
             .join("runtime")
@@ -692,6 +691,7 @@ async fn test_request_review_rejects_total_review_livelock() {
         ("BREHON_AGENT_NAME", "supervisor-1"),
         ("BREHON_AGENT_ROLE", "supervisor"),
     ]);
+    crate::tools::agent::write_session_file("reviewer-1", "reviewer", "sess-1", Some("codex"));
     std::fs::write(
         brehon_root
             .join("runtime")
@@ -897,7 +897,7 @@ async fn test_reset_rounds_force_new_epoch_allows_manual_recovery() {
 }
 
 #[tokio::test]
-async fn test_request_review_starts_new_epoch_after_new_commit() {
+async fn test_request_review_rejects_new_commit_after_total_review_livelock() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let workspace = tempfile::tempdir().unwrap();
     let brehon_root = workspace.path().join(".brehon");
@@ -971,22 +971,19 @@ async fn test_request_review_starts_new_epoch_after_new_commit() {
         .await
         .unwrap();
 
+    assert_eq!(result.is_error, Some(true));
+    let text = match &result.content[0] {
+        ContentBlock::Text { text } => text.clone(),
+        _ => String::new(),
+    };
+    assert!(text.contains("review livelock"), "{text}");
     assert!(
-        result.is_error.is_none(),
-        "{}",
-        match &result.content[0] {
-            ContentBlock::Text { text } => text.clone(),
-            _ => String::new(),
-        }
+        text.contains("Refusing to start/reset review round 10"),
+        "{text}"
     );
-    let payload = result_payload(&result);
-    assert_eq!(payload["round"], 10);
-    assert_eq!(payload["cycle_round"], 1);
-    assert_eq!(payload["review_epoch_round"], 1);
-    assert_eq!(payload["new_review_epoch"], true);
     let state = read_review_state("T-new-epoch").expect("new review state");
-    assert_eq!(state.review_epoch_start_round, 10);
-    assert_eq!(state.cycle_start_round, 10);
+    assert_eq!(state.review_epoch_start_round, 1);
+    assert_eq!(state.cycle_start_round, 9);
 }
 
 #[tokio::test]

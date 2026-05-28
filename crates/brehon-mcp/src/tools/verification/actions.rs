@@ -592,29 +592,6 @@ fn next_action_after_review_outcome(task_id: &str, outcome: &str) -> Value {
     }
 }
 
-fn reviewed_commit_changed_for_new_epoch(
-    task_id: &str,
-    state: &ReviewState,
-    next_commit: &str,
-) -> bool {
-    let next_commit = next_commit.trim();
-    if next_commit.is_empty() {
-        return false;
-    }
-    let last_round = state.current_round.max(highest_round_on_disk(task_id));
-    let previous_request = read_round_request(task_id, state.current_round)
-        .or_else(|| read_round_request(task_id, last_round));
-    let Some(previous_commit) = previous_request
-        .as_ref()
-        .map(|request| request.commit.trim())
-        .filter(|commit| !commit.is_empty())
-    else {
-        return false;
-    };
-
-    !commits_refer_to_same_oid(previous_commit, next_commit)
-}
-
 impl VerificationTool {
     pub(super) async fn handle_request_review(&self, args: &Value) -> Result<ToolResult, McpError> {
         let task_id = match args.get("task_id").and_then(|v| v.as_str()) {
@@ -846,21 +823,16 @@ impl VerificationTool {
             .as_ref()
             .map(|state| state.max_rounds)
             .unwrap_or(self.config.policy.max_review_rounds);
-        let mut starts_new_review_epoch = existing_state.is_none();
+        let starts_new_review_epoch = existing_state.is_none();
         if let Some(state) = existing_state.as_ref() {
             if next_review_round_would_exceed_total_limit(state, next_round) {
-                if reviewed_commit_changed_for_new_epoch(task_id, state, &commit) {
-                    starts_new_review_epoch = true;
-                } else {
-                    let consumed_epoch_round =
-                        review_epoch_round(state, next_round.saturating_sub(1));
-                    return Ok(error_result(review_livelock_guard_message(
-                        task_id,
-                        consumed_epoch_round,
-                        next_round,
-                        max_rounds,
-                    )));
-                }
+                let consumed_epoch_round = review_epoch_round(state, next_round.saturating_sub(1));
+                return Ok(error_result(review_livelock_guard_message(
+                    task_id,
+                    consumed_epoch_round,
+                    next_round,
+                    max_rounds,
+                )));
             }
         }
         if !starts_new_review_epoch && next_cycle_round > max_rounds as u32 {
