@@ -5,7 +5,7 @@
 
 use async_trait::async_trait;
 use fjall::{Config, Keyspace, PartitionCreateOptions, PartitionHandle, PersistMode};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -74,11 +74,16 @@ pub struct FjallEventStoreInner {
     query_executor: QueryExecutor,
     queue_manager: QueueManager,
     run_store: RunStoreManager,
-    proof_store: crate::proof_store::ProofStoreManager,
+    proof_store: Option<crate::proof_store::ProofStoreManager>,
 }
 
 pub struct FjallEventStore {
     inner: Arc<FjallEventStoreInner>,
+}
+
+struct KeyspaceOpen {
+    keyspace: Keyspace,
+    proof_projection_quarantined: bool,
 }
 
 impl std::clone::Clone for FjallEventStore {
@@ -94,7 +99,8 @@ impl FjallEventStore {
         let path = path.as_ref();
         info!("Opening FjallEventStore at {:?}", path);
 
-        let keyspace = Config::new(path).open()?;
+        let keyspace_open = Self::open_keyspace_with_optional_projection_recovery(path)?;
+        let keyspace = keyspace_open.keyspace;
 
         let events =
             keyspace.open_partition(EVENTS_PARTITION, PartitionCreateOptions::default())?;
@@ -104,8 +110,43 @@ impl FjallEventStore {
         let archive =
             keyspace.open_partition(ARCHIVE_PARTITION, PartitionCreateOptions::default())?;
         let runs = keyspace.open_partition(RUNS_PARTITION, PartitionCreateOptions::default())?;
-        let proofs =
-            keyspace.open_partition(PROOFS_PARTITION, PartitionCreateOptions::default())?;
+        let mut proof_store =
+            match keyspace.open_partition(PROOFS_PARTITION, PartitionCreateOptions::default()) {
+                Ok(proofs) => Some(crate::proof_store::ProofStoreManager::new(
+                    keyspace.clone(),
+                    proofs,
+                )),
+                Err(err) => {
+                    tracing::error!(
+                        partition = PROOFS_PARTITION,
+                        error = %err,
+                        "Fjall proof projection unavailable; continuing without proof store"
+                    );
+                    None
+                }
+            };
+        if keyspace_open.proof_projection_quarantined {
+            if let Some(proof_store_ref) = proof_store.as_ref() {
+                match proof_store_ref.rebuild_from_events(&events) {
+                    Ok(applied) => {
+                        keyspace.persist(PersistMode::SyncAll)?;
+                        tracing::warn!(
+                            applied,
+                            partition = PROOFS_PARTITION,
+                            "Rebuilt quarantined Fjall proof projection from event log"
+                        );
+                    }
+                    Err(err) => {
+                        tracing::error!(
+                            partition = PROOFS_PARTITION,
+                            error = %err,
+                            "Failed to rebuild quarantined Fjall proof projection; continuing without proof store"
+                        );
+                        proof_store = None;
+                    }
+                }
+            }
+        }
 
         let seq = Self::load_seq(&meta, &events)?;
 
@@ -119,8 +160,6 @@ impl FjallEventStore {
         let query_executor = QueryExecutor::new(events.clone(), meta.clone());
         let queue_manager = QueueManager::new(queue.clone(), Self::queue_lock_scope(path));
         let run_store = RunStoreManager::new(keyspace.clone(), runs);
-        let proof_store = crate::proof_store::ProofStoreManager::new(keyspace.clone(), proofs);
-
         let views_watermark = Self::load_views_watermark(&meta)?;
         let events_watermark = Self::load_high_water_mark(&events)?;
         let views_are_valid = view_manager.validate_views(events_watermark)?;
@@ -184,6 +223,91 @@ impl FjallEventStore {
         Ok(Self { inner })
     }
 
+    fn open_keyspace_with_optional_projection_recovery(
+        path: &Path,
+    ) -> Result<KeyspaceOpen, StoreError> {
+        match Config::new(path).open() {
+            Ok(keyspace) => {
+                return Ok(KeyspaceOpen {
+                    keyspace,
+                    proof_projection_quarantined: false,
+                });
+            }
+            Err(err) => {
+                let original_error = err.to_string();
+                let proof_path = path.join("partitions").join(PROOFS_PARTITION);
+                if !proof_path.exists() {
+                    return Err(StoreError::Storage(original_error));
+                }
+
+                let quarantine_path = Self::unique_quarantine_path(path, &proof_path);
+                if let Some(parent) = quarantine_path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                if let Err(quarantine_err) = std::fs::rename(&proof_path, &quarantine_path) {
+                    return Err(StoreError::Storage(format!(
+                        "Fjall keyspace open failed ({original_error}) and optional proof projection could not be quarantined: {quarantine_err}"
+                    )));
+                }
+
+                tracing::error!(
+                    partition = PROOFS_PARTITION,
+                    original_error = %original_error,
+                    quarantine_path = %quarantine_path.display(),
+                    "Quarantined optional Fjall proof projection after keyspace recovery failed"
+                );
+
+                match Config::new(path).open() {
+                    Ok(keyspace) => Ok(KeyspaceOpen {
+                        keyspace,
+                        proof_projection_quarantined: true,
+                    }),
+                    Err(retry_err) => {
+                        let retry_error = retry_err.to_string();
+                        if !proof_path.exists() {
+                            if let Err(restore_err) = std::fs::rename(&quarantine_path, &proof_path)
+                            {
+                                tracing::error!(
+                                    partition = PROOFS_PARTITION,
+                                    quarantine_path = %quarantine_path.display(),
+                                    restore_error = %restore_err,
+                                    "Failed to restore quarantined Fjall proof projection after retry failed"
+                                );
+                            }
+                        }
+                        Err(StoreError::Storage(format!(
+                            "Fjall keyspace open failed after quarantining optional proof projection: {retry_error}; original error: {original_error}"
+                        )))
+                    }
+                }
+            }
+        }
+    }
+
+    fn unique_quarantine_path(db_path: &Path, partition_path: &Path) -> PathBuf {
+        let parent = db_path.join("quarantine");
+        let name = partition_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("partition");
+        let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%S%.3fZ");
+        for attempt in 0..1000 {
+            let suffix = if attempt == 0 {
+                format!("quarantined.{stamp}.{}", std::process::id())
+            } else {
+                format!("quarantined.{stamp}.{}.{}", std::process::id(), attempt)
+            };
+            let candidate = parent.join(format!("{name}.{suffix}"));
+            if !candidate.exists() {
+                return candidate;
+            }
+        }
+        parent.join(format!(
+            "{name}.quarantined.{stamp}.{}.fallback",
+            std::process::id()
+        ))
+    }
+
     fn queue_lock_scope(path: &Path) -> String {
         std::fs::canonicalize(path)
             .unwrap_or_else(|_| path.to_path_buf())
@@ -199,8 +323,12 @@ impl FjallEventStore {
         &self.inner.run_store
     }
 
-    pub(crate) fn proof_store(&self) -> &crate::proof_store::ProofStoreManager {
-        &self.inner.proof_store
+    pub fn proof_store_available(&self) -> bool {
+        self.inner.proof_store.is_some()
+    }
+
+    pub(crate) fn proof_store(&self) -> Option<&crate::proof_store::ProofStoreManager> {
+        self.inner.proof_store.as_ref()
     }
 
     pub(crate) fn events_partition(&self) -> &PartitionHandle {
@@ -881,8 +1009,10 @@ impl EventStore for FjallEventStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use brehon_ports::ProofStore;
     use brehon_types::{
-        EventKind, ReviewStatus, TaskStatus, TaskView, ViewOperation, ViewType, ViewUpdate,
+        EventKind, ProofBundleId, ReviewStatus, TaskId, TaskStatus, TaskView, ViewOperation,
+        ViewType, ViewUpdate,
     };
     use std::collections::HashSet;
     use tempfile::tempdir;
@@ -906,6 +1036,96 @@ mod tests {
         let events = store.stream(None, 10).await.unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].0.kind, event.kind);
+    }
+
+    #[tokio::test]
+    async fn opens_and_appends_when_proof_partition_is_unavailable() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("db");
+        let store = FjallEventStore::new(&db_path).unwrap();
+        assert!(store.proof_store_available());
+        store.close().unwrap();
+
+        let proofs_path = db_path.join("partitions").join(PROOFS_PARTITION);
+        std::fs::remove_dir_all(&proofs_path).unwrap();
+        std::fs::write(&proofs_path, b"not a partition directory").unwrap();
+
+        let reopened = FjallEventStore::new(&db_path)
+            .expect("core event store should open without proof projection");
+        assert!(!reopened.proof_store_available());
+
+        let event = Event {
+            kind: EventKind::TaskCreated {
+                task_id: "T-no-proof".into(),
+            },
+            timestamp: chrono::Utc::now(),
+            aggregate_id: "T-no-proof".into(),
+        };
+
+        let event_id = reopened.append(event.clone()).await.unwrap();
+        assert!(event_id.as_u64() > 0);
+        let events = reopened.stream(None, 10).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0.kind, event.kind);
+    }
+
+    #[tokio::test]
+    async fn quarantines_and_rebuilds_corrupt_proof_partition_that_blocks_keyspace_open() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("db");
+        let store = FjallEventStore::new(&db_path).unwrap();
+        let task_id = TaskId::new("T-corrupt-proof");
+        let proof_bundle_id = ProofBundleId::new("proof-T-corrupt-proof");
+        let now = chrono::Utc::now();
+        store
+            .append(Event {
+                kind: EventKind::ProofBundleCreated {
+                    proof_bundle_id: proof_bundle_id.clone(),
+                    task_id: task_id.clone(),
+                    run_ids: Vec::new(),
+                    created_at: now,
+                },
+                timestamp: now,
+                aggregate_id: task_id.as_str().to_string(),
+            })
+            .await
+            .unwrap();
+        store.rebuild_proof_projection().await.unwrap();
+        store.close().unwrap();
+
+        let proof_path = db_path.join("partitions").join(PROOFS_PARTITION);
+        std::fs::remove_dir_all(proof_path.join("segments")).unwrap();
+        std::fs::create_dir(proof_path.join("segments")).unwrap();
+        std::fs::write(
+            proof_path.join("levels"),
+            [
+                0x4c, 0x53, 0x4d, 0x02, 0x07, 0, 0, 0, 0x04, 0, 0, 0, 0, 0, 0, 0, 0x08, 0, 0, 0, 0,
+                0, 0, 0, 0x07, 0, 0, 0, 0, 0, 0, 0, 0x06, 0, 0, 0, 0, 0, 0, 0, 0x05, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            ],
+        )
+        .unwrap();
+
+        let reopened = FjallEventStore::new(&db_path)
+            .expect("proof projection corruption should not block core store open");
+        assert!(reopened.proof_store_available());
+        let bundle = reopened
+            .proof_bundle_for_task(&task_id)
+            .await
+            .unwrap()
+            .expect("proof projection should rebuild from event log");
+        assert_eq!(bundle.proof_bundle_id, proof_bundle_id);
+
+        let partition_names: Vec<String> = std::fs::read_dir(db_path.join("quarantine"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(
+            partition_names
+                .iter()
+                .any(|name| name.starts_with("proofs.quarantined.")),
+            "corrupt proof partition should be retained under a quarantine name"
+        );
     }
 
     #[test]

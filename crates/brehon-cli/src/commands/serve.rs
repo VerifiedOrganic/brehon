@@ -8,9 +8,8 @@ pub async fn execute() -> Result<()> {
 
     let project_root = resolve_project_root()?;
     let config = brehon_config::load_config(Some(&project_root))?;
-    let store = Arc::new(brehon_store_fjall::FjallEventStore::new(
-        resolve_state_path(&project_root, &config.context.db_path),
-    )?);
+    let store_path = resolve_state_path(&project_root, &config.context.db_path);
+    let store = Arc::new(brehon_store_fjall::FjallEventStore::new(&store_path)?);
     let search_index = Arc::new(
         brehon_search_tantivy::TantivySearchIndex::new(&resolve_state_path(
             &project_root,
@@ -18,11 +17,19 @@ pub async fn execute() -> Result<()> {
         ))
         .await?,
     );
+    let proof_store_available = store.proof_store_available();
     let mut server = McpServer::new("brehon", env!("CARGO_PKG_VERSION"))
         .with_event_store(store.clone())
-        .with_proof_store(store.clone())
-        .with_run_store(store)
+        .with_run_store(store.clone())
         .with_search_index(search_index);
+    if proof_store_available {
+        server = server.with_proof_store(store.clone());
+    } else {
+        tracing::error!(
+            path = %store_path.display(),
+            "Starting Brehon MCP server without durable proof projection; task coordination remains available"
+        );
+    }
     server.register_builtin_tools();
 
     if let Err(err) = write_mcp_server_metadata(&project_root) {

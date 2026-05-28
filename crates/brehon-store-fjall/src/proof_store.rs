@@ -444,8 +444,10 @@ impl ProofStoreManager {
 #[async_trait]
 impl ProofStore for FjallEventStore {
     async fn rebuild_proof_projection(&self) -> ProofStoreResult<usize> {
-        self.proof_store()
-            .rebuild_from_events(self.events_partition())
+        let Some(proof_store) = self.proof_store() else {
+            return Err(proof_projection_unavailable());
+        };
+        proof_store.rebuild_from_events(self.events_partition())
     }
 
     async fn apply_proof_event(
@@ -453,26 +455,44 @@ impl ProofStore for FjallEventStore {
         event: &Event,
         event_id: EventId,
     ) -> ProofStoreResult<Option<ProofBundle>> {
-        self.proof_store().apply_event(event, event_id)
+        let Some(proof_store) = self.proof_store() else {
+            return Err(proof_projection_unavailable());
+        };
+        proof_store.apply_event(event, event_id)
     }
 
     async fn proof_bundle(
         &self,
         proof_bundle_id: &ProofBundleId,
     ) -> ProofStoreResult<Option<ProofBundle>> {
-        self.proof_store().get_bundle(proof_bundle_id)
+        let Some(proof_store) = self.proof_store() else {
+            return Err(proof_projection_unavailable());
+        };
+        proof_store.get_bundle(proof_bundle_id)
     }
 
     async fn proof_bundle_for_task(
         &self,
         task_id: &TaskId,
     ) -> ProofStoreResult<Option<ProofBundle>> {
-        self.proof_store().get_bundle_for_task(task_id)
+        let Some(proof_store) = self.proof_store() else {
+            return Err(proof_projection_unavailable());
+        };
+        proof_store.get_bundle_for_task(task_id)
     }
 
     async fn proof_bundle_for_run(&self, run_id: &RunId) -> ProofStoreResult<Option<ProofBundle>> {
-        self.proof_store().get_bundle_for_run(run_id)
+        let Some(proof_store) = self.proof_store() else {
+            return Err(proof_projection_unavailable());
+        };
+        proof_store.get_bundle_for_run(run_id)
     }
+}
+
+fn proof_projection_unavailable() -> ProofStoreError {
+    ProofStoreError::Storage(
+        "proof projection is unavailable; rebuild or archive the proofs partition".to_string(),
+    )
 }
 
 #[cfg(test)]

@@ -72,10 +72,15 @@ fn attach_durable_backing(mut server: McpServer, env: &[(String, String)]) -> Mc
     match brehon_store_fjall::FjallEventStore::new(&db_path) {
         Ok(store) => {
             let store = Arc::new(store);
+            let proof_store_available = store.proof_store_available();
             server = server
                 .with_event_store(store.clone())
-                .with_proof_store(store.clone())
-                .with_run_store(store);
+                .with_run_store(store.clone());
+            if proof_store_available {
+                server = server.with_proof_store(store);
+            } else {
+                tracing::warn!(path = %db_path.display(), "Direct MCP tools running without durable proof projection");
+            }
         }
         Err(err) => {
             tracing::warn!(path = %db_path.display(), error = %err, "Direct MCP tools running without fjall backing");
