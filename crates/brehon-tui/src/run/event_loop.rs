@@ -4661,6 +4661,47 @@ Do not call request_review, reseat_panel, reassign_panel, release_panel, reset_r
         .expect("task file");
     }
 
+    fn write_active_assigned_task_with_assignment_fixture(
+        brehon_root: &std::path::Path,
+        assigned_at: chrono::DateTime<chrono::Utc>,
+        progress_started: bool,
+    ) {
+        let runtime_dir = brehon_root.join("runtime");
+        std::fs::create_dir_all(runtime_dir.join("tasks")).expect("tasks dir");
+        let mut assignment_propagation = serde_json::json!({
+            "owner": "worker-1",
+            "assignment_kind": "task",
+            "assigned_at": assigned_at.to_rfc3339(),
+            "prompt_id": "prompt-worker-1",
+            "delivery_method": "queued",
+            "acknowledged_at": (assigned_at + chrono::Duration::seconds(5)).to_rfc3339(),
+            "acknowledged_by": "worker-1",
+            "acknowledged_via": "task action=mine"
+        });
+        if progress_started {
+            assignment_propagation["progress_started_at"] = serde_json::Value::String(
+                (assigned_at + chrono::Duration::seconds(10)).to_rfc3339(),
+            );
+            assignment_propagation["progress_started_by"] =
+                serde_json::Value::String("worker-1".to_string());
+            assignment_propagation["progress_started_via"] =
+                serde_json::Value::String("task action=progress".to_string());
+        }
+        std::fs::write(
+            runtime_dir.join("tasks").join("T-owned.json"),
+            serde_json::json!({
+                "task_id": "T-owned",
+                "title": "Owned task",
+                "status": "in_progress",
+                "task_type": "task",
+                "assignee": "worker-1",
+                "assignment_propagation": assignment_propagation
+            })
+            .to_string(),
+        )
+        .expect("task file");
+    }
+
     fn write_inactive_task_fixture(brehon_root: &std::path::Path, task_id: &str) {
         let runtime_dir = brehon_root.join("runtime");
         std::fs::create_dir_all(runtime_dir.join("tasks")).expect("tasks dir");
@@ -6291,6 +6332,198 @@ TypeError: Cannot read properties of undefined"#,
             .ctx
             .active_worker_recovery_nudges_sent
             .contains_key(&("worker-1".to_string(), "T-owned".to_string())));
+    }
+
+    #[test]
+    fn active_assigned_worker_without_task_progress_gets_nudged_despite_recent_output() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let brehon_root = temp.path().join(".brehon");
+        write_active_assigned_task_with_assignment_fixture(
+            &brehon_root,
+            chrono::Utc::now() - chrono::Duration::seconds(120),
+            false,
+        );
+        write_worker_worktree_fixture(&brehon_root, "worker-1");
+
+        let mut mux = Mux::new(24, 80);
+        mux.add_pane(make_worker_pane("worker-1"));
+        let mut harness = harness_with_mux(mux);
+        let now = Instant::now();
+        harness.ctx.auto_recover_threshold = Duration::from_secs(60);
+        harness.ctx.stall_check_interval = Duration::ZERO;
+        harness.ctx.last_stall_check = now - Duration::from_secs(60);
+        harness
+            .ctx
+            .last_activity
+            .insert("worker-1".to_string(), now);
+        harness
+            .ctx
+            .dashboard_data
+            .lock()
+            .expect("dashboard")
+            .brehon_root = Some(brehon_root.clone());
+
+        crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
+
+        let routed = recv_route(&harness.rx);
+        assert_eq!(routed.command.target.pane_id.as_deref(), Some("worker-1"));
+        assert!(matches!(
+            routed.command.kind,
+            RuntimeCommandKind::SendPrompt { ref text, .. }
+                if text.contains("No task progress recorded")
+                    && text.contains("T-owned")
+                    && text.contains("action=progress")
+                    && text.contains("action=complete")
+        ));
+        assert!(
+            harness.rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "recent terminal output must only get a no-progress nudge on the first sweep"
+        );
+        assert!(harness
+            .ctx
+            .active_worker_recovery_nudges_sent
+            .contains_key(&("worker-1".to_string(), "T-owned".to_string())));
+        let task = serde_json::from_str::<serde_json::Value>(
+            &std::fs::read_to_string(
+                brehon_root
+                    .join("runtime")
+                    .join("tasks")
+                    .join("T-owned.json"),
+            )
+            .expect("task file"),
+        )
+        .expect("task json");
+        assert_eq!(task["status"], "in_progress");
+        assert_eq!(task["assignee"], "worker-1");
+    }
+
+    #[test]
+    fn active_assigned_worker_without_task_progress_reassigns_after_nudge_despite_recent_output() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let brehon_root = temp.path().join(".brehon");
+        write_active_assigned_task_with_assignment_fixture(
+            &brehon_root,
+            chrono::Utc::now() - chrono::Duration::seconds(180),
+            false,
+        );
+        write_worker_worktree_fixture(&brehon_root, "worker-1");
+        write_worker_session_fixture(&brehon_root, "worker-2");
+
+        let mut mux = Mux::new(24, 80);
+        mux.add_pane(make_worker_pane("worker-1"));
+        mux.add_pane(make_worker_pane("worker-2"));
+        let mut harness = harness_with_mux(mux);
+        let now = Instant::now();
+        harness.ctx.auto_recover_threshold = Duration::from_secs(60);
+        harness.ctx.stall_check_interval = Duration::ZERO;
+        harness.ctx.last_stall_check = now - Duration::from_secs(60);
+        harness.ctx.active_worker_recovery_nudges_sent.insert(
+            ("worker-1".to_string(), "T-owned".to_string()),
+            now - Duration::from_secs(90),
+        );
+        harness
+            .ctx
+            .last_activity
+            .insert("worker-1".to_string(), now);
+        harness
+            .ctx
+            .dashboard_data
+            .lock()
+            .expect("dashboard")
+            .brehon_root = Some(brehon_root.clone());
+
+        crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
+
+        let recycled = recv_route(&harness.rx);
+        assert_eq!(recycled.command.target.pane_id.as_deref(), Some("worker-1"));
+        assert!(matches!(
+            recycled.command.kind,
+            RuntimeCommandKind::RecyclePane { ref reason }
+                if reason == "auto-fence recovered stalled worker pane after task T-owned handoff"
+        ));
+        let reassigned = recv_route(&harness.rx);
+        assert_eq!(
+            reassigned.command.target.pane_id.as_deref(),
+            Some("worker-2")
+        );
+        assert!(matches!(
+            reassigned.command.kind,
+            RuntimeCommandKind::SendPrompt { ref text, .. }
+                if text.contains("You have been assigned recovered task T-owned: Owned task")
+                    && text.contains("worker-1")
+        ));
+        assert!(
+            harness.rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "no-progress recovery should not emit extra same-sweep work"
+        );
+
+        let task = serde_json::from_str::<serde_json::Value>(
+            &std::fs::read_to_string(
+                brehon_root
+                    .join("runtime")
+                    .join("tasks")
+                    .join("T-owned.json"),
+            )
+            .expect("task file"),
+        )
+        .expect("task json");
+        assert_eq!(task["status"], "assigned");
+        assert_eq!(task["assignee"], "worker-2");
+        assert!(task["recovery_note"]
+            .as_str()
+            .unwrap_or("")
+            .contains("Automatically recovered stalled task"));
+    }
+
+    #[test]
+    fn active_assigned_worker_with_task_progress_receipt_is_not_no_progress_recovered() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let brehon_root = temp.path().join(".brehon");
+        write_active_assigned_task_with_assignment_fixture(
+            &brehon_root,
+            chrono::Utc::now() - chrono::Duration::seconds(180),
+            true,
+        );
+        write_worker_worktree_fixture(&brehon_root, "worker-1");
+        write_worker_session_fixture(&brehon_root, "worker-2");
+
+        let mut mux = Mux::new(24, 80);
+        mux.add_pane(make_worker_pane("worker-1"));
+        mux.add_pane(make_worker_pane("worker-2"));
+        let mut harness = harness_with_mux(mux);
+        let now = Instant::now();
+        harness.ctx.auto_recover_threshold = Duration::from_secs(60);
+        harness.ctx.stall_check_interval = Duration::ZERO;
+        harness.ctx.last_stall_check = now - Duration::from_secs(60);
+        harness
+            .ctx
+            .last_activity
+            .insert("worker-1".to_string(), now);
+        harness
+            .ctx
+            .dashboard_data
+            .lock()
+            .expect("dashboard")
+            .brehon_root = Some(brehon_root.clone());
+
+        crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
+
+        assert!(
+            harness.rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "valid task progress receipt must suppress no-progress recovery"
+        );
+        let task = serde_json::from_str::<serde_json::Value>(
+            &std::fs::read_to_string(
+                brehon_root
+                    .join("runtime")
+                    .join("tasks")
+                    .join("T-owned.json"),
+            )
+            .expect("task file"),
+        )
+        .expect("task json");
+        assert_eq!(task["status"], "in_progress");
+        assert_eq!(task["assignee"], "worker-1");
     }
 
     #[test]

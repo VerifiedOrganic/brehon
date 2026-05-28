@@ -27,8 +27,8 @@ use super::recovery::{
     block_task_for_stalled_worker_manual_recovery, clear_agent_health_marker,
     inspect_worker_worktree_state, prompt_blocked_detail, prompt_blocked_info,
     push_dashboard_event, quarantined_supervisor_names, quarantined_worker_names,
-    read_agent_health_marker, read_prompt_retry_deferral_snapshot, sync_worker_task_contexts,
-    write_prompt_blocked_recovery_failed_marker_or_clear_stale_marker,
+    read_agent_health_marker, read_prompt_retry_deferral_snapshot, read_raw_task_file,
+    sync_worker_task_contexts, write_prompt_blocked_recovery_failed_marker_or_clear_stale_marker,
     PROMPT_BLOCKED_HEALTH_REASON, PROMPT_BLOCKED_RECOVERY_FAILED_HEALTH_REASON,
     PROMPT_BLOCKED_RECOVERY_FAILURE_ACTIVITY, STALLED_WORKER_MANUAL_RECOVERY_ACTIVITY,
 };
@@ -1595,6 +1595,45 @@ fn send_active_worker_recovery_nudge(
     true
 }
 
+fn send_no_task_progress_recovery_nudge(
+    ctx: &mut EventLoopCtx,
+    worker_id: &str,
+    task: &TaskInfo,
+    assigned_mins: u64,
+    now: std::time::Instant,
+) -> bool {
+    let Some(pane) = ctx.mux.get(worker_id) else {
+        return false;
+    };
+    let task_cmd = format!("{}task", pane.cli_type().capabilities().tool_prefix);
+    let prompt = format!(
+        "[brehon] No task progress recorded for {task_id}: {title}\n\n\
+         This task was assigned to you {assigned_mins}m ago, but Brehon has not seen a \
+         progress, checkpoint, complete, or blocked task call for this assignment. \
+         Terminal output, prose, and exploratory tool calls do not update task lifecycle state.\n\n\
+         Make exactly one Brehon task call now:\n\
+         - Still working: `{task_cmd} action=progress id={task_id} percent=<n> notes=\"<status>\" activity=<reading|editing|testing|reviewing>`\n\
+         - Ready for review: `{task_cmd} action=complete id={task_id} notes=\"<summary>\" activity=testing`\n\
+         - Blocked: `{task_cmd} action=update id={task_id} status=blocked blockers=\"<reason>\"`\n\n\
+         Do not narrate a plan. Call the Brehon MCP tool.",
+        task_id = task.id,
+        title = task.title,
+    );
+    if !dispatch_runtime_prompt(ctx, worker_id, prompt, None) {
+        return false;
+    }
+    ctx.active_worker_recovery_nudges_sent
+        .insert(active_worker_recovery_key(worker_id, &task.id), now);
+    push_dashboard_event(
+        &ctx.dashboard_data,
+        format!(
+            "nudged assigned worker {} for task {} after {}m without Brehon task progress",
+            worker_id, task.id, assigned_mins
+        ),
+    );
+    true
+}
+
 fn send_dirty_worktree_handoff_nudge(
     ctx: &mut EventLoopCtx,
     worker_id: &str,
@@ -1621,6 +1660,151 @@ fn send_dirty_worktree_handoff_nudge(
         ),
     );
     true
+}
+
+fn task_assignment_without_progress_age(
+    brehon_root: &std::path::Path,
+    task: &TaskInfo,
+    worker_id: &str,
+    now_utc: chrono::DateTime<chrono::Utc>,
+) -> Option<std::time::Duration> {
+    let raw = read_raw_task_file(brehon_root, &task.id)?;
+    let propagation = raw.get("assignment_propagation")?.as_object()?;
+    if propagation
+        .get("owner")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        != Some(worker_id)
+    {
+        return None;
+    }
+    if propagation
+        .get("assignment_kind")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        != Some("task")
+    {
+        return None;
+    }
+
+    let assigned_at = parse_rfc3339_utc(
+        propagation
+            .get("assigned_at")
+            .and_then(|value| value.as_str()),
+    )?;
+    let progress_started_at = propagation
+        .get("progress_started_at")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .and_then(|value| parse_rfc3339_utc(Some(value)));
+    let progress_started_by_matches = propagation
+        .get("progress_started_by")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .is_none_or(|owner| owner == worker_id);
+    if progress_started_by_matches
+        && progress_started_at.is_some_and(|started_at| started_at >= assigned_at)
+    {
+        return None;
+    }
+
+    let age = now_utc.signed_duration_since(assigned_at);
+    if age < chrono::Duration::zero() {
+        return None;
+    }
+    age.to_std().ok()
+}
+
+fn parse_rfc3339_utc(value: Option<&str>) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(value?)
+        .ok()
+        .map(|timestamp| timestamp.with_timezone(&chrono::Utc))
+}
+
+fn recover_assigned_workers_without_task_progress(
+    ctx: &mut EventLoopCtx,
+    brehon_root: &std::path::Path,
+    tasks_snapshot: &mut Vec<TaskInfo>,
+    sessions_snapshot: &mut std::collections::HashMap<String, (String, String, String)>,
+    now: std::time::Instant,
+) {
+    let now_utc = chrono::Utc::now();
+    let candidates = tasks_snapshot
+        .iter()
+        .filter_map(|task| {
+            let worker_id = task.assignee.as_deref()?;
+            if !active_worker_task(task, worker_id) {
+                return None;
+            }
+            let pane = ctx.mux.get(worker_id)?;
+            if *pane.kind() != PaneKind::Worker
+                || pane.has_exited()
+                || pane.is_tool_executing()
+                || matches!(
+                    pane.pane_state(),
+                    Some(
+                        PaneState::Busy { .. } | PaneState::Blocked { .. } | PaneState::Dead { .. }
+                    )
+                )
+            {
+                return None;
+            }
+            let assignment_age =
+                task_assignment_without_progress_age(brehon_root, task, worker_id, now_utc)?;
+            (assignment_age >= ctx.auto_recover_threshold).then(|| {
+                (
+                    worker_id.to_string(),
+                    task.clone(),
+                    (assignment_age.as_secs() / 60).max(1),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+
+    for (worker_id, task, assigned_mins) in candidates {
+        if agent_is_quarantined_for_run(brehon_root, &worker_id)
+            || worker_reset_or_recycle_command_pending(ctx, &worker_id)
+        {
+            continue;
+        }
+        let key = active_worker_recovery_key(&worker_id, &task.id);
+        if ctx.active_worker_recovery_resets_sent.contains_key(&key) {
+            continue;
+        }
+        match ctx.active_worker_recovery_nudges_sent.get(&key).copied() {
+            Some(sent_at) if now.duration_since(sent_at) >= ctx.auto_recover_threshold => {}
+            Some(_) => continue,
+            None => {
+                send_no_task_progress_recovery_nudge(ctx, &worker_id, &task, assigned_mins, now);
+                continue;
+            }
+        }
+
+        let live_sessions =
+            worker_sessions_available_for_auto_recovery(ctx, brehon_root, sessions_snapshot);
+        if let Some(outcome) = attempt_auto_recover_stalled_worker(
+            brehon_root,
+            &worker_id,
+            tasks_snapshot,
+            &live_sessions,
+            assigned_mins,
+        ) {
+            if handle_auto_recovered_stalled_worker(
+                ctx,
+                brehon_root,
+                &task,
+                tasks_snapshot,
+                sessions_snapshot,
+                assigned_mins,
+                now,
+                outcome,
+            ) {
+                continue;
+            }
+        }
+        reset_active_assigned_worker(ctx, &worker_id, &task.id, assigned_mins, false, now);
+    }
 }
 
 pub(crate) fn build_dirty_worktree_handoff_nudge_message(
@@ -2477,6 +2661,13 @@ pub(super) fn detect_and_handle_stalls(ctx: &mut EventLoopCtx) {
     // checkpoint (new commit SHA) legitimately earns a new nudge window.
     send_post_checkpoint_handoff_nudges(ctx, &tasks_snapshot, now);
     if let Some(root) = brehon_root.as_ref() {
+        recover_assigned_workers_without_task_progress(
+            ctx,
+            root,
+            &mut tasks_snapshot,
+            &mut sessions_snapshot,
+            now,
+        );
         send_dirty_worktree_handoff_nudges(ctx, root, &tasks_snapshot, now);
     }
 
