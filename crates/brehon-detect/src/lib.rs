@@ -324,7 +324,12 @@ pub fn default_rules() -> Vec<PatternRule> {
                 "usage limit",
                 "quota exceeded",
                 "credit balance",
+                "context window exceeds limit",
+                "context window exceeds",
+                "context window exceeded",
                 "context length exceeded",
+                "maximum context length",
+                "context limit exceeded",
                 "token limit",
             ],
         ),
@@ -392,6 +397,23 @@ mod tests {
         assert_eq!(detections[0].meta.source, RuntimeSource::Detector);
         assert_eq!(detections[0].meta.pane_id, "worker-1");
         assert_eq!(detections[0].meta.generation, 3);
+    }
+
+    #[tokio::test]
+    async fn detects_provider_context_window_limit_from_output_bytes() {
+        let engine = PatternDetectionEngine::default();
+        let detections = engine
+            .observe(output_event(
+                "API Error: 400 invalid params, context window exceeds limit (2013)\n",
+            ))
+            .await
+            .expect("observe");
+
+        assert!(detections.iter().any(|event| matches!(
+            &event.kind,
+            RuntimeEventKind::DetectionEvent(detection)
+                if detection.rule_id == "usage_limit.warning"
+        )));
     }
 
     #[tokio::test]

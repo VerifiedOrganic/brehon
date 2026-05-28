@@ -156,6 +156,22 @@ impl Mux {
         ]
     }
 
+    fn terminal_provider_context_limit_keywords() -> &'static [&'static str] {
+        &[
+            "context window exceeds limit",
+            "context window exceeds",
+            "context window exceeded",
+            "context length exceeded",
+            "maximum context length",
+            "context limit exceeded",
+            "token limit exceeded",
+        ]
+    }
+
+    fn terminal_provider_context_limit_signal_tokens() -> &'static [&'static str] {
+        &["context", "token limit", "maximum context"]
+    }
+
     fn ascii_insensitive_contains(haystack: &[u8], needle: &[u8]) -> bool {
         if needle.is_empty() {
             return true;
@@ -245,6 +261,20 @@ impl Mux {
                 && !Self::terminal_prompt_status_line_is_informational(line)
                 && Self::terminal_prompt_keywords().iter().any(|needle| {
                     Self::ascii_insensitive_contains(line.as_bytes(), needle.as_bytes())
+                })
+        })
+    }
+
+    fn terminal_provider_context_limit_line(text: &str) -> Option<&str> {
+        text.lines().rev().map(str::trim).find(|line| {
+            if line.is_empty() {
+                return false;
+            }
+            let stripped = Self::strip_ansi_escape_sequences(line);
+            Self::terminal_provider_context_limit_keywords()
+                .iter()
+                .any(|needle| {
+                    Self::ascii_insensitive_contains(stripped.as_bytes(), needle.as_bytes())
                 })
         })
     }
@@ -370,6 +400,7 @@ impl Mux {
     fn pane_output_may_contain_blocking_prompt(prefix: &str, data: &[u8]) -> bool {
         Self::terminal_prompt_signal_tokens()
             .iter()
+            .chain(Self::terminal_provider_context_limit_signal_tokens().iter())
             .any(|needle| Self::ascii_insensitive_window_contains(prefix, data, needle.as_bytes()))
     }
 
@@ -423,15 +454,49 @@ impl Mux {
         })
     }
 
+    fn blocked_info_from_provider_context_limit_text(
+        pane: &crate::pane::Pane,
+        text: &str,
+        viewport: &str,
+    ) -> Option<RuntimePaneBlockInfo> {
+        let line = Self::terminal_provider_context_limit_line(text)?;
+        Some(RuntimePaneBlockInfo {
+            kind: RuntimePaneBlockKind::TerminalPrompt,
+            summary: format!(
+                "provider context limit blocked automatic recovery: {}",
+                Self::truncate_blocked_text(line, 160)
+            ),
+            command_or_tool: Some(Self::truncate_blocked_text(line, 240)),
+            request_id: Self::pane_prompt_id_for_blocked(pane),
+            task_id: pane.assignment_task_id(),
+            excerpt: Self::terminal_prompt_excerpt(viewport, Some(line)),
+        })
+    }
+
     fn blocked_info_from_terminal_prompt(
         pane: &crate::pane::Pane,
         prefilter_window: &str,
     ) -> Option<RuntimePaneBlockInfo> {
         let viewport = pane.dump_viewport().ok()?;
         let recent_viewport = Self::terminal_prompt_recent_viewport_text(&viewport);
-        Self::blocked_info_from_terminal_prompt_text(pane, &recent_viewport, &viewport).or_else(
-            || Self::blocked_info_from_terminal_prompt_text(pane, prefilter_window, &viewport),
-        )
+        Self::blocked_info_from_terminal_prompt_text(pane, &recent_viewport, &viewport)
+            .or_else(|| {
+                Self::blocked_info_from_provider_context_limit_text(
+                    pane,
+                    &recent_viewport,
+                    &viewport,
+                )
+            })
+            .or_else(|| {
+                Self::blocked_info_from_terminal_prompt_text(pane, prefilter_window, &viewport)
+            })
+            .or_else(|| {
+                Self::blocked_info_from_provider_context_limit_text(
+                    pane,
+                    prefilter_window,
+                    &viewport,
+                )
+            })
     }
 
     fn permission_resolution_matches_blocked_request(

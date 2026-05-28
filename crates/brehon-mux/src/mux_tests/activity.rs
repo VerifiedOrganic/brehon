@@ -62,6 +62,53 @@ fn capture_debug_logs(run: impl FnOnce()) -> String {
     capture_logs_at(tracing::Level::DEBUG, run)
 }
 
+fn mux_with_busy_worker_for_output(pane_id: &str) -> (Mux, Generation) {
+    let mut mux = Mux::new(24, 80);
+    let pane = Pane::worker(
+        pane_id,
+        PathBuf::from("/tmp"),
+        None,
+        "supervisor",
+        &AgentAdapter::BuiltIn(SupervisorCli::Codex),
+        None,
+        None,
+        24,
+        80,
+        None,
+        None,
+        None,
+    )
+    .expect("create worker pane");
+    mux.add_pane(pane);
+
+    let generation = mux
+        .get(pane_id)
+        .expect("worker pane exists")
+        .current_generation();
+    let now = std::time::Instant::now();
+    let pane = mux.get_mut(pane_id).expect("worker pane exists");
+    pane.set_pane_state(PaneState::Busy {
+        prompt_id: brehon_types::PromptId::new("busy-prompt".to_string()),
+        generation,
+        delivered_at: now,
+        last_activity_at: now,
+    });
+    pane.set_task_context(crate::TaskContextSnapshot {
+        task_id: "T-output".to_string(),
+        title: "Output task".to_string(),
+        status: brehon_types::task::TaskStatus::InProgress,
+        completion_mode: None,
+        merge_target: None,
+        parent_id: None,
+        epic_branch: None,
+        epic_worktree: None,
+        blocked_reason: None,
+        updated_at: std::time::Instant::now(),
+    });
+
+    (mux, generation)
+}
+
 #[test]
 fn test_activity_events_drive_pane_state_transitions() {
     let mut mux = Mux::new(24, 80);
@@ -1700,6 +1747,108 @@ fn test_terminal_prompt_output_detects_split_keyword_across_chunks() {
         }
         other => panic!("expected blocked pane state, got {other:?}"),
     }
+}
+
+#[test]
+fn test_provider_context_limit_output_blocks_worker() {
+    let (mut mux, generation) = mux_with_busy_worker_for_output("minimax-worker");
+
+    mux.event_tx
+        .try_send(MuxEvent::PaneOutput {
+            pane_id: "minimax-worker".to_string(),
+            data: b"API Error: 400 invalid params, context window exceeds limit (2013)\r\n"
+                .to_vec(),
+            generation,
+        })
+        .expect("queue context limit output");
+    let (_bytes, _events) = mux.poll_batch();
+
+    let pane = mux.get("minimax-worker").expect("worker pane exists");
+    match pane.pane_state() {
+        Some(PaneState::Blocked { info, .. }) => {
+            assert_eq!(
+                info.kind,
+                brehon_types::RuntimePaneBlockKind::TerminalPrompt
+            );
+            assert_eq!(
+                info.command_or_tool.as_deref(),
+                Some("API Error: 400 invalid params, context window exceeds limit (2013)")
+            );
+            assert_eq!(info.request_id.as_deref(), Some("busy-prompt"));
+            assert_eq!(info.task_id.as_deref(), Some("T-output"));
+            assert!(
+                info.summary
+                    .starts_with("provider context limit blocked automatic recovery:")
+            );
+        }
+        other => panic!("expected blocked pane state, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_provider_context_limit_output_detects_split_phrase_across_chunks() {
+    let (mut mux, generation) = mux_with_busy_worker_for_output("minimax-worker");
+
+    mux.event_tx
+        .try_send(MuxEvent::PaneOutput {
+            pane_id: "minimax-worker".to_string(),
+            data: b"API Error: 400 invalid params, context window".to_vec(),
+            generation,
+        })
+        .expect("queue first context limit output chunk");
+    let (_bytes, _events) = mux.poll_batch();
+    assert!(matches!(
+        mux.get("minimax-worker")
+            .expect("worker pane exists")
+            .pane_state(),
+        Some(PaneState::Busy { .. })
+    ));
+
+    mux.event_tx
+        .try_send(MuxEvent::PaneOutput {
+            pane_id: "minimax-worker".to_string(),
+            data: b" exceeds limit (2013)\r\n".to_vec(),
+            generation,
+        })
+        .expect("queue second context limit output chunk");
+    let (_bytes, _events) = mux.poll_batch();
+
+    let pane = mux.get("minimax-worker").expect("worker pane exists");
+    match pane.pane_state() {
+        Some(PaneState::Blocked { info, .. }) => {
+            assert_eq!(
+                info.kind,
+                brehon_types::RuntimePaneBlockKind::TerminalPrompt
+            );
+            assert_eq!(
+                info.command_or_tool.as_deref(),
+                Some("API Error: 400 invalid params, context window exceeds limit (2013)")
+            );
+            assert_eq!(info.request_id.as_deref(), Some("busy-prompt"));
+        }
+        other => panic!("expected blocked pane state, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_context_usage_status_line_does_not_block_worker() {
+    let (mut mux, generation) = mux_with_busy_worker_for_output("minimax-worker");
+
+    mux.event_tx
+        .try_send(MuxEvent::PaneOutput {
+            pane_id: "minimax-worker".to_string(),
+            data: b"224k/200k (111%)\r\n100% context used\r\n".to_vec(),
+            generation,
+        })
+        .expect("queue context usage status output");
+    let (_bytes, _events) = mux.poll_batch();
+
+    assert!(matches!(
+        mux.get("minimax-worker")
+            .expect("worker pane exists")
+            .pane_state(),
+        Some(PaneState::Busy { .. })
+    ));
 }
 
 #[test]
