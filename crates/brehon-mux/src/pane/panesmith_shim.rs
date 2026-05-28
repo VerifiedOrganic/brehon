@@ -20,8 +20,8 @@ use panesmith::{
 #[cfg(test)]
 pub(crate) const FORCE_PANESMITH_SPAWN_FAILURE_PANE_ID: &str = "__brehon_test_panesmith_spawn_fail";
 
-const BREHON_PANESMITH_SCROLLBACK_LINES: usize = 2_000;
-const BREHON_PANESMITH_SCROLLBACK_BYTES: usize = 8 * 1024 * 1024;
+const BREHON_PANESMITH_SCROLLBACK_LINES: usize = 500;
+const BREHON_PANESMITH_SCROLLBACK_BYTES: usize = 2 * 1024 * 1024;
 const BREHON_PANESMITH_EVENT_LOG_EVENTS: usize = 2_000;
 const BREHON_PANESMITH_MAX_PTY_FRAMES_PER_DRAIN: usize = 4;
 

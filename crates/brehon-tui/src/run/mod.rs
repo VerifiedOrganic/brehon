@@ -492,6 +492,8 @@ pub fn run_tui_with_panels_and_runtime_commands(
         recent_runtime_commands,
         pending_runtime_approval_resolutions,
         entry_chrome_fade_complete: false,
+        last_panesmith_snapshot_panes: std::collections::BTreeSet::new(),
+        force_panesmith_snapshot_refresh: true,
         project_config_loader,
         needs_redraw: true,
     };

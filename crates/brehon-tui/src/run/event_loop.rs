@@ -220,6 +220,8 @@ pub(crate) struct EventLoopCtx {
     pub recent_runtime_commands: Vec<RuntimeCommandActivity>,
     pub pending_runtime_approval_resolutions: Vec<PendingRuntimeApprovalResolution>,
     pub entry_chrome_fade_complete: bool,
+    pub last_panesmith_snapshot_panes: BTreeSet<String>,
+    pub force_panesmith_snapshot_refresh: bool,
 
     /// Loads the merged project `BrehonConfig` on demand. Injected from
     /// `brehon-cli` so this crate can stay free of a `brehon-config` dep.
@@ -276,6 +278,17 @@ fn visible_panesmith_snapshot_panes(
         }
     }
     panes
+}
+
+fn panesmith_snapshot_refresh_targets(
+    current: &BTreeSet<String>,
+    previous: &BTreeSet<String>,
+    force_refresh: bool,
+) -> BTreeSet<String> {
+    if force_refresh {
+        return current.clone();
+    }
+    current.difference(previous).cloned().collect()
 }
 
 fn pane_is_visible_for_output(
@@ -2272,6 +2285,7 @@ fn resize_panes(ctx: &mut EventLoopCtx, terminal_size: &Rect) {
         ctx.group_tab,
         ctx.has_panels,
     );
+    ctx.force_panesmith_snapshot_refresh = true;
 
     if !ctx.runtime_agent_factory_host_owned || !ctx.runtime_terminal_host_absolute_resize {
         return;
@@ -3132,8 +3146,8 @@ pub(super) fn new_headless_event_loop_ctx(
             drain_timeout_secs: None,
             worktree_root: None,
         },
-        tick_active: Duration::from_millis(16),
-        tick_idle: Duration::from_millis(100),
+        tick_active: Duration::from_millis(50),
+        tick_idle: Duration::from_millis(200),
         idle_threshold: Duration::from_secs(1),
         last_output_at: now,
         started_at: now,
@@ -3203,6 +3217,8 @@ pub(super) fn new_headless_event_loop_ctx(
         recent_runtime_commands: Vec::new(),
         pending_runtime_approval_resolutions: Vec::new(),
         entry_chrome_fade_complete: false,
+        last_panesmith_snapshot_panes: BTreeSet::new(),
+        force_panesmith_snapshot_refresh: true,
         project_config_loader: crate::run::no_project_config_loader(),
         needs_redraw: false,
         runtime_agent_factory_host_owned,
@@ -3531,9 +3547,6 @@ pub(super) fn run(ctx: &mut EventLoopCtx) -> io::Result<()> {
         }
 
         if ctx.needs_redraw {
-            for pane_id in &panesmith_snapshot_panes {
-                let _ = ctx.mux.refresh_panesmith_snapshot(pane_id);
-            }
             if ctx.pending_initial_resize {
                 if let Ok(size) = ctx.terminal.size() {
                     let terminal_size = size.into();
@@ -3541,6 +3554,16 @@ pub(super) fn run(ctx: &mut EventLoopCtx) -> io::Result<()> {
                 }
                 ctx.pending_initial_resize = false;
             }
+            let panesmith_snapshot_refresh_targets = panesmith_snapshot_refresh_targets(
+                &panesmith_snapshot_panes,
+                &ctx.last_panesmith_snapshot_panes,
+                ctx.force_panesmith_snapshot_refresh,
+            );
+            for pane_id in &panesmith_snapshot_refresh_targets {
+                let _ = ctx.mux.refresh_panesmith_snapshot(pane_id);
+            }
+            ctx.last_panesmith_snapshot_panes = panesmith_snapshot_panes.clone();
+            ctx.force_panesmith_snapshot_refresh = false;
             ctx.terminal.draw(|f| {
                 let areas = if ctx.runtime_agent_factory_host_owned {
                     calculate_host_owned_layout(f.area(), ctx.group_tab, ctx.has_panels)
@@ -4040,6 +4063,49 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn panesmith_snapshot_refresh_targets_skip_stable_visible_set() {
+        let current = ["worker-a", "claude-supervisor"]
+            .into_iter()
+            .map(String::from)
+            .collect::<BTreeSet<_>>();
+        let previous = current.clone();
+
+        let targets = panesmith_snapshot_refresh_targets(&current, &previous, false);
+
+        assert!(
+            targets.is_empty(),
+            "stable visible panes must not force expensive snapshot refreshes"
+        );
+    }
+
+    #[test]
+    fn panesmith_snapshot_refresh_targets_include_new_or_forced_panes() {
+        let current = ["worker-a", "claude-supervisor"]
+            .into_iter()
+            .map(String::from)
+            .collect::<BTreeSet<_>>();
+        let previous = ["claude-supervisor"]
+            .into_iter()
+            .map(String::from)
+            .collect::<BTreeSet<_>>();
+
+        let targets = panesmith_snapshot_refresh_targets(&current, &previous, false);
+        assert_eq!(targets, BTreeSet::from(["worker-a".to_string()]));
+
+        let forced = panesmith_snapshot_refresh_targets(&current, &previous, true);
+        assert_eq!(forced, current);
+    }
+
+    #[test]
+    fn dashboard_default_tick_rate_is_cpu_bounded() {
+        let mux = Mux::new(24, 80);
+        let harness = harness_with_mux(mux);
+
+        assert_eq!(harness.ctx.tick_active, Duration::from_millis(50));
+        assert_eq!(harness.ctx.tick_idle, Duration::from_millis(200));
+    }
+
     impl SelectiveRecordingRouter {
         fn should_reject(&self, command: &RuntimeCommand) -> bool {
             self.rejections.iter().any(|rejection| match rejection {
@@ -4289,8 +4355,8 @@ mod tests {
                 terminal,
                 dashboard_data,
                 orchestration: orchestration(),
-                tick_active: Duration::from_millis(16),
-                tick_idle: Duration::from_millis(100),
+                tick_active: Duration::from_millis(50),
+                tick_idle: Duration::from_millis(200),
                 idle_threshold: Duration::from_secs(1),
                 last_output_at: now,
                 started_at: now,
@@ -4360,6 +4426,8 @@ mod tests {
                 recent_runtime_commands: Vec::new(),
                 pending_runtime_approval_resolutions: Vec::new(),
                 entry_chrome_fade_complete: false,
+                last_panesmith_snapshot_panes: BTreeSet::new(),
+                force_panesmith_snapshot_refresh: true,
                 project_config_loader: crate::run::no_project_config_loader(),
                 needs_redraw: false,
                 runtime_agent_factory_host_owned: host_owned,
