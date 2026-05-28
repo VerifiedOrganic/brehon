@@ -348,6 +348,10 @@ def recv(proc):
         raise RuntimeError("Brehon MCP server closed stdout before replying: " + stderr)
     return json.loads(line)
 
+def tool_result_is_error(message):
+    result = message.get("result") if isinstance(message, dict) else None
+    return isinstance(result, dict) and result.get("isError") is True
+
 def main():
     if len(sys.argv) < 2:
         usage()
@@ -392,7 +396,7 @@ def main():
         }})
         result = recv(proc)
         print(json.dumps(result, indent=2))
-        if "error" in result:
+        if "error" in result or tool_result_is_error(result):
             sys.exit(1)
     finally:
         proc.terminate()
@@ -1103,7 +1107,86 @@ mod tests {
         assert!(helper.contains("\"BREHON_WORKTREE_ROOT\": \"/external/worktrees\""));
         assert!(helper.contains("\"method\": \"tools/call\""));
         assert!(helper.contains("\"name\": tool_name"));
+        assert!(helper.contains("def tool_result_is_error(message):"));
+        assert!(helper.contains("result.get(\"isError\") is True"));
         assert!(!helper.contains("\"PATH\""));
+
+        let _ = std::fs::remove_dir_all(test_root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn agy_mcp_helper_exits_nonzero_on_tool_result_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let test_root = std::env::temp_dir().join(format!(
+            "brehon-agy-helper-error-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let workspace = test_root.join("workspace");
+        let helper_path = workspace.join(AGY_BREHON_MCP_CLIENT_PATH);
+        let fake_brehon = test_root.join("fake-brehon.py");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(
+            &fake_brehon,
+            r#"#!/usr/bin/env python3
+import json
+import sys
+
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    if method == "initialize":
+        print(json.dumps({
+            "jsonrpc": "2.0",
+            "id": message.get("id"),
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "serverInfo": {"name": "fake-brehon", "version": "test"}
+            }
+        }), flush=True)
+    elif method == "tools/call":
+        print(json.dumps({
+            "jsonrpc": "2.0",
+            "id": message.get("id"),
+            "result": {
+                "content": [{"type": "text", "text": "tool failed"}],
+                "isError": True
+            }
+        }), flush=True)
+        break
+"#,
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&fake_brehon).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_brehon, permissions).unwrap();
+
+        write_brehon_mcp_client_helper_at(
+            &helper_path,
+            &workspace,
+            fake_brehon.to_str().unwrap(),
+            &[],
+        )
+        .unwrap();
+
+        let output = std::process::Command::new("python3")
+            .arg(&helper_path)
+            .arg("task")
+            .arg(r#"{"action":"complete","id":"T-x"}"#)
+            .output()
+            .expect("run generated agy helper");
+
+        assert!(
+            !output.status.success(),
+            "helper must fail when MCP tool result has isError=true; stdout={}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("\"isError\": true"),
+            "helper should still print the MCP response for the agent to inspect"
+        );
 
         let _ = std::fs::remove_dir_all(test_root);
     }
