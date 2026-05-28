@@ -1,5 +1,6 @@
 //! Mux-level integration for Panesmith-owned interactive PTY panes.
 
+use std::collections::BTreeSet;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -46,6 +47,28 @@ impl Mux {
         pane_id: &str,
     ) -> Option<&panesmith::OwnedScrollbackSnapshot> {
         self.panesmith.scrollback(pane_id)
+    }
+
+    /// Refresh and cache full retained Panesmith scrollback for a pane.
+    ///
+    /// This is intentionally explicit because full scrollback snapshots can be
+    /// large. Normal dashboard rendering should use the live surface snapshot
+    /// only and call this only when the operator scrolls a pane.
+    pub fn refresh_panesmith_scrollback(&mut self, pane_id: &str) -> Result<bool> {
+        self.panesmith.refresh_scrollback(pane_id)
+    }
+
+    /// Refresh and cache the live Panesmith surface snapshot for a pane.
+    ///
+    /// The TUI uses this when a pane becomes visible so background panes do not
+    /// pay snapshot cloning/render-prep costs on every drain tick.
+    pub fn refresh_panesmith_snapshot(&mut self, pane_id: &str) -> Result<bool> {
+        self.panesmith.refresh_snapshot(pane_id)
+    }
+
+    /// Drop Brehon's owned copy of a pane's full Panesmith scrollback.
+    pub fn clear_panesmith_scrollback(&mut self, pane_id: &str) {
+        self.panesmith.clear_scrollback(pane_id);
     }
 
     /// Whether a Brehon pane currently has a Panesmith-managed PTY/surface.
@@ -316,7 +339,15 @@ impl Mux {
     }
 
     pub(crate) fn drain_panesmith_events_to_mux(&mut self) -> Vec<MuxEvent> {
-        let mirrored = self.panesmith.drain_events();
+        let mirrored = self.panesmith.drain_events(None);
+        self.mirror_panesmith_events_to_mux(mirrored)
+    }
+
+    pub(crate) fn drain_panesmith_events_to_mux_for_snapshots(
+        &mut self,
+        snapshot_panes: &BTreeSet<String>,
+    ) -> Vec<MuxEvent> {
+        let mirrored = self.panesmith.drain_events(Some(snapshot_panes));
         self.mirror_panesmith_events_to_mux(mirrored)
     }
 
@@ -324,7 +355,7 @@ impl Mux {
         &mut self,
         pane_id: &str,
     ) -> (Vec<MuxEvent>, PanesmithInputEventStats) {
-        let mirrored = self.panesmith.drain_events();
+        let mirrored = self.panesmith.drain_events(None);
         let input_stats = panesmith_input_event_stats(pane_id, &mirrored);
         let mux_events = self.mirror_panesmith_events_to_mux(mirrored);
         (mux_events, input_stats)
@@ -335,6 +366,7 @@ impl Mux {
         mirrored: Vec<crate::pane::panesmith_shim::BrehonPanesmithEvent>,
     ) -> Vec<MuxEvent> {
         let mut mux_events = Vec::new();
+        let mut changed_panes = BTreeSet::new();
 
         for event in mirrored {
             tracing::trace!(
@@ -351,11 +383,7 @@ impl Mux {
                     if let Some(pane) = self.panes.get_mut(&event.pane_id) {
                         pane.record_output_activity();
                         pane.bump_render_generation();
-                        mux_events.push(MuxEvent::PaneOutput {
-                            pane_id: event.pane_id.clone(),
-                            data: Vec::new(),
-                            generation: pane.current_generation(),
-                        });
+                        changed_panes.insert((event.pane_id.clone(), pane.current_generation()));
                     }
                 }
                 BrehonPanesmithEventKind::Exited { code } => {
@@ -380,6 +408,14 @@ impl Mux {
                     );
                 }
             }
+        }
+
+        for (pane_id, generation) in changed_panes {
+            mux_events.push(MuxEvent::PaneOutput {
+                pane_id,
+                data: Vec::new(),
+                generation,
+            });
         }
 
         mux_events

@@ -4,6 +4,7 @@
 //! iterations.  `run()` contains the `while !shutdown` loop body; setup and
 //! teardown stay in `mod.rs`.
 
+use std::collections::BTreeSet;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -231,6 +232,108 @@ pub(crate) struct PendingRuntimeCommandTask {
     command_id: String,
     effect: PendingRuntimeCommandEffect,
     handle: tokio::task::JoinHandle<Result<brehon_types::RuntimeCommandResult, PortError>>,
+}
+
+fn active_left_pane_id(ctx: &EventLoopCtx) -> Option<String> {
+    match ctx.group_tab {
+        GroupTab::Dashboard | GroupTab::Runtime | GroupTab::Advisors | GroupTab::Research => None,
+        GroupTab::Workers => ctx.worker_ids.get(ctx.selected_worker).cloned(),
+        GroupTab::Reviewers => ctx
+            .panels
+            .get(ctx.selected_panel)
+            .and_then(|p| {
+                let mi = ctx
+                    .selected_member
+                    .get(ctx.selected_panel)
+                    .copied()
+                    .unwrap_or(0);
+                p.members.get(mi)
+            })
+            .cloned(),
+    }
+}
+
+fn visible_panesmith_snapshot_panes(
+    ctx: &EventLoopCtx,
+    active_left_id: Option<&str>,
+) -> BTreeSet<String> {
+    let mut panes = BTreeSet::new();
+    if let Some(pane_id) = active_left_id {
+        if ctx.mux.is_panesmith_managed(pane_id) {
+            panes.insert(pane_id.to_string());
+        }
+    }
+    if !ctx.runtime_agent_factory_host_owned {
+        if let Some(supervisor_id) = ctx.supervisor_id.as_deref() {
+            if ctx.mux.is_panesmith_managed(supervisor_id) {
+                panes.insert(supervisor_id.to_string());
+            }
+        }
+    }
+    if let Some(focused_id) = ctx.mux.focused_id() {
+        if ctx.mux.is_panesmith_managed(focused_id) {
+            panes.insert(focused_id.to_string());
+        }
+    }
+    panes
+}
+
+fn pane_is_visible_for_output(
+    pane_id: &str,
+    active_left_id: Option<&str>,
+    supervisor_id: Option<&str>,
+    runtime_agent_factory_host_owned: bool,
+) -> bool {
+    active_left_id == Some(pane_id)
+        || (!runtime_agent_factory_host_owned && supervisor_id == Some(pane_id))
+}
+
+fn mux_event_affects_visible_ui(
+    event: &MuxEvent,
+    active_left_id: Option<&str>,
+    supervisor_id: Option<&str>,
+    runtime_agent_factory_host_owned: bool,
+) -> bool {
+    match event {
+        MuxEvent::PaneOutput { pane_id, .. }
+        | MuxEvent::ActivityEvent { pane_id, .. }
+        | MuxEvent::ActivityFlush { pane_id, .. }
+        | MuxEvent::TaskContextChanged { pane_id, .. }
+        | MuxEvent::ReviewContextChanged { pane_id, .. } => pane_is_visible_for_output(
+            pane_id,
+            active_left_id,
+            supervisor_id,
+            runtime_agent_factory_host_owned,
+        ),
+        MuxEvent::PaneExited { .. }
+        | MuxEvent::PaneAdded { .. }
+        | MuxEvent::PaneRemoved { .. }
+        | MuxEvent::FocusChanged { .. }
+        | MuxEvent::AsyncGatewayPromptDeliveryCompleted { .. }
+        | MuxEvent::AsyncTeamsPromptDeliveryCompleted { .. } => true,
+    }
+}
+
+fn visible_structured_pane_has_active_tool(
+    ctx: &EventLoopCtx,
+    active_left_id: Option<&str>,
+    supervisor_id: Option<&str>,
+) -> bool {
+    for id in [active_left_id, supervisor_id].into_iter().flatten() {
+        if !ctx.structured_mode.contains(id) {
+            continue;
+        }
+        let Some(pane) = ctx.mux.get(id) else {
+            continue;
+        };
+        let Some(buf) = pane.activity_buffer() else {
+            continue;
+        };
+        if buf.active_tools().next().is_some() {
+            return true;
+        }
+    }
+    false
 }
 
 pub(crate) enum PendingRuntimeCommandEffect {
@@ -3120,31 +3223,19 @@ pub(super) fn run(ctx: &mut EventLoopCtx) -> io::Result<()> {
         // yet at this point in the tick — they're built post-render
         // around line 1949 / 1965 below.
         let pre_focused_id = ctx.mux.focused_id().map(str::to_string);
-        let pre_active_left_id: Option<String> = match ctx.group_tab {
-            GroupTab::Dashboard | GroupTab::Runtime | GroupTab::Advisors | GroupTab::Research => {
-                None
-            }
-            GroupTab::Workers => ctx.worker_ids.get(ctx.selected_worker).cloned(),
-            GroupTab::Reviewers => ctx
-                .panels
-                .get(ctx.selected_panel)
-                .and_then(|p| {
-                    let mi = ctx
-                        .selected_member
-                        .get(ctx.selected_panel)
-                        .copied()
-                        .unwrap_or(0);
-                    p.members.get(mi)
-                })
-                .cloned(),
-        };
+        let pre_active_left_id = active_left_pane_id(ctx);
         let pre_drain =
             drain_pending_input(ctx, Duration::ZERO, &pre_focused_id, &pre_active_left_id)?;
         if pre_drain.should_break {
             break;
         }
+        let visible_active_left_id = active_left_pane_id(ctx);
+        let panesmith_snapshot_panes =
+            visible_panesmith_snapshot_panes(ctx, visible_active_left_id.as_deref());
 
-        let (_total_bytes, batch_events) = ctx.mux.poll_batch();
+        let (_total_bytes, batch_events) = ctx
+            .mux
+            .poll_batch_with_panesmith_snapshot_panes(&panesmith_snapshot_panes);
         ctx.mux.flush_pending_inbox_nudges(&ctx.rt);
         let loop_now = std::time::Instant::now();
 
@@ -3190,8 +3281,19 @@ pub(super) fn run(ctx: &mut EventLoopCtx) -> io::Result<()> {
 
         process_pending_queued_gateway_prompt_deliveries(ctx);
 
-        // Mark dirty when new PTY output arrives.
-        if !batch_events.is_empty() {
+        let visible_event_seen = batch_events.iter().any(|event| {
+            mux_event_affects_visible_ui(
+                event,
+                visible_active_left_id.as_deref(),
+                ctx.supervisor_id.as_deref(),
+                ctx.runtime_agent_factory_host_owned,
+            )
+        });
+
+        // Mark dirty when visible pane output arrives. Hidden pane output is
+        // still drained and reflected in runtime/session state, but it must
+        // not force the operator dashboard into a full redraw loop.
+        if visible_event_seen {
             ctx.needs_redraw = true;
             ctx.last_output_at = Instant::now();
         }
@@ -3387,24 +3489,7 @@ pub(super) fn run(ctx: &mut EventLoopCtx) -> io::Result<()> {
         detect_and_handle_supervisor_resets(ctx, &batch_events, loop_now);
 
         // Determine which left pane is active
-        let active_left_id: Option<String> = match ctx.group_tab {
-            GroupTab::Dashboard | GroupTab::Runtime | GroupTab::Advisors | GroupTab::Research => {
-                None
-            } // these views have no pane
-            GroupTab::Workers => ctx.worker_ids.get(ctx.selected_worker).cloned(),
-            GroupTab::Reviewers => ctx
-                .panels
-                .get(ctx.selected_panel)
-                .and_then(|p| {
-                    let mi = ctx
-                        .selected_member
-                        .get(ctx.selected_panel)
-                        .copied()
-                        .unwrap_or(0);
-                    p.members.get(mi)
-                })
-                .cloned(),
-        };
+        let active_left_id = active_left_pane_id(ctx);
         let focused_id = ctx.mux.focused_id().map(str::to_string);
         let dashboard_snapshot = ctx.dashboard_data.lock().unwrap().clone();
         let runtime_status = if ctx.runtime_agent_factory_host_owned {
@@ -3434,21 +3519,21 @@ pub(super) fn run(ctx: &mut EventLoopCtx) -> io::Result<()> {
             }
         }
 
-        // Keep redrawing while any structured pane shows an active tool timer.
-        if !ctx.needs_redraw {
-            for id in ctx.structured_mode.iter() {
-                if let Some(pane) = ctx.mux.get(id) {
-                    if let Some(buf) = pane.activity_buffer() {
-                        if buf.active_tools().next().is_some() {
-                            ctx.needs_redraw = true;
-                            break;
-                        }
-                    }
-                }
-            }
+        // Keep active timers moving only for panes currently on screen.
+        if !ctx.needs_redraw
+            && visible_structured_pane_has_active_tool(
+                ctx,
+                active_left_id.as_deref(),
+                ctx.supervisor_id.as_deref(),
+            )
+        {
+            ctx.needs_redraw = true;
         }
 
         if ctx.needs_redraw {
+            for pane_id in &panesmith_snapshot_panes {
+                let _ = ctx.mux.refresh_panesmith_snapshot(pane_id);
+            }
             if ctx.pending_initial_resize {
                 if let Ok(size) = ctx.terminal.size() {
                     let terminal_size = size.into();
@@ -3899,6 +3984,60 @@ mod tests {
     struct SelectiveRecordingRouter {
         tx: std::sync::Mutex<mpsc::Sender<RecordedRoute>>,
         rejections: Vec<TestRouteRejection>,
+    }
+
+    #[test]
+    fn hidden_pane_output_does_not_invalidate_visible_ui() {
+        let event = MuxEvent::PaneOutput {
+            pane_id: "hidden-worker".to_string(),
+            data: Vec::new(),
+            generation: brehon_mux::Generation(1),
+        };
+
+        assert!(!mux_event_affects_visible_ui(
+            &event,
+            Some("visible-worker"),
+            Some("claude-supervisor"),
+            false,
+        ));
+    }
+
+    #[test]
+    fn visible_pane_output_invalidates_visible_ui() {
+        let event = MuxEvent::PaneOutput {
+            pane_id: "visible-worker".to_string(),
+            data: Vec::new(),
+            generation: brehon_mux::Generation(1),
+        };
+
+        assert!(mux_event_affects_visible_ui(
+            &event,
+            Some("visible-worker"),
+            Some("claude-supervisor"),
+            false,
+        ));
+    }
+
+    #[test]
+    fn supervisor_output_invalidates_visible_ui_when_embedded() {
+        let event = MuxEvent::PaneOutput {
+            pane_id: "claude-supervisor".to_string(),
+            data: Vec::new(),
+            generation: brehon_mux::Generation(1),
+        };
+
+        assert!(mux_event_affects_visible_ui(
+            &event,
+            None,
+            Some("claude-supervisor"),
+            false,
+        ));
+        assert!(!mux_event_affects_visible_ui(
+            &event,
+            None,
+            Some("claude-supervisor"),
+            true,
+        ));
     }
 
     impl SelectiveRecordingRouter {
@@ -8163,6 +8302,7 @@ TypeError: Cannot read properties of undefined"#,
                 previous: None,
                 current: brehon_types::RuntimePaneState::Ready,
                 reason: Some("state machine ready".to_string()),
+                blocked: None,
             }),
         );
         assert!(

@@ -30,41 +30,15 @@ const BREHON_PROTECTED_BRANCH_HOOKS: &[&str] = &[
 /// teammate ever sees them as uncommitted work they need to reason
 /// about.
 pub(crate) fn ensure_mcp_config(cwd: &Path) -> Result<()> {
-    let brehon_exe = std::env::current_exe()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|_| "brehon".to_string());
+    let brehon_exe = current_brehon_exe();
 
     // ── .mcp.json ────────────────────────────────────────────────────────
     let mcp_path = cwd.join(".mcp.json");
-    let brehon_server = serde_json::json!({
-        "command": brehon_exe,
-        "args": ["serve"]
-    });
-
-    if mcp_path.exists() {
-        let content = std::fs::read_to_string(&mcp_path).unwrap_or_default();
-        let mut doc: serde_json::Value =
-            serde_json::from_str(&content).unwrap_or_else(|_| serde_json::json!({}));
-        let servers = doc
-            .as_object_mut()
-            .unwrap()
-            .entry("mcpServers")
-            .or_insert_with(|| serde_json::json!({}));
-        if let Some(obj) = servers.as_object_mut() {
-            if obj.get("brehon") != Some(&brehon_server) {
-                obj.insert("brehon".to_string(), brehon_server);
-                std::fs::write(&mcp_path, serde_json::to_string_pretty(&doc)?)?;
-                tracing::info!("Updated .mcp.json with brehon server");
-            }
-        }
-    } else {
-        let doc = serde_json::json!({
-            "mcpServers": {
-                "brehon": brehon_server
-            }
-        });
-        std::fs::write(&mcp_path, serde_json::to_string_pretty(&doc)?)?;
-        tracing::info!("Created .mcp.json with brehon server");
+    let brehon_server =
+        brehon_mcp_server_config(&brehon_exe, cwd, cwd, None, None, None, None, None);
+    let mcp_action = upsert_brehon_mcp_server(&mcp_path, brehon_server)?;
+    if let Some(action) = mcp_action {
+        tracing::info!("{action} .mcp.json with brehon server");
     }
 
     // ── .claude/settings.local.json — add mcp__brehon__* permission ───────
@@ -129,20 +103,40 @@ pub(crate) fn ensure_mcp_config(cwd: &Path) -> Result<()> {
 /// These files are deliberately excluded from git because they contain
 /// developer-local paths and permissions, but agents launched from a worktree
 /// still need them for MCP discovery and tool authorization.
+#[allow(clippy::too_many_arguments)]
 fn sync_local_agent_scaffolding_to_worktree(
     project_root: &Path,
     worktree_path: &Path,
+    worktrees_root: &Path,
+    session_scope: Option<&str>,
+    scope: Option<&str>,
+    name: &str,
+    supervisor_name: &str,
 ) -> Result<()> {
-    sync_project_local_file_to_worktree(
+    let role = scope.unwrap_or("worker");
+    let brehon_server = brehon_mcp_server_config(
+        &current_brehon_exe(),
+        project_root,
+        worktree_path,
+        Some(worktrees_root),
+        session_scope,
+        Some(name),
+        Some(role),
+        Some(supervisor_name),
+    );
+
+    sync_brehon_mcp_config_to_worktree(
         project_root,
         worktree_path,
         Path::new(".mcp.json"),
+        &brehon_server,
         "MCP discovery config",
     )?;
-    sync_project_local_file_to_worktree(
+    sync_brehon_mcp_config_to_worktree(
         project_root,
         worktree_path,
         Path::new(".agents/mcp_config.json"),
+        &brehon_server,
         "Antigravity CLI MCP discovery config",
     )?;
     sync_project_local_file_to_worktree(
@@ -151,6 +145,178 @@ fn sync_local_agent_scaffolding_to_worktree(
         Path::new(".claude/settings.local.json"),
         "Claude local settings",
     )?;
+    Ok(())
+}
+
+fn current_brehon_exe() -> String {
+    std::env::current_exe()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| "brehon".to_string())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn brehon_mcp_server_config(
+    brehon_exe: &str,
+    project_root: &Path,
+    workspace_root: &Path,
+    worktrees_root: Option<&Path>,
+    session_scope: Option<&str>,
+    agent_name: Option<&str>,
+    agent_role: Option<&str>,
+    supervisor_name: Option<&str>,
+) -> serde_json::Value {
+    let mut env = serde_json::Map::new();
+    insert_env_path(&mut env, "BREHON_ROOT", &project_root.join(".brehon"));
+    insert_env_path(&mut env, "BREHON_PROJECT_ROOT", project_root);
+    insert_env_path(&mut env, "BREHON_WORKSPACE_ROOT", workspace_root);
+    insert_env_path(&mut env, "BREHON_CLONE_PATH", workspace_root);
+    if let Some(worktrees_root) = worktrees_root {
+        insert_env_path(&mut env, "BREHON_WORKTREE_ROOT", worktrees_root);
+    }
+    if let Some(session_scope) = session_scope
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        env.insert(
+            "BREHON_SESSION_NAME".to_string(),
+            serde_json::Value::String(session_scope.to_string()),
+        );
+    }
+    if let Some(agent_name) = agent_name.map(str::trim).filter(|value| !value.is_empty()) {
+        env.insert(
+            "BREHON_AGENT_NAME".to_string(),
+            serde_json::Value::String(agent_name.to_string()),
+        );
+    }
+    if let Some(agent_role) = agent_role.map(str::trim).filter(|value| !value.is_empty()) {
+        env.insert(
+            "BREHON_AGENT_ROLE".to_string(),
+            serde_json::Value::String(agent_role.to_string()),
+        );
+    }
+    if let Some(supervisor_name) = supervisor_name
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        env.insert(
+            "BREHON_SUPERVISOR_NAME".to_string(),
+            serde_json::Value::String(supervisor_name.to_string()),
+        );
+    }
+
+    serde_json::json!({
+        "command": brehon_exe,
+        "args": ["serve"],
+        "cwd": workspace_root,
+        "env": env,
+    })
+}
+
+fn insert_env_path(env: &mut serde_json::Map<String, serde_json::Value>, key: &str, path: &Path) {
+    env.insert(
+        key.to_string(),
+        serde_json::Value::String(path.to_string_lossy().to_string()),
+    );
+}
+
+fn upsert_brehon_mcp_server(
+    path: &Path,
+    brehon_server: serde_json::Value,
+) -> Result<Option<&'static str>> {
+    let existed = path.exists();
+    let mut doc = read_json_object_or_empty(path);
+    let obj = doc
+        .as_object_mut()
+        .expect("read_json_object_or_empty always returns object");
+    let servers = obj
+        .entry("mcpServers".to_string())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    if !servers.is_object() {
+        *servers = serde_json::Value::Object(serde_json::Map::new());
+    }
+    let servers = servers
+        .as_object_mut()
+        .expect("mcpServers normalized to object");
+    let removed_legacy = remove_legacy_agora_servers(servers);
+    let needs_brehon_update = servers.get("brehon") != Some(&brehon_server);
+    if !needs_brehon_update && !removed_legacy && existed {
+        return Ok(None);
+    }
+
+    servers.insert("brehon".to_string(), brehon_server);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, serde_json::to_string_pretty(&doc)?)?;
+    Ok(Some(if existed { "Updated" } else { "Created" }))
+}
+
+fn read_json_object_or_empty(path: &Path) -> serde_json::Value {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return serde_json::json!({});
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return serde_json::json!({});
+    };
+    if value.is_object() {
+        value
+    } else {
+        serde_json::json!({})
+    }
+}
+
+fn remove_legacy_agora_servers(servers: &mut serde_json::Map<String, serde_json::Value>) -> bool {
+    let keys = servers
+        .keys()
+        .filter(|key| key.eq_ignore_ascii_case("agora"))
+        .cloned()
+        .collect::<Vec<_>>();
+    let removed = !keys.is_empty();
+    for key in keys {
+        servers.remove(&key);
+    }
+    removed
+}
+
+fn sync_brehon_mcp_config_to_worktree(
+    project_root: &Path,
+    worktree_path: &Path,
+    relative_path: &Path,
+    brehon_server: &serde_json::Value,
+    label: &str,
+) -> Result<()> {
+    let source = project_root.join(relative_path);
+    let target = worktree_path.join(relative_path);
+    let mut doc = read_json_object_or_empty(&source);
+    let obj = doc
+        .as_object_mut()
+        .expect("read_json_object_or_empty always returns object");
+    let servers = obj
+        .entry("mcpServers".to_string())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    if !servers.is_object() {
+        *servers = serde_json::Value::Object(serde_json::Map::new());
+    }
+    let servers = servers
+        .as_object_mut()
+        .expect("mcpServers normalized to object");
+    remove_legacy_agora_servers(servers);
+    servers.insert("brehon".to_string(), brehon_server.clone());
+
+    if let Some(target_dir) = target.parent() {
+        std::fs::create_dir_all(target_dir).with_context(|| {
+            format!(
+                "Failed to create {label} directory '{}' in isolated worktree",
+                target_dir.display()
+            )
+        })?;
+    }
+    std::fs::write(&target, serde_json::to_string_pretty(&doc)?).with_context(|| {
+        format!(
+            "Failed to sync {label} to isolated worktree '{}'",
+            target.display()
+        )
+    })?;
     Ok(())
 }
 
@@ -2138,6 +2304,7 @@ where
     })?;
 
     let project_root = normalize_project_root(cwd);
+    ensure_brehon_ignored_in_repo(&project_root)?;
     let worktrees_dir = effective_worktree_root(&project_root, config);
     std::fs::create_dir_all(&worktrees_dir).with_context(|| {
         format!(
@@ -2215,7 +2382,15 @@ where
                 worktree_path.display()
             )
         })?;
-        sync_local_agent_scaffolding_to_worktree(&project_root, &worktree_path)?;
+        sync_local_agent_scaffolding_to_worktree(
+            &project_root,
+            &worktree_path,
+            &worktrees_dir,
+            session_scope,
+            scope,
+            name,
+            &config.roles.supervisor.name,
+        )?;
         report(format!(
             "{scope_label} {name} ready at {}",
             worktree_path.display()
@@ -3932,12 +4107,12 @@ mod tests {
         .unwrap();
         std::fs::write(
             temp.path().join(".mcp.json"),
-            r#"{"mcpServers":{"brehon":{"command":"/tmp/brehon","args":["serve"]}}}"#,
+            r#"{"mcpServers":{"agora":{"command":"agora","args":["serve"]},"brehon":{"command":"/tmp/brehon","args":["serve"]}}}"#,
         )
         .unwrap();
         std::fs::write(
             temp.path().join(".agents/mcp_config.json"),
-            r#"{"mcpServers":{"other":{"command":"other"}}}"#,
+            r#"{"mcpServers":{"agora":{"command":"agora","args":["serve"]},"other":{"command":"other"}}}"#,
         )
         .unwrap();
         run_git(temp.path(), &["add", ".mcp.json"]);
@@ -3997,21 +4172,70 @@ mod tests {
             std::fs::read_to_string(reviewer_path.join(".claude/settings.local.json")).unwrap(),
             r#"{"permissions":{"allow":["mcp__brehon__*"]}}"#
         );
+        let supervisor_mcp: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(supervisor_path.join(".mcp.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(supervisor_mcp["mcpServers"].get("agora").is_none());
         assert_eq!(
-            std::fs::read_to_string(supervisor_path.join(".mcp.json")).unwrap(),
-            r#"{"mcpServers":{"brehon":{"command":"/tmp/brehon","args":["serve"]}}}"#
+            supervisor_mcp["mcpServers"]["brehon"]["env"]["BREHON_AGENT_NAME"],
+            "claude-code"
         );
         assert_eq!(
-            std::fs::read_to_string(reviewer_path.join(".mcp.json")).unwrap(),
-            r#"{"mcpServers":{"brehon":{"command":"/tmp/brehon","args":["serve"]}}}"#
+            supervisor_mcp["mcpServers"]["brehon"]["env"]["BREHON_AGENT_ROLE"],
+            "supervisor"
         );
         assert_eq!(
-            std::fs::read_to_string(supervisor_path.join(".agents/mcp_config.json")).unwrap(),
-            r#"{"mcpServers":{"other":{"command":"other"}}}"#
+            supervisor_mcp["mcpServers"]["brehon"]["env"]["BREHON_SESSION_NAME"],
+            "session-role"
         );
         assert_eq!(
-            std::fs::read_to_string(reviewer_path.join(".agents/mcp_config.json")).unwrap(),
-            r#"{"mcpServers":{"other":{"command":"other"}}}"#
+            supervisor_mcp["mcpServers"]["brehon"]["env"]["BREHON_PROJECT_ROOT"],
+            temp.path().to_string_lossy().to_string()
+        );
+        assert_eq!(
+            supervisor_mcp["mcpServers"]["brehon"]["env"]["BREHON_WORKSPACE_ROOT"],
+            supervisor_path.to_string_lossy().to_string()
+        );
+
+        let reviewer_mcp: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(reviewer_path.join(".mcp.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(reviewer_mcp["mcpServers"].get("agora").is_none());
+        assert_eq!(
+            reviewer_mcp["mcpServers"]["brehon"]["env"]["BREHON_AGENT_NAME"],
+            "reviewer-a"
+        );
+        assert_eq!(
+            reviewer_mcp["mcpServers"]["brehon"]["env"]["BREHON_AGENT_ROLE"],
+            "reviewer"
+        );
+        assert_eq!(
+            reviewer_mcp["mcpServers"]["brehon"]["env"]["BREHON_WORKSPACE_ROOT"],
+            reviewer_path.to_string_lossy().to_string()
+        );
+
+        let supervisor_agy: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(supervisor_path.join(".agents/mcp_config.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(supervisor_agy["mcpServers"].get("agora").is_none());
+        assert_eq!(supervisor_agy["mcpServers"]["other"]["command"], "other");
+        assert_eq!(
+            supervisor_agy["mcpServers"]["brehon"]["env"]["BREHON_AGENT_NAME"],
+            "claude-code"
+        );
+
+        let reviewer_agy: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(reviewer_path.join(".agents/mcp_config.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(reviewer_agy["mcpServers"].get("agora").is_none());
+        assert_eq!(reviewer_agy["mcpServers"]["other"]["command"], "other");
+        assert_eq!(
+            reviewer_agy["mcpServers"]["brehon"]["env"]["BREHON_AGENT_NAME"],
+            "reviewer-a"
         );
 
         cleanup_scoped_worktrees(temp.path(), &supervisor_cwds).await;
@@ -4313,7 +4537,7 @@ mod tests {
         .unwrap();
         std::fs::write(
             temp.path().join(".mcp.json"),
-            r#"{"mcpServers":{"brehon":{"command":"/tmp/brehon","args":["serve"]}}}"#,
+            r#"{"mcpServers":{"agora":{"command":"agora","args":["serve"]},"brehon":{"command":"/tmp/brehon","args":["serve"]}}}"#,
         )
         .unwrap();
         run_git(temp.path(), &["add", ".mcp.json"]);
@@ -4358,9 +4582,22 @@ mod tests {
             std::fs::read_to_string(worktree_path.join(".claude/settings.local.json")).unwrap(),
             r#"{"permissions":{"allow":["mcp__brehon__*"]}}"#
         );
+        let mcp_config: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(worktree_path.join(".mcp.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(mcp_config["mcpServers"].get("agora").is_none());
         assert_eq!(
-            std::fs::read_to_string(worktree_path.join(".mcp.json")).unwrap(),
-            r#"{"mcpServers":{"brehon":{"command":"/tmp/brehon","args":["serve"]}}}"#
+            mcp_config["mcpServers"]["brehon"]["env"]["BREHON_AGENT_NAME"],
+            "worker-dotbrehon"
+        );
+        assert_eq!(
+            mcp_config["mcpServers"]["brehon"]["env"]["BREHON_AGENT_ROLE"],
+            "worker"
+        );
+        assert_eq!(
+            mcp_config["mcpServers"]["brehon"]["env"]["BREHON_PROJECT_ROOT"],
+            temp.path().to_string_lossy().to_string()
         );
 
         // Identity must be derived from the repo name, not `.brehon`.
@@ -5045,7 +5282,7 @@ mod tests {
         init_git_repo(temp.path());
         std::fs::write(
             temp.path().join(".mcp.json"),
-            r#"{"mcpServers":{"other":{"command":"other"},"brehon":{"command":"/stale/brehon","args":["serve"]}}}"#,
+            r#"{"mcpServers":{"agora":{"command":"agora","args":["serve"]},"other":{"command":"other"},"brehon":{"command":"/stale/brehon","args":["serve"]}}}"#,
         )
         .unwrap();
 
@@ -5062,6 +5299,15 @@ mod tests {
             config["mcpServers"]["brehon"]["args"],
             serde_json::json!(["serve"])
         );
+        assert_eq!(
+            config["mcpServers"]["brehon"]["env"]["BREHON_PROJECT_ROOT"],
+            temp.path().to_string_lossy().to_string()
+        );
+        assert_eq!(
+            config["mcpServers"]["brehon"]["env"]["BREHON_ROOT"],
+            temp.path().join(".brehon").to_string_lossy().to_string()
+        );
         assert_eq!(config["mcpServers"]["other"]["command"], "other");
+        assert!(config["mcpServers"].get("agora").is_none());
     }
 }

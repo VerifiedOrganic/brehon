@@ -68,7 +68,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -79,7 +79,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -1462,7 +1462,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users 0.5.2",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -1558,7 +1558,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -2662,7 +2662,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -2794,8 +2794,8 @@ dependencies = [
 
 [[package]]
 name = "panesmith"
-version = "0.2.0"
-source = "git+ssh://git@github.com/VerifiedOrganic/panesmith.git?tag=v0.2.0#04eac324e594866bcb4643cec6bf6d43b585279e"
+version = "0.2.2"
+source = "git+ssh://git@github.com/VerifiedOrganic/panesmith.git?tag=v0.2.2#68c4d38667f7b722ea7e95eb129e8e55de22eb08"
 dependencies = [
  "panesmith-attach",
  "panesmith-core",
@@ -2805,8 +2805,8 @@ dependencies = [
 
 [[package]]
 name = "panesmith-attach"
-version = "0.2.0"
-source = "git+ssh://git@github.com/VerifiedOrganic/panesmith.git?tag=v0.2.0#04eac324e594866bcb4643cec6bf6d43b585279e"
+version = "0.2.2"
+source = "git+ssh://git@github.com/VerifiedOrganic/panesmith.git?tag=v0.2.2#68c4d38667f7b722ea7e95eb129e8e55de22eb08"
 dependencies = [
  "crossterm 0.28.1",
  "libc",
@@ -2816,8 +2816,8 @@ dependencies = [
 
 [[package]]
 name = "panesmith-core"
-version = "0.2.0"
-source = "git+ssh://git@github.com/VerifiedOrganic/panesmith.git?tag=v0.2.0#04eac324e594866bcb4643cec6bf6d43b585279e"
+version = "0.2.2"
+source = "git+ssh://git@github.com/VerifiedOrganic/panesmith.git?tag=v0.2.2#68c4d38667f7b722ea7e95eb129e8e55de22eb08"
 dependencies = [
  "crossterm 0.28.1",
  "libc",
@@ -2828,8 +2828,8 @@ dependencies = [
 
 [[package]]
 name = "panesmith-ratatui"
-version = "0.2.0"
-source = "git+ssh://git@github.com/VerifiedOrganic/panesmith.git?tag=v0.2.0#04eac324e594866bcb4643cec6bf6d43b585279e"
+version = "0.2.2"
+source = "git+ssh://git@github.com/VerifiedOrganic/panesmith.git?tag=v0.2.2#68c4d38667f7b722ea7e95eb129e8e55de22eb08"
 dependencies = [
  "panesmith-core",
  "ratatui",
@@ -2837,8 +2837,8 @@ dependencies = [
 
 [[package]]
 name = "panesmith-vt100"
-version = "0.2.0"
-source = "git+ssh://git@github.com/VerifiedOrganic/panesmith.git?tag=v0.2.0#04eac324e594866bcb4643cec6bf6d43b585279e"
+version = "0.2.2"
+source = "git+ssh://git@github.com/VerifiedOrganic/panesmith.git?tag=v0.2.2#68c4d38667f7b722ea7e95eb129e8e55de22eb08"
 dependencies = [
  "panesmith-core",
  "vt100",
@@ -3654,7 +3654,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -3983,7 +3983,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a766e1110788c36f4fa1c2b71b387a7815aa65f88ce0229841826633d93723e"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -4248,7 +4248,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]

@@ -24,6 +24,7 @@ use super::epic::{
 };
 use super::followups::summarize_followups;
 use super::git_ops::detect_default_branch;
+use super::integration_state::task_has_active_integration;
 use super::lifecycle::{
     ancestor_chain_has_closed_parent, child_collection_label, direct_children, is_container_task,
     is_epic, is_initiative, reconcile_dependency_states,
@@ -104,6 +105,73 @@ fn acknowledge_task_assignment(
         return true;
     }
     false
+}
+
+fn task_reserves_worker_slot(task: &serde_json::Map<String, Value>) -> bool {
+    if task_has_supervisor_integration_conflict(task) || task_has_active_integration(task) {
+        return false;
+    }
+
+    match task.get("status").and_then(|value| value.as_str()) {
+        Some(status) => match normalize_task_status(status) {
+            Some(
+                "assigned" | "in_progress" | "review_ready" | "in_review" | "changes_requested"
+                | "approved",
+            ) => true,
+            Some(_) => false,
+            None => true,
+        },
+        None => true,
+    }
+}
+
+fn active_worker_assignment_conflicts(all_tasks: &[serde_json::Map<String, Value>]) -> Vec<Value> {
+    let mut by_worker: std::collections::BTreeMap<String, Vec<Value>> =
+        std::collections::BTreeMap::new();
+
+    for task in all_tasks {
+        let Some(worker) = nonempty_json_string(task, "assignee") else {
+            continue;
+        };
+        if task.get("task_type").and_then(|value| value.as_str()) != Some("task") {
+            continue;
+        }
+        if !task_reserves_worker_slot(task) {
+            continue;
+        }
+        let Some(task_id) = nonempty_json_string(task, "task_id") else {
+            continue;
+        };
+        let status = task
+            .get("status")
+            .and_then(|value| value.as_str())
+            .unwrap_or("unknown");
+        let title = task
+            .get("title")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        by_worker
+            .entry(worker)
+            .or_default()
+            .push(serde_json::json!({
+                "task_id": task_id,
+                "status": status,
+                "title": title,
+            }));
+    }
+
+    by_worker
+        .into_iter()
+        .filter(|(_, tasks)| tasks.len() > 1)
+        .map(|(worker, tasks)| {
+            serde_json::json!({
+                "worker": worker,
+                "tasks": tasks,
+                "task_count": tasks.len(),
+                "kind": "duplicate_active_worker_assignment",
+            })
+        })
+        .collect()
 }
 
 fn acknowledge_review_assignments(reviewer: &str, via: &str) {
@@ -945,6 +1013,7 @@ pub(super) async fn execute_ready(args: &Value) -> Result<ToolResult, McpError> 
     let all_tasks = read_all_tasks();
     let project_config =
         project_root().and_then(|root| brehon_config::load_config(Some(&root)).ok());
+    let active_worker_assignment_conflicts = active_worker_assignment_conflicts(&all_tasks);
     let integration_conflict_tasks = supervisor_integration_conflicts_from_tasks(&all_tasks);
     let blocked_handoff_tasks: Vec<Value> = all_tasks
         .iter()
@@ -1109,7 +1178,13 @@ pub(super) async fn execute_ready(args: &Value) -> Result<ToolResult, McpError> 
     let approved_count = approved_tasks.len();
     let followup_source_count = followup_source_tasks.len();
     let stalled_count = stalled_tasks.len();
+    let active_worker_assignment_conflict_count = active_worker_assignment_conflicts.len();
     let mut priority_notes = Vec::new();
+    if active_worker_assignment_conflict_count > 0 {
+        priority_notes.push(format!(
+            "{active_worker_assignment_conflict_count} worker assignment invariant conflict(s): at least one worker owns multiple active task slots"
+        ));
+    }
     if integration_conflict_count > 0 {
         priority_notes.push(format!(
             "{integration_conflict_count} supervisor-owned integration conflict(s) require immediate resolution"
@@ -1249,6 +1324,8 @@ pub(super) async fn execute_ready(args: &Value) -> Result<ToolResult, McpError> 
     let result = serde_json::json!({
         "tasks": tasks,
         "count": count,
+        "active_worker_assignment_conflicts": active_worker_assignment_conflicts,
+        "active_worker_assignment_conflict_count": active_worker_assignment_conflict_count,
         "integration_conflict_tasks": integration_conflict_tasks,
         "integration_conflict_count": integration_conflict_count,
         "blocked_handoff_tasks": blocked_handoff_tasks,

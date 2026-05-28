@@ -126,8 +126,10 @@ fn render_terminal_viewport(
         let scroll_offset = structured_scroll_offset.unwrap_or_default();
         let mut widget = TerminalPaneWidget::new(snapshot)
             .focused(focused && pane.accepts_manual_input() && scroll_offset == 0);
-        if let Some(scrollback) = mux.panesmith_scrollback(pane_id) {
-            widget = widget.with_scrollback(scrollback);
+        if scroll_offset > 0 {
+            if let Some(scrollback) = mux.panesmith_scrollback(pane_id) {
+                widget = widget.with_scrollback(scrollback);
+            }
         }
         if scroll_offset > 0 {
             widget = widget.with_viewport(TerminalViewport::scrolled(scroll_offset));

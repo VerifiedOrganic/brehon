@@ -560,6 +560,7 @@ fn scroll_pane_view(
         .map(|pane| structured_mode.contains(pane_id) && pane.is_gateway_backed())
         .unwrap_or(false);
     if mux.is_panesmith_managed(pane_id) {
+        let _ = mux.refresh_panesmith_scrollback(pane_id);
         let Some(snapshot) = mux.panesmith_snapshot(pane_id) else {
             return false;
         };
@@ -579,6 +580,7 @@ fn scroll_pane_view(
         let offset = next_metrics.effective_scroll_offset;
         if offset == 0 {
             structured_scroll_offsets.remove(pane_id);
+            mux.clear_panesmith_scrollback(pane_id);
         } else {
             structured_scroll_offsets.insert(pane_id.to_string(), offset);
         }

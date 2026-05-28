@@ -25,7 +25,7 @@ use super::dependencies::{
 use super::epic::{
     apply_integration_conflict_cleanup, container_base_branch_for_parent,
     ensure_container_integration_worktree, read_parent_task, remove_container_integration_worktree,
-    task_has_integration_conflict_recovery_marker,
+    task_has_integration_conflict_recovery_marker, task_has_supervisor_integration_conflict,
 };
 use super::followups::resolve_promoted_followups_for_terminal_task;
 use super::git_ops::{
@@ -34,13 +34,14 @@ use super::git_ops::{
     ensure_worker_branch_safe_for_task, git_stdout_in, primary_checkout_status_warning,
     PrimaryCheckoutWarning,
 };
+use super::integration_state::task_has_active_integration;
 use super::lifecycle::{
     caller_name, caller_role, caller_supervisor, is_container_task, is_valid_subtask,
     reconcile_dependency_states_with_task_lock, task_completion_mode_from_task,
     task_has_merge_flow_state, task_has_started_worker_execution, validate_status_transition,
 };
 use super::locking::acquire_task_lock;
-use super::persistence::{archive_task_runtime, read_task, write_task};
+use super::persistence::{archive_task_runtime, read_all_tasks, read_task, write_task};
 use super::proof::{copy_proof_result, WorkerProofRecorder};
 use super::review_gate::{
     archive_review_obligation_blockers, format_review_obligation_blockers,
@@ -342,6 +343,48 @@ fn worker_task_ownership_error(
     Some(format!(
         "Task {id} is assigned to '{assignee}' not '{caller_name}'. Only the assigned worker can {action} this task."
     ))
+}
+
+fn task_reserves_worker_slot(task: &serde_json::Map<String, Value>) -> bool {
+    if task_has_supervisor_integration_conflict(task) || task_has_active_integration(task) {
+        return false;
+    }
+
+    match task.get("status").and_then(|value| value.as_str()) {
+        Some(status) => match normalize_task_status(status) {
+            Some(
+                "assigned" | "in_progress" | "review_ready" | "in_review" | "changes_requested"
+                | "approved",
+            ) => true,
+            Some(_) => false,
+            None => true,
+        },
+        None => true,
+    }
+}
+
+fn active_task_summaries_for_worker(worker_name: &str, excluding_task_id: &str) -> Vec<String> {
+    read_all_tasks()
+        .into_iter()
+        .filter(|task| task.get("assignee").and_then(|value| value.as_str()) == Some(worker_name))
+        .filter(|task| {
+            task.get("task_id")
+                .and_then(|value| value.as_str())
+                .is_some_and(|task_id| task_id != excluding_task_id)
+        })
+        .filter(task_reserves_worker_slot)
+        .map(|task| {
+            let task_id = task
+                .get("task_id")
+                .and_then(|value| value.as_str())
+                .unwrap_or("?");
+            let status = task
+                .get("status")
+                .and_then(|value| value.as_str())
+                .unwrap_or("?");
+            format!("{task_id} [{status}]")
+        })
+        .collect()
 }
 
 fn task_has_recorded_worker_handoff_commit(task: &serde_json::Map<String, Value>) -> bool {
@@ -718,6 +761,24 @@ pub(super) async fn execute_progress(
         }
     }
     let normalized_status = normalize_task_status(&current_status);
+    if caller_role == "worker"
+        && task_type == "task"
+        && matches!(
+            normalized_status,
+            Some("assigned" | "in_progress" | "changes_requested")
+        )
+    {
+        if let Some(worker) = worker_caller_name.as_deref() {
+            let other_active_tasks = active_task_summaries_for_worker(worker, id);
+            if !other_active_tasks.is_empty() {
+                return Ok(error_result(format!(
+                    "Refusing `task action=progress id={id}`: worker '{worker}' already owns active task(s): {}. \
+                     Workers are single-task while using per-worker worktrees. A supervisor must release, reassign, or repair the duplicate ownership before this worker can report progress.",
+                    other_active_tasks.join(", ")
+                )));
+            }
+        }
+    }
     let resume_started_pending_task = caller_role == "worker"
         && task_type == "task"
         && matches!(normalized_status, Some("pending"))
@@ -814,9 +875,10 @@ pub(super) async fn execute_progress(
             Some("assigned" | "in_progress" | "changes_requested")
         )
     {
-        if let Some(worker) = worker_caller_name.as_ref() {
-            task.insert("assignee".into(), Value::String(worker.clone()));
-        }
+        let worker = worker_caller_name.as_deref().unwrap_or("worker");
+        return Ok(error_result(format!(
+            "Task {id} is assigned to '' not '{worker}'. Workers cannot claim active or revision tasks via `task action=progress`; a supervisor must assign or recover the task with factory action=assign_workers first."
+        )));
     }
 
     task.insert("percent".into(), Value::Number(percent.into()));

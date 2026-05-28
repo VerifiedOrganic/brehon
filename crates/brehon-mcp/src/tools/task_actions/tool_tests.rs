@@ -2827,6 +2827,46 @@ async fn test_ready_surfaces_unassigned_changes_requested_tasks_separately() {
 }
 
 #[tokio::test]
+async fn test_ready_surfaces_duplicate_active_worker_assignments() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let root = make_test_root();
+    let _env = ScopedEnv::set_with_defaults(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
+    let tool = TaskActionsTool::new();
+
+    write_test_task(root.path(), "T-review-a", "in_review", "task");
+    write_test_task(root.path(), "T-review-b", "changes_requested", "task");
+
+    let ready = tool
+        .execute(serde_json::json!({"action": "ready"}))
+        .await
+        .unwrap();
+    let payload: Value = serde_json::from_str(&extract_text(&ready)).unwrap();
+
+    assert_eq!(
+        payload["active_worker_assignment_conflict_count"], 1,
+        "{payload}"
+    );
+    let conflict = &payload["active_worker_assignment_conflicts"][0];
+    assert_eq!(conflict["worker"], "worker-1");
+    assert_eq!(conflict["task_count"], 2);
+    let task_ids = conflict["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|task| task["task_id"].as_str())
+        .collect::<std::collections::HashSet<_>>();
+    assert!(task_ids.contains("T-review-a"), "{conflict}");
+    assert!(task_ids.contains("T-review-b"), "{conflict}");
+    assert!(
+        payload["message"]
+            .as_str()
+            .unwrap()
+            .contains("worker assignment invariant conflict"),
+        "{payload}"
+    );
+}
+
+#[tokio::test]
 async fn test_ready_surfaces_recoverable_blocked_worker_handoffs() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
@@ -5425,6 +5465,96 @@ async fn test_progress_rejects_non_assignee_worker() {
     assert_eq!(task["status"], "in_progress");
     assert_eq!(task["percent"], 0);
     assert!(task.get("notes").is_none());
+}
+
+#[tokio::test]
+async fn test_progress_rejects_unassigned_changes_requested_self_claim() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let root = make_test_root();
+    let _env = ScopedEnv::set_with_defaults(&[
+        ("BREHON_ROOT", root.path().to_str().unwrap()),
+        ("BREHON_AGENT_ROLE", "worker"),
+        ("BREHON_AGENT_NAME", "worker-1"),
+    ]);
+    let tool = TaskActionsTool::new();
+    write_test_task(
+        root.path(),
+        "T-unassigned-revision",
+        "changes_requested",
+        "task",
+    );
+    let mut task = read_test_task(root.path(), "T-unassigned-revision");
+    task["assignee"] = Value::Null;
+    task["review_owner"] = Value::Null;
+    std::fs::write(
+        root.path()
+            .join("runtime")
+            .join("tasks")
+            .join("T-unassigned-revision.json"),
+        serde_json::to_string_pretty(&task).unwrap(),
+    )
+    .unwrap();
+
+    let result = tool
+        .execute(serde_json::json!({
+            "action": "progress",
+            "id": "T-unassigned-revision",
+            "percent": 50,
+            "notes": "continuing revision"
+        }))
+        .await
+        .unwrap();
+
+    assert_eq!(result.is_error, Some(true));
+    let text = extract_text(&result);
+    assert!(text.contains("assigned to '' not 'worker-1'"), "{text}");
+    assert!(
+        text.contains("Workers cannot claim active or revision tasks via `task action=progress`"),
+        "{text}"
+    );
+
+    let stored = read_test_task(root.path(), "T-unassigned-revision");
+    assert_eq!(stored["status"], "changes_requested");
+    assert_eq!(stored["assignee"], Value::Null);
+    assert_eq!(stored["percent"], 0);
+    assert!(stored.get("notes").is_none());
+}
+
+#[tokio::test]
+async fn test_progress_rejects_worker_with_duplicate_active_assignment() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let root = make_test_root();
+    let _env = ScopedEnv::set_with_defaults(&[
+        ("BREHON_ROOT", root.path().to_str().unwrap()),
+        ("BREHON_AGENT_ROLE", "worker"),
+        ("BREHON_AGENT_NAME", "worker-1"),
+    ]);
+    let tool = TaskActionsTool::new();
+    write_test_task(root.path(), "T-current", "changes_requested", "task");
+    write_test_task(root.path(), "T-other", "changes_requested", "task");
+
+    let result = tool
+        .execute(serde_json::json!({
+            "action": "progress",
+            "id": "T-current",
+            "percent": 50,
+            "notes": "continuing current task"
+        }))
+        .await
+        .unwrap();
+
+    assert_eq!(result.is_error, Some(true));
+    let text = extract_text(&result);
+    assert!(
+        text.contains("worker 'worker-1' already owns active task(s): T-other [changes_requested]"),
+        "{text}"
+    );
+    assert!(text.contains("Workers are single-task"), "{text}");
+
+    let stored = read_test_task(root.path(), "T-current");
+    assert_eq!(stored["status"], "changes_requested");
+    assert_eq!(stored["percent"], 0);
+    assert!(stored.get("notes").is_none());
 }
 
 #[tokio::test]

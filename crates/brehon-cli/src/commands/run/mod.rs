@@ -1298,6 +1298,7 @@ pub async fn execute(
     let config = load_config_with_override(Some(&cwd), config_override)?;
     ensure_runtime_terminal_host_supported(&config)?;
     let eager_gateway_bootstrap = eager_gateway_bootstrap_enabled(&config.runtime.terminal_host);
+    let runtime_worktree_root = effective_worktree_root(&cwd, &config);
 
     let session_name = format!(
         "brehon-{}",
@@ -1309,7 +1310,9 @@ pub async fn execute(
     );
 
     std::env::set_var("BREHON_ROOT", cwd.join(".brehon"));
+    std::env::set_var("BREHON_PROJECT_ROOT", &cwd);
     std::env::set_var("BREHON_WORKSPACE_ROOT", &cwd);
+    std::env::set_var("BREHON_WORKTREE_ROOT", &runtime_worktree_root);
     std::env::set_var("BREHON_SESSION_NAME", &session_name);
 
     splash.set_stage("Preparing runtime");
@@ -1461,9 +1464,7 @@ pub async fn execute(
             model_name.to_string()
         }
     };
-    let worktree_root_env_value = effective_worktree_root(&cwd, &config)
-        .to_string_lossy()
-        .to_string();
+    let worktree_root_env_value = runtime_worktree_root.to_string_lossy().to_string();
     let launcher_env_pairs = |lane: &str| -> Vec<(String, String)> {
         let mut pairs = config
             .lane_launcher(lane)
@@ -4143,7 +4144,9 @@ mod tests {
 
         // Save original env vars so we can restore them after the test.
         let original_root = std::env::var("BREHON_ROOT").ok();
+        let original_project = std::env::var("BREHON_PROJECT_ROOT").ok();
         let original_workspace = std::env::var("BREHON_WORKSPACE_ROOT").ok();
+        let original_worktree = std::env::var("BREHON_WORKTREE_ROOT").ok();
         let original_session = std::env::var("BREHON_SESSION_NAME").ok();
 
         let temp = tempfile::tempdir().unwrap();
@@ -4193,6 +4196,23 @@ mod tests {
             brehon_dir.to_string_lossy().to_string(),
             "BREHON_ROOT should be repo_root/.brehon"
         );
+        let project_root =
+            std::env::var("BREHON_PROJECT_ROOT").expect("BREHON_PROJECT_ROOT should be set");
+        assert_eq!(
+            project_root,
+            repo_root.to_string_lossy().to_string(),
+            "BREHON_PROJECT_ROOT should be the normalized repo root"
+        );
+        let worktree_root =
+            std::env::var("BREHON_WORKTREE_ROOT").expect("BREHON_WORKTREE_ROOT should be set");
+        let resolved_config = brehon_config::load_config(Some(&repo_root)).unwrap();
+        assert_eq!(
+            worktree_root,
+            effective_worktree_root(&repo_root, &resolved_config)
+                .to_string_lossy()
+                .to_string(),
+            "BREHON_WORKTREE_ROOT should match the resolved orchestration worktree root"
+        );
 
         // ensure_mcp_config writes .mcp.json at the project root.
         assert!(
@@ -4219,9 +4239,17 @@ mod tests {
             Some(v) => std::env::set_var("BREHON_ROOT", v),
             None => std::env::remove_var("BREHON_ROOT"),
         }
+        match original_project {
+            Some(v) => std::env::set_var("BREHON_PROJECT_ROOT", v),
+            None => std::env::remove_var("BREHON_PROJECT_ROOT"),
+        }
         match original_workspace {
             Some(v) => std::env::set_var("BREHON_WORKSPACE_ROOT", v),
             None => std::env::remove_var("BREHON_WORKSPACE_ROOT"),
+        }
+        match original_worktree {
+            Some(v) => std::env::set_var("BREHON_WORKTREE_ROOT", v),
+            None => std::env::remove_var("BREHON_WORKTREE_ROOT"),
         }
         match original_session {
             Some(v) => std::env::set_var("BREHON_SESSION_NAME", v),

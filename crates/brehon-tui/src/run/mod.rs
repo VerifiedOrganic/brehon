@@ -259,8 +259,8 @@ pub fn run_tui_with_panels_and_runtime_commands(
     terminal.clear()?;
 
     let started_at = Instant::now();
-    let tick_active = Duration::from_millis(8); // ~120fps during active output
-    let tick_idle = Duration::from_millis(50); // ~20fps when idle
+    let tick_active = Duration::from_millis(50); // ~20fps during visible output
+    let tick_idle = Duration::from_millis(250); // ~4fps when idle/background-only output
     let idle_threshold = Duration::from_millis(500);
     let last_output_at = Instant::now();
     let group_tab = GroupTab::Dashboard;
@@ -394,7 +394,7 @@ pub fn run_tui_with_panels_and_runtime_commands(
     let pending_initial_resize = true;
 
     let last_session_poll = std::time::Instant::now();
-    let session_poll_interval = Duration::from_secs(2);
+    let session_poll_interval = Duration::from_secs(5);
     let runtime_session_name = mux.session_name().map(str::to_string);
     let last_shared_root_issue: Option<String> = None;
     let pending_dashboard_refresh: Option<tokio::task::JoinHandle<DashboardRefreshSnapshot>> = None;
@@ -2467,6 +2467,7 @@ mod tests {
     #[cfg(unix)]
     fn wait_for_panesmith_scrollback_text(mux: &mut Mux, pane_id: &str, needle: &str) {
         wait_for_panesmith_condition(mux, |mux| {
+            let _ = mux.refresh_panesmith_scrollback(pane_id);
             mux.panesmith_scrollback(pane_id).is_some_and(|scrollback| {
                 panesmith_scrollback_style_for_text(scrollback, needle).is_some()
             })
@@ -2474,7 +2475,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn wait_for_panesmith_condition(mux: &mut Mux, mut predicate: impl FnMut(&Mux) -> bool) {
+    fn wait_for_panesmith_condition(mux: &mut Mux, mut predicate: impl FnMut(&mut Mux) -> bool) {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             mux.poll_batch();

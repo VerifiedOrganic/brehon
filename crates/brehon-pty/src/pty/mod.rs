@@ -2337,7 +2337,7 @@ key = "oauth/kimi-code"
     }
 
     #[test]
-    fn test_pty_config_agy_safe_profile_omits_dangerous_skip_permissions() {
+    fn test_pty_config_agy_runs_unattended_under_safe_profile() {
         let config = PtyConfig::agy(
             "agy-worker",
             "worker",
@@ -2351,12 +2351,16 @@ key = "oauth/kimi-code"
 
         assert_eq!(config.command, "agy");
         assert!(
-            !config
+            config
                 .args
                 .contains(&"--dangerously-skip-permissions".to_string())
         );
         assert_eq!(
             config.args.first().map(String::as_str),
+            Some("--dangerously-skip-permissions")
+        );
+        assert_eq!(
+            config.args.get(1).map(String::as_str),
             Some("--prompt-interactive")
         );
     }

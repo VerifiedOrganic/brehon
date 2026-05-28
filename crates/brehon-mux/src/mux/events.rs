@@ -1,6 +1,6 @@
 //! Event routing, polling, and the ACP event bridge.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
@@ -1569,6 +1569,22 @@ impl Mux {
     /// The MuxEvent::PaneOutput events include the raw PTY bytes so WebSocket clients
     /// can feed them to their own terminal emulators.
     pub fn poll_batch(&mut self) -> (usize, Vec<MuxEvent>) {
+        self.poll_batch_inner(None)
+    }
+
+    /// Poll all panes while only refreshing owned Panesmith snapshots for the
+    /// panes the caller may render immediately.
+    pub fn poll_batch_with_panesmith_snapshot_panes(
+        &mut self,
+        snapshot_panes: &BTreeSet<String>,
+    ) -> (usize, Vec<MuxEvent>) {
+        self.poll_batch_inner(Some(snapshot_panes))
+    }
+
+    fn poll_batch_inner(
+        &mut self,
+        snapshot_panes: Option<&BTreeSet<String>>,
+    ) -> (usize, Vec<MuxEvent>) {
         let mut events = Vec::new();
         let mut total_bytes = 0;
 
@@ -1589,7 +1605,12 @@ impl Mux {
         while let Some(event) = self.pending_panesmith_events.pop_front() {
             events.push(event);
         }
-        events.extend(self.drain_panesmith_events_to_mux());
+        match snapshot_panes {
+            Some(snapshot_panes) => {
+                events.extend(self.drain_panesmith_events_to_mux_for_snapshots(snapshot_panes));
+            }
+            None => events.extend(self.drain_panesmith_events_to_mux()),
+        }
 
         // Drain each pane using coalesced output (more efficient for high throughput)
         for (id, pane) in self.panes.iter_mut() {
