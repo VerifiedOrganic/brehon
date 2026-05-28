@@ -25,9 +25,10 @@ use super::recovery::{
     active_worker_task, agent_health_marker_reason, agent_is_quarantined_for_run,
     attempt_auto_recover_stalled_worker, block_task_for_prompt_block_recovery_failure,
     block_task_for_stalled_worker_manual_recovery, clear_agent_health_marker,
-    prompt_blocked_detail, prompt_blocked_info, push_dashboard_event, quarantined_supervisor_names,
-    quarantined_worker_names, read_agent_health_marker, read_prompt_retry_deferral_snapshot,
-    sync_worker_task_contexts, write_prompt_blocked_recovery_failed_marker_or_clear_stale_marker,
+    inspect_worker_worktree_state, prompt_blocked_detail, prompt_blocked_info,
+    push_dashboard_event, quarantined_supervisor_names, quarantined_worker_names,
+    read_agent_health_marker, read_prompt_retry_deferral_snapshot, sync_worker_task_contexts,
+    write_prompt_blocked_recovery_failed_marker_or_clear_stale_marker,
     PROMPT_BLOCKED_HEALTH_REASON, PROMPT_BLOCKED_RECOVERY_FAILED_HEALTH_REASON,
     PROMPT_BLOCKED_RECOVERY_FAILURE_ACTIVITY, STALLED_WORKER_MANUAL_RECOVERY_ACTIVITY,
 };
@@ -38,7 +39,9 @@ use super::self_improvement::{
     find_review_wait_task_for_worker, next_self_improvement_prompt,
 };
 use super::session::read_session_files;
-use super::types::{PendingReviewObligation, StalledRecoveryOutcome, TaskInfo};
+use super::types::{
+    PendingReviewObligation, StalledRecoveryOutcome, TaskInfo, WorkerWorktreeInspection,
+};
 
 fn queue_worker_recycle(
     ctx: &mut EventLoopCtx,
@@ -1592,6 +1595,55 @@ fn send_active_worker_recovery_nudge(
     true
 }
 
+fn send_dirty_worktree_handoff_nudge(
+    ctx: &mut EventLoopCtx,
+    worker_id: &str,
+    task: &TaskInfo,
+    reason: &str,
+    idle_secs: u64,
+    now: std::time::Instant,
+) -> bool {
+    let Some(pane) = ctx.mux.get(worker_id) else {
+        return false;
+    };
+    let task_cmd = format!("{}task", pane.cli_type().capabilities().tool_prefix);
+    let prompt = build_dirty_worktree_handoff_nudge_message(task, &task_cmd, reason, idle_secs);
+    if !dispatch_runtime_prompt(ctx, worker_id, prompt, None) {
+        return false;
+    }
+    ctx.active_worker_recovery_nudges_sent
+        .insert(active_worker_recovery_key(worker_id, &task.id), now);
+    push_dashboard_event(
+        &ctx.dashboard_data,
+        format!(
+            "nudged {worker_id} to checkpoint, complete, or block {} after dirty worktree handoff gap ({idle_secs}s idle)",
+            task.id
+        ),
+    );
+    true
+}
+
+pub(crate) fn build_dirty_worktree_handoff_nudge_message(
+    task: &TaskInfo,
+    task_cmd: &str,
+    reason: &str,
+    idle_secs: u64,
+) -> String {
+    format!(
+        "[brehon] Dirty worktree handoff required for {task_id}: {title}\n\n\
+         Brehon sees uncommitted work in your assigned worktree ({reason}) and the task is still \
+         status `{status}` after {idle_secs}s idle. Shell output, prose, and local edits do not \
+         update Brehon state. Make exactly one Brehon task call now:\n\n\
+         - Ready for review: `{task_cmd} action=complete id={task_id} notes=\"<summary>\" activity=testing`\n\
+         - Still working but need to preserve this revision: `{task_cmd} action=checkpoint id={task_id} message=\"<summary>\"`, then `{task_cmd} action=progress id={task_id} percent=<n> notes=\"<status>\" activity=<reading|editing|testing|reviewing>`\n\
+         - Blocked: `{task_cmd} action=update id={task_id} status=blocked blockers=\"<reason>\"`\n\n\
+         Do not run more edits first. Do not narrate completion. Call the Brehon MCP tool.",
+        task_id = task.id,
+        title = task.title,
+        status = task.status,
+    )
+}
+
 fn reset_active_assigned_worker(
     ctx: &mut EventLoopCtx,
     worker_id: &str,
@@ -1928,7 +1980,6 @@ fn handle_auto_recovered_stalled_worker(
             worker,
             reason,
         } => {
-            // Dirty/uninspectable-but-present worktrees still fall through to an in-place reset.
             let event = format!(
                 "stalled task {task_id} stayed with worker {worker}; safe reassignment was blocked because {reason}"
             );
@@ -1940,7 +1991,58 @@ fn handle_auto_recovered_stalled_worker(
                 "{event}"
             );
             push_dashboard_event(&ctx.dashboard_data, event);
-            false
+            if send_dirty_worktree_handoff_nudge(
+                ctx,
+                &worker,
+                task,
+                &reason,
+                idle_mins.saturating_mul(60),
+                now,
+            ) {
+                return true;
+            }
+            match block_task_for_stalled_worker_manual_recovery(
+                brehon_root,
+                &task_id,
+                &worker,
+                &reason,
+            ) {
+                Ok(()) => {
+                    refresh_stall_recovery_snapshot(
+                        ctx,
+                        brehon_root,
+                        tasks_snapshot,
+                        sessions_snapshot,
+                    );
+                    let event = format!(
+                        "blocked stalled task {task_id} for supervisor/manual recovery; dirty worker {worker} could not be safely nudged or reassigned: {reason}"
+                    );
+                    tracing::warn!(
+                        task_id = %task_id,
+                        worker = %worker,
+                        idle_minutes = idle_mins,
+                        reason = %reason,
+                        activity = STALLED_WORKER_MANUAL_RECOVERY_ACTIVITY,
+                        "{event}"
+                    );
+                    push_dashboard_event(&ctx.dashboard_data, event);
+                }
+                Err(err) => {
+                    let event = format!(
+                        "failed to block dirty stalled task {task_id} for supervisor/manual recovery: {err}"
+                    );
+                    tracing::warn!(
+                        task_id = %task_id,
+                        worker = %worker,
+                        idle_minutes = idle_mins,
+                        reason = %reason,
+                        error = %err,
+                        "{event}"
+                    );
+                    push_dashboard_event(&ctx.dashboard_data, event);
+                }
+            }
+            true
         }
         StalledRecoveryOutcome::ManualRecoveryRequired {
             task_id,
@@ -2374,6 +2476,9 @@ pub(super) fn detect_and_handle_stalls(ctx: &mut EventLoopCtx) {
     // same checkpoint can't produce duplicate nudges, and a fresh
     // checkpoint (new commit SHA) legitimately earns a new nudge window.
     send_post_checkpoint_handoff_nudges(ctx, &tasks_snapshot, now);
+    if let Some(root) = brehon_root.as_ref() {
+        send_dirty_worktree_handoff_nudges(ctx, root, &tasks_snapshot, now);
+    }
 
     let stale_worker_candidates: Vec<(String, bool)> = ctx
         .mux
@@ -2708,6 +2813,81 @@ pub(crate) fn send_post_checkpoint_handoff_nudges(
     );
 }
 
+/// Detect assigned workers that have uncommitted work in their dedicated
+/// worktree but have not made a Brehon lifecycle call.
+///
+/// This covers the no-MCP handoff failure mode: the agent edited and tested
+/// locally, then ended the turn with prose instead of `action=complete`,
+/// `action=checkpoint`, or `action=progress`. A dirty assigned worktree must
+/// not be reset; the worker needs an explicit handoff prompt first.
+pub(crate) fn send_dirty_worktree_handoff_nudges(
+    ctx: &mut super::event_loop::EventLoopCtx,
+    brehon_root: &std::path::Path,
+    tasks: &[super::types::TaskInfo],
+    now: std::time::Instant,
+) {
+    let worker_panes: std::collections::HashSet<String> = ctx
+        .mux
+        .panes()
+        .filter(|pane| {
+            *pane.kind() == PaneKind::Worker
+                && !pane.has_exited()
+                && !matches!(pane.pane_state(), Some(PaneState::Dead { .. }))
+        })
+        .map(|pane| pane.id().to_string())
+        .collect();
+    let busy_workers: std::collections::HashSet<String> = ctx
+        .mux
+        .panes()
+        .filter(|pane| {
+            *pane.kind() == PaneKind::Worker
+                && (pane.is_tool_executing()
+                    || matches!(pane.pane_state(), Some(PaneState::Busy { .. })))
+        })
+        .map(|pane| pane.id().to_string())
+        .collect();
+
+    for task in tasks {
+        let Some(worker_id) = task.assignee.as_deref() else {
+            continue;
+        };
+        if !active_worker_task(task, worker_id)
+            || !worker_panes.contains(worker_id)
+            || busy_workers.contains(worker_id)
+        {
+            continue;
+        }
+        let worker_idle = now
+            .checked_duration_since(ctx.last_activity.get(worker_id).copied().unwrap_or(now))
+            .unwrap_or_default();
+        if worker_idle < ctx.post_checkpoint_nudge_threshold {
+            continue;
+        }
+        let key = active_worker_recovery_key(worker_id, &task.id);
+        if ctx
+            .active_worker_recovery_nudges_sent
+            .get(&key)
+            .is_some_and(|sent_at| {
+                now.saturating_duration_since(*sent_at) < ctx.post_checkpoint_nudge_cooldown
+            })
+        {
+            continue;
+        }
+        if let WorkerWorktreeInspection::Dirty(reason) =
+            inspect_worker_worktree_state(brehon_root, worker_id)
+        {
+            send_dirty_worktree_handoff_nudge(
+                ctx,
+                worker_id,
+                task,
+                &reason,
+                worker_idle.as_secs(),
+                now,
+            );
+        }
+    }
+}
+
 /// A worker+task+commit triple that is due a handoff-reminder nudge.
 ///
 /// Exposed as a plain struct rather than a tuple so the field order at
@@ -2907,6 +3087,25 @@ mod post_checkpoint_nudge_tests {
         assert!(msg.contains("action=progress"));
         // Must explicitly remind that checkpoint does not transition status.
         assert!(msg.contains("does NOT transition"));
+    }
+
+    #[test]
+    fn dirty_worktree_nudge_requires_lifecycle_tool_call() {
+        let task = in_progress_task("T-dirty", "worker-a", None);
+        let msg = build_dirty_worktree_handoff_nudge_message(
+            &task,
+            "mcp_brehon_task",
+            "worktree has uncommitted changes",
+            94,
+        );
+        assert!(msg.contains("Dirty worktree handoff required"));
+        assert!(msg.contains("T-dirty"));
+        assert!(msg.contains("94s"));
+        assert!(msg.contains("action=complete"));
+        assert!(msg.contains("action=checkpoint"));
+        assert!(msg.contains("action=progress"));
+        assert!(msg.contains("action=update"));
+        assert!(msg.contains("Do not narrate completion"));
     }
 
     #[test]

@@ -938,7 +938,28 @@ async fn test_submit_review_rejects_unsupported_negative_and_allows_same_reviewe
         "{}",
         extract_text(&resubmitted)
     );
-    assert_eq!(parse_result(&resubmitted)["outcome"], "changes_requested");
+    let resubmitted_json = parse_result(&resubmitted);
+    assert_eq!(resubmitted_json["panel_progress"], "1/2");
+    assert_eq!(resubmitted_json["next_action"]["kind"], "wait_for_reviews");
+    assert!(resubmitted_json.get("outcome").is_none());
+
+    std::env::set_var("BREHON_AGENT_NAME", "reviewer-beta");
+    let beta = tool
+        .execute(serde_json::json!({
+            "action": "submit_review",
+            "review_id": review_id,
+            "reviewer": "reviewer-beta",
+            "score": 8,
+            "verdict": "approved",
+            "summary": "No additional blockers"
+        }))
+        .await
+        .unwrap();
+    assert!(beta.is_error.is_none(), "{}", extract_text(&beta));
+    let beta_json = parse_result(&beta);
+    assert_eq!(beta_json["outcome"], "changes_requested");
+    assert_eq!(beta_json["panel_progress"], "2/2");
+    assert_eq!(beta_json["completed_early"], false);
 }
 
 #[tokio::test]
@@ -1047,7 +1068,7 @@ async fn test_persisted_unsupported_negative_review_does_not_block_two_valid_app
 }
 
 #[tokio::test]
-async fn test_review_round_closes_early_when_blocking_verdict_arrives() {
+async fn test_review_round_waits_for_full_panel_when_blocking_verdict_arrives() {
     let _lock = ENV_LOCK.lock().unwrap();
     let env = TestEnv::new();
     env.write_session("reviewer-gamma", "reviewer", Some("claude"));
@@ -1135,10 +1156,66 @@ async fn test_review_round_closes_early_when_blocking_verdict_arrives() {
         extract_text(&needs_revision)
     );
     let json = parse_result(&needs_revision);
-    assert_eq!(json["outcome"], "changes_requested");
-    assert_eq!(json["completed_early"], true);
     assert_eq!(json["panel_progress"], "2/3");
-    assert_eq!(json["next_action"]["kind"], "assign_revision_worker");
+    assert_eq!(json["next_action"]["kind"], "wait_for_reviews");
+    assert!(json.get("outcome").is_none());
+    assert!(json.get("completed_early").is_none());
+
+    let task: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            env.root
+                .join("runtime")
+                .join("tasks")
+                .join(format!("{}.json", env.task_id)),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(task["status"], "in_review");
+
+    let consolidated_path = env
+        .root
+        .join("runtime")
+        .join("reviews")
+        .join(&env.task_id)
+        .join("round-1")
+        .join("consolidated.json");
+    assert!(
+        !consolidated_path.exists(),
+        "partial negative panel must not write a consolidated report"
+    );
+
+    let state: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            env.root
+                .join("runtime")
+                .join("reviews")
+                .join(&env.task_id)
+                .join("state.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(state["status"], "collecting");
+    assert_eq!(state["submissions_received"].as_array().unwrap().len(), 2);
+
+    std::env::set_var("BREHON_AGENT_NAME", "reviewer-gamma");
+    let gamma = tool
+        .execute(json!({
+            "action": "submit_review",
+            "review_id": review_id,
+            "score": 8,
+            "verdict": "approved",
+            "summary": "third reviewer completed"
+        }))
+        .await
+        .unwrap();
+    assert!(gamma.is_error.is_none(), "{}", extract_text(&gamma));
+    let gamma_json = parse_result(&gamma);
+    assert_eq!(gamma_json["outcome"], "changes_requested");
+    assert_eq!(gamma_json["completed_early"], false);
+    assert_eq!(gamma_json["panel_progress"], "3/3");
+    assert_eq!(gamma_json["next_action"]["kind"], "assign_revision_worker");
 
     let task: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(
@@ -1164,7 +1241,7 @@ async fn test_review_round_closes_early_when_blocking_verdict_arrives() {
     )
     .unwrap();
     assert_eq!(state["status"], "changes_requested");
-    assert_eq!(state["submissions_received"].as_array().unwrap().len(), 2);
+    assert_eq!(state["submissions_received"].as_array().unwrap().len(), 3);
 }
 
 #[tokio::test]
@@ -2794,8 +2871,10 @@ async fn test_changes_requested_persists_review_feedback_and_notifies_worker() {
         .unwrap();
     assert!(alpha.is_error.is_none(), "{}", extract_text(&alpha));
     let alpha_json = parse_result(&alpha);
-    assert_eq!(alpha_json["outcome"], "changes_requested");
-    assert_eq!(alpha_json["completed_early"], true);
+    assert_eq!(alpha_json["panel_progress"], "1/2");
+    assert_eq!(alpha_json["next_action"]["kind"], "wait_for_reviews");
+    assert!(alpha_json.get("outcome").is_none());
+    assert!(alpha_json.get("completed_early").is_none());
 
     std::env::set_var("BREHON_AGENT_NAME", "reviewer-beta");
     std::env::set_var("BREHON_AGENT_ROLE", "reviewer");
@@ -2815,6 +2894,10 @@ async fn test_changes_requested_persists_review_feedback_and_notifies_worker() {
         .await
         .unwrap();
     assert!(beta.is_error.is_none(), "{}", extract_text(&beta));
+    let beta_json = parse_result(&beta);
+    assert_eq!(beta_json["outcome"], "changes_requested");
+    assert_eq!(beta_json["completed_early"], false);
+    assert_eq!(beta_json["panel_progress"], "2/2");
 
     let task: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&task_path).unwrap()).unwrap();
@@ -2844,7 +2927,7 @@ async fn test_changes_requested_persists_review_feedback_and_notifies_worker() {
             .as_array()
             .unwrap()
             .len(),
-        0
+        1
     );
 
     let worker_messages = queued_messages_for(&env.root, "worker-1");

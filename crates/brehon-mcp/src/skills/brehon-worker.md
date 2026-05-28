@@ -48,7 +48,7 @@ When implementation is done:
    - Optional: add `message="checkpoint summary"` if the commit message should differ from the review note.
 5. You do not need to take further action after `action=complete`. The supervisor will initiate the review pipeline.
 
-If the review comes back with changes requested, fix the issues and report 100% again.
+If the review comes back with changes requested, fix the issues and call `mcp__brehon__task action=complete` again when the revised work is ready for review. Do not just report 100%, describe completion in prose, or stop after shell tests; those do not update Brehon state.
 
 If any Brehon task action tells you the task is already terminal (`closed`, `merged`, etc.):
 

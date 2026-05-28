@@ -6178,7 +6178,7 @@ TypeError: Cannot read properties of undefined"#,
     }
 
     #[test]
-    fn stale_dirty_active_assigned_worker_resets_once_after_nudge_window() {
+    fn stale_dirty_active_assigned_worker_is_not_reset_after_nudge_window() {
         let temp = tempfile::tempdir().expect("tempdir");
         let brehon_root = temp.path().join(".brehon");
         write_active_assigned_task_fixture(&brehon_root);
@@ -6213,10 +6213,12 @@ TypeError: Cannot read properties of undefined"#,
         assert_eq!(routed.command.target.pane_id.as_deref(), Some("worker-1"));
         assert!(matches!(
             routed.command.kind,
-            RuntimeCommandKind::ResetPane { ref reason }
-                if reason == "auto-recover idle assigned worker pane via daemon reset"
+            RuntimeCommandKind::SendPrompt { ref text, .. }
+                if text.contains("Dirty worktree handoff required")
+                    && text.contains("T-owned")
+                    && text.contains("action=complete")
+                    && text.contains("action=checkpoint")
         ));
-        assert_eq!(harness.ctx.pending_runtime_commands.len(), 1);
         let task = serde_json::from_str::<serde_json::Value>(
             &std::fs::read_to_string(
                 brehon_root
@@ -6230,9 +6232,7 @@ TypeError: Cannot read properties of undefined"#,
         assert_eq!(task["status"], "in_progress");
         assert_eq!(task["assignee"], "worker-1");
 
-        drain_runtime_commands(&mut harness);
-        assert_eq!(harness.ctx.mux.pending_delayed_prompt_count(), 1);
-        assert!(harness
+        assert!(!harness
             .ctx
             .active_worker_recovery_resets_sent
             .contains_key(&("worker-1".to_string(), "T-owned".to_string())));
@@ -6245,8 +6245,52 @@ TypeError: Cannot read properties of undefined"#,
         crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
         assert!(
             harness.rx.recv_timeout(Duration::from_millis(50)).is_err(),
-            "active assigned worker reset must not loop for the same task"
+            "dirty assigned worker nudge must not loop within the cooldown"
         );
+    }
+
+    #[test]
+    fn idle_dirty_assigned_worker_gets_handoff_nudge_before_reset_threshold() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let brehon_root = temp.path().join(".brehon");
+        write_active_assigned_task_fixture(&brehon_root);
+        let worktree = write_worker_worktree_fixture(&brehon_root, "worker-1");
+        std::fs::write(worktree.join("dirty.txt"), "pending changes\n").expect("dirty worktree");
+
+        let mut mux = Mux::new(24, 80);
+        mux.add_pane(make_worker_pane("worker-1"));
+        let mut harness = harness_with_mux(mux);
+        let now = Instant::now();
+        harness.ctx.auto_recover_threshold = Duration::from_secs(60);
+        harness.ctx.post_checkpoint_nudge_threshold = Duration::from_secs(1);
+        harness.ctx.stall_check_interval = Duration::ZERO;
+        harness.ctx.last_stall_check = now - Duration::from_secs(60);
+        harness
+            .ctx
+            .last_activity
+            .insert("worker-1".to_string(), now - Duration::from_secs(5));
+        harness
+            .ctx
+            .dashboard_data
+            .lock()
+            .expect("dashboard")
+            .brehon_root = Some(brehon_root.clone());
+
+        crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
+
+        let routed = recv_route(&harness.rx);
+        assert_eq!(routed.command.target.pane_id.as_deref(), Some("worker-1"));
+        assert!(matches!(
+            routed.command.kind,
+            RuntimeCommandKind::SendPrompt { ref text, .. }
+                if text.contains("Dirty worktree handoff required")
+                    && text.contains("Shell output, prose, and local edits do not update Brehon state")
+                    && text.contains("action=complete")
+        ));
+        assert!(harness
+            .ctx
+            .active_worker_recovery_nudges_sent
+            .contains_key(&("worker-1".to_string(), "T-owned".to_string())));
     }
 
     #[test]
