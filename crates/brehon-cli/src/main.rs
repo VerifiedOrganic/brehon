@@ -54,6 +54,42 @@ fn resolve_project_root(config_arg: Option<&PathBuf>) -> Option<PathBuf> {
     }
 }
 
+fn project_root_from_brehon_env() -> Option<PathBuf> {
+    if let Some(project_root) = std::env::var_os("BREHON_PROJECT_ROOT")
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        return absolutize_project_root(&project_root);
+    }
+
+    let brehon_root = std::env::var_os("BREHON_ROOT")
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())?;
+    let project_root = if brehon_root.file_name().and_then(|name| name.to_str()) == Some(".brehon")
+    {
+        brehon_root
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."))
+    } else {
+        brehon_root
+    };
+    absolutize_project_root(&project_root)
+}
+
+fn task_command_project_root(
+    config_arg: Option<&PathBuf>,
+    resolved_project_path: Option<PathBuf>,
+) -> PathBuf {
+    if config_arg.is_none() {
+        if let Some(project_root) = project_root_from_brehon_env() {
+            return project_root;
+        }
+    }
+    resolved_project_path.unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
+}
+
 fn resolve_config_override(config_arg: Option<&PathBuf>) -> Option<PathBuf> {
     match config_arg {
         Some(path) if path.is_file() => Some(path.clone()),
@@ -695,7 +731,7 @@ async fn main() -> ExitCode {
             }
         },
         Some(Commands::Task { command }) => {
-            let path = project_path.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+            let path = task_command_project_root(cli.config.as_ref(), project_path);
             match task::execute(&path, &command).await {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
@@ -719,6 +755,39 @@ async fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &Path) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+
+        fn unset(key: &'static str) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::remove_var(key);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = &self.previous {
+                std::env::set_var(self.key, previous);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
 
     #[test]
     fn project_root_from_relative_dot_brehon_config_uses_current_dir() {
@@ -751,5 +820,47 @@ mod tests {
         let root = resolve_project_root(Some(&config_path)).expect("project root");
 
         assert_eq!(root, temp.path());
+    }
+
+    #[test]
+    fn task_command_project_root_prefers_brehon_project_root_env_without_config() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let cwd_project = tempfile::tempdir().unwrap();
+        let _project_root = EnvGuard::set("BREHON_PROJECT_ROOT", project.path());
+        let _brehon_root = EnvGuard::unset("BREHON_ROOT");
+
+        let root = task_command_project_root(None, Some(cwd_project.path().to_path_buf()));
+
+        assert_eq!(root, project.path());
+    }
+
+    #[test]
+    fn task_command_project_root_derives_project_root_from_brehon_root_env() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let cwd_project = tempfile::tempdir().unwrap();
+        let _project_root = EnvGuard::unset("BREHON_PROJECT_ROOT");
+        let _brehon_root = EnvGuard::set("BREHON_ROOT", &project.path().join(".brehon"));
+
+        let root = task_command_project_root(None, Some(cwd_project.path().to_path_buf()));
+
+        assert_eq!(root, project.path());
+    }
+
+    #[test]
+    fn task_command_project_root_keeps_explicit_config_over_brehon_env() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let env_project = tempfile::tempdir().unwrap();
+        let explicit_project = tempfile::tempdir().unwrap();
+        let config_path = explicit_project.path().join(".brehon/config.yaml");
+        let _project_root = EnvGuard::set("BREHON_PROJECT_ROOT", env_project.path());
+
+        let root = task_command_project_root(
+            Some(&config_path),
+            Some(explicit_project.path().to_path_buf()),
+        );
+
+        assert_eq!(root, explicit_project.path());
     }
 }
