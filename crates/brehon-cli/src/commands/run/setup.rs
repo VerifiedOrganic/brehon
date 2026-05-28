@@ -692,7 +692,7 @@ pub(crate) fn agent_to_adapter(name: &str, config: &BrehonConfig) -> brehon_mux:
                     one_shot: false,
                     uses_ink_prompt: false,
                     prompt_injection_strategy: PromptInjectionStrategy::ImmediateSubmit,
-                    tool_prefix: std::borrow::Cow::Borrowed("brehon__"),
+                    tool_prefix: std::borrow::Cow::Borrowed("mcp__brehon__"),
                     transport: HarnessTransport::AppServer,
                     preferred_control_plane: HarnessControlPlane::Acp,
                 }
@@ -2704,7 +2704,7 @@ mod tests {
     }
 
     #[test]
-    fn test_agent_to_adapter_uses_grok_tool_prefix_for_grok_acp() {
+    fn test_agent_to_adapter_uses_mcp_tool_prefix_for_grok_acp() {
         let mut config = brehon_config::parse_defaults().unwrap();
         config.launchers.insert(
             "grok".to_string(),
@@ -2745,7 +2745,7 @@ mod tests {
         let adapter = agent_to_adapter("grok-worker", &config);
 
         assert!(adapter.as_builtin().is_none());
-        assert_eq!(adapter.capabilities().tool_prefix.as_ref(), "brehon__");
+        assert_eq!(adapter.capabilities().tool_prefix.as_ref(), "mcp__brehon__");
         assert_eq!(
             adapter.capabilities().preferred_control_plane,
             brehon_mux::HarnessControlPlane::Acp

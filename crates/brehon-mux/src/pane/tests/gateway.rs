@@ -626,7 +626,7 @@ fn grok_adapter(name: &str) -> AgentAdapter {
             one_shot: false,
             uses_ink_prompt: false,
             prompt_injection_strategy: PromptInjectionStrategy::ImmediateSubmit,
-            tool_prefix: std::borrow::Cow::Borrowed("brehon__"),
+            tool_prefix: std::borrow::Cow::Borrowed("mcp__brehon__"),
             transport: HarnessTransport::AppServer,
             preferred_control_plane: HarnessControlPlane::Acp,
         },
