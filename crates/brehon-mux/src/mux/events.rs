@@ -169,7 +169,14 @@ impl Mux {
     }
 
     fn terminal_provider_context_limit_signal_tokens() -> &'static [&'static str] {
-        &["context", "token limit", "maximum context"]
+        &[
+            "context window exceeds",
+            "context window exceeded",
+            "context length exceeded",
+            "context limit exceeded",
+            "maximum context length",
+            "token limit exceeded",
+        ]
     }
 
     fn ascii_insensitive_contains(haystack: &[u8], needle: &[u8]) -> bool {
@@ -461,7 +468,7 @@ impl Mux {
     ) -> Option<RuntimePaneBlockInfo> {
         let line = Self::terminal_provider_context_limit_line(text)?;
         Some(RuntimePaneBlockInfo {
-            kind: RuntimePaneBlockKind::TerminalPrompt,
+            kind: RuntimePaneBlockKind::ProviderContextLimit,
             summary: format!(
                 "provider context limit blocked automatic recovery: {}",
                 Self::truncate_blocked_text(line, 160)

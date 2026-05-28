@@ -1768,7 +1768,7 @@ fn test_provider_context_limit_output_blocks_worker() {
         Some(PaneState::Blocked { info, .. }) => {
             assert_eq!(
                 info.kind,
-                brehon_types::RuntimePaneBlockKind::TerminalPrompt
+                brehon_types::RuntimePaneBlockKind::ProviderContextLimit
             );
             assert_eq!(
                 info.command_or_tool.as_deref(),
@@ -1818,7 +1818,7 @@ fn test_provider_context_limit_output_detects_split_phrase_across_chunks() {
         Some(PaneState::Blocked { info, .. }) => {
             assert_eq!(
                 info.kind,
-                brehon_types::RuntimePaneBlockKind::TerminalPrompt
+                brehon_types::RuntimePaneBlockKind::ProviderContextLimit
             );
             assert_eq!(
                 info.command_or_tool.as_deref(),
@@ -1845,6 +1845,31 @@ fn test_context_usage_status_line_does_not_block_worker() {
 
     assert!(matches!(
         mux.get("minimax-worker")
+            .expect("worker pane exists")
+            .pane_state(),
+        Some(PaneState::Busy { .. })
+    ));
+}
+
+#[test]
+fn test_regular_context_output_does_not_rescan_stale_prompt_text() {
+    let (mut mux, generation) = mux_with_busy_worker_for_output("codex-worker");
+    mux.get_mut("codex-worker")
+        .expect("worker pane exists")
+        .append_output(b"Permission request: cargo test\r\n")
+        .expect("seed stale prompt-like viewport text");
+
+    mux.event_tx
+        .try_send(MuxEvent::PaneOutput {
+            pane_id: "codex-worker".to_string(),
+            data: b"Review handoff context:\r\nFocused context for the current task\r\n".to_vec(),
+            generation,
+        })
+        .expect("queue ordinary context output");
+    let (_bytes, _events) = mux.poll_batch();
+
+    assert!(matches!(
+        mux.get("codex-worker")
             .expect("worker pane exists")
             .pane_state(),
         Some(PaneState::Busy { .. })

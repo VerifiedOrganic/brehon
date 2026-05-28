@@ -700,4 +700,23 @@ mod tests {
         );
         assert!(matches!(dead.pane_state(), Some(PaneState::Dead { .. })));
     }
+
+    #[test]
+    fn provider_context_limit_block_does_not_arm_permission_resolution_fallback() {
+        let now = Instant::now();
+        let mut pane = make_test_pane();
+        pane.set_pane_blocked(
+            RuntimePaneBlockInfo {
+                kind: RuntimePaneBlockKind::ProviderContextLimit,
+                summary: "provider context limit blocked automatic recovery".to_string(),
+                command_or_tool: Some("context window exceeds limit".to_string()),
+                request_id: Some("busy-prompt".to_string()),
+                task_id: Some("T-1".to_string()),
+                excerpt: Some("API Error: context window exceeds limit".to_string()),
+            },
+            now,
+        );
+
+        assert!(!pane.permission_resolution_fallback_pending(now));
+    }
 }

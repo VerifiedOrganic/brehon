@@ -273,6 +273,7 @@ pub enum RuntimePaneState {
 pub enum RuntimePaneBlockKind {
     PermissionRequest,
     TerminalPrompt,
+    ProviderContextLimit,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
