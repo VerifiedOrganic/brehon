@@ -464,23 +464,12 @@ fn resolved_builtin_cli(
     agent_name: &str,
     config: &BrehonConfig,
 ) -> Option<(brehon_mux::SupervisorCli, bool)> {
-    let agent_config = config.lane_launcher(agent_name);
-    if let Some(cli) = builtin_cli_alias(agent_name).or_else(|| {
-        config
-            .lane_launcher_name(agent_name)
-            .and_then(builtin_cli_alias)
-    }) {
-        let has_capability_overrides = agent_config.is_some_and(launcher_has_capability_overrides);
-        return Some((cli, has_capability_overrides));
+    if let Some(agent_config) = config.lane_launcher(agent_name) {
+        return builtin_cli_from_launcher_config(agent_config)
+            .map(|cli| (cli, launcher_has_capability_overrides(agent_config)));
     }
 
-    let agent_config = agent_config?;
-    let cli = builtin_cli_from_launcher_config(agent_config)?;
-    if cli == brehon_mux::SupervisorCli::Claude {
-        return None;
-    }
-    let has_capability_overrides = launcher_has_capability_overrides(agent_config);
-    Some((cli, has_capability_overrides))
+    builtin_cli_alias(agent_name).map(|cli| (cli, false))
 }
 
 fn launches_codex_app_server(command: &str, args: &[String]) -> bool {
@@ -2608,10 +2597,10 @@ mod tests {
     }
 
     #[test]
-    fn test_agent_to_adapter_maps_claude_launcher_alias_to_builtin() {
+    fn test_agent_to_adapter_maps_claude_alias_to_builtin() {
         let mut config = brehon_config::parse_defaults().unwrap();
         config.launchers.insert(
-            "claude".to_string(),
+            "claude-reviewer".to_string(),
             brehon_types::AgentConnectionConfig {
                 adapter: brehon_types::agent::AdapterKind::Acp,
                 command: Some("claude".to_string()),
@@ -2631,16 +2620,6 @@ mod tests {
                 headers: std::collections::HashMap::new(),
             },
         );
-        config.lanes.insert(
-            "claude-reviewer".to_string(),
-            brehon_types::LaneConfig {
-                launcher: "claude".to_string(),
-                model: None,
-                reasoning_effort: None,
-                system_prompt: None,
-                profile: None,
-            },
-        );
 
         let adapter = agent_to_adapter("claude-reviewer", &config);
         assert_eq!(
@@ -2650,7 +2629,7 @@ mod tests {
     }
 
     #[test]
-    fn test_agent_to_adapter_keeps_custom_claude_launcher_custom_when_env_is_set() {
+    fn test_agent_to_adapter_keeps_claude_builtin_when_launcher_sets_env() {
         let mut config = brehon_config::parse_defaults().unwrap();
         config.launchers.insert(
             "claude-ollama-worker".to_string(),
@@ -2681,69 +2660,9 @@ mod tests {
         );
 
         let adapter = agent_to_adapter("claude-ollama-worker", &config);
-        assert!(adapter.as_builtin().is_none());
-        assert!(!adapter.capabilities().supports_teams);
         assert_eq!(
-            adapter.capabilities().transport,
-            brehon_mux::HarnessTransport::AppServer
-        );
-        assert_eq!(
-            adapter.capabilities().preferred_control_plane,
-            brehon_mux::HarnessControlPlane::Acp
-        );
-    }
-
-    #[test]
-    fn test_agent_to_adapter_keeps_deepseek_claude_launcher_custom() {
-        let mut config = brehon_config::parse_defaults().unwrap();
-        config.launchers.insert(
-            "claude-deepseek".to_string(),
-            brehon_types::AgentConnectionConfig {
-                adapter: brehon_types::agent::AdapterKind::Acp,
-                command: Some("claude".to_string()),
-                args: vec![],
-                provider: None,
-                transport: None,
-                control_plane: None,
-                base_url: None,
-                api_key_env: None,
-                permission_mode: None,
-                profile: None,
-                max_parallel_tool_calls: None,
-                assistant_message_passthrough_fields: Vec::new(),
-                reasoning_effort_param: None,
-                extra_body: None,
-                env: std::collections::HashMap::from([
-                    (
-                        "ANTHROPIC_BASE_URL".to_string(),
-                        "https://api.deepseek.com/anthropic".to_string(),
-                    ),
-                    ("ANTHROPIC_AUTH_TOKEN".to_string(), "secret".to_string()),
-                ]),
-                headers: std::collections::HashMap::new(),
-            },
-        );
-        config.lanes.insert(
-            "deepseek-claude-reviewer".to_string(),
-            brehon_types::LaneConfig {
-                launcher: "claude-deepseek".to_string(),
-                model: None,
-                reasoning_effort: None,
-                system_prompt: None,
-                profile: None,
-            },
-        );
-
-        let adapter = agent_to_adapter("deepseek-claude-reviewer", &config);
-        assert!(adapter.as_builtin().is_none());
-        assert!(!adapter.capabilities().supports_teams);
-        assert_eq!(
-            adapter.capabilities().transport,
-            brehon_mux::HarnessTransport::AppServer
-        );
-        assert_eq!(
-            adapter.capabilities().preferred_control_plane,
-            brehon_mux::HarnessControlPlane::Acp
+            adapter.as_builtin(),
+            Some(brehon_mux::SupervisorCli::Claude)
         );
     }
 
