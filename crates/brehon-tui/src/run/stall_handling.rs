@@ -509,10 +509,9 @@ fn recover_stale_reviewer_obligations(
                 .get(&nudge_key)
                 .copied();
             let resend_sent_at = ctx.review_obligation_resends_sent.get(&nudge_key).copied();
-            let reset_due = reviewer_idle >= ctx.review_obligation_reset_threshold
-                || nudge_sent_at.is_some_and(|sent_at| {
-                    now.duration_since(sent_at) >= ctx.review_obligation_nudge_threshold
-                });
+            let reset_due = nudge_sent_at.or(resend_sent_at).is_some_and(|sent_at| {
+                now.duration_since(sent_at) >= ctx.review_obligation_reset_threshold
+            });
             if !reset_due {
                 if nudge_sent_at.is_none() && resend_sent_at.is_none() {
                     let resent = live_reviewer_should_receive_resend(obligation)

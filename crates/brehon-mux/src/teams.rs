@@ -30,11 +30,21 @@ const AGENT_COLORS: &[InboxMessageColor] = &[
     InboxMessageColor::White,
 ];
 
-/// The director agent name registered in the team config.
-/// Used as the sender identity for system/auto-prompt messages.
+/// Normal Teams member used as the sender identity for Brehon-generated prompts.
+///
+/// Claude Code treats some Teams member types as semantic roles. Keep automated
+/// runtime prompts on an ordinary teammate identity so Anthropic-compatible
+/// provider shims do not receive mid-conversation `system` messages.
+pub const AUTOMATION_AGENT_NAME: &str = "brehon";
+/// Legacy director sender name. Older runtime state may still contain unread
+/// messages from this identity, so cleanup still treats it as Brehon-owned.
 pub const DIRECTOR_AGENT_NAME: &str = "director";
 /// Default supervisor name when callers do not override it.
 pub const SUPERVISOR_TEAM_MEMBER_NAME: &str = "supervisor";
+
+fn is_brehon_runtime_sender(name: &str) -> bool {
+    matches!(name, AUTOMATION_AGENT_NAME | DIRECTOR_AGENT_NAME)
+}
 
 fn normalized_member_alias(name: &str) -> Option<&'static str> {
     match name {
@@ -337,11 +347,11 @@ impl TeamsManager {
             backend_type: Some("tmux".to_string()),
         }];
 
-        // Director (daemon identity for system messages)
+        // Brehon automation identity for daemon/runtime prompts.
         members.push(TeamMember {
-            agent_id: self.agent_id_for(DIRECTOR_AGENT_NAME),
-            name: DIRECTOR_AGENT_NAME.to_string(),
-            agent_type: "director".to_string(),
+            agent_id: self.agent_id_for(AUTOMATION_AGENT_NAME),
+            name: AUTOMATION_AGENT_NAME.to_string(),
+            agent_type: "general-purpose".to_string(),
             model: None,
             prompt: None,
             color: Some(InboxMessageColor::White.to_string()),
@@ -385,7 +395,7 @@ impl TeamsManager {
 
         // Create empty inbox files
         self.ensure_inbox(supervisor_name)?;
-        self.ensure_inbox(DIRECTOR_AGENT_NAME)?;
+        self.ensure_inbox(AUTOMATION_AGENT_NAME)?;
         for name in member_names {
             self.ensure_inbox(name)?;
         }
@@ -483,7 +493,7 @@ impl TeamsManager {
             return;
         }
 
-        let has_unread = self.has_unread_non_director_messages();
+        let has_unread = self.has_unread_non_runtime_messages();
 
         if has_unread {
             let timestamp = chrono::Utc::now()
@@ -523,7 +533,7 @@ impl TeamsManager {
         }
     }
 
-    fn has_unread_non_director_messages(&self) -> bool {
+    fn has_unread_non_runtime_messages(&self) -> bool {
         let inboxes_dir = self.paths.inboxes_dir();
         let Ok(entries) = std::fs::read_dir(&inboxes_dir) else {
             return false;
@@ -549,7 +559,7 @@ impl TeamsManager {
                 continue;
             };
             for msg in &messages {
-                if !msg.read && msg.from != DIRECTOR_AGENT_NAME {
+                if !msg.read && !is_brehon_runtime_sender(&msg.from) {
                     return true;
                 }
             }
@@ -680,7 +690,7 @@ mod tests {
             "missing agent field in logs: {logs}"
         );
         assert!(
-            logs.contains("from=director"),
+            logs.contains("from=brehon"),
             "missing from field in logs: {logs}"
         );
         assert!(
@@ -765,10 +775,17 @@ mod tests {
 
         assert!(manager.paths.config().exists());
         assert!(manager.paths.inbox_for("supervisor").unwrap().exists());
+        assert!(
+            manager
+                .paths
+                .inbox_for(AUTOMATION_AGENT_NAME)
+                .unwrap()
+                .exists()
+        );
         assert!(manager.paths.inbox_for("worker-1").unwrap().exists());
 
         manager
-            .write_to_inbox("worker-1", "director", "hello worker", None)
+            .write_to_inbox("worker-1", AUTOMATION_AGENT_NAME, "hello worker", None)
             .unwrap();
 
         let messages: Vec<InboxMessage> = serde_json::from_str(
@@ -777,7 +794,22 @@ mod tests {
         .unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].text, "hello worker");
-        assert_eq!(messages[0].from, "director");
+        assert_eq!(messages[0].from, AUTOMATION_AGENT_NAME);
+
+        let config = manager.load_config().unwrap();
+        let automation = config
+            .members
+            .iter()
+            .find(|member| member.name == AUTOMATION_AGENT_NAME)
+            .expect("automation team member");
+        assert_eq!(automation.agent_type, "general-purpose");
+        assert!(
+            config
+                .members
+                .iter()
+                .all(|member| member.agent_type != "director"),
+            "Teams config must not register a semantic director member"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -820,7 +852,7 @@ mod tests {
         assert_eq!(config_json, serde_json::to_string_pretty(&config).unwrap());
 
         manager
-            .write_to_inbox("worker-1", "director", "hello worker", None)
+            .write_to_inbox("worker-1", AUTOMATION_AGENT_NAME, "hello worker", None)
             .unwrap();
 
         let inbox_json =
@@ -850,7 +882,12 @@ mod tests {
             .unwrap();
 
         manager
-            .write_to_inbox("claude-code", "director", "hello supervisor", None)
+            .write_to_inbox(
+                "claude-code",
+                AUTOMATION_AGENT_NAME,
+                "hello supervisor",
+                None,
+            )
             .unwrap();
 
         let messages: Vec<InboxMessage> = serde_json::from_str(
@@ -944,7 +981,8 @@ mod tests {
         let garbage = "this is not json {{[";
         std::fs::write(&inbox_path, garbage).unwrap();
 
-        let result = manager.write_to_inbox("worker-1", "director", "hello worker", None);
+        let result =
+            manager.write_to_inbox("worker-1", AUTOMATION_AGENT_NAME, "hello worker", None);
         let corrupt_path = match result {
             Err(Error::CorruptInbox { path, reason }) => {
                 assert!(
@@ -1005,6 +1043,9 @@ mod tests {
 
     #[test]
     fn write_to_inbox_emits_structured_info_logs_for_success_and_corrupt_inbox() {
+        let _lock = brehon_test_harness::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
         let dir = std::env::temp_dir().join(format!("brehon-teams-test-{}", uuid::Uuid::new_v4()));
         let manager = test_manager(&dir);
         let summary = "hello summary";
@@ -1021,7 +1062,12 @@ mod tests {
 
         let success_logs = capture_info_logs(|| {
             manager
-                .write_to_inbox("worker-1", "director", "hello worker", Some(summary))
+                .write_to_inbox(
+                    "worker-1",
+                    AUTOMATION_AGENT_NAME,
+                    "hello worker",
+                    Some(summary),
+                )
                 .unwrap();
         });
         assert_inbox_write_log_fields(
@@ -1035,8 +1081,12 @@ mod tests {
         std::fs::write(&inbox_path, "this is not json {{[").unwrap();
 
         let failure_logs = capture_info_logs(|| {
-            let result =
-                manager.write_to_inbox("worker-1", "director", "hello worker", Some(summary));
+            let result = manager.write_to_inbox(
+                "worker-1",
+                AUTOMATION_AGENT_NAME,
+                "hello worker",
+                Some(summary),
+            );
             assert!(matches!(result, Err(Error::CorruptInbox { .. })));
         });
         assert_inbox_write_log_fields(

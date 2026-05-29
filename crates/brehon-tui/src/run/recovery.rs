@@ -609,6 +609,22 @@ pub(crate) fn queued_prompt_retry_delay(ahead_of: usize) -> Duration {
         .unwrap_or(Duration::from_secs(30))
 }
 
+pub(crate) fn queued_prompt_backpressure_retry_delay(path: &Path, ahead_of: usize) -> Duration {
+    let queue_delay = queued_prompt_retry_delay(ahead_of);
+    let deferrals = read_prompt_retry_deferral_snapshot(path)
+        .map(|snapshot| snapshot.deferrals)
+        .unwrap_or(0);
+    let backoff_delay = match deferrals {
+        0 => Duration::from_secs(10),
+        1 => Duration::from_secs(30),
+        2 => Duration::from_secs(120),
+        3 => Duration::from_secs(300),
+        4 => Duration::from_secs(900),
+        _ => Duration::from_secs(3600),
+    };
+    queue_delay.max(backoff_delay)
+}
+
 pub(crate) fn record_prompt_retry_failure(
     path: &Path,
     error: &str,
@@ -1934,6 +1950,29 @@ mod tests {
                 .join("prompt-queue")
                 .join("_legacy")
         ));
+    }
+
+    #[test]
+    fn queued_prompt_backpressure_retry_delay_expands_with_deferrals() {
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("queued.prompt");
+
+        assert_eq!(
+            queued_prompt_backpressure_retry_delay(&path, 1),
+            Duration::from_secs(10)
+        );
+
+        record_prompt_retry_deferral(&path, Duration::from_secs(1), "busy");
+        assert_eq!(
+            queued_prompt_backpressure_retry_delay(&path, 1),
+            Duration::from_secs(30)
+        );
+
+        record_prompt_retry_deferral(&path, Duration::from_secs(1), "still busy");
+        assert_eq!(
+            queued_prompt_backpressure_retry_delay(&path, 1),
+            Duration::from_secs(120)
+        );
     }
 
     #[test]

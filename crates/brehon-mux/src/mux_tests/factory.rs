@@ -2,7 +2,7 @@ use super::{ScopedEnv, TEST_ENV_LOCK};
 use crate::mux::*;
 use crate::pane::panesmith_shim::FORCE_PANESMITH_SPAWN_FAILURE_PANE_ID;
 use crate::pty::{Pty, PtyConfig};
-use crate::teams::{TeamsManager, TeamsPaths};
+use crate::teams::{AUTOMATION_AGENT_NAME, TeamsManager, TeamsPaths};
 use crate::{
     AgentAdapter, CustomAgentConfig, HarnessCapabilities, HarnessControlPlane, HarnessTransport,
     Pane, PaneBackend, PaneKind, PaneState, PromptInjectionStrategy, SupervisorCli,
@@ -2058,7 +2058,7 @@ async fn test_deliver_prompt_routes_claude_supervisor_to_teams_inbox() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|message| message["from"] == "director")
+            .any(|message| message["from"] == AUTOMATION_AGENT_NAME)
     );
     assert!(
         mux.get("claude-code")

@@ -24,11 +24,11 @@ use super::helpers::{
 use super::recovery::{
     agent_health_marker_reason, agent_is_quarantined_for_run, clear_agent_health_marker,
     clear_prompt_retry_meta, dead_letter_prompt_for_session, extract_consolidated_report_identity,
-    prompt_retry_not_due, push_dashboard_event, queued_prompt_matches_session,
-    queued_prompt_retry_delay, read_queued_prompt, record_prompt_retry_deferral,
-    record_prompt_retry_failure, rewrite_stale_consolidated_report,
+    prompt_retry_not_due, push_dashboard_event, queued_prompt_backpressure_retry_delay,
+    queued_prompt_matches_session, queued_prompt_retry_delay, read_queued_prompt,
+    record_prompt_retry_deferral, record_prompt_retry_failure, rewrite_stale_consolidated_report,
     runtime_prompt_queue_sweep_dirs, should_dead_letter_prompt_after_failure,
-    should_drop_stale_review_prompt, QueuedPromptPayload,
+    should_drop_stale_review_prompt, QueuedPromptPayload, PROMPT_BLOCKED_HEALTH_REASON,
 };
 use super::self_improvement::{
     build_reviewer_reset_startup_prompt, build_supervisor_reset_startup_prompt,
@@ -37,6 +37,7 @@ use super::self_improvement::{
 use super::types::task_is_terminal;
 
 const TERMINAL_HOST_STARTUP_PROMPT_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
+pub(super) const MAX_PROMPT_DELIVERY_ATTEMPTS_PER_SWEEP: usize = 24;
 
 fn runtime_command_timestamp_ms() -> u64 {
     std::time::SystemTime::now()
@@ -270,7 +271,7 @@ pub(super) fn enqueue_terminal_host_startup_prompt(
     let temp_path = prompt_queue_dir.join(format!(".{file_name}.tmp"));
     let payload = serde_json::json!({
         "target": target,
-        "from": brehon_mux::teams::DIRECTOR_AGENT_NAME,
+        "from": brehon_mux::teams::AUTOMATION_AGENT_NAME,
         "message": prompt,
         "session_name": session_name,
         "prompt_id": prompt_id,
@@ -373,7 +374,7 @@ fn deliver_queued_prompt_via_terminal_host(
                 prompt_id,
                 ahead_of,
             }) => {
-                let retry_after = queued_prompt_retry_delay(ahead_of);
+                let retry_after = queued_prompt_backpressure_retry_delay(path, ahead_of);
                 let next_retry_at = record_prompt_deferral_and_recover(
                     ctx,
                     path,
@@ -394,7 +395,8 @@ fn deliver_queued_prompt_via_terminal_host(
                 prompt_id,
                 position,
             }) => {
-                let retry_after = queued_prompt_retry_delay(position.retry_ahead_of());
+                let retry_after =
+                    queued_prompt_backpressure_retry_delay(path, position.retry_ahead_of());
                 let next_retry_at = record_prompt_deferral_and_recover(
                     ctx,
                     path,
@@ -683,7 +685,9 @@ fn queue_queued_prompt_delivery_via_daemon(
 }
 
 pub(super) fn deliver_pending_prompts(ctx: &mut EventLoopCtx, brehon_root: &std::path::Path) {
-    for pq_dir in runtime_prompt_queue_sweep_dirs(brehon_root, ctx.runtime_session_name.as_deref())
+    let mut delivery_attempts = 0usize;
+    'prompt_dirs: for pq_dir in
+        runtime_prompt_queue_sweep_dirs(brehon_root, ctx.runtime_session_name.as_deref())
     {
         let Ok(entries) = std::fs::read_dir(&pq_dir) else {
             continue;
@@ -709,6 +713,14 @@ pub(super) fn deliver_pending_prompts(ctx: &mut EventLoopCtx, brehon_root: &std:
             if prompt_retry_not_due(&path) {
                 continue;
             }
+            if delivery_attempts >= MAX_PROMPT_DELIVERY_ATTEMPTS_PER_SWEEP {
+                tracing::debug!(
+                    limit = MAX_PROMPT_DELIVERY_ATTEMPTS_PER_SWEEP,
+                    "Reached prompt delivery sweep budget; deferring remaining prompt files to next tick"
+                );
+                break 'prompt_dirs;
+            }
+            delivery_attempts += 1;
             let queued = read_queued_prompt(&path).or_else(|| {
                 let worker = path
                     .file_stem()
@@ -809,18 +821,48 @@ pub(super) fn deliver_pending_prompts(ctx: &mut EventLoopCtx, brehon_root: &std:
                 let prompt_text = rewrite_stale_consolidated_report(brehon_root, &prompt_text)
                     .unwrap_or(prompt_text);
 
-                if agent_is_quarantined_for_run(brehon_root, &target) {
-                    let target_is_supervisor = ctx.mux.get(&target).is_some_and(|pane| {
-                        pane.kind() == &PaneKind::Supervisor
-                            && !matches!(pane.pane_state(), Some(PaneState::Dead { .. }))
-                    });
+                if ctx.mux.get(&target).is_none() {
+                    dead_letter_prompt_for_session(
+                        brehon_root,
+                        ctx.runtime_session_name.as_deref(),
+                        &path,
+                        &target,
+                        from.as_deref(),
+                        &prompt_text,
+                        "target pane not present in current runtime",
+                        "target pane missing",
+                    );
+                    clear_prompt_retry_meta(&path);
+                    push_dashboard_event(
+                        &ctx.dashboard_data,
+                        format!(
+                            "dead-lettered queued prompt for {target} because the target pane is not present in this runtime"
+                        ),
+                    );
+                    tracing::warn!(
+                        target = %target,
+                        path = %path.display(),
+                        "Dead-lettered prompt-queue message for missing target pane"
+                    );
+                    continue;
+                }
+
+                let marker_reason = agent_health_marker_reason(brehon_root, &target);
+                let has_prompt_blocked_marker =
+                    marker_reason.as_deref() == Some(PROMPT_BLOCKED_HEALTH_REASON);
+                let target_is_supervisor = ctx.mux.get(&target).is_some_and(|pane| {
+                    pane.kind() == &PaneKind::Supervisor
+                        && !matches!(pane.pane_state(), Some(PaneState::Dead { .. }))
+                });
+                if agent_is_quarantined_for_run(brehon_root, &target)
+                    || (has_prompt_blocked_marker && target_is_supervisor)
+                {
                     let mut quarantine_cleared = false;
                     if target_is_supervisor {
-                        let marker_reason = agent_health_marker_reason(brehon_root, &target);
                         let supervisor_ready = ctx.mux.get(&target).is_some_and(|pane| {
                             matches!(pane.pane_state(), Some(PaneState::Ready { .. }))
                         });
-                        if marker_reason.as_deref() == Some("prompt_blocked") && supervisor_ready {
+                        if has_prompt_blocked_marker && supervisor_ready {
                             clear_agent_health_marker(brehon_root, &target);
                             quarantine_cleared = true;
                             push_dashboard_event(
@@ -942,7 +984,8 @@ pub(super) fn deliver_pending_prompts(ctx: &mut EventLoopCtx, brehon_root: &std:
                             prompt_id,
                             ahead_of,
                         }) => {
-                            let retry_after = queued_prompt_retry_delay(ahead_of);
+                            let retry_after =
+                                queued_prompt_backpressure_retry_delay(&path, ahead_of);
                             let next_retry_at = record_prompt_deferral_and_recover(
                                 ctx,
                                 &path,
@@ -1030,7 +1073,7 @@ pub(super) fn deliver_pending_prompts(ctx: &mut EventLoopCtx, brehon_root: &std:
                         prompt_id,
                         ahead_of,
                     }) => {
-                        let retry_after = queued_prompt_retry_delay(ahead_of);
+                        let retry_after = queued_prompt_backpressure_retry_delay(&path, ahead_of);
                         let next_retry_at = record_prompt_deferral_and_recover(
                             ctx,
                             &path,
@@ -1051,7 +1094,10 @@ pub(super) fn deliver_pending_prompts(ctx: &mut EventLoopCtx, brehon_root: &std:
                         prompt_id,
                         position,
                     }) => {
-                        let retry_after = queued_prompt_retry_delay(position.retry_ahead_of());
+                        let retry_after = queued_prompt_backpressure_retry_delay(
+                            &path,
+                            position.retry_ahead_of(),
+                        );
                         let next_retry_at = record_prompt_deferral_and_recover(
                             ctx,
                             &path,

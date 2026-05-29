@@ -919,7 +919,7 @@ impl Mux {
                     } else {
                         let sender = from
                             .clone()
-                            .unwrap_or_else(|| teams::DIRECTOR_AGENT_NAME.to_string());
+                            .unwrap_or_else(|| teams::AUTOMATION_AGENT_NAME.to_string());
                         if let Some(inject_after) = teams_inbox_write_not_before
                             .filter(|inject_after| Instant::now() < *inject_after)
                         {
@@ -1239,7 +1239,7 @@ impl Mux {
             });
         }
 
-        let sender = from.unwrap_or(teams::DIRECTOR_AGENT_NAME);
+        let sender = from.unwrap_or(teams::AUTOMATION_AGENT_NAME);
         if let Err(err) = teams.write_to_inbox(pane_id, sender, prompt, None) {
             let error = format!("Teams inbox write failed: {err}");
             Self::log_teams_inbox_delivery_failure(teams.team_name(), pane_id, &error);

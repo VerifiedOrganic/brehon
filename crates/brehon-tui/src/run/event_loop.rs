@@ -65,10 +65,10 @@ use super::layout::{
 use super::recovery::{
     block_task_for_prompt_block_recovery_failure, clear_agent_health_marker,
     clear_prompt_retry_meta, dead_letter_prompt_for_session, promote_active_assigned_task,
-    prompt_blocked_detail, prompt_blocked_info, push_dashboard_event, queued_prompt_retry_delay,
-    record_prompt_retry_deferral, record_prompt_retry_failure,
-    should_dead_letter_prompt_after_failure, sync_worker_task_contexts,
-    write_prompt_blocked_recovery_failed_marker_or_clear_stale_marker,
+    prompt_blocked_detail, prompt_blocked_info, push_dashboard_event,
+    queued_prompt_backpressure_retry_delay, record_prompt_retry_deferral,
+    record_prompt_retry_failure, should_dead_letter_prompt_after_failure,
+    sync_worker_task_contexts, write_prompt_blocked_recovery_failed_marker_or_clear_stale_marker,
 };
 use super::refresh::{
     apply_dashboard_refresh_snapshot, collect_dashboard_refresh, collect_session_refresh_entries,
@@ -1443,7 +1443,7 @@ pub(super) fn process_pending_queued_gateway_prompt_deliveries(ctx: &mut EventLo
                             Instant::now(),
                         );
                     }
-                    let retry_after = queued_prompt_retry_delay(ahead_of);
+                    let retry_after = queued_prompt_backpressure_retry_delay(&task.path, ahead_of);
                     let next_retry_at = record_prompt_retry_deferral(
                         &task.path,
                         retry_after,
@@ -1468,7 +1468,10 @@ pub(super) fn process_pending_queued_gateway_prompt_deliveries(ctx: &mut EventLo
                     prompt_id,
                     position,
                 }) => {
-                    let retry_after = queued_prompt_retry_delay(position.retry_ahead_of());
+                    let retry_after = queued_prompt_backpressure_retry_delay(
+                        &task.path,
+                        position.retry_ahead_of(),
+                    );
                     let next_retry_at = record_prompt_retry_deferral(
                         &task.path,
                         retry_after,
@@ -1674,7 +1677,7 @@ fn handle_runtime_command_deferred(
 ) {
     match effect {
         PendingRuntimeCommandEffect::QueuedPromptDelivery { path, target, .. } => {
-            let retry_after = queued_prompt_retry_delay(1);
+            let retry_after = queued_prompt_backpressure_retry_delay(&path, 1);
             let next_retry_at =
                 record_prompt_retry_deferral(&path, retry_after, "daemon prompt delivery deferred");
             super::stall_handling::recover_stale_deferred_prompt_delivery(
@@ -4223,6 +4226,25 @@ mod tests {
             None,
         )
         .expect("worker pane")
+    }
+
+    fn make_terminal_worker_pane(name: &str) -> brehon_mux::Pane {
+        let dir = tempfile::tempdir().expect("tempdir");
+        brehon_mux::Pane::worker(
+            name,
+            dir.path().to_path_buf(),
+            None,
+            "supervisor",
+            &brehon_mux::AgentAdapter::BuiltIn(brehon_mux::SupervisorCli::Claude),
+            None,
+            None,
+            24,
+            80,
+            None,
+            None,
+            None,
+        )
+        .expect("terminal worker pane")
     }
 
     fn make_reviewer_pane(name: &str) -> brehon_mux::Pane {
@@ -7880,7 +7902,7 @@ TypeError: Cannot read properties of undefined"#,
                 "T-review".to_string(),
                 "REV-review".to_string(),
             ),
-            now - Duration::from_secs(5),
+            now - Duration::from_secs(120),
         );
         harness
             .ctx
@@ -7927,7 +7949,7 @@ TypeError: Cannot read properties of undefined"#,
     }
 
     #[test]
-    fn stale_reviewer_obligation_resets_when_idle_exceeds_reset_threshold() {
+    fn stale_live_reviewer_obligation_gets_nudged_even_when_idle_exceeds_reset_threshold() {
         let temp = tempfile::tempdir().expect("tempdir");
         let brehon_root = temp.path().join(".brehon");
         write_review_obligation_fixture(&brehon_root);
@@ -7957,12 +7979,19 @@ TypeError: Cannot read properties of undefined"#,
         assert_eq!(routed.command.target.pane_id.as_deref(), Some("reviewer-1"));
         assert!(matches!(
             routed.command.kind,
-            RuntimeCommandKind::ResetPane { ref reason }
-                if reason == "auto-recover idle reviewer pane with pending review obligation"
+            RuntimeCommandKind::SendPrompt { ref text, .. }
+                if text.contains("Review-obligation nudge")
         ));
         assert!(
-            harness.ctx.review_obligation_notifications_sent.is_empty(),
-            "reset threshold should not spend a turn on a nudge first"
+            harness
+                .ctx
+                .review_obligation_notifications_sent
+                .contains_key(&(
+                    "reviewer-1".to_string(),
+                    "T-review".to_string(),
+                    "REV-review".to_string()
+                )),
+            "reviewer should be nudged before any reset"
         );
     }
 
@@ -8154,7 +8183,7 @@ TypeError: Cannot read properties of undefined"#,
                 "T-review".to_string(),
                 "REV-review".to_string(),
             ),
-            now - Duration::from_secs(5),
+            now - Duration::from_secs(120),
         );
         harness
             .ctx
@@ -8281,7 +8310,7 @@ TypeError: Cannot read properties of undefined"#,
                 "T-phase-gate".to_string(),
                 "REV-phase-gate".to_string(),
             ),
-            Instant::now() - Duration::from_secs(5),
+            Instant::now() - Duration::from_secs(120),
         );
         harness.ctx.last_activity.insert(
             "reviewer-reset".to_string(),
@@ -8492,11 +8521,7 @@ TypeError: Cannot read properties of undefined"#,
             serde_json::json!({
                 "agent": "claude-supervisor",
                 "status": "unavailable",
-                "reason": "prompt_blocked",
-                "blocked": {
-                    "kind": "permission_request",
-                    "summary": "allow bash ls"
-                }
+                "reason": "quota_exhausted"
             })
             .to_string(),
         )
@@ -8571,6 +8596,7 @@ TypeError: Cannot read properties of undefined"#,
 
         let mut mux = Mux::new(24, 80);
         mux.add_pane(make_supervisor_pane("claude-supervisor"));
+        apply_taskless_prompt_blocked_runtime_state(&mut mux, "claude-supervisor");
         let mut harness = harness_with_mux(mux);
         harness
             .ctx
@@ -8716,7 +8742,7 @@ TypeError: Cannot read properties of undefined"#,
         .expect("prompt file");
 
         let mut mux = Mux::new(24, 80);
-        mux.add_pane(make_worker_pane("worker-1"));
+        mux.add_pane(make_terminal_worker_pane("worker-1"));
         let mut harness = harness_with_mux(mux);
         harness
             .ctx
@@ -8759,6 +8785,109 @@ TypeError: Cannot read properties of undefined"#,
                 .join(format!("{}.json", sanitize_prompt_key("prompt-1")))
                 .exists(),
             "successful daemon delivery writes prompt ack"
+        );
+    }
+
+    #[test]
+    fn queued_prompt_for_missing_target_is_dead_lettered_without_retry_loop() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let brehon_root = temp.path().join(".brehon");
+        let runtime_dir = brehon_root.join("runtime");
+        let queue_dir = runtime_dir.join("prompt-queue");
+        std::fs::create_dir_all(&queue_dir).expect("queue dir");
+        let prompt_path = queue_dir.join("000.prompt");
+        std::fs::write(
+            &prompt_path,
+            serde_json::json!({
+                "target": "stale-worker",
+                "from": "supervisor",
+                "message": "this prompt belongs to a previous runtime",
+                "prompt_id": "prompt-stale"
+            })
+            .to_string(),
+        )
+        .expect("prompt file");
+
+        let mut mux = Mux::new(24, 80);
+        mux.add_pane(make_worker_pane("live-worker"));
+        let mut harness = harness_with_mux(mux);
+        harness
+            .ctx
+            .dashboard_data
+            .lock()
+            .expect("dashboard")
+            .brehon_root = Some(brehon_root.clone());
+
+        crate::run::prompt_delivery::deliver_pending_prompts(&mut harness.ctx, &brehon_root);
+
+        assert!(
+            harness.rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "stale prompt should not route to the runtime"
+        );
+        assert!(!prompt_path.exists(), "stale prompt should be moved away");
+        assert!(
+            !crate::run::recovery::prompt_retry_meta_path(&prompt_path).exists(),
+            "stale prompt should not leave retry metadata behind"
+        );
+        let dead_letters = std::fs::read_dir(runtime_dir.join("prompt-dead-letter"))
+            .map(|entries| entries.count())
+            .unwrap_or(0);
+        assert_eq!(dead_letters, 1);
+    }
+
+    #[test]
+    fn queued_prompt_sweep_budget_limits_stale_prompt_churn() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let brehon_root = temp.path().join(".brehon");
+        let runtime_dir = brehon_root.join("runtime");
+        let queue_dir = runtime_dir.join("prompt-queue");
+        std::fs::create_dir_all(&queue_dir).expect("queue dir");
+        let prompt_count = crate::run::prompt_delivery::MAX_PROMPT_DELIVERY_ATTEMPTS_PER_SWEEP + 1;
+        for idx in 0..prompt_count {
+            std::fs::write(
+                queue_dir.join(format!("{idx:03}.prompt")),
+                serde_json::json!({
+                    "target": format!("stale-worker-{idx}"),
+                    "from": "supervisor",
+                    "message": "this prompt belongs to a previous runtime",
+                    "prompt_id": format!("prompt-stale-{idx}")
+                })
+                .to_string(),
+            )
+            .expect("prompt file");
+        }
+
+        let mut mux = Mux::new(24, 80);
+        mux.add_pane(make_worker_pane("live-worker"));
+        let mut harness = harness_with_mux(mux);
+        harness
+            .ctx
+            .dashboard_data
+            .lock()
+            .expect("dashboard")
+            .brehon_root = Some(brehon_root.clone());
+
+        crate::run::prompt_delivery::deliver_pending_prompts(&mut harness.ctx, &brehon_root);
+
+        assert!(
+            harness.rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "stale prompts should not route to the runtime"
+        );
+        let remaining_prompts = std::fs::read_dir(&queue_dir)
+            .expect("queue entries")
+            .flatten()
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "prompt"))
+            .count();
+        assert_eq!(
+            remaining_prompts, 1,
+            "one prompt should remain for the next sweep"
+        );
+        let dead_letters = std::fs::read_dir(runtime_dir.join("prompt-dead-letter"))
+            .map(|entries| entries.count())
+            .unwrap_or(0);
+        assert_eq!(
+            dead_letters,
+            crate::run::prompt_delivery::MAX_PROMPT_DELIVERY_ATTEMPTS_PER_SWEEP
         );
     }
 
