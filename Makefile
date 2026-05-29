@@ -93,13 +93,13 @@ release-fast:
 
 ## install        — Install binaries to ~/.cargo/bin
 install:
-	$(CARGO) install --path $(CLI_CRATE)
-	$(CARGO) install --path $(NATIVE_AGENT_CRATE)
+	$(CARGO) install --locked --path $(CLI_CRATE)
+	$(CARGO) install --locked --path $(NATIVE_AGENT_CRATE)
 
 ## install-fast   — Install with thin LTO profile
 install-fast:
-	$(CARGO) install --path $(CLI_CRATE) --profile release-fast
-	$(CARGO) install --path $(NATIVE_AGENT_CRATE) --profile release-fast
+	$(CARGO) install --locked --path $(CLI_CRATE) --profile release-fast
+	$(CARGO) install --locked --path $(NATIVE_AGENT_CRATE) --profile release-fast
 
 ## uninstall      — Remove installed binaries
 uninstall:

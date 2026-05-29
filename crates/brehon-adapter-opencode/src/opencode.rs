@@ -12,7 +12,7 @@ use reqwest::{Client, RequestBuilder, Response, StatusCode};
 use serde::Deserialize;
 use serde_json::Value;
 use thiserror::Error;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
 
@@ -32,6 +32,7 @@ const TURN_START_TIMEOUT_ENV: &str = "BREHON_OPENCODE_TURN_START_TIMEOUT_MS";
 const PROMPT_RESULT_POLL_MS: u64 = 50;
 const SESSION_STATUS_POLL_MS: u64 = 250;
 const SESSION_SETTLE_PASSES: usize = 2;
+const EVENT_SUBSCRIBE_READY_TIMEOUT_MS: u64 = 1_000;
 const SERVER_REQUEST_TIMEOUT_SECS: u64 = 120;
 const SERVER_MESSAGE_RETRY_ATTEMPTS: usize = 3;
 const SERVER_MESSAGE_RETRY_BACKOFF_MS: u64 = 250;
@@ -40,6 +41,36 @@ const SERVER_FETCH_RETRY_BACKOFF_MS: u64 = 200;
 const SESSION_MESSAGE_LIMIT: usize = 24;
 
 type PromptResults = Arc<Mutex<HashMap<String, Result<brehon_adapter_sdk::PromptResult, String>>>>;
+
+struct OpenCodeServerEvent {
+    message: String,
+    failure: bool,
+}
+
+struct OpenCodeEventSubscription {
+    rx: mpsc::Receiver<OpenCodeServerEvent>,
+    ready: Option<oneshot::Receiver<bool>>,
+    handle: JoinHandle<()>,
+}
+
+impl OpenCodeEventSubscription {
+    async fn wait_ready(&mut self) {
+        let Some(ready) = self.ready.take() else {
+            return;
+        };
+        let _ = timeout(
+            Duration::from_millis(EVENT_SUBSCRIBE_READY_TIMEOUT_MS),
+            ready,
+        )
+        .await;
+    }
+}
+
+impl Drop for OpenCodeEventSubscription {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum OpenCodeError {
@@ -718,12 +749,32 @@ async fn run_prompt(
     let mut seen_messages = fetch_seen_message_parts(&inner, &opencode_session_id)
         .await
         .unwrap_or_default();
+    let mut server_events = subscribe_open_code_events(&inner, &opencode_session_id);
+    server_events.wait_ready().await;
     let session_id = send_server_message(&inner, &opencode_session_id, &prompt.content).await?;
     let turn_started_at = tokio::time::Instant::now();
     let turn_activity_timeout = turn_start_timeout();
     let mut progress = OpenCodeTurnProgress::default();
 
     loop {
+        let mut saw_server_event_activity = false;
+        while let Ok(server_event) = server_events.rx.try_recv() {
+            saw_server_event_activity = true;
+            if server_event.failure && turn_error.is_none() {
+                turn_error = Some(server_event.message.clone());
+            }
+            let normalized = AdapterEvent::Output {
+                text: server_event.message,
+            };
+            if let AdapterEvent::Output { text, .. } = &normalized {
+                if !response_text.is_empty() && !text.starts_with('\n') {
+                    response_text.push('\n');
+                }
+                response_text.push_str(text);
+            }
+            emit_event(&inner, normalized).await;
+        }
+
         let (events, saw_model_activity, tokens_delta) =
             fetch_new_message_events(&inner, &session_id, &mut seen_messages, &prompt.content)
                 .await?;
@@ -748,13 +799,17 @@ async fn run_prompt(
         }
 
         let session_busy = fetch_session_busy(&inner, &session_id).await?;
-        if progress.observe(session_busy, saw_model_activity) {
+        if progress.observe(
+            session_busy,
+            saw_model_activity || saw_server_event_activity,
+        ) {
             break;
         }
         if !progress.saw_activity() && turn_started_at.elapsed() >= turn_activity_timeout {
+            let details = no_activity_timeout_details(&inner, &session_id, &prompt.content).await;
             return Err(OpenCodeError::Turn(format!(
-                "OpenCode accepted prompt_async for session {session_id} but no assistant/tool activity appeared within {}ms",
-                turn_activity_timeout.as_millis()
+                "OpenCode accepted prompt_async for session {session_id} but no assistant/tool activity appeared within {}ms; {details}",
+                turn_activity_timeout.as_millis(),
             )));
         }
 
@@ -1041,6 +1096,127 @@ async fn response_body_string(response: Response, context: &str) -> Result<Strin
     Ok(String::from_utf8_lossy(&bytes).to_string())
 }
 
+fn subscribe_open_code_events(
+    inner: &Arc<OpenCodeServerSessionInner>,
+    opencode_session_id: &str,
+) -> OpenCodeEventSubscription {
+    let client = inner.client.clone();
+    let auth = inner.auth.clone();
+    let server_url = inner.server_url.clone();
+    let opencode_session_id = opencode_session_id.to_string();
+    let (tx, rx) = mpsc::channel(16);
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let handle = tokio::spawn(async move {
+        let response = match server_request(
+            &client,
+            auth.as_ref(),
+            reqwest::Method::GET,
+            format!("{server_url}/event"),
+        )
+        .send()
+        .await
+        {
+            Ok(response) => response,
+            Err(_) => {
+                let _ = ready_tx.send(false);
+                return;
+            }
+        };
+
+        if !response.status().is_success() {
+            let _ = ready_tx.send(false);
+            return;
+        }
+        let _ = ready_tx.send(true);
+
+        let mut response = response;
+        let mut buffer = String::new();
+        loop {
+            let chunk = match response.chunk().await {
+                Ok(Some(chunk)) => chunk,
+                Ok(None) | Err(_) => break,
+            };
+            buffer.push_str(
+                &String::from_utf8_lossy(&chunk)
+                    .replace("\r\n", "\n")
+                    .replace('\r', "\n"),
+            );
+            while let Some(event) = next_sse_json_event(&mut buffer) {
+                if let Some(server_event) =
+                    normalize_open_code_server_event(&opencode_session_id, &event)
+                {
+                    if tx.send(server_event).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    });
+
+    OpenCodeEventSubscription {
+        rx,
+        ready: Some(ready_rx),
+        handle,
+    }
+}
+
+fn next_sse_json_event(buffer: &mut String) -> Option<Value> {
+    let end = buffer.find("\n\n")?;
+    let raw = buffer[..end].to_string();
+    buffer.drain(..end + 2);
+    let data = raw
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:"))
+        .map(str::trim_start)
+        .collect::<Vec<_>>()
+        .join("\n");
+    if data.trim().is_empty() {
+        return None;
+    }
+    serde_json::from_str(&data).ok()
+}
+
+fn normalize_open_code_server_event(
+    opencode_session_id: &str,
+    event: &Value,
+) -> Option<OpenCodeServerEvent> {
+    let event_type = event.get("type").and_then(Value::as_str)?;
+    let properties = event.get("properties").unwrap_or(event);
+    if !opencode_event_matches_session(properties, opencode_session_id) {
+        return None;
+    }
+
+    match event_type {
+        "session.error" => {
+            let error = properties
+                .get("error")
+                .or_else(|| event.get("error"))
+                .and_then(opencode_error_text)?;
+            Some(OpenCodeServerEvent {
+                message: format!("OpenCode session error: {error}"),
+                failure: true,
+            })
+        }
+        "message.updated" => {
+            opencode_message_error_message(properties).map(|message| OpenCodeServerEvent {
+                message,
+                failure: true,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn opencode_event_matches_session(value: &Value, opencode_session_id: &str) -> bool {
+    value
+        .get("sessionID")
+        .or_else(|| value.get("sessionId"))
+        .or_else(|| value.get("session_id"))
+        .and_then(Value::as_str)
+        .map(|session_id| session_id == opencode_session_id)
+        .unwrap_or(true)
+}
+
 fn looks_like_html_shell(body: &str) -> bool {
     let trimmed = body.trim_start();
     trimmed.starts_with("<!doctype html") || trimmed.starts_with("<html")
@@ -1288,23 +1464,75 @@ fn opencode_error_text(value: &Value) -> Option<String> {
         return Some(text.to_string());
     }
     if let Some(object) = value.as_object() {
-        for field in ["message", "error", "detail", "name"] {
-            if let Some(text) = object
-                .get(field)
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|text| !text.is_empty())
-            {
-                return Some(text.to_string());
+        let mut parts = Vec::new();
+        if let Some(name) = object
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+        {
+            parts.push(name.to_string());
+        }
+        if let Some(status_code) = object.get("statusCode").and_then(Value::as_u64) {
+            parts.push(format!("status {status_code}"));
+        }
+        for field in ["message", "error", "detail"] {
+            if let Some(field_value) = object.get(field) {
+                if let Some(text) = field_value
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                    .map(ToString::to_string)
+                    .or_else(|| {
+                        field_value
+                            .as_object()
+                            .and_then(|_| opencode_error_text(field_value))
+                    })
+                {
+                    if !parts.iter().any(|part| part == &text) {
+                        parts.push(text);
+                    }
+                }
             }
+        }
+        if let Some(response_body) = object
+            .get("responseBody")
+            .or_else(|| object.get("response_body"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+        {
+            parts.push(format!("response body: {response_body}"));
+        }
+        if !parts.is_empty() {
+            return Some(parts.join(": "));
         }
     }
     Some(value.to_string()).filter(|text| text != "null")
 }
 
+fn opencode_message_error_message(message: &Value) -> Option<String> {
+    let info = message_info_value(message);
+    let error = info
+        .get("error")
+        .or_else(|| message.get("error"))
+        .or_else(|| message.get("message").and_then(|value| value.get("error")))?;
+    let text = opencode_error_text(error)?;
+    let role = message_role(message).unwrap_or("message");
+    Some(format!("OpenCode {role} error: {text}"))
+}
+
 fn opencode_event_failure_message(event: &AdapterEvent) -> Option<String> {
     match event {
         AdapterEvent::Output { text, .. } if text.starts_with("OpenCode retry ") => {
+            Some(text.trim().to_string())
+        }
+        AdapterEvent::Output { text, .. } if text.starts_with("OpenCode session error: ") => {
+            Some(text.trim().to_string())
+        }
+        AdapterEvent::Output { text, .. }
+            if text.starts_with("OpenCode ") && text.contains(" error: ") =>
+        {
             Some(text.trim().to_string())
         }
         AdapterEvent::OperationCompleted {
@@ -1582,10 +1810,18 @@ fn message_should_emit(message: &Value) -> bool {
     )
 }
 
-fn message_role(message: &Value) -> Option<&str> {
+fn message_info_value(message: &Value) -> &Value {
     message
+        .get("info")
+        .or_else(|| message.get("message"))
+        .unwrap_or(message)
+}
+
+fn message_role(message: &Value) -> Option<&str> {
+    message_info_value(message)
         .get("role")
         .and_then(Value::as_str)
+        .or_else(|| message.get("role").and_then(Value::as_str))
         .or_else(|| message.get("type").and_then(Value::as_str))
         .or_else(|| {
             message
@@ -1654,6 +1890,13 @@ fn record_seen_message_parts(
         return;
     }
 
+    if opencode_message_error_message(message).is_some() {
+        seen.event_keys.insert(format!(
+            "{}:message-error",
+            message_identity(message, message_index)
+        ));
+    }
+
     let parts = message_parts(message);
     if parts.is_empty() {
         if let Some(text) = message_content_text(message) {
@@ -1719,16 +1962,22 @@ fn normalize_new_message_parts(
     let mut tokens_used = 0u64;
     let mut saw_model_activity = false;
     let parts = message_parts(message);
+    let message_id = message_identity(message, message_index);
+
+    if let Some(text) = opencode_message_error_message(message) {
+        if seen
+            .event_keys
+            .insert(format!("{message_id}:message-error"))
+        {
+            events.push(AdapterEvent::Output { text });
+            saw_model_activity = true;
+        }
+    }
 
     if parts.is_empty() {
         if let Some(text) = message_content_text(message) {
             let before = events.len();
-            push_text_delta(
-                &mut events,
-                seen,
-                format!("{}:content", message_identity(message, message_index)),
-                text,
-            );
+            push_text_delta(&mut events, seen, format!("{message_id}:content"), text);
             if events.len() > before && !text_is_prompt_echo(text, prompt_echo) {
                 saw_model_activity = true;
             }
@@ -1903,6 +2152,12 @@ fn message_identity(message: &Value, message_index: usize) -> String {
         &["id", "messageID", "messageId", "message_id", "uuid"],
     )
     .or_else(|| {
+        value_string_field(
+            message_info_value(message),
+            &["id", "messageID", "messageId", "message_id", "uuid"],
+        )
+    })
+    .or_else(|| {
         message.get("message").and_then(|nested| {
             value_string_field(
                 nested,
@@ -1943,6 +2198,107 @@ fn value_string_field(value: &Value, fields: &[&str]) -> Option<String> {
             .and_then(Value::as_str)
             .map(ToString::to_string)
     })
+}
+
+async fn no_activity_timeout_details(
+    inner: &Arc<OpenCodeServerSessionInner>,
+    opencode_session_id: &str,
+    prompt: &str,
+) -> String {
+    let configured_model = inner
+        .model
+        .lock()
+        .await
+        .as_ref()
+        .map(opencode_model_selection_label)
+        .unwrap_or_else(|| "default".to_string());
+    let messages = fetch_session_messages(inner, opencode_session_id)
+        .await
+        .unwrap_or_default();
+    let mut role_counts: HashMap<String, usize> = HashMap::new();
+    let mut models = HashSet::new();
+    let mut errors = Vec::new();
+    let mut prompt_echo_seen = false;
+
+    for message in &messages {
+        let role = message_role(message).unwrap_or("unknown").to_string();
+        *role_counts.entry(role).or_default() += 1;
+        if let Some(model) = message_model_label(message) {
+            models.insert(model);
+        }
+        if let Some(error) = opencode_message_error_message(message) {
+            errors.push(error);
+        }
+        for part in message_parts(message) {
+            if let Some(text) = part
+                .get("text")
+                .or_else(|| part.get("content"))
+                .and_then(Value::as_str)
+            {
+                if text_is_prompt_echo(text, prompt) {
+                    prompt_echo_seen = true;
+                }
+            }
+        }
+    }
+
+    let mut role_counts = role_counts.into_iter().collect::<Vec<_>>();
+    role_counts.sort_by(|(left, _), (right, _)| left.cmp(right));
+    let roles = role_counts
+        .into_iter()
+        .map(|(role, count)| format!("{role}:{count}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut models = models.into_iter().collect::<Vec<_>>();
+    models.sort();
+    let mut details = format!(
+        "configured_model={configured_model}; prompt_chars={}; messages={}; roles={}; observed_models={}; prompt_echo_seen={}",
+        prompt.chars().count(),
+        messages.len(),
+        if roles.is_empty() { "none" } else { &roles },
+        if models.is_empty() {
+            "none".to_string()
+        } else {
+            models.join(",")
+        },
+        prompt_echo_seen,
+    );
+    if !errors.is_empty() {
+        details.push_str("; message_errors=");
+        details.push_str(&errors.join(" | "));
+    }
+    details
+}
+
+fn opencode_model_selection_label(model: &OpenCodeModelSelection) -> String {
+    format!("{}/{}", model.provider_id, model.model_id)
+}
+
+fn message_model_label(message: &Value) -> Option<String> {
+    let info = message_info_value(message);
+    if let Some(model) = info.get("model") {
+        let provider = model
+            .get("providerID")
+            .or_else(|| model.get("provider_id"))
+            .and_then(Value::as_str)?;
+        let model_id = model
+            .get("modelID")
+            .or_else(|| model.get("modelId"))
+            .or_else(|| model.get("model_id"))
+            .or_else(|| model.get("id"))
+            .and_then(Value::as_str)?;
+        return Some(format!("{provider}/{model_id}"));
+    }
+    let provider = info
+        .get("providerID")
+        .or_else(|| info.get("provider_id"))
+        .and_then(Value::as_str)?;
+    let model_id = info
+        .get("modelID")
+        .or_else(|| info.get("modelId"))
+        .or_else(|| info.get("model_id"))
+        .and_then(Value::as_str)?;
+    Some(format!("{provider}/{model_id}"))
 }
 
 async fn fetch_session_messages(
@@ -2651,6 +3007,57 @@ mod tests {
         assert_eq!(body["model"]["modelID"], "deepseek-v4-pro[1m]");
         assert_eq!(body["parts"][0]["type"], "text");
         assert_eq!(body["parts"][0]["text"], "review this");
+    }
+
+    #[test]
+    fn test_sse_event_surfaces_session_error() {
+        let event = serde_json::json!({
+            "type": "session.error",
+            "properties": {
+                "sessionID": "ses_123",
+                "error": {
+                    "name": "APIError",
+                    "statusCode": 400,
+                    "message": "model rejected",
+                    "responseBody": "{\"error\":\"bad model\"}"
+                }
+            }
+        });
+
+        let normalized = normalize_open_code_server_event("ses_123", &event).expect("event");
+
+        assert!(normalized.failure);
+        assert!(normalized.message.contains("OpenCode session error"));
+        assert!(normalized.message.contains("status 400"));
+        assert!(normalized.message.contains("model rejected"));
+        assert!(normalized.message.contains("bad model"));
+    }
+
+    #[test]
+    fn test_normalize_new_message_parts_surfaces_assistant_info_error() {
+        let mut seen = OpenCodeSeenMessageParts::default();
+        let message = serde_json::json!({
+            "info": {
+                "id": "msg-1",
+                "role": "assistant",
+                "error": {
+                    "message": "The supported API model names are deepseek-v4-pro or deepseek-v4-flash"
+                }
+            },
+            "parts": []
+        });
+
+        let (events, tokens, saw_activity) =
+            normalize_new_message_parts(&message, 0, &mut seen, "");
+
+        assert_eq!(tokens, 0);
+        assert!(saw_activity);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AdapterEvent::Output { text, .. }
+                if text.contains("OpenCode assistant error")
+                    && text.contains("supported API model names")
+        )));
     }
 
     #[test]
