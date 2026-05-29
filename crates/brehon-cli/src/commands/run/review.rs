@@ -583,15 +583,34 @@ pub(crate) fn migrate_current_round_submission_aliases(
     Ok(())
 }
 
-fn remap_reviewer_prompt_body(prompt: String, old_reviewer: &str, new_reviewer: &str) -> String {
-    if old_reviewer == new_reviewer {
-        return prompt;
-    }
+fn normalize_reviewer_prompt_body(prompt: String, reviewer: &str) -> String {
+    const REVIEWER_TOKEN: &str = "reviewer=";
 
-    prompt.replace(
-        &format!("reviewer={old_reviewer}"),
-        &format!("reviewer={new_reviewer}"),
-    )
+    let mut rest = prompt.as_str();
+    let mut normalized = String::with_capacity(prompt.len());
+    while let Some(index) = rest.find(REVIEWER_TOKEN) {
+        normalized.push_str(&rest[..index]);
+        normalized.push_str(REVIEWER_TOKEN);
+
+        let value_start = index + REVIEWER_TOKEN.len();
+        let value_end = rest[value_start..]
+            .find(|ch: char| !is_reviewer_name_char(ch))
+            .map(|offset| value_start + offset)
+            .unwrap_or(rest.len());
+
+        if value_end == value_start {
+            rest = &rest[index + REVIEWER_TOKEN.len()..];
+        } else {
+            normalized.push_str(reviewer);
+            rest = &rest[value_end..];
+        }
+    }
+    normalized.push_str(rest);
+    normalized
+}
+
+fn is_reviewer_name_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '-' || ch == '_'
 }
 
 pub(crate) fn reconcile_review_runtime_for_run(
@@ -822,8 +841,7 @@ pub(crate) fn reconcile_review_runtime_for_run(
                                 .get(&old_reviewer)
                                 .cloned()
                                 .unwrap_or_else(|| old_reviewer.clone());
-                            let prompt =
-                                remap_reviewer_prompt_body(prompt, &old_reviewer, &new_reviewer);
+                            let prompt = normalize_reviewer_prompt_body(prompt, &new_reviewer);
                             remapped_prompts.insert(new_reviewer, prompt);
                         }
                         request.reviewer_prompts = remapped_prompts;
@@ -1159,6 +1177,23 @@ mod tests {
     }
 
     #[test]
+    fn test_normalize_reviewer_prompt_body_rewrites_stale_submit_reviewer_tokens() {
+        let prompt = "Submit your review through the Brehon MCP verification tool; \
+            IMPORTANT: include reviewer=stale-cat-11:\n  \
+            verification action=submit_review review_id=REV-1 reviewer=stale-cat-11 \
+            score=<1-10> verdict=<approved|needs_revision|rejected>\n\
+            Placeholder reviewer=<your_name> should stay readable."
+            .to_string();
+
+        let normalized = normalize_reviewer_prompt_body(prompt, "fresh-dog-22");
+
+        assert!(normalized.contains("include reviewer=fresh-dog-22"));
+        assert!(normalized.contains("review_id=REV-1 reviewer=fresh-dog-22 score=<1-10>"));
+        assert!(!normalized.contains("reviewer=stale-cat-11"));
+        assert!(normalized.contains("reviewer=<your_name>"));
+    }
+
+    #[test]
     fn test_reconcile_review_runtime_reseats_collecting_review_and_requeues_pending_reviewers() {
         let temp = tempfile::tempdir().unwrap();
         let brehon_root = temp.path().join(".brehon");
@@ -1218,17 +1253,17 @@ mod tests {
                 reviewer_prompts: BTreeMap::from([
                     (
                         "claude-old".to_string(),
-                        "Canonical prompt for claude reviewer=claude-old include reviewer=claude-old"
+                        "Canonical prompt for claude reviewer=stale-claude include reviewer=stale-claude"
                             .to_string(),
                     ),
                     (
                         "codex-old".to_string(),
-                        "Canonical prompt for codex reviewer=codex-old include reviewer=codex-old"
+                        "Canonical prompt for codex reviewer=stale-codex include reviewer=stale-codex"
                             .to_string(),
                     ),
                     (
                         "gemini-old".to_string(),
-                        "Canonical prompt for gemini reviewer=gemini-old include reviewer=gemini-old"
+                        "Canonical prompt for gemini reviewer=stale-gemini include reviewer=stale-gemini"
                             .to_string(),
                     ),
                 ]),
@@ -1380,11 +1415,13 @@ mod tests {
                     assert!(message.contains("Canonical prompt for codex"));
                     assert!(message.contains("reviewer=codex-new"));
                     assert!(!message.contains("reviewer=codex-old"));
+                    assert!(!message.contains("reviewer=stale-codex"));
                 }
                 "gemini-new" => {
                     assert!(message.contains("Canonical prompt for gemini"));
                     assert!(message.contains("reviewer=gemini-new"));
                     assert!(!message.contains("reviewer=gemini-old"));
+                    assert!(!message.contains("reviewer=stale-gemini"));
                 }
                 other => panic!("unexpected queued target: {}", other),
             }
@@ -1417,6 +1454,7 @@ mod tests {
             .expect("claude prompt should be remapped");
         assert!(claude_prompt.contains("reviewer=claude-new"));
         assert!(!claude_prompt.contains("reviewer=claude-old"));
+        assert!(!claude_prompt.contains("reviewer=stale-claude"));
 
         let codex_prompt = rewritten_request
             .reviewer_prompts
@@ -1425,6 +1463,7 @@ mod tests {
         assert!(codex_prompt.contains("Canonical prompt for codex"));
         assert!(codex_prompt.contains("reviewer=codex-new"));
         assert!(!codex_prompt.contains("reviewer=codex-old"));
+        assert!(!codex_prompt.contains("reviewer=stale-codex"));
 
         let gemini_prompt = rewritten_request
             .reviewer_prompts
@@ -1433,6 +1472,7 @@ mod tests {
         assert!(gemini_prompt.contains("Canonical prompt for gemini"));
         assert!(gemini_prompt.contains("reviewer=gemini-new"));
         assert!(!gemini_prompt.contains("reviewer=gemini-old"));
+        assert!(!gemini_prompt.contains("reviewer=stale-gemini"));
     }
 
     #[test]
