@@ -286,6 +286,18 @@ impl AgentProcess {
         }
     }
 
+    pub async fn drain_stdout_lines(&self, max_lines: usize) -> Vec<String> {
+        let rx = self.stdout_rx.clone();
+        let mut guard = rx.lock().await;
+        drain_available_lines(&mut guard, max_lines)
+    }
+
+    pub async fn drain_stderr_lines(&self, max_lines: usize) -> Vec<String> {
+        let rx = self.stderr_rx.clone();
+        let mut guard = rx.lock().await;
+        drain_available_lines(&mut guard, max_lines)
+    }
+
     pub fn is_alive(&self) -> bool {
         self.is_alive.load(Ordering::SeqCst)
     }
@@ -417,6 +429,19 @@ impl AgentProcess {
     pub fn pid(&self) -> Option<u32> {
         self.pid
     }
+}
+
+fn drain_available_lines(rx: &mut mpsc::Receiver<String>, max_lines: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    while lines.len() < max_lines {
+        match rx.try_recv() {
+            Ok(line) => lines.push(line),
+            Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {
+                break;
+            }
+        }
+    }
+    lines
 }
 
 #[cfg(test)]

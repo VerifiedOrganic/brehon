@@ -23,6 +23,10 @@ use brehon_adapter_sdk::AdapterEvent;
 const DEFAULT_SERVER_READY_TIMEOUT_MS: u64 = 30_000;
 const SERVER_READY_TIMEOUT_ENV: &str = "BREHON_OPENCODE_SERVER_READY_TIMEOUT_MS";
 const SERVER_READY_POLL_MS: u64 = 100;
+const SERVER_READY_HEALTH_TIMEOUT_MS: u64 = 1_000;
+const SERVER_PROCESS_EXIT_GRACE_MS: u64 = 100;
+const SERVER_PROCESS_OUTPUT_LINES: usize = 64;
+const SERVER_SPAWN_ATTEMPTS: usize = 3;
 const PROMPT_RESULT_POLL_MS: u64 = 50;
 const SESSION_STATUS_POLL_MS: u64 = 250;
 const SESSION_SETTLE_PASSES: usize = 2;
@@ -74,6 +78,14 @@ struct OpenCodeServerSessionInner {
     turn_lock: Mutex<()>,
     alive: AtomicBool,
     capabilities: AgentCapabilities,
+}
+
+struct SpawnedOpenCodeServer {
+    process: AgentProcess,
+    server_url: String,
+    client: Client,
+    auth: Option<OpenCodeServerAuth>,
+    opencode_session_id: String,
 }
 
 pub struct OpenCodeServerSession {
@@ -176,30 +188,16 @@ impl OpenCodeServerSession {
     ) -> Result<Self, OpenCodeError> {
         let session_id = SessionId::new(uuid::Uuid::new_v4().to_string());
         let created_at = chrono::Utc::now();
-        let server_url = server_url_from_launch(args, env)?;
-        let auth = server_auth_from_env(env);
-
-        let process = AgentProcess::spawn_with_env(command, args, &spec.worktree_path, env)
-            .await
-            .map_err(|e| OpenCodeError::Spawn(e.to_string()))?;
-
-        let client = Client::builder()
-            .timeout(Duration::from_secs(SERVER_REQUEST_TIMEOUT_SECS))
-            .build()
-            .map_err(|e| OpenCodeError::Http(e.to_string()))?;
-
-        wait_for_server(&client, &server_url, auth.as_ref()).await?;
-        let opencode_session_id =
-            create_server_session(&client, &server_url, auth.as_ref(), &spec).await?;
+        let spawned = spawn_server_with_retries(&spec, command, args, env).await?;
 
         let inner = Arc::new(OpenCodeServerSessionInner {
             session_id: session_id.clone(),
             spec,
-            process: Mutex::new(Some(process)),
-            server_url,
-            client,
-            auth,
-            opencode_session_id: Mutex::new(Some(opencode_session_id)),
+            process: Mutex::new(Some(spawned.process)),
+            server_url: spawned.server_url,
+            client: spawned.client,
+            auth: spawned.auth,
+            opencode_session_id: Mutex::new(Some(spawned.opencode_session_id)),
             adapter_event_tx: std::sync::Mutex::new(None),
             active_prompts: Mutex::new(HashMap::new()),
             prompt_results: Arc::new(Mutex::new(HashMap::new())),
@@ -523,6 +521,150 @@ impl brehon_adapter_sdk::AgentAdapter for OpenCodeServerSession {
     }
 }
 
+async fn spawn_server_with_retries(
+    spec: &SessionSpec,
+    command: &str,
+    args: &[String],
+    env: &[(String, String)],
+) -> Result<SpawnedOpenCodeServer, OpenCodeError> {
+    let mut launch_args = args.to_vec();
+    let mut launch_env = env.to_vec();
+    let mut last_error: Option<OpenCodeError> = None;
+
+    for attempt in 0..SERVER_SPAWN_ATTEMPTS {
+        if attempt > 0 {
+            let port = allocate_loopback_port()?;
+            if !set_launch_loopback_port(&mut launch_args, &mut launch_env, port) {
+                break;
+            }
+        }
+
+        match spawn_server_once(spec, command, &launch_args, &launch_env).await {
+            Ok(spawned) => return Ok(spawned),
+            Err(err) => {
+                let should_retry = attempt + 1 < SERVER_SPAWN_ATTEMPTS
+                    && launch_has_port(&launch_args)
+                    && should_retry_spawn_with_fresh_port(&err);
+                last_error = Some(err);
+                if !should_retry {
+                    break;
+                }
+            }
+        }
+    }
+
+    Err(last_error
+        .unwrap_or_else(|| OpenCodeError::Spawn("failed to spawn OpenCode server".to_string())))
+}
+
+async fn spawn_server_once(
+    spec: &SessionSpec,
+    command: &str,
+    args: &[String],
+    env: &[(String, String)],
+) -> Result<SpawnedOpenCodeServer, OpenCodeError> {
+    let server_url = server_url_from_launch(args, env)?;
+    let auth = server_auth_from_env(env);
+
+    let process = AgentProcess::spawn_with_env(command, args, &spec.worktree_path, env)
+        .await
+        .map_err(|e| OpenCodeError::Spawn(e.to_string()))?;
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(SERVER_REQUEST_TIMEOUT_SECS))
+        .build()
+        .map_err(|e| OpenCodeError::Http(e.to_string()))?;
+
+    if let Err(err) = wait_for_server(&client, &server_url, auth.as_ref(), Some(&process)).await {
+        let _ = process.kill().await;
+        return Err(err);
+    }
+
+    let opencode_session_id =
+        match create_server_session(&client, &server_url, auth.as_ref(), spec).await {
+            Ok(session_id) => session_id,
+            Err(err) => {
+                let output = process_output_summary(&process).await;
+                let _ = process.kill().await;
+                return Err(attach_process_output(err, output.as_deref()));
+            }
+        };
+
+    Ok(SpawnedOpenCodeServer {
+        process,
+        server_url,
+        client,
+        auth,
+        opencode_session_id,
+    })
+}
+
+fn allocate_loopback_port() -> Result<u16, OpenCodeError> {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
+        .map_err(|err| OpenCodeError::Spawn(format!("failed to allocate retry port: {err}")))?;
+    let port = listener
+        .local_addr()
+        .map_err(|err| OpenCodeError::Spawn(format!("failed to read retry port: {err}")))?
+        .port();
+    drop(listener);
+    Ok(port)
+}
+
+fn launch_has_port(args: &[String]) -> bool {
+    args.iter()
+        .enumerate()
+        .any(|(idx, arg)| arg == "--port" && args.get(idx + 1).is_some())
+        || args.iter().any(|arg| arg.starts_with("--port="))
+}
+
+fn set_launch_loopback_port(
+    args: &mut Vec<String>,
+    env: &mut Vec<(String, String)>,
+    port: u16,
+) -> bool {
+    let mut changed = false;
+    for idx in 0..args.len() {
+        if args[idx] == "--port" {
+            if let Some(value) = args.get_mut(idx + 1) {
+                *value = port.to_string();
+                changed = true;
+            }
+        } else if args[idx].starts_with("--port=") {
+            args[idx] = format!("--port={port}");
+            changed = true;
+        }
+    }
+
+    if changed {
+        upsert_env_value(
+            env,
+            "BREHON_OPENCODE_SERVER_URL",
+            &format!("http://127.0.0.1:{port}"),
+        );
+    }
+    changed
+}
+
+fn upsert_env_value(env: &mut Vec<(String, String)>, key: &str, value: &str) {
+    if let Some((_, existing)) = env.iter_mut().find(|(env_key, _)| env_key == key) {
+        *existing = value.to_string();
+    } else {
+        env.push((key.to_string(), value.to_string()));
+    }
+}
+
+fn should_retry_spawn_with_fresh_port(err: &OpenCodeError) -> bool {
+    let OpenCodeError::Spawn(message) = err else {
+        return false;
+    };
+    let message = message.to_ascii_lowercase();
+    message.contains("port")
+        && (message.contains("in use")
+            || message.contains("address already in use")
+            || message.contains("eaddrinuse")
+            || message.contains("failed to start server"))
+}
+
 async fn run_prompt(
     inner: Arc<OpenCodeServerSessionInner>,
     prompt: PromptTurn,
@@ -652,6 +794,90 @@ fn persist_task_token_delta(inner: &OpenCodeServerSessionInner, task_id: &str, t
             "Failed to persist OpenCode task token usage"
         );
     }
+}
+
+async fn process_output_summary(process: &AgentProcess) -> Option<String> {
+    sleep(Duration::from_millis(SERVER_PROCESS_EXIT_GRACE_MS)).await;
+    let stderr = process
+        .drain_stderr_lines(SERVER_PROCESS_OUTPUT_LINES)
+        .await;
+    let stdout = process
+        .drain_stdout_lines(SERVER_PROCESS_OUTPUT_LINES)
+        .await;
+
+    let mut sections = Vec::new();
+    if !stderr.is_empty() {
+        sections.push(format!("stderr:\n{}", stderr.join("\n")));
+    }
+    if !stdout.is_empty() {
+        sections.push(format!("stdout:\n{}", stdout.join("\n")));
+    }
+
+    let mut log_paths = HashSet::new();
+    for line in &stderr {
+        let Some(path) = opencode_log_path_from_line(line) else {
+            continue;
+        };
+        if !log_paths.insert(path.clone()) {
+            continue;
+        }
+        if let Some(tail) = read_text_tail(&path, 16 * 1024) {
+            sections.push(format!("opencode log {}:\n{}", path.display(), tail));
+        }
+    }
+
+    (!sections.is_empty()).then(|| sections.join("\n"))
+}
+
+fn opencode_log_path_from_line(line: &str) -> Option<std::path::PathBuf> {
+    let (_, rest) = line.split_once("check log file at ")?;
+    let path = rest
+        .split(" for more details")
+        .next()
+        .unwrap_or(rest)
+        .trim();
+    (!path.is_empty()).then(|| std::path::PathBuf::from(path))
+}
+
+fn read_text_tail(path: &std::path::Path, max_bytes: u64) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let start = len.saturating_sub(max_bytes);
+    file.seek(SeekFrom::Start(start)).ok()?;
+
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf).ok()?;
+    let mut text = String::from_utf8_lossy(&buf).to_string();
+    if start > 0 {
+        if let Some(idx) = text.find('\n') {
+            text = text[idx + 1..].to_string();
+        }
+        text.insert_str(0, "[log tail truncated]\n");
+    }
+    let text = text.trim().to_string();
+    (!text.is_empty()).then_some(text)
+}
+
+fn attach_process_output(err: OpenCodeError, output: Option<&str>) -> OpenCodeError {
+    match err {
+        OpenCodeError::Spawn(message) => OpenCodeError::Spawn(with_process_output(message, output)),
+        OpenCodeError::SessionCreate(message) => {
+            OpenCodeError::SessionCreate(with_process_output(message, output))
+        }
+        OpenCodeError::Turn(message) => OpenCodeError::Turn(with_process_output(message, output)),
+        OpenCodeError::Http(message) => OpenCodeError::Http(with_process_output(message, output)),
+        other => other,
+    }
+}
+
+fn with_process_output(mut message: String, output: Option<&str>) -> String {
+    if let Some(output) = output.map(str::trim).filter(|output| !output.is_empty()) {
+        message.push_str("\nOpenCode process output:\n");
+        message.push_str(output);
+    }
+    message
 }
 
 fn server_auth_from_env(env: &[(String, String)]) -> Option<OpenCodeServerAuth> {
@@ -858,7 +1084,7 @@ async fn send_server_message_once(
 async fn recreate_server_session(
     inner: &Arc<OpenCodeServerSessionInner>,
 ) -> Result<String, OpenCodeError> {
-    wait_for_server(&inner.client, &inner.server_url, inner.auth.as_ref()).await?;
+    wait_for_server(&inner.client, &inner.server_url, inner.auth.as_ref(), None).await?;
     let new_session_id = create_server_session(
         &inner.client,
         &inner.server_url,
@@ -1863,24 +2089,59 @@ async fn wait_for_server(
     client: &Client,
     server_url: &str,
     auth: Option<&OpenCodeServerAuth>,
+    process: Option<&AgentProcess>,
 ) -> Result<(), OpenCodeError> {
     let _ = parse_host_port(server_url)?;
     let deadline = server_ready_timeout();
-    timeout(deadline, async move {
-        loop {
-            match server_health(client, server_url, auth).await {
-                Ok(true) => return Ok(()),
-                Ok(false) | Err(_) => sleep(Duration::from_millis(SERVER_READY_POLL_MS)).await,
+    let started_at = tokio::time::Instant::now();
+    let mut last_health_error: Option<String> = None;
+    loop {
+        if let Some(process) = process {
+            if !process.is_alive() {
+                let output = process_output_summary(process).await;
+                return Err(OpenCodeError::Spawn(with_process_output(
+                    format!("OpenCode server process exited before readiness at {server_url}"),
+                    output.as_deref(),
+                )));
             }
         }
-    })
-    .await
-    .map_err(|_| {
-        OpenCodeError::Spawn(format!(
-            "timed out waiting for OpenCode server at {server_url} after {}ms",
-            deadline.as_millis()
-        ))
-    })?
+
+        match timeout(
+            Duration::from_millis(SERVER_READY_HEALTH_TIMEOUT_MS),
+            server_health(client, server_url, auth),
+        )
+        .await
+        {
+            Ok(Ok(true)) => return Ok(()),
+            Ok(Ok(false)) => {}
+            Ok(Err(err)) => last_health_error = Some(err.to_string()),
+            Err(_) => {
+                last_health_error = Some(format!(
+                    "health check timed out after {SERVER_READY_HEALTH_TIMEOUT_MS}ms"
+                ));
+            }
+        }
+
+        if started_at.elapsed() >= deadline {
+            let output = match process {
+                Some(process) => process_output_summary(process).await,
+                None => None,
+            };
+            let mut message = format!(
+                "timed out waiting for OpenCode server at {server_url} after {}ms",
+                deadline.as_millis()
+            );
+            if let Some(err) = last_health_error {
+                message.push_str(&format!("; last health error: {err}"));
+            }
+            return Err(OpenCodeError::Spawn(with_process_output(
+                message,
+                output.as_deref(),
+            )));
+        }
+
+        sleep(Duration::from_millis(SERVER_READY_POLL_MS)).await;
+    }
 }
 
 fn server_ready_timeout() -> Duration {
@@ -1980,6 +2241,52 @@ mod tests {
             server_ready_timeout_from_env_value(Some("invalid")),
             Duration::from_millis(DEFAULT_SERVER_READY_TIMEOUT_MS)
         );
+    }
+
+    #[test]
+    fn test_set_launch_loopback_port_updates_args_and_server_url_env() {
+        let mut args = vec![
+            "serve".to_string(),
+            "--hostname".to_string(),
+            "127.0.0.1".to_string(),
+            "--port".to_string(),
+            "43100".to_string(),
+        ];
+        let mut env = vec![
+            (
+                "BREHON_OPENCODE_SERVER_URL".to_string(),
+                "http://127.0.0.1:43100".to_string(),
+            ),
+            ("OTHER".to_string(), "value".to_string()),
+        ];
+
+        assert!(set_launch_loopback_port(&mut args, &mut env, 43210));
+        assert_eq!(args[4], "43210");
+        assert_eq!(
+            server_url_from_launch(&args, &env).expect("server url"),
+            "http://127.0.0.1:43210"
+        );
+        assert!(env
+            .iter()
+            .any(|(key, value)| { key == "OTHER" && value == "value" }));
+    }
+
+    #[test]
+    fn test_should_retry_spawn_with_fresh_port_only_for_port_bind_failures() {
+        assert!(should_retry_spawn_with_fresh_port(&OpenCodeError::Spawn(
+            "OpenCode server process exited before readiness\n\
+             OpenCode process output:\n\
+             opencode log /tmp/opencode.log:\n\
+             Error: Failed to start server. Is port 43100 in use?"
+                .to_string()
+        )));
+        assert!(!should_retry_spawn_with_fresh_port(&OpenCodeError::Spawn(
+            "timed out waiting for OpenCode server at http://127.0.0.1:43100 after 30000ms"
+                .to_string()
+        )));
+        assert!(!should_retry_spawn_with_fresh_port(
+            &OpenCodeError::SessionCreate("session create failed".to_string())
+        ));
     }
 
     #[test]
