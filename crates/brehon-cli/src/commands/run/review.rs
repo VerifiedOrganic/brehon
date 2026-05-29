@@ -583,6 +583,17 @@ pub(crate) fn migrate_current_round_submission_aliases(
     Ok(())
 }
 
+fn remap_reviewer_prompt_body(prompt: String, old_reviewer: &str, new_reviewer: &str) -> String {
+    if old_reviewer == new_reviewer {
+        return prompt;
+    }
+
+    prompt.replace(
+        &format!("reviewer={old_reviewer}"),
+        &format!("reviewer={new_reviewer}"),
+    )
+}
+
 pub(crate) fn reconcile_review_runtime_for_run(
     brehon_root: &Path,
     planned_panels: &[PlannedReviewPanel],
@@ -810,7 +821,9 @@ pub(crate) fn reconcile_review_runtime_for_run(
                             let new_reviewer = rename_map
                                 .get(&old_reviewer)
                                 .cloned()
-                                .unwrap_or(old_reviewer);
+                                .unwrap_or_else(|| old_reviewer.clone());
+                            let prompt =
+                                remap_reviewer_prompt_body(prompt, &old_reviewer, &new_reviewer);
                             remapped_prompts.insert(new_reviewer, prompt);
                         }
                         request.reviewer_prompts = remapped_prompts;
@@ -1205,15 +1218,18 @@ mod tests {
                 reviewer_prompts: BTreeMap::from([
                     (
                         "claude-old".to_string(),
-                        "Canonical prompt for claude".to_string(),
+                        "Canonical prompt for claude reviewer=claude-old include reviewer=claude-old"
+                            .to_string(),
                     ),
                     (
                         "codex-old".to_string(),
-                        "Canonical prompt for codex".to_string(),
+                        "Canonical prompt for codex reviewer=codex-old include reviewer=codex-old"
+                            .to_string(),
                     ),
                     (
                         "gemini-old".to_string(),
-                        "Canonical prompt for gemini".to_string(),
+                        "Canonical prompt for gemini reviewer=gemini-old include reviewer=gemini-old"
+                            .to_string(),
                     ),
                 ]),
                 context: "extra".to_string(),
@@ -1360,8 +1376,16 @@ mod tests {
             let target = value["target"].as_str().unwrap();
             let message = value["message"].as_str().unwrap();
             match target {
-                "codex-new" => assert!(message.contains("Canonical prompt for codex")),
-                "gemini-new" => assert!(message.contains("Canonical prompt for gemini")),
+                "codex-new" => {
+                    assert!(message.contains("Canonical prompt for codex"));
+                    assert!(message.contains("reviewer=codex-new"));
+                    assert!(!message.contains("reviewer=codex-old"));
+                }
+                "gemini-new" => {
+                    assert!(message.contains("Canonical prompt for gemini"));
+                    assert!(message.contains("reviewer=gemini-new"));
+                    assert!(!message.contains("reviewer=gemini-old"));
+                }
                 other => panic!("unexpected queued target: {}", other),
             }
         }
@@ -1387,14 +1411,28 @@ mod tests {
                 .contains_key("claude-old"),
             "request.json should no longer contain old reviewer keys"
         );
-        assert_eq!(
-            rewritten_request.reviewer_prompts.get("codex-new"),
-            Some(&"Canonical prompt for codex".to_string())
-        );
-        assert_eq!(
-            rewritten_request.reviewer_prompts.get("gemini-new"),
-            Some(&"Canonical prompt for gemini".to_string())
-        );
+        let claude_prompt = rewritten_request
+            .reviewer_prompts
+            .get("claude-new")
+            .expect("claude prompt should be remapped");
+        assert!(claude_prompt.contains("reviewer=claude-new"));
+        assert!(!claude_prompt.contains("reviewer=claude-old"));
+
+        let codex_prompt = rewritten_request
+            .reviewer_prompts
+            .get("codex-new")
+            .expect("codex prompt should be remapped");
+        assert!(codex_prompt.contains("Canonical prompt for codex"));
+        assert!(codex_prompt.contains("reviewer=codex-new"));
+        assert!(!codex_prompt.contains("reviewer=codex-old"));
+
+        let gemini_prompt = rewritten_request
+            .reviewer_prompts
+            .get("gemini-new")
+            .expect("gemini prompt should be remapped");
+        assert!(gemini_prompt.contains("Canonical prompt for gemini"));
+        assert!(gemini_prompt.contains("reviewer=gemini-new"));
+        assert!(!gemini_prompt.contains("reviewer=gemini-old"));
     }
 
     #[test]
