@@ -287,8 +287,8 @@ pub fn run_tui_with_panels_and_runtime_commands(
     let mut last_activity: std::collections::HashMap<String, std::time::Instant> =
         std::collections::HashMap::new();
     let auto_recover_threshold = Duration::from_secs(15 * 60);
-    let review_obligation_nudge_threshold = Duration::from_secs(10 * 60);
-    let review_obligation_reset_threshold = Duration::from_secs(30 * 60);
+    let review_obligation_nudge_threshold = Duration::from_secs(5 * 60);
+    let review_obligation_reset_threshold = Duration::from_secs(10 * 60);
     let worker_context_reset_cooldown = Duration::from_secs(60);
     let self_improve_idle_threshold = Duration::from_secs(2 * 60);
     let self_improve_retry_cooldown = Duration::from_secs(10 * 60);

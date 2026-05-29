@@ -7949,7 +7949,7 @@ TypeError: Cannot read properties of undefined"#,
     }
 
     #[test]
-    fn stale_live_reviewer_obligation_gets_nudged_even_when_idle_exceeds_reset_threshold() {
+    fn stale_live_reviewer_obligation_resets_when_idle_exceeds_reset_threshold() {
         let temp = tempfile::tempdir().expect("tempdir");
         let brehon_root = temp.path().join(".brehon");
         write_review_obligation_fixture(&brehon_root);
@@ -7979,20 +7979,10 @@ TypeError: Cannot read properties of undefined"#,
         assert_eq!(routed.command.target.pane_id.as_deref(), Some("reviewer-1"));
         assert!(matches!(
             routed.command.kind,
-            RuntimeCommandKind::SendPrompt { ref text, .. }
-                if text.contains("Review-obligation nudge")
+            RuntimeCommandKind::ResetPane { ref reason }
+                if reason == "auto-recover idle reviewer pane with pending review obligation"
         ));
-        assert!(
-            harness
-                .ctx
-                .review_obligation_notifications_sent
-                .contains_key(&(
-                    "reviewer-1".to_string(),
-                    "T-review".to_string(),
-                    "REV-review".to_string()
-                )),
-            "reviewer should be nudged before any reset"
-        );
+        assert_eq!(harness.ctx.pending_runtime_commands.len(), 1);
     }
 
     #[test]
