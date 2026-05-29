@@ -275,6 +275,28 @@ impl VerificationTool {
             .join("")
     }
 
+    fn release_timed_out_panel_lease(task_id: &str, review_id: &str) {
+        match release_panel_lease_for_task(task_id) {
+            Ok(Some(panel_id)) => tracing::warn!(
+                task_id,
+                review_id,
+                panel_id,
+                "Released review panel lease after timed-out review"
+            ),
+            Ok(None) => tracing::warn!(
+                task_id,
+                review_id,
+                "Timed-out review had no panel lease to release"
+            ),
+            Err(err) => tracing::warn!(
+                task_id,
+                review_id,
+                error = %err,
+                "Failed to release timed-out review panel lease"
+            ),
+        }
+    }
+
     fn write_task_json(task_id: &str, task: &Value) -> Result<(), String> {
         let path = Self::runtime_tasks_dir()
             .ok_or_else(|| "BREHON_ROOT is not configured".to_string())?
@@ -1795,6 +1817,7 @@ impl VerificationTool {
                 if let Err(err) = write_review_state(task_id, state) {
                     tracing::warn!(task_id, error = %err, "Failed to persist timed-out review state");
                 }
+                Self::release_timed_out_panel_lease(task_id, &state.current_review_id);
                 let msg = format!(
                     "Review timeout for task {task_id} (round {}). \
                      No reviewers submitted within {} minutes. \
@@ -1883,6 +1906,7 @@ impl VerificationTool {
                 if let Err(err) = write_review_state(task_id, state) {
                     tracing::warn!(task_id, error = %err, "Failed to persist timed-out review state");
                 }
+                Self::release_timed_out_panel_lease(task_id, &state.current_review_id);
                 let msg = format!(
                     "Review timeout for task {task_id} (round {}) with {}/{} submissions. \
                      Incomplete quorum was not evaluated, and no terminal review outcome was produced. \
@@ -1943,6 +1967,7 @@ impl VerificationTool {
             if let Err(err) = write_review_state(task_id, state) {
                 tracing::warn!(task_id, error = %err, "Failed to persist timeout review state");
             }
+            Self::release_timed_out_panel_lease(task_id, &state.current_review_id);
             let notification = format!(
                 "Review timeout for task {task_id} — evaluated with {}/{} submissions.\n{}",
                 submissions.len(),

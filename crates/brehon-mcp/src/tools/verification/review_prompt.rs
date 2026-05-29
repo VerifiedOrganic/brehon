@@ -211,7 +211,9 @@ pub(crate) fn build_review_request_prompt(input: &ReviewRequestPromptInput<'_>) 
     );
 
     out.push_str(&format!(
-        "\nSubmit your review (IMPORTANT: include reviewer={reviewer}):\n  \
+        "\nSubmit your review through the Brehon MCP verification tool; prose alone does not count. \
+         Depending on your harness, the tool may appear as `verification`, `mcp__brehon__verification`, \
+         or `mcp_brehon_verification`. IMPORTANT: include reviewer={reviewer}:\n  \
          verification action=submit_review review_id={review_id} \
          reviewer={reviewer} score=<1-10> verdict=<approved|needs_revision|rejected> \
          summary=\"Your review\" findings='[{{\"description\":\"...\", \
@@ -512,6 +514,8 @@ mod tests {
     fn submission_contract_preserved() {
         let prompt = build_review_request_prompt(&base_input());
         assert!(prompt.contains("verification action=submit_review review_id=REV-abc123"));
+        assert!(prompt.contains("mcp__brehon__verification"));
+        assert!(prompt.contains("prose alone does not count"));
         assert!(prompt.contains("score=<1-10>"));
         assert!(prompt.contains("verdict=<approved|needs_revision|rejected>"));
         assert!(prompt.contains("severity"));

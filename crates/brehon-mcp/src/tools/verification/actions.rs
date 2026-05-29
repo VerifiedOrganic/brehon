@@ -1856,6 +1856,16 @@ impl VerificationTool {
                         "The current review round is terminal and has no submissions. \
                          Start a fresh round with: verification action=request_review task_id={resolved_task_id}"
                     ));
+                } else if state.status == "escalated"
+                    && !total_review_rounds_exhausted(&state)
+                    && current_review_cycle_round(&state) < state.max_rounds as u32
+                {
+                    result["action_needed"] = serde_json::json!("request_review");
+                    result["next_action"] = next_action_request_review(&resolved_task_id);
+                    result["message"] = serde_json::json!(format!(
+                        "The current review round escalated without a complete quorum. \
+                         Start a fresh round with: verification action=request_review task_id={resolved_task_id}"
+                    ));
                 }
 
                 if state.status == "released" {

@@ -20,7 +20,8 @@ use crate::process::AgentProcess;
 use brehon_adapter_sdk::stability_runtime::brehon_root_from_env;
 use brehon_adapter_sdk::AdapterEvent;
 
-const SERVER_READY_TIMEOUT_MS: u64 = 8_000;
+const DEFAULT_SERVER_READY_TIMEOUT_MS: u64 = 30_000;
+const SERVER_READY_TIMEOUT_ENV: &str = "BREHON_OPENCODE_SERVER_READY_TIMEOUT_MS";
 const SERVER_READY_POLL_MS: u64 = 100;
 const PROMPT_RESULT_POLL_MS: u64 = 50;
 const SESSION_STATUS_POLL_MS: u64 = 250;
@@ -1864,7 +1865,7 @@ async fn wait_for_server(
     auth: Option<&OpenCodeServerAuth>,
 ) -> Result<(), OpenCodeError> {
     let _ = parse_host_port(server_url)?;
-    let deadline = Duration::from_millis(SERVER_READY_TIMEOUT_MS);
+    let deadline = server_ready_timeout();
     timeout(deadline, async move {
         loop {
             match server_health(client, server_url, auth).await {
@@ -1874,7 +1875,35 @@ async fn wait_for_server(
         }
     })
     .await
-    .map_err(|_| OpenCodeError::Spawn("timed out waiting for OpenCode server".to_string()))?
+    .map_err(|_| {
+        OpenCodeError::Spawn(format!(
+            "timed out waiting for OpenCode server at {server_url} after {}ms",
+            deadline.as_millis()
+        ))
+    })?
+}
+
+fn server_ready_timeout() -> Duration {
+    let timeout_env = std::env::var(SERVER_READY_TIMEOUT_ENV).ok();
+    server_ready_timeout_from_env_value(timeout_env.as_deref())
+}
+
+fn server_ready_timeout_from_env_value(value: Option<&str>) -> Duration {
+    value
+        .and_then(parse_server_ready_timeout_ms)
+        .map(Duration::from_millis)
+        .unwrap_or_else(|| Duration::from_millis(DEFAULT_SERVER_READY_TIMEOUT_MS))
+}
+
+fn parse_server_ready_timeout_ms(value: &str) -> Option<u64> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    value
+        .parse::<u64>()
+        .ok()
+        .filter(|timeout_ms| *timeout_ms > 0)
 }
 
 fn parse_host_port(server_url: &str) -> Result<(String, u16), OpenCodeError> {
@@ -1927,6 +1956,30 @@ mod tests {
         )
         .expect("server url");
         assert_eq!(url, "http://127.0.0.1:43100");
+    }
+
+    #[test]
+    fn test_server_ready_timeout_uses_env_value_or_default() {
+        assert_eq!(
+            server_ready_timeout_from_env_value(Some("45000")),
+            Duration::from_millis(45_000)
+        );
+        assert_eq!(
+            server_ready_timeout_from_env_value(Some(" 1200 ")),
+            Duration::from_millis(1_200)
+        );
+        assert_eq!(
+            server_ready_timeout_from_env_value(None),
+            Duration::from_millis(DEFAULT_SERVER_READY_TIMEOUT_MS)
+        );
+        assert_eq!(
+            server_ready_timeout_from_env_value(Some("0")),
+            Duration::from_millis(DEFAULT_SERVER_READY_TIMEOUT_MS)
+        );
+        assert_eq!(
+            server_ready_timeout_from_env_value(Some("invalid")),
+            Duration::from_millis(DEFAULT_SERVER_READY_TIMEOUT_MS)
+        );
     }
 
     #[test]

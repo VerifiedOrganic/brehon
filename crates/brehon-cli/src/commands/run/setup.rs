@@ -19,8 +19,8 @@ const BREHON_PROTECTED_BRANCH_HOOKS: &[&str] = &[
     "reference-transaction",
 ];
 
-/// Ensure `.mcp.json` exists at the project root so agents can discover the
-/// Brehon MCP server.  Also update `.claude/settings.local.json` to allow
+/// Ensure MCP discovery files exist at the project root so agents can discover
+/// the Brehon MCP server. Also update `.claude/settings.local.json` to allow
 /// `mcp__brehon__*` tool calls for Claude Code agents.
 ///
 /// Both files are machine-local (absolute brehon binary path in the
@@ -39,6 +39,15 @@ pub(crate) fn ensure_mcp_config(cwd: &Path) -> Result<()> {
     let mcp_action = upsert_brehon_mcp_server(&mcp_path, brehon_server)?;
     if let Some(action) = mcp_action {
         tracing::info!("{action} .mcp.json with brehon server");
+    }
+
+    // ── opencode.json ────────────────────────────────────────────────────
+    let opencode_path = cwd.join("opencode.json");
+    let brehon_server =
+        brehon_mcp_server_config(&brehon_exe, cwd, cwd, None, None, None, None, None);
+    let opencode_action = upsert_brehon_opencode_mcp_server(&opencode_path, brehon_server)?;
+    if let Some(action) = opencode_action {
+        tracing::info!("{action} opencode.json with brehon MCP server");
     }
 
     // ── .claude/settings.local.json — add mcp__brehon__* permission ───────
@@ -138,6 +147,13 @@ fn sync_local_agent_scaffolding_to_worktree(
         Path::new(".agents/mcp_config.json"),
         &brehon_server,
         "Antigravity CLI MCP discovery config",
+    )?;
+    sync_brehon_opencode_config_to_worktree(
+        project_root,
+        worktree_path,
+        Path::new("opencode.json"),
+        &brehon_server,
+        "OpenCode MCP discovery config",
     )?;
     sync_project_local_file_to_worktree(
         project_root,
@@ -251,6 +267,65 @@ fn upsert_brehon_mcp_server(
     Ok(Some(if existed { "Updated" } else { "Created" }))
 }
 
+fn opencode_brehon_mcp_server_config(brehon_server: &serde_json::Value) -> serde_json::Value {
+    let mut command = Vec::new();
+    if let Some(cmd) = brehon_server
+        .get("command")
+        .and_then(|value| value.as_str())
+    {
+        command.push(serde_json::Value::String(cmd.to_string()));
+    }
+    if let Some(args) = brehon_server.get("args").and_then(|value| value.as_array()) {
+        command.extend(args.iter().filter_map(|arg| {
+            arg.as_str()
+                .map(|value| serde_json::Value::String(value.to_string()))
+        }));
+    }
+
+    serde_json::json!({
+        "type": "local",
+        "command": command,
+        "environment": brehon_server
+            .get("env")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({})),
+        "enabled": true,
+        "timeout": 10000,
+    })
+}
+
+fn upsert_brehon_opencode_mcp_server(
+    path: &Path,
+    brehon_server: serde_json::Value,
+) -> Result<Option<&'static str>> {
+    let existed = path.exists();
+    let mut doc = read_json_object_or_empty(path);
+    let obj = doc
+        .as_object_mut()
+        .expect("read_json_object_or_empty always returns object");
+    obj.entry("$schema".to_string())
+        .or_insert_with(|| serde_json::Value::String("https://opencode.ai/config.json".into()));
+    let servers = obj
+        .entry("mcp".to_string())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    if !servers.is_object() {
+        *servers = serde_json::Value::Object(serde_json::Map::new());
+    }
+    let servers = servers.as_object_mut().expect("mcp normalized to object");
+    let desired = opencode_brehon_mcp_server_config(&brehon_server);
+    let needs_brehon_update = servers.get("brehon") != Some(&desired);
+    if !needs_brehon_update && existed {
+        return Ok(None);
+    }
+
+    servers.insert("brehon".to_string(), desired);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, serde_json::to_string_pretty(&doc)?)?;
+    Ok(Some(if existed { "Updated" } else { "Created" }))
+}
+
 fn read_json_object_or_empty(path: &Path) -> serde_json::Value {
     let Ok(content) = std::fs::read_to_string(path) else {
         return serde_json::json!({});
@@ -302,6 +377,50 @@ fn sync_brehon_mcp_config_to_worktree(
         .expect("mcpServers normalized to object");
     remove_legacy_agora_servers(servers);
     servers.insert("brehon".to_string(), brehon_server.clone());
+
+    if let Some(target_dir) = target.parent() {
+        std::fs::create_dir_all(target_dir).with_context(|| {
+            format!(
+                "Failed to create {label} directory '{}' in isolated worktree",
+                target_dir.display()
+            )
+        })?;
+    }
+    std::fs::write(&target, serde_json::to_string_pretty(&doc)?).with_context(|| {
+        format!(
+            "Failed to sync {label} to isolated worktree '{}'",
+            target.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn sync_brehon_opencode_config_to_worktree(
+    project_root: &Path,
+    worktree_path: &Path,
+    relative_path: &Path,
+    brehon_server: &serde_json::Value,
+    label: &str,
+) -> Result<()> {
+    let source = project_root.join(relative_path);
+    let target = worktree_path.join(relative_path);
+    let mut doc = read_json_object_or_empty(&source);
+    let obj = doc
+        .as_object_mut()
+        .expect("read_json_object_or_empty always returns object");
+    obj.entry("$schema".to_string())
+        .or_insert_with(|| serde_json::Value::String("https://opencode.ai/config.json".into()));
+    let servers = obj
+        .entry("mcp".to_string())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    if !servers.is_object() {
+        *servers = serde_json::Value::Object(serde_json::Map::new());
+    }
+    let servers = servers.as_object_mut().expect("mcp normalized to object");
+    servers.insert(
+        "brehon".to_string(),
+        opencode_brehon_mcp_server_config(brehon_server),
+    );
 
     if let Some(target_dir) = target.parent() {
         std::fs::create_dir_all(target_dir).with_context(|| {
@@ -933,6 +1052,8 @@ pub(crate) fn default_initiative_integration_worktree(
 ///   [`ensure_mcp_config`]); the path won't resolve on any other host.
 /// * `.agents/mcp_config.json` — Antigravity CLI workspace MCP discovery
 ///   file. Also contains an absolute path to this machine's brehon binary.
+/// * `opencode.json` — OpenCode project MCP discovery file. Also contains
+///   an absolute path to this machine's brehon binary.
 /// * `.antigravitycli` — Antigravity CLI's project-local state/cache.
 /// * `.claude/settings.local.json` — Claude Code per-developer
 ///   permissions file. The `.local.json` suffix already signals
@@ -946,6 +1067,7 @@ pub(crate) fn default_initiative_integration_worktree(
 const BREHON_LOCAL_EXTRA_GITIGNORE_PATTERNS: &[&str] = &[
     ".mcp.json",
     ".agents/mcp_config.json",
+    "opencode.json",
     ".antigravitycli",
     ".claude/settings.local.json",
 ];
@@ -4115,6 +4237,11 @@ mod tests {
             r#"{"mcpServers":{"agora":{"command":"agora","args":["serve"]},"other":{"command":"other"}}}"#,
         )
         .unwrap();
+        std::fs::write(
+            temp.path().join("opencode.json"),
+            r#"{"$schema":"https://opencode.ai/config.json","mcp":{"other":{"type":"local","command":["other"]}}}"#,
+        )
+        .unwrap();
         run_git(temp.path(), &["add", ".mcp.json"]);
         run_git(temp.path(), &["commit", "-m", "add mcp config"]);
         ensure_brehon_ignored_in_repo(temp.path()).unwrap();
@@ -4236,6 +4363,36 @@ mod tests {
         assert_eq!(
             reviewer_agy["mcpServers"]["brehon"]["env"]["BREHON_AGENT_NAME"],
             "reviewer-a"
+        );
+
+        let reviewer_opencode: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(reviewer_path.join("opencode.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            reviewer_opencode["mcp"]["other"]["command"],
+            serde_json::json!(["other"])
+        );
+        assert_eq!(reviewer_opencode["mcp"]["brehon"]["type"], "local");
+        assert_eq!(
+            reviewer_opencode["mcp"]["brehon"]["command"],
+            serde_json::json!([current_brehon_exe(), "serve"])
+        );
+        assert_eq!(
+            reviewer_opencode["mcp"]["brehon"]["environment"]["BREHON_AGENT_NAME"],
+            "reviewer-a"
+        );
+        assert_eq!(
+            reviewer_opencode["mcp"]["brehon"]["environment"]["BREHON_AGENT_ROLE"],
+            "reviewer"
+        );
+        assert_eq!(
+            reviewer_opencode["mcp"]["brehon"]["environment"]["BREHON_PROJECT_ROOT"],
+            temp.path().to_string_lossy().to_string()
+        );
+        assert_eq!(
+            reviewer_opencode["mcp"]["brehon"]["environment"]["BREHON_WORKSPACE_ROOT"],
+            reviewer_path.to_string_lossy().to_string()
         );
 
         cleanup_scoped_worktrees(temp.path(), &supervisor_cwds).await;
@@ -4997,6 +5154,7 @@ mod tests {
         assert!(contents.contains(".brehon/"));
         assert!(contents.contains(".mcp.json"));
         assert!(contents.contains(".agents/mcp_config.json"));
+        assert!(contents.contains("opencode.json"));
         assert!(contents.contains(".antigravitycli"));
         assert!(contents.contains(".claude/settings.local.json"));
     }
@@ -5166,6 +5324,7 @@ mod tests {
         assert!(contents.contains("\n.brehon/\n"));
         assert!(contents.contains("\n.mcp.json\n"));
         assert!(contents.contains("\n.agents/mcp_config.json\n"));
+        assert!(contents.contains("\nopencode.json\n"));
         assert!(contents.contains("\n.antigravitycli\n"));
     }
 
@@ -5241,6 +5400,7 @@ mod tests {
 
         // Files were generated as expected.
         assert!(temp.path().join(".mcp.json").exists());
+        assert!(temp.path().join("opencode.json").exists());
         assert!(temp.path().join(".claude/settings.local.json").exists());
         assert!(temp.path().join(".agents/mcp_config.json").exists());
 
@@ -5253,6 +5413,10 @@ mod tests {
         assert!(
             lines.iter().any(|l| l == ".agents/mcp_config.json"),
             "ensure_mcp_config did not auto-ignore .agents/mcp_config.json: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l == "opencode.json"),
+            "ensure_mcp_config did not auto-ignore opencode.json: {lines:?}"
         );
         assert!(
             lines.iter().any(|l| l == ".claude/settings.local.json"),
@@ -5269,6 +5433,10 @@ mod tests {
         assert!(
             !status.contains(".agents"),
             "git status still sees .agents local config as untracked:\n{status}"
+        );
+        assert!(
+            !status.contains("opencode.json"),
+            "git status still sees opencode.json as untracked:\n{status}"
         );
         assert!(
             !status.contains(".claude/settings.local.json"),
@@ -5309,5 +5477,23 @@ mod tests {
         );
         assert_eq!(config["mcpServers"]["other"]["command"], "other");
         assert!(config["mcpServers"].get("agora").is_none());
+
+        let opencode_config: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(temp.path().join("opencode.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(opencode_config["mcp"]["brehon"]["type"], "local");
+        assert_eq!(
+            opencode_config["mcp"]["brehon"]["command"],
+            serde_json::json!([expected_exe, "serve"])
+        );
+        assert_eq!(
+            opencode_config["mcp"]["brehon"]["environment"]["BREHON_PROJECT_ROOT"],
+            temp.path().to_string_lossy().to_string()
+        );
+        assert_eq!(
+            opencode_config["mcp"]["brehon"]["environment"]["BREHON_ROOT"],
+            temp.path().join(".brehon").to_string_lossy().to_string()
+        );
     }
 }

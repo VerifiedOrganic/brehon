@@ -613,6 +613,7 @@ async fn test_request_review_recovers_blocked_integration_conflict_task() {
         ("BREHON_AGENT_NAME", "supervisor-1"),
         ("BREHON_AGENT_ROLE", "supervisor"),
     ]);
+    crate::tools::agent::write_session_file("reviewer-1", "reviewer", "sess-1", Some("codex"));
     std::fs::write(
         brehon_root
             .join("runtime")
@@ -1657,6 +1658,138 @@ async fn test_request_review_conflict_releases_stale_panel_lease() {
     );
     assert!(read_review_state("T-conflicting-review").is_none());
     assert!(find_panel_lease_by_task("T-conflicting-review").is_none());
+}
+
+#[tokio::test]
+async fn review_timeout_with_no_submissions_releases_panel_lease() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let root = tempfile::tempdir().unwrap();
+    let brehon_root = root.path().join(".brehon");
+    std::fs::create_dir_all(brehon_root.join("runtime").join("tasks")).unwrap();
+    let _env = ScopedEnv::set(&[("BREHON_ROOT", brehon_root.to_str().unwrap())]);
+
+    let task_id = "T-timeout-empty-panel";
+    let review_id = "REV-timeout-empty-panel";
+    write_task_with_status(&brehon_root, task_id, "in_review");
+    write_review_request_fixture(task_id, review_id);
+
+    let mut state = review_state_fixture(task_id, review_id, "collecting");
+    state.panel_id = "primary".to_string();
+    state.panel = vec!["reviewer-1".to_string(), "reviewer-2".to_string()];
+    state.created_at = (chrono::Utc::now() - chrono::Duration::minutes(2)).to_rfc3339();
+    state.updated_at = state.created_at.clone();
+    state::write_review_state(task_id, &state).unwrap();
+    panel::write_panel_lease(&PanelLeaseState {
+        panel_id: "primary".to_string(),
+        task_id: task_id.to_string(),
+        review_id: review_id.to_string(),
+        round: 1,
+        members: vec![
+            PanelLeaseMember {
+                slot_agent: "slot-1".to_string(),
+                reviewer: "reviewer-1".to_string(),
+            },
+            PanelLeaseMember {
+                slot_agent: "slot-2".to_string(),
+                reviewer: "reviewer-2".to_string(),
+            },
+        ],
+        leased_at: chrono::Utc::now().to_rfc3339(),
+        updated_at: chrono::Utc::now().to_rfc3339(),
+    })
+    .unwrap();
+
+    let mut tool = make_tool();
+    tool.config.timeout_minutes = 1;
+    assert!(tool.check_timeout(task_id, &mut state).await);
+
+    let persisted = read_review_state(task_id).expect("review state should remain for audit");
+    assert_eq!(persisted.status, "escalated");
+    assert!(find_panel_lease_by_task(task_id).is_none());
+    let task = read_task(task_id).expect("task should exist");
+    assert_eq!(task["status"], "changes_requested");
+}
+
+#[tokio::test]
+async fn review_timeout_with_incomplete_quorum_releases_panel_lease() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let root = tempfile::tempdir().unwrap();
+    let brehon_root = root.path().join(".brehon");
+    std::fs::create_dir_all(brehon_root.join("runtime").join("tasks")).unwrap();
+    let _env = ScopedEnv::set(&[("BREHON_ROOT", brehon_root.to_str().unwrap())]);
+
+    let task_id = "T-timeout-partial-panel";
+    let review_id = "REV-timeout-partial-panel";
+    write_task_with_status(&brehon_root, task_id, "in_review");
+    write_review_request_fixture(task_id, review_id);
+
+    let mut state = review_state_fixture(task_id, review_id, "collecting");
+    state.panel_id = "primary".to_string();
+    state.panel = vec![
+        "reviewer-1".to_string(),
+        "reviewer-2".to_string(),
+        "reviewer-3".to_string(),
+    ];
+    state.submissions_received = vec!["reviewer-1".to_string(), "reviewer-2".to_string()];
+    state.created_at = (chrono::Utc::now() - chrono::Duration::minutes(2)).to_rfc3339();
+    state.updated_at = state.created_at.clone();
+    state::write_review_state(task_id, &state).unwrap();
+    for reviewer in ["reviewer-1", "reviewer-2"] {
+        state::write_submission(
+            task_id,
+            1,
+            reviewer,
+            &StoredSubmission {
+                review_id: review_id.to_string(),
+                reviewer: reviewer.to_string(),
+                round: 1,
+                score: 9,
+                verdict: "approved".to_string(),
+                summary: format!("{reviewer} approves"),
+                findings: vec![],
+                submitted_at: chrono::Utc::now().to_rfc3339(),
+            },
+        )
+        .unwrap();
+    }
+    panel::write_panel_lease(&PanelLeaseState {
+        panel_id: "primary".to_string(),
+        task_id: task_id.to_string(),
+        review_id: review_id.to_string(),
+        round: 1,
+        members: state
+            .panel
+            .iter()
+            .map(|reviewer| PanelLeaseMember {
+                slot_agent: format!("{reviewer}-slot"),
+                reviewer: reviewer.clone(),
+            })
+            .collect(),
+        leased_at: chrono::Utc::now().to_rfc3339(),
+        updated_at: chrono::Utc::now().to_rfc3339(),
+    })
+    .unwrap();
+
+    let mut tool = make_tool();
+    tool.config.timeout_minutes = 1;
+    assert!(tool.check_timeout(task_id, &mut state).await);
+
+    let persisted = read_review_state(task_id).expect("review state should remain for audit");
+    assert_eq!(persisted.status, "escalated");
+    assert!(find_panel_lease_by_task(task_id).is_none());
+    let task = read_task(task_id).expect("task should exist");
+    assert_eq!(task["status"], "in_review");
+
+    let status_result = tool
+        .execute(serde_json::json!({
+            "action": "review_status",
+            "task_id": task_id,
+        }))
+        .await
+        .unwrap();
+    let status = result_payload(&status_result);
+    assert_eq!(status["action_needed"], "request_review");
+    assert_eq!(status["next_action"]["kind"], "request_review");
 }
 
 #[tokio::test]
