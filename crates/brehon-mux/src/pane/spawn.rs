@@ -447,6 +447,11 @@ fn command_basename(command: &str) -> &str {
         .unwrap_or(command)
 }
 
+fn is_native_agent_command(command: &str) -> bool {
+    let name = command_basename(command);
+    name == "native-agent" || name.ends_with("-native-agent")
+}
+
 fn is_grok_agent_stdio(command: &str, args: &[String]) -> bool {
     command_basename(command) == "grok"
         && args.iter().any(|arg| arg == "agent")
@@ -874,9 +879,20 @@ impl Pane {
             .as_ref()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|| ".".to_string());
+        let model = config_env_value(&config.env, "BREHON_AGENT_MODEL")
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        let mut args = config.args;
+        if is_native_agent_command(&config.command)
+            && let Some(model) = model.as_deref()
+            && !args_contain_option(&args, "--model")
+        {
+            args.push("--model".to_string());
+            args.push(model.to_string());
+        }
         let spawn_config = GatewaySpawnConfig {
             command: Some(config.command),
-            args: config.args,
+            args,
             env: config.env,
             cwd,
             protocol: gateway_protocol_for(&cli_type),
@@ -884,7 +900,7 @@ impl Pane {
             base_url: None,
             api_key_env: None,
             headers: Vec::new(),
-            model: None,
+            model,
             sidecar_socket_path: None,
             sidecar_ready_path: None,
             sidecar_connect_timeout_ms: None,

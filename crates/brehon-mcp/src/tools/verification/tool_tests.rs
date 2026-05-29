@@ -437,11 +437,22 @@ async fn test_submit_review_missing_state_reports_missing_review_state_for_activ
         .await
         .unwrap();
 
-    assert_eq!(result.is_error, None);
+    assert_eq!(result.is_error, Some(true));
     let payload = result_payload(&result);
-    assert_eq!(payload["ignored"], true);
+    assert_eq!(payload["status"], "error");
     assert_eq!(payload["reason"], "missing_review_state");
+    assert_eq!(payload["review_id"], "REV-missing-state");
+    assert_eq!(payload["task_id"], "T-missing-review-state");
     assert_eq!(payload["task_status"], "in_review");
+    assert_eq!(payload["next_action"]["args"]["action"], "review_status");
+    assert_eq!(
+        payload["next_action"]["args"]["task_id"],
+        "T-missing-review-state"
+    );
+    assert_eq!(
+        payload["next_action"]["args"]["review_id"],
+        "REV-missing-state"
+    );
 }
 
 #[tokio::test]

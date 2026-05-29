@@ -38,6 +38,11 @@ pub(super) fn is_opencode_acp_spawn(spawn_config: &GatewaySpawnConfig) -> bool {
         && matches!(spawn_config.args.first().map(String::as_str), Some("acp"))
 }
 
+pub(super) fn is_opencode_model_config_spawn(spawn_config: &GatewaySpawnConfig) -> bool {
+    is_opencode_acp_spawn(spawn_config)
+        || spawn_config.protocol == brehon_acp::GatewayProtocol::OpenCodeServer
+}
+
 pub(super) fn opencode_model_candidates(spawn_config: &GatewaySpawnConfig) -> Vec<String> {
     let Some(model) = gateway_env_value(&spawn_config.env, "BREHON_AGENT_MODEL")
         .map(str::trim)
@@ -47,11 +52,14 @@ pub(super) fn opencode_model_candidates(spawn_config: &GatewaySpawnConfig) -> Ve
     };
 
     let mut candidates = Vec::new();
-    if let Some(reasoning_effort) = gateway_env_value(&spawn_config.env, "BREHON_REASONING_EFFORT")
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        candidates.push(format!("{model}/{reasoning_effort}"));
+    if spawn_config.protocol != brehon_acp::GatewayProtocol::OpenCodeServer {
+        if let Some(reasoning_effort) =
+            gateway_env_value(&spawn_config.env, "BREHON_REASONING_EFFORT")
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        {
+            candidates.push(format!("{model}/{reasoning_effort}"));
+        }
     }
     candidates.push(model.to_string());
     candidates
@@ -1628,7 +1636,7 @@ impl Mux {
         session_id: &brehon_types::SessionId,
         spawn_config: &GatewaySpawnConfig,
     ) {
-        if !is_opencode_acp_spawn(spawn_config) {
+        if !is_opencode_model_config_spawn(spawn_config) {
             return;
         }
 
@@ -1651,7 +1659,7 @@ impl Mux {
                         pane = %pane_id,
                         session = %session_id,
                         model = %candidate,
-                        "Applied OpenCode ACP model override"
+                        "Applied OpenCode model override"
                     );
                     return;
                 }
@@ -1673,7 +1681,7 @@ impl Mux {
                 "Brehon could not apply the OpenCode model override; using default model ({err})."
             );
             if let Some(pane) = self.panes.get_mut(pane_id) {
-                let _ = pane.append_output(format!("\x1b[2m{message}\x1b[0m\r\n").as_bytes());
+                let _ = pane.append_output(format!("\x1b[1;31m{message}\x1b[0m\r\n").as_bytes());
             }
         }
     }

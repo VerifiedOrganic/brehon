@@ -613,7 +613,9 @@ fn native_agent_command(configured: Option<&str>) -> String {
         .map(str::trim)
         .filter(|command| !command.is_empty())
     {
-        return command.to_string();
+        if command_basename(command) != "agora-native-agent" {
+            return command.to_string();
+        }
     }
 
     std::env::current_exe()
@@ -654,6 +656,7 @@ fn native_agent_args(
         "--provider",
         agent_config.provider_str().unwrap_or("openai-compatible"),
     );
+    set_option_arg(&mut args, "--tool-prefix", "mcp_brehon_");
     if let Some(base_url) = agent_config.base_url_str() {
         push_option_arg(&mut args, "--base-url", base_url);
     }
@@ -705,6 +708,27 @@ fn native_agent_args(
 
 fn push_option_arg(args: &mut Vec<String>, option: &str, value: &str) {
     if value.trim().is_empty() || args.iter().any(|arg| arg == option) {
+        return;
+    }
+    args.push(option.to_string());
+    args.push(value.to_string());
+}
+
+fn set_option_arg(args: &mut Vec<String>, option: &str, value: &str) {
+    if value.trim().is_empty() {
+        return;
+    }
+    let inline_prefix = format!("{option}=");
+    if let Some(idx) = args.iter().position(|arg| arg.starts_with(&inline_prefix)) {
+        args[idx] = format!("{option}={value}");
+        return;
+    }
+    if let Some(idx) = args.iter().position(|arg| arg == option) {
+        if let Some(existing) = args.get_mut(idx + 1) {
+            *existing = value.to_string();
+        } else {
+            args.push(value.to_string());
+        }
         return;
     }
     args.push(option.to_string());
@@ -3562,6 +3586,10 @@ mod tests {
         assert!(custom
             .args
             .windows(2)
+            .any(|window| window == ["--tool-prefix", "mcp_brehon_"]));
+        assert!(custom
+            .args
+            .windows(2)
             .any(|window| window == ["--permission-mode", "bypass"]));
         assert!(custom
             .args
@@ -3633,6 +3661,9 @@ mod tests {
         assert!(args.iter().any(|arg| arg == "--worker"));
         assert!(args
             .windows(2)
+            .any(|window| window == ["--tool-prefix", "mcp_brehon_"]));
+        assert!(args
+            .windows(2)
             .any(|window| window == ["--permission-mode", "bypass"]));
     }
 
@@ -3667,6 +3698,40 @@ mod tests {
         assert!(args
             .windows(2)
             .any(|window| window == ["--permission-mode", "bypass"]));
+    }
+
+    #[test]
+    fn test_native_agent_args_overwrite_legacy_agora_tool_prefix() {
+        let agent_config = brehon_types::AgentConnectionConfig {
+            adapter: brehon_types::agent::AdapterKind::NativeAgent,
+            command: None,
+            args: vec![
+                "--worker".to_string(),
+                "--tool-prefix=mcp_agora_".to_string(),
+            ],
+            provider: Some("openai-compatible".to_string()),
+            transport: None,
+            control_plane: None,
+            base_url: None,
+            api_key_env: None,
+            permission_mode: None,
+            profile: None,
+            max_parallel_tool_calls: None,
+            assistant_message_passthrough_fields: Vec::new(),
+            reasoning_effort_param: None,
+            extra_body: None,
+            env: std::collections::HashMap::new(),
+            headers: std::collections::HashMap::new(),
+        };
+
+        let args = native_agent_args(
+            &agent_config,
+            &brehon_types::config::PermissionsConfig::default(),
+            &default_security(),
+        );
+
+        assert!(args.iter().any(|arg| arg == "--tool-prefix=mcp_brehon_"));
+        assert!(!args.iter().any(|arg| arg.contains("mcp_agora_")));
     }
 
     #[test]
@@ -3763,7 +3828,18 @@ mod tests {
         assert!(custom
             .args
             .windows(2)
+            .any(|window| window == ["--tool-prefix", "mcp_brehon_"]));
+        assert!(custom
+            .args
+            .windows(2)
             .any(|window| window == ["--permission-mode", "bypass"]));
+    }
+
+    #[test]
+    fn test_native_agent_legacy_agora_command_maps_to_brehon_binary() {
+        let command = native_agent_command(Some("/Users/recursive/.cargo/bin/agora-native-agent"));
+
+        assert_eq!(command_basename(&command), "brehon-native-agent");
     }
 
     #[test]

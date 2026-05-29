@@ -1359,7 +1359,7 @@ fn test_opencode_reviewer_uses_server_gateway_protocol() {
         24,
         80,
         &AgentAdapter::BuiltIn(SupervisorCli::OpenCode),
-        None,
+        Some("deepseek/deepseek-v4-pro[1m]"),
         None,
         None,
         None,
@@ -1372,6 +1372,10 @@ fn test_opencode_reviewer_uses_server_gateway_protocol() {
         .expect("gateway config should exist");
     assert_eq!(config.protocol, GatewayProtocol::OpenCodeServer);
     assert_eq!(config.command.as_deref(), Some("opencode"));
+    assert_eq!(
+        config.model.as_deref(),
+        Some("deepseek/deepseek-v4-pro[1m]")
+    );
     assert_eq!(config.args.first().map(String::as_str), Some("serve"));
     assert!(config.args.contains(&"--port".to_string()));
     assert!(
@@ -1379,6 +1383,13 @@ fn test_opencode_reviewer_uses_server_gateway_protocol() {
             .env
             .iter()
             .any(|(k, _)| k == "BREHON_OPENCODE_SERVER_URL")
+    );
+    assert!(
+        config
+            .env
+            .iter()
+            .any(|(key, value)| key == "BREHON_AGENT_MODEL"
+                && value == "deepseek/deepseek-v4-pro[1m]")
     );
 }
 
@@ -2288,6 +2299,74 @@ fn test_custom_acp_sidecar_supervisor_has_pty_and_gateway_contract() {
         pane.terminal_host_launch_plan("session"),
         AgentTerminalLaunchPlan::TerminalHost(_)
     ));
+}
+
+#[test]
+fn test_native_agent_acp_reviewer_passes_model_as_env_and_arg() {
+    let adapter = AgentAdapter::Custom(CustomAgentConfig {
+        name: "deepseek-native".to_string(),
+        command: Some("agora-native-agent".to_string()),
+        args: vec!["--worker".to_string()],
+        base_url: None,
+        api_key_env: None,
+        headers: Vec::new(),
+        capabilities: HarnessCapabilities {
+            supports_hooks: false,
+            supports_subagents: false,
+            supports_textbox_submit: true,
+            supports_teams: false,
+            one_shot: false,
+            uses_ink_prompt: false,
+            prompt_injection_strategy: PromptInjectionStrategy::ImmediateSubmit,
+            tool_prefix: std::borrow::Cow::Borrowed("mcp_brehon_"),
+            transport: HarnessTransport::AppServer,
+            preferred_control_plane: HarnessControlPlane::Acp,
+        },
+    });
+
+    let pane = Pane::reviewer_with_agent_type_materialized(
+        "reviewer-1",
+        PathBuf::from("/tmp"),
+        Some("runtime-session"),
+        None,
+        24,
+        80,
+        &adapter,
+        Some("deepseek-v4-pro"),
+        None,
+        None,
+        Some("deepseek-native-reviewer"),
+        Some("max"),
+        &[],
+        AgentPaneMaterialization::PlanOnly,
+        None,
+    )
+    .expect("create native-agent reviewer pane");
+
+    let config = pane
+        .gateway_spawn_config()
+        .expect("gateway config should exist");
+    assert_eq!(config.protocol, GatewayProtocol::AcpStdio);
+    assert_eq!(config.command.as_deref(), Some("agora-native-agent"));
+    assert_eq!(config.model.as_deref(), Some("deepseek-v4-pro"));
+    assert!(
+        config
+            .env
+            .iter()
+            .any(|(key, value)| key == "BREHON_AGENT_MODEL" && value == "deepseek-v4-pro")
+    );
+    assert!(
+        config
+            .env
+            .iter()
+            .any(|(key, value)| key == "BREHON_REASONING_EFFORT" && value == "max")
+    );
+    assert!(
+        config
+            .args
+            .windows(2)
+            .any(|window| window == ["--model", "deepseek-v4-pro"])
+    );
 }
 
 #[test]

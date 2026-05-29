@@ -63,6 +63,12 @@ struct OpenCodeServerAuth {
     password: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct OpenCodeModelSelection {
+    provider_id: String,
+    model_id: String,
+}
+
 struct OpenCodeServerSessionInner {
     session_id: SessionId,
     spec: SessionSpec,
@@ -70,6 +76,7 @@ struct OpenCodeServerSessionInner {
     server_url: String,
     client: Client,
     auth: Option<OpenCodeServerAuth>,
+    model: Mutex<Option<OpenCodeModelSelection>>,
     opencode_session_id: Mutex<Option<String>>,
     adapter_event_tx: std::sync::Mutex<Option<mpsc::Sender<AdapterEvent>>>,
     active_prompts: Mutex<HashMap<String, JoinHandle<()>>>,
@@ -136,6 +143,8 @@ struct OpenCodeToolState {
     output: Option<Value>,
     #[serde(default)]
     result: Option<Value>,
+    #[serde(default)]
+    error: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -150,6 +159,12 @@ struct OpenCodeHttpPart {
     input: Option<Value>,
     #[serde(default)]
     output: Option<Value>,
+    #[serde(default)]
+    error: Option<Value>,
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    attempt: Option<u64>,
     #[serde(rename = "callID", default)]
     call_id: Option<String>,
     #[serde(default)]
@@ -189,6 +204,7 @@ impl OpenCodeServerSession {
         let session_id = SessionId::new(uuid::Uuid::new_v4().to_string());
         let created_at = chrono::Utc::now();
         let spawned = spawn_server_with_retries(&spec, command, args, env).await?;
+        let model = opencode_model_selection_from_env(env)?;
 
         let inner = Arc::new(OpenCodeServerSessionInner {
             session_id: session_id.clone(),
@@ -197,6 +213,7 @@ impl OpenCodeServerSession {
             server_url: spawned.server_url,
             client: spawned.client,
             auth: spawned.auth,
+            model: Mutex::new(model),
             opencode_session_id: Mutex::new(Some(spawned.opencode_session_id)),
             adapter_event_tx: std::sync::Mutex::new(None),
             active_prompts: Mutex::new(HashMap::new()),
@@ -369,8 +386,16 @@ impl OpenCodeServerSession {
         }
     }
 
-    pub async fn set_config(&self, _option: &str, _value: &str) -> Result<(), OpenCodeError> {
-        Ok(())
+    pub async fn set_config(&self, option: &str, value: &str) -> Result<(), OpenCodeError> {
+        match option.trim_end_matches('!') {
+            "model" => {
+                let selection =
+                    parse_opencode_model_selection(value).map_err(OpenCodeError::Turn)?;
+                *self.inner.model.lock().await = Some(selection);
+                Ok(())
+            }
+            _ => Ok(()),
+        }
     }
 
     pub async fn wait_for_response(
@@ -672,6 +697,7 @@ async fn run_prompt(
     let _guard = inner.turn_lock.lock().await;
     let mut response_text = String::new();
     let mut prompt_tokens_used = 0u64;
+    let mut turn_error: Option<String> = None;
     let task_token_target = infer_prompt_token_target(&inner, &prompt.content);
 
     emit_event(
@@ -704,6 +730,9 @@ async fn run_prompt(
             }
         }
         for normalized in events {
+            if turn_error.is_none() {
+                turn_error = opencode_event_failure_message(&normalized);
+            }
             if let AdapterEvent::Output { text, .. } = &normalized {
                 if !response_text.is_empty() && !text.starts_with('\n') {
                     response_text.push('\n');
@@ -733,16 +762,16 @@ async fn run_prompt(
         &inner,
         AdapterEvent::OperationCompleted {
             operation: "opencode turn".to_string(),
-            success: true,
+            success: turn_error.is_none(),
         },
     )
     .await;
 
-    inner
-        .prompt_results
-        .lock()
-        .await
-        .insert(prompt.prompt_id.as_str().to_string(), {
+    inner.prompt_results.lock().await.insert(
+        prompt.prompt_id.as_str().to_string(),
+        if let Some(error) = turn_error {
+            Err(error)
+        } else {
             let mut result = brehon_adapter_sdk::PromptResult::default();
             result.response = if response_text.trim().is_empty() {
                 None
@@ -752,7 +781,8 @@ async fn run_prompt(
             result.tokens_used = (prompt_tokens_used > 0).then_some(prompt_tokens_used);
             result.stop_reason = Some("completed".to_string());
             Ok(result)
-        });
+        },
+    );
 
     Ok(())
 }
@@ -893,6 +923,65 @@ fn server_auth_from_env(env: &[(String, String)]) -> Option<OpenCodeServerAuth> 
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "brehon".to_string());
     Some(OpenCodeServerAuth { username, password })
+}
+
+fn opencode_model_selection_from_env(
+    env: &[(String, String)],
+) -> Result<Option<OpenCodeModelSelection>, OpenCodeError> {
+    let Some((_, value)) = env
+        .iter()
+        .find(|(key, _)| key == "BREHON_AGENT_MODEL")
+        .filter(|(_, value)| !value.trim().is_empty())
+    else {
+        return Ok(None);
+    };
+
+    parse_opencode_model_selection(value)
+        .map(Some)
+        .map_err(|err| OpenCodeError::Spawn(format!("invalid BREHON_AGENT_MODEL: {err}")))
+}
+
+fn parse_opencode_model_selection(value: &str) -> Result<OpenCodeModelSelection, String> {
+    let trimmed = value.trim();
+    let Some((provider_id, model_id)) = trimmed.split_once('/') else {
+        return Err(format!(
+            "OpenCode model '{trimmed}' must use provider/model format"
+        ));
+    };
+    let provider_id = provider_id.trim();
+    let model_id = model_id.trim();
+    if provider_id.is_empty() || model_id.is_empty() || model_id.contains('/') {
+        return Err(format!(
+            "OpenCode model '{trimmed}' must use provider/model format"
+        ));
+    }
+    Ok(OpenCodeModelSelection {
+        provider_id: provider_id.to_string(),
+        model_id: model_id.to_string(),
+    })
+}
+
+fn opencode_prompt_body(prompt: &str, model: Option<&OpenCodeModelSelection>) -> Value {
+    let mut body = serde_json::Map::new();
+    if let Some(model) = model {
+        body.insert(
+            "model".to_string(),
+            serde_json::json!({
+                "providerID": &model.provider_id,
+                "modelID": &model.model_id,
+            }),
+        );
+    }
+    body.insert(
+        "parts".to_string(),
+        serde_json::json!([
+            {
+                "type": "text",
+                "text": prompt,
+            }
+        ]),
+    );
+    Value::Object(body)
 }
 
 fn server_request(
@@ -1046,6 +1135,8 @@ async fn send_server_message_once(
     opencode_session_id: &str,
     prompt: &str,
 ) -> Result<(), OpenCodeError> {
+    let model = inner.model.lock().await.clone();
+    let body = opencode_prompt_body(prompt, model.as_ref());
     let response = server_request(
         &inner.client,
         inner.auth.as_ref(),
@@ -1055,14 +1146,7 @@ async fn send_server_message_once(
             inner.server_url, opencode_session_id
         ),
     )
-    .json(&serde_json::json!({
-        "parts": [
-            {
-                "type": "text",
-                "text": prompt,
-            }
-        ]
-    }))
+    .json(&body)
     .send()
     .await
     .map_err(|e| OpenCodeError::Turn(e.to_string()))?;
@@ -1129,6 +1213,79 @@ fn extract_string_field(value: &Value, fields: &[&str]) -> Option<String> {
             .filter(|text| !text.is_empty())
             .map(ToString::to_string)
     })
+}
+
+fn opencode_step_success(part: &OpenCodeHttpPart) -> bool {
+    if let Some(status) = part
+        .state
+        .as_ref()
+        .and_then(|state| state.status.as_deref())
+    {
+        return !opencode_status_is_failure(status);
+    }
+    part.reason
+        .as_deref()
+        .map(|reason| !opencode_status_is_failure(reason))
+        .unwrap_or(true)
+}
+
+fn opencode_status_is_failure(value: &str) -> bool {
+    let normalized = value.trim().to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "error" | "failed" | "failure" | "cancelled" | "canceled"
+    ) || normalized.contains("error")
+        || normalized.contains("failed")
+}
+
+fn opencode_retry_error_message(part: &OpenCodeHttpPart) -> Option<String> {
+    let error = part.error.as_ref().and_then(opencode_error_text)?;
+    Some(match part.attempt {
+        Some(attempt) => format!("OpenCode retry attempt {attempt} failed: {error}"),
+        None => format!("OpenCode retry failed: {error}"),
+    })
+}
+
+fn opencode_error_text(value: &Value) -> Option<String> {
+    if let Some(text) = value
+        .as_str()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    {
+        return Some(text.to_string());
+    }
+    if let Some(object) = value.as_object() {
+        for field in ["message", "error", "detail", "name"] {
+            if let Some(text) = object
+                .get(field)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+            {
+                return Some(text.to_string());
+            }
+        }
+    }
+    Some(value.to_string()).filter(|text| text != "null")
+}
+
+fn opencode_event_failure_message(event: &AdapterEvent) -> Option<String> {
+    match event {
+        AdapterEvent::Output { text, .. } if text.starts_with("OpenCode retry ") => {
+            Some(text.trim().to_string())
+        }
+        AdapterEvent::OperationCompleted {
+            operation,
+            success: false,
+            ..
+        } => Some(format!("OpenCode {operation} failed")),
+        AdapterEvent::ToolCallCompleted {
+            tool_name, status, ..
+        } if opencode_status_is_failure(status) => Some(format!(
+            "OpenCode tool {tool_name} failed with status {status}"
+        )),
+        _ => None,
+    }
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -1261,6 +1418,12 @@ fn normalize_message_value(_session_id: &SessionId, response: &Value) -> Vec<Ada
             continue;
         };
         match part.part_type.as_deref() {
+            Some("retry") => {
+                if let Some(text) = opencode_retry_error_message(&part) {
+                    result.push(AdapterEvent::Output { text });
+                }
+                continue;
+            }
             Some("step-start" | "step_start") => {
                 result.push(AdapterEvent::OperationStarted {
                     operation: "step".to_string(),
@@ -1270,12 +1433,7 @@ fn normalize_message_value(_session_id: &SessionId, response: &Value) -> Vec<Ada
             Some("step-finish" | "step_finish") => {
                 result.push(AdapterEvent::OperationCompleted {
                     operation: "step".to_string(),
-                    success: part
-                        .state
-                        .as_ref()
-                        .and_then(|state| state.status.as_deref())
-                        .map(|status| !matches!(status, "failed" | "error"))
-                        .unwrap_or(true),
+                    success: opencode_step_success(&part),
                 });
                 continue;
             }
@@ -1374,6 +1532,12 @@ fn opencode_tool_details(part: &OpenCodeHttpPart, started: bool) -> Option<Value
         .or_else(|| part.state.as_ref().and_then(|state| state.result.as_ref()))
     {
         object.insert("output".to_string(), output.clone());
+    } else if let Some(error) = part
+        .error
+        .as_ref()
+        .or_else(|| part.state.as_ref().and_then(|state| state.error.as_ref()))
+    {
+        object.insert("error".to_string(), error.clone());
     }
     (!object.is_empty()).then_some(Value::Object(object))
 }
@@ -1473,6 +1637,11 @@ fn record_seen_message_parts(
         };
         let base_key = message_part_base_key(message, message_index, part_value, part_index);
         match part.part_type.as_deref() {
+            Some("retry") => {
+                if part.error.is_some() {
+                    seen.event_keys.insert(format!("{base_key}:retry-error"));
+                }
+            }
             Some("step-start" | "step_start") => {
                 seen.event_keys.insert(format!("{base_key}:step-start"));
             }
@@ -1533,6 +1702,14 @@ fn normalize_new_message_parts(
         };
         let base_key = message_part_base_key(message, message_index, part_value, part_index);
         match part.part_type.as_deref() {
+            Some("retry") => {
+                if let Some(text) = opencode_retry_error_message(&part) {
+                    if seen.event_keys.insert(format!("{base_key}:retry-error")) {
+                        events.push(AdapterEvent::Output { text });
+                    }
+                }
+                continue;
+            }
             Some("step-start" | "step_start") => {
                 if seen.event_keys.insert(format!("{base_key}:step-start")) {
                     events.push(AdapterEvent::OperationStarted {
@@ -1551,12 +1728,7 @@ fn normalize_new_message_parts(
                     );
                     events.push(AdapterEvent::OperationCompleted {
                         operation: "step".to_string(),
-                        success: part
-                            .state
-                            .as_ref()
-                            .and_then(|state| state.status.as_deref())
-                            .map(|status| !matches!(status, "failed" | "error"))
-                            .unwrap_or(true),
+                        success: opencode_step_success(&part),
                     });
                 }
                 continue;
@@ -2334,6 +2506,29 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_opencode_model_selection_requires_provider_model() {
+        let model =
+            parse_opencode_model_selection(" deepseek/deepseek-v4-pro[1m] ").expect("model");
+        assert_eq!(model.provider_id, "deepseek");
+        assert_eq!(model.model_id, "deepseek-v4-pro[1m]");
+
+        assert!(parse_opencode_model_selection("deepseek-v4-pro").is_err());
+        assert!(parse_opencode_model_selection("deepseek/model/extra").is_err());
+        assert!(parse_opencode_model_selection("/deepseek-v4-pro").is_err());
+    }
+
+    #[test]
+    fn test_opencode_prompt_body_includes_model_selection() {
+        let model = parse_opencode_model_selection("deepseek/deepseek-v4-pro[1m]").expect("model");
+        let body = opencode_prompt_body("review this", Some(&model));
+
+        assert_eq!(body["model"]["providerID"], "deepseek");
+        assert_eq!(body["model"]["modelID"], "deepseek-v4-pro[1m]");
+        assert_eq!(body["parts"][0]["type"], "text");
+        assert_eq!(body["parts"][0]["text"], "review this");
+    }
+
+    #[test]
     fn test_normalize_message_response_reads_text_parts() {
         let session_id = SessionId::new("brehon-session");
         let response = serde_json::json!({
@@ -2352,6 +2547,51 @@ mod tests {
             &normalized[1],
             AdapterEvent::Output { text, .. } if text == "world"
         ));
+    }
+
+    #[test]
+    fn test_normalize_message_response_surfaces_retry_error() {
+        let session_id = SessionId::new("brehon-session");
+        let response = serde_json::json!({
+            "role": "assistant",
+            "parts": [
+                {
+                    "type": "retry",
+                    "attempt": 2,
+                    "error": {
+                        "message": "The supported API model names are deepseek-v4-pro or deepseek-v4-flash"
+                    }
+                }
+            ]
+        });
+
+        let events = normalize_message_response(&session_id, &response);
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AdapterEvent::Output { text, .. }
+                if text.contains("OpenCode retry attempt 2 failed")
+                    && text.contains("supported API model names")
+        )));
+    }
+
+    #[test]
+    fn test_normalize_message_response_marks_error_step_failed() {
+        let session_id = SessionId::new("brehon-session");
+        let response = serde_json::json!({
+            "role": "assistant",
+            "parts": [
+                { "type": "step-finish", "reason": "error" }
+            ]
+        });
+
+        let events = normalize_message_response(&session_id, &response);
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AdapterEvent::OperationCompleted { operation, success: false, .. }
+                if operation == "step"
+        )));
     }
 
     #[test]

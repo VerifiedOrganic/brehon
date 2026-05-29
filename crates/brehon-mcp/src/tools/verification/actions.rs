@@ -1225,15 +1225,44 @@ impl VerificationTool {
         let mut state = match read_review_state(&task_id) {
             Some(s) => s,
             None => {
-                let reason = if task_status_closes_review(task_status.as_deref()) {
-                    RejectionReason::TaskClosed
-                } else {
-                    RejectionReason::MissingReviewState
-                };
+                if !task_status_closes_review(task_status.as_deref()) {
+                    let mut next_action = next_action_review_status(&task_id);
+                    if let Some(args) = next_action
+                        .get_mut("args")
+                        .and_then(serde_json::Value::as_object_mut)
+                    {
+                        args.insert(
+                            "review_id".to_string(),
+                            serde_json::Value::String(review_id.clone()),
+                        );
+                    }
+                    let message = format!(
+                        "Review {review_id} for task {task_id} has no active review state; the review was not submitted. Run review_status to refresh/recover the round before submitting again."
+                    );
+                    let mut result = serde_json::json!({
+                        "status": "error",
+                        "reason": RejectionReason::MissingReviewState.as_str(),
+                        "review_id": review_id,
+                        "task_id": task_id,
+                        "message": message,
+                        "next_action": next_action,
+                    });
+                    if let Some(task_status) = task_status.as_deref() {
+                        result["task_status"] = serde_json::json!(task_status);
+                    }
+                    return Ok(error_result(
+                        serde_json::to_string_pretty(&result).unwrap_or_else(|_| {
+                            format!(
+                                "{{\"status\":\"error\",\"reason\":\"{}\"}}",
+                                RejectionReason::MissingReviewState.as_str()
+                            )
+                        }),
+                    ));
+                }
                 return Ok(self.ignored_submit_review_result(
                     &review_id,
                     &task_id,
-                    reason,
+                    RejectionReason::TaskClosed,
                     format!(
                         "Review {review_id} for task {task_id} is no longer active because its review state is gone. Late submissions are ignored."
                     ),
