@@ -45,6 +45,7 @@ type PromptResults = Arc<Mutex<HashMap<String, Result<brehon_adapter_sdk::Prompt
 struct OpenCodeServerEvent {
     message: String,
     failure: bool,
+    dedupe_key: String,
 }
 
 struct OpenCodeEventSubscription {
@@ -755,6 +756,7 @@ async fn run_prompt(
     let turn_started_at = tokio::time::Instant::now();
     let turn_activity_timeout = turn_start_timeout();
     let mut progress = OpenCodeTurnProgress::default();
+    let mut emitted_server_failures = HashSet::new();
 
     loop {
         let mut saw_server_event_activity = false;
@@ -763,8 +765,13 @@ async fn run_prompt(
             if server_event.failure && turn_error.is_none() {
                 turn_error = Some(server_event.message.clone());
             }
+            if server_event.failure
+                && !emitted_server_failures.insert(server_event.dedupe_key.clone())
+            {
+                continue;
+            }
             let normalized = AdapterEvent::Output {
-                text: server_event.message,
+                text: output_line(server_event.message),
             };
             if let AdapterEvent::Output { text, .. } = &normalized {
                 if !response_text.is_empty() && !text.starts_with('\n') {
@@ -1188,21 +1195,19 @@ fn normalize_open_code_server_event(
 
     match event_type {
         "session.error" => {
-            let error = properties
-                .get("error")
-                .or_else(|| event.get("error"))
-                .and_then(opencode_error_text)?;
+            let error_value = properties.get("error").or_else(|| event.get("error"))?;
+            let error = opencode_error_text(error_value)?;
             Some(OpenCodeServerEvent {
                 message: format!("OpenCode session error: {error}"),
                 failure: true,
+                dedupe_key: opencode_error_dedupe_key(error_value),
             })
         }
-        "message.updated" => {
-            opencode_message_error_message(properties).map(|message| OpenCodeServerEvent {
-                message,
-                failure: true,
-            })
-        }
+        "message.updated" => opencode_message_error(properties).map(|error| OpenCodeServerEvent {
+            message: error.message,
+            failure: true,
+            dedupe_key: error.dedupe_key,
+        }),
         _ => None,
     }
 }
@@ -1215,6 +1220,14 @@ fn opencode_event_matches_session(value: &Value, opencode_session_id: &str) -> b
         .and_then(Value::as_str)
         .map(|session_id| session_id == opencode_session_id)
         .unwrap_or(true)
+}
+
+fn output_line(message: String) -> String {
+    if message.ends_with('\n') {
+        message
+    } else {
+        format!("{message}\n")
+    }
 }
 
 fn looks_like_html_shell(body: &str) -> bool {
@@ -1455,6 +1468,11 @@ fn opencode_retry_error_message(part: &OpenCodeHttpPart) -> Option<String> {
     })
 }
 
+struct OpenCodeErrorMessage {
+    message: String,
+    dedupe_key: String,
+}
+
 fn opencode_error_text(value: &Value) -> Option<String> {
     if let Some(text) = value
         .as_str()
@@ -1465,34 +1483,21 @@ fn opencode_error_text(value: &Value) -> Option<String> {
     }
     if let Some(object) = value.as_object() {
         let mut parts = Vec::new();
-        if let Some(name) = object
-            .get("name")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|text| !text.is_empty())
-        {
-            parts.push(name.to_string());
-        }
-        if let Some(status_code) = object.get("statusCode").and_then(Value::as_u64) {
-            parts.push(format!("status {status_code}"));
-        }
-        for field in ["message", "error", "detail"] {
+        push_unique_error_part(&mut parts, object_string_field(object, "name"));
+        push_unique_error_part(
+            &mut parts,
+            object
+                .get("statusCode")
+                .or_else(|| object.get("status_code"))
+                .or_else(|| object.get("status"))
+                .and_then(Value::as_u64)
+                .map(|status| format!("status {status}")),
+        );
+        for field in [
+            "message", "error", "detail", "details", "body", "data", "cause", "metadata",
+        ] {
             if let Some(field_value) = object.get(field) {
-                if let Some(text) = field_value
-                    .as_str()
-                    .map(str::trim)
-                    .filter(|text| !text.is_empty())
-                    .map(ToString::to_string)
-                    .or_else(|| {
-                        field_value
-                            .as_object()
-                            .and_then(|_| opencode_error_text(field_value))
-                    })
-                {
-                    if !parts.iter().any(|part| part == &text) {
-                        parts.push(text);
-                    }
-                }
+                push_unique_error_part(&mut parts, opencode_error_text(field_value));
             }
         }
         if let Some(response_body) = object
@@ -1502,16 +1507,25 @@ fn opencode_error_text(value: &Value) -> Option<String> {
             .map(str::trim)
             .filter(|text| !text.is_empty())
         {
-            parts.push(format!("response body: {response_body}"));
+            if let Some(parsed) = parse_json_error_response(response_body) {
+                push_unique_error_part(&mut parts, Some(parsed));
+            }
+            push_unique_error_part(&mut parts, Some(format!("response body: {response_body}")));
         }
         if !parts.is_empty() {
+            if parts.len() == 1 && object.contains_key("name") {
+                parts.push(format!(
+                    "no detail in OpenCode error payload; raw_error={}",
+                    compact_json(value, 700)
+                ));
+            }
             return Some(parts.join(": "));
         }
     }
-    Some(value.to_string()).filter(|text| text != "null")
+    Some(compact_json(value, 700)).filter(|text| text != "null")
 }
 
-fn opencode_message_error_message(message: &Value) -> Option<String> {
+fn opencode_message_error(message: &Value) -> Option<OpenCodeErrorMessage> {
     let info = message_info_value(message);
     let error = info
         .get("error")
@@ -1519,7 +1533,65 @@ fn opencode_message_error_message(message: &Value) -> Option<String> {
         .or_else(|| message.get("message").and_then(|value| value.get("error")))?;
     let text = opencode_error_text(error)?;
     let role = message_role(message).unwrap_or("message");
-    Some(format!("OpenCode {role} error: {text}"))
+    Some(OpenCodeErrorMessage {
+        message: format!("OpenCode {role} error: {text}"),
+        dedupe_key: opencode_error_dedupe_key(error),
+    })
+}
+
+fn opencode_message_error_message(message: &Value) -> Option<String> {
+    opencode_message_error(message).map(|error| error.message)
+}
+
+fn opencode_error_dedupe_key(error: &Value) -> String {
+    opencode_error_text(error).unwrap_or_else(|| compact_json(error, 700))
+}
+
+fn push_unique_error_part(parts: &mut Vec<String>, text: Option<String>) {
+    let Some(text) = text
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty() && text != "null")
+    else {
+        return;
+    };
+    if !parts.iter().any(|part| part == &text) {
+        parts.push(text);
+    }
+}
+
+fn object_string_field(object: &serde_json::Map<String, Value>, field: &str) -> Option<String> {
+    object
+        .get(field)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(ToString::to_string)
+}
+
+fn parse_json_error_response(response_body: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(response_body).ok()?;
+    value
+        .get("error")
+        .and_then(|error| {
+            error
+                .get("message")
+                .and_then(Value::as_str)
+                .or_else(|| error.as_str())
+        })
+        .or_else(|| value.get("message").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(ToString::to_string)
+}
+
+fn compact_json(value: &Value, max_chars: usize) -> String {
+    let text = serde_json::to_string(value).unwrap_or_else(|_| value.to_string());
+    if text.chars().count() <= max_chars {
+        return text;
+    }
+    let mut truncated = text.chars().take(max_chars).collect::<String>();
+    truncated.push_str("...");
+    truncated
 }
 
 fn opencode_event_failure_message(event: &AdapterEvent) -> Option<String> {
@@ -3031,6 +3103,30 @@ mod tests {
         assert!(normalized.message.contains("status 400"));
         assert!(normalized.message.contains("model rejected"));
         assert!(normalized.message.contains("bad model"));
+    }
+
+    #[test]
+    fn test_sse_event_name_only_error_keeps_raw_payload() {
+        let event = serde_json::json!({
+            "type": "session.error",
+            "properties": {
+                "sessionID": "ses_123",
+                "error": {
+                    "name": "APIError"
+                }
+            }
+        });
+
+        let normalized = normalize_open_code_server_event("ses_123", &event).expect("event");
+
+        assert!(normalized.failure);
+        assert!(normalized.message.contains("APIError"));
+        assert!(normalized
+            .message
+            .contains("no detail in OpenCode error payload"));
+        assert!(normalized
+            .message
+            .contains("raw_error={\"name\":\"APIError\"}"));
     }
 
     #[test]
