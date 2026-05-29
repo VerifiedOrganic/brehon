@@ -683,6 +683,83 @@ fn push_wrapped_activity_text(
     }
 }
 
+fn opencode_output_error_summary(output_lines: &[String]) -> Option<String> {
+    output_lines
+        .iter()
+        .find_map(|line| summarize_opencode_error_line(line))
+}
+
+fn summarize_opencode_error_line(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    let rest = trimmed
+        .strip_prefix("OpenCode session error: ")
+        .or_else(|| trimmed.strip_prefix("OpenCode assistant error: "))?;
+    let rest = rest.trim();
+    let rest = rest.strip_prefix("APIError: ").unwrap_or(rest).trim();
+    if rest.is_empty() {
+        return Some("OpenCode error".to_string());
+    }
+
+    let message = collapse_spaces(opencode_error_message_before_payload(rest));
+    if message.is_empty() {
+        Some("OpenCode error".to_string())
+    } else if message.starts_with("status ") {
+        Some(format!("OpenCode API error: {message}"))
+    } else {
+        Some(format!("OpenCode error: {message}"))
+    }
+}
+
+fn opencode_error_message_before_payload(value: &str) -> &str {
+    let mut end = value.len();
+    for marker in [": {\"url\"", ": response body", " response body: {"] {
+        if let Some(idx) = value.find(marker) {
+            end = end.min(idx);
+        }
+    }
+    value[..end].trim()
+}
+
+fn collapse_spaces(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn push_opencode_error_activity(
+    lines: &mut Vec<ActivityDisplayLine>,
+    key: &str,
+    summary: &str,
+    raw_details: &str,
+    expanded: bool,
+    area_width: usize,
+) {
+    let marker = if expanded { "▾" } else { "▸" };
+    let prefix = format!(" {marker}✗ ");
+    let summary_width = area_width.saturating_sub(prefix.width()).max(1);
+    lines.push(keyed_activity_line(
+        Line::from(vec![
+            Span::styled(prefix, Style::default().fg(BORDER)),
+            Span::styled(
+                truncate_to(summary, summary_width),
+                status_style(StatusKind::Error).add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        key,
+    ));
+
+    if expanded {
+        push_wrapped_activity_text(
+            lines,
+            key,
+            "  │ ",
+            "  │ ",
+            raw_details,
+            area_width,
+            EXPANDED_ACTIVITY_TEXT_LINES,
+            Style::default().fg(TEXT_MUTED),
+        );
+    }
+}
+
 fn activity_visible_range(
     total_lines: usize,
     viewport_height: usize,
@@ -988,6 +1065,20 @@ fn render_structured_pane_with_padding(
                         }
                     }
                     if !output_lines.is_empty() {
+                        if let Some(summary) = opencode_output_error_summary(&output_lines) {
+                            let raw_details = output_lines.join("\n");
+                            push_opencode_error_activity(
+                                &mut lines,
+                                &group.key,
+                                &summary,
+                                &raw_details,
+                                expanded,
+                                inner_width,
+                            );
+                            lines.push(plain_activity_line(Line::from("")));
+                            continue;
+                        }
+
                         let max_lines = if expanded {
                             EXPANDED_ACTIVITY_TEXT_LINES
                         } else {

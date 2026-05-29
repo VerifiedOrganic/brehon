@@ -6608,6 +6608,98 @@ mod tests {
     }
 
     #[test]
+    fn test_render_structured_pane_collapses_opencode_api_error() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let mut pane = make_custom_worker_pane("worker-opencode-error", "opencode-worker");
+        pane.ensure_activity_buffer();
+        let error = concat!(
+            "OpenCode session error: APIError: status 400: The supported API model names are ",
+            "deepseek-v4-pro or deepseek-v4-flash, but you passed deepseek-v4-pro[1m].: ",
+            "{\"url\":\"https://api.deepseek.com/chat/completions\"}: response body: ",
+            "{\"error\":{\"message\":\"The supported API model names are deepseek-v4-pro or ",
+            "deepseek-v4-flash, but you passed deepseek-v4-pro[1m].\"}}\n",
+        );
+        {
+            let activity = pane.activity_buffer_mut().expect("activity buffer");
+            activity.append_output(error);
+            activity.flush_output_buffer();
+        }
+
+        let mut mux = Mux::new(24, 80);
+        mux.add_pane(pane);
+
+        let collapsed = std::collections::HashSet::new();
+        let mut regions = Vec::new();
+        let mut terminal = Terminal::new(TestBackend::new(160, 10)).unwrap();
+        terminal
+            .draw(|frame| {
+                let _ = render_pane_in_area_with_activity_regions(
+                    frame,
+                    Rect::new(0, 0, 160, 10),
+                    &mux,
+                    "worker-opencode-error",
+                    true,
+                    None,
+                    true,
+                    &collapsed,
+                    None,
+                    Some(&mut regions),
+                );
+            })
+            .unwrap();
+
+        let collapsed_rows = (0..10)
+            .map(|row| buffer_row_string(terminal.backend().buffer(), row))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            collapsed_rows.contains("OpenCode API error: status 400"),
+            "{collapsed_rows}"
+        );
+        assert!(!collapsed_rows.contains("\"url\""), "{collapsed_rows}");
+        assert!(
+            !collapsed_rows.contains("response body"),
+            "{collapsed_rows}"
+        );
+
+        let entry_key = regions
+            .iter()
+            .find_map(|region| match &region.target {
+                ClickTarget::ActivityRow { entry_key, .. } => Some(entry_key.clone()),
+                _ => None,
+            })
+            .expect("activity row region");
+        let mut expanded = std::collections::HashSet::new();
+        expanded.insert(("worker-opencode-error".to_string(), entry_key));
+
+        let mut expanded_terminal = Terminal::new(TestBackend::new(160, 14)).unwrap();
+        expanded_terminal
+            .draw(|frame| {
+                let _ = render_pane_in_area_with_activity_regions(
+                    frame,
+                    Rect::new(0, 0, 160, 14),
+                    &mux,
+                    "worker-opencode-error",
+                    true,
+                    None,
+                    true,
+                    &expanded,
+                    None,
+                    None,
+                );
+            })
+            .unwrap();
+
+        let expanded_rows = (0..14)
+            .map(|row| buffer_row_string(expanded_terminal.backend().buffer(), row))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(expanded_rows.contains("\"url\""), "{expanded_rows}");
+        assert!(expanded_rows.contains("response body"), "{expanded_rows}");
+    }
+
+    #[test]
     fn test_render_status_bar_prefers_configured_agent_type() {
         use insta::assert_snapshot;
         use ratatui::{backend::TestBackend, Terminal};
