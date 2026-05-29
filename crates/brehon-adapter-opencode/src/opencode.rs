@@ -38,6 +38,8 @@ const SERVER_MESSAGE_RETRY_ATTEMPTS: usize = 3;
 const SERVER_MESSAGE_RETRY_BACKOFF_MS: u64 = 250;
 const SERVER_FETCH_RETRY_ATTEMPTS: usize = 5;
 const SERVER_FETCH_RETRY_BACKOFF_MS: u64 = 200;
+const TURN_POLL_RECOVERY_TIMEOUT_MS: u64 = 60_000;
+const TURN_POLL_RECOVERY_BACKOFF_MS: u64 = 1_000;
 const SESSION_MESSAGE_LIMIT: usize = 24;
 
 type PromptResults = Arc<Mutex<HashMap<String, Result<brehon_adapter_sdk::PromptResult, String>>>>;
@@ -756,6 +758,7 @@ async fn run_prompt(
     let turn_started_at = tokio::time::Instant::now();
     let turn_activity_timeout = turn_start_timeout();
     let mut progress = OpenCodeTurnProgress::default();
+    let mut poll_recovery = OpenCodeTurnPollRecovery::default();
     let mut emitted_server_failures = HashSet::new();
 
     loop {
@@ -782,9 +785,21 @@ async fn run_prompt(
             emit_event(&inner, normalized).await;
         }
 
-        let (events, saw_model_activity, tokens_delta) =
-            fetch_new_message_events(&inner, &session_id, &mut seen_messages, &prompt.content)
-                .await?;
+        let (events, saw_model_activity, tokens_delta) = match fetch_new_message_events(
+            &inner,
+            &session_id,
+            &mut seen_messages,
+            &prompt.content,
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(err) if poll_recovery.should_retry(&err) => {
+                sleep(Duration::from_millis(TURN_POLL_RECOVERY_BACKOFF_MS)).await;
+                continue;
+            }
+            Err(err) => return Err(err),
+        };
         if tokens_delta > 0 {
             prompt_tokens_used = prompt_tokens_used.saturating_add(tokens_delta);
             inner.tokens_used.fetch_add(tokens_delta, Ordering::Relaxed);
@@ -805,7 +820,15 @@ async fn run_prompt(
             emit_event(&inner, normalized).await;
         }
 
-        let session_busy = fetch_session_busy(&inner, &session_id).await?;
+        let session_busy = match fetch_session_busy(&inner, &session_id).await {
+            Ok(session_busy) => session_busy,
+            Err(err) if poll_recovery.should_retry(&err) => {
+                sleep(Duration::from_millis(TURN_POLL_RECOVERY_BACKOFF_MS)).await;
+                continue;
+            }
+            Err(err) => return Err(err),
+        };
+        poll_recovery.record_success();
         if progress.observe(
             session_busy,
             saw_model_activity || saw_server_event_activity,
@@ -879,6 +902,27 @@ impl OpenCodeTurnProgress {
         }
 
         self.saw_activity && !session_busy && self.settle_passes >= SESSION_SETTLE_PASSES
+    }
+}
+
+#[derive(Default)]
+struct OpenCodeTurnPollRecovery {
+    first_error_at: Option<tokio::time::Instant>,
+}
+
+impl OpenCodeTurnPollRecovery {
+    fn should_retry(&mut self, err: &OpenCodeError) -> bool {
+        if !should_retry_turn_error(err) {
+            return false;
+        }
+
+        let now = tokio::time::Instant::now();
+        let first_error_at = *self.first_error_at.get_or_insert(now);
+        now.duration_since(first_error_at) < Duration::from_millis(TURN_POLL_RECOVERY_TIMEOUT_MS)
+    }
+
+    fn record_success(&mut self) {
+        self.first_error_at = None;
     }
 }
 
@@ -1421,6 +1465,10 @@ fn should_retry_turn_error(err: &OpenCodeError) -> bool {
         || message.contains("timeout")
         || message.contains("404")
         || message.contains("not found")
+        || message.contains("500")
+        || message.contains("internal server error")
+        || message.contains("unknownerror")
+        || message.contains("unexpected server error")
         || message.contains("502")
         || message.contains("503")
         || message.contains("504")
@@ -2939,6 +2987,43 @@ mod tests {
             turn_start_timeout_from_env_value(Some("invalid")),
             Duration::from_millis(DEFAULT_TURN_START_TIMEOUT_MS)
         );
+    }
+
+    #[test]
+    fn test_should_retry_turn_error_treats_opencode_500_as_retryable() {
+        assert!(should_retry_turn_error(&OpenCodeError::Http(
+            "session message fetch failed with 500 Internal Server Error: \
+             {\"name\":\"UnknownError\",\"data\":{\"message\":\"Unexpected server error\"}}"
+                .to_string()
+        )));
+        assert!(should_retry_turn_error(&OpenCodeError::Turn(
+            "OpenCode prompt_async failed with 500 Internal Server Error: \
+             {\"name\":\"UnknownError\"}"
+                .to_string()
+        )));
+        assert!(!should_retry_turn_error(&OpenCodeError::Turn(
+            "OpenCode prompt_async failed with 400 Bad Request: invalid model".to_string()
+        )));
+    }
+
+    #[test]
+    fn test_turn_poll_recovery_stops_after_budget() {
+        let mut recovery = OpenCodeTurnPollRecovery::default();
+        let err = OpenCodeError::Http(
+            "session message fetch failed with 500 Internal Server Error".to_string(),
+        );
+
+        assert!(recovery.should_retry(&err));
+
+        recovery.first_error_at = Some(
+            tokio::time::Instant::now()
+                .checked_sub(Duration::from_millis(TURN_POLL_RECOVERY_TIMEOUT_MS + 1))
+                .expect("expired instant"),
+        );
+        assert!(!recovery.should_retry(&err));
+
+        recovery.record_success();
+        assert!(recovery.should_retry(&err));
     }
 
     #[test]
