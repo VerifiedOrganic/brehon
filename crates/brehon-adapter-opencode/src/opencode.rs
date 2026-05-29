@@ -724,8 +724,9 @@ async fn run_prompt(
     let mut progress = OpenCodeTurnProgress::default();
 
     loop {
-        let (events, saw_new_messages, tokens_delta) =
-            fetch_new_message_events(&inner, &session_id, &mut seen_messages).await?;
+        let (events, saw_model_activity, tokens_delta) =
+            fetch_new_message_events(&inner, &session_id, &mut seen_messages, &prompt.content)
+                .await?;
         if tokens_delta > 0 {
             prompt_tokens_used = prompt_tokens_used.saturating_add(tokens_delta);
             inner.tokens_used.fetch_add(tokens_delta, Ordering::Relaxed);
@@ -747,12 +748,12 @@ async fn run_prompt(
         }
 
         let session_busy = fetch_session_busy(&inner, &session_id).await?;
-        if progress.observe(session_busy, saw_new_messages) {
+        if progress.observe(session_busy, saw_model_activity) {
             break;
         }
         if !progress.saw_activity() && turn_started_at.elapsed() >= turn_activity_timeout {
             return Err(OpenCodeError::Turn(format!(
-                "OpenCode accepted prompt_async for session {session_id} but no assistant activity appeared within {}ms",
+                "OpenCode accepted prompt_async for session {session_id} but no assistant/tool activity appeared within {}ms",
                 turn_activity_timeout.as_millis()
             )));
         }
@@ -800,14 +801,14 @@ impl OpenCodeTurnProgress {
         self.saw_activity
     }
 
-    fn observe(&mut self, session_busy: bool, saw_new_messages: bool) -> bool {
-        if session_busy || saw_new_messages {
+    fn observe(&mut self, session_busy: bool, saw_model_activity: bool) -> bool {
+        if saw_model_activity {
             self.saw_activity = true;
         }
 
         if session_busy {
             self.settle_passes = 0;
-        } else if saw_new_messages {
+        } else if saw_model_activity {
             self.settle_passes = 1;
         } else if self.saw_activity {
             self.settle_passes = self.settle_passes.saturating_add(1);
@@ -1623,24 +1624,25 @@ async fn fetch_new_message_events(
     inner: &Arc<OpenCodeServerSessionInner>,
     opencode_session_id: &str,
     seen_messages: &mut OpenCodeSeenMessageParts,
+    prompt_echo: &str,
 ) -> Result<(Vec<AdapterEvent>, bool, u64), OpenCodeError> {
     let messages = fetch_session_messages(inner, opencode_session_id).await?;
     let mut events = Vec::new();
-    let mut saw_new_messages = false;
+    let mut saw_model_activity = false;
     let mut tokens_used = 0u64;
     for (message_index, message) in messages.into_iter().enumerate() {
         if !message_should_emit(&message) {
             continue;
         }
-        let (mut message_events, message_tokens) =
-            normalize_new_message_parts(&message, message_index, seen_messages);
-        if !message_events.is_empty() || message_tokens > 0 {
-            saw_new_messages = true;
+        let (mut message_events, message_tokens, message_activity) =
+            normalize_new_message_parts(&message, message_index, seen_messages, prompt_echo);
+        if message_activity || message_tokens > 0 {
+            saw_model_activity = true;
         }
         tokens_used = tokens_used.saturating_add(message_tokens);
         events.append(&mut message_events);
     }
-    Ok((events, saw_new_messages, tokens_used))
+    Ok((events, saw_model_activity, tokens_used))
 }
 
 fn record_seen_message_parts(
@@ -1711,21 +1713,27 @@ fn normalize_new_message_parts(
     message: &Value,
     message_index: usize,
     seen: &mut OpenCodeSeenMessageParts,
-) -> (Vec<AdapterEvent>, u64) {
+    prompt_echo: &str,
+) -> (Vec<AdapterEvent>, u64, bool) {
     let mut events = Vec::new();
     let mut tokens_used = 0u64;
+    let mut saw_model_activity = false;
     let parts = message_parts(message);
 
     if parts.is_empty() {
         if let Some(text) = message_content_text(message) {
+            let before = events.len();
             push_text_delta(
                 &mut events,
                 seen,
                 format!("{}:content", message_identity(message, message_index)),
                 text,
             );
+            if events.len() > before && !text_is_prompt_echo(text, prompt_echo) {
+                saw_model_activity = true;
+            }
         }
-        return (events, tokens_used);
+        return (events, tokens_used, saw_model_activity);
     }
 
     for (part_index, part_value) in parts.iter().enumerate() {
@@ -1738,6 +1746,7 @@ fn normalize_new_message_parts(
                 if let Some(text) = opencode_retry_error_message(&part) {
                     if seen.event_keys.insert(format!("{base_key}:retry-error")) {
                         events.push(AdapterEvent::Output { text });
+                        saw_model_activity = true;
                     }
                 }
                 continue;
@@ -1747,6 +1756,7 @@ fn normalize_new_message_parts(
                     events.push(AdapterEvent::OperationStarted {
                         operation: "step".to_string(),
                     });
+                    saw_model_activity = true;
                 }
                 continue;
             }
@@ -1762,6 +1772,7 @@ fn normalize_new_message_parts(
                         operation: "step".to_string(),
                         success: opencode_step_success(&part),
                     });
+                    saw_model_activity = true;
                 }
                 continue;
             }
@@ -1788,6 +1799,7 @@ fn normalize_new_message_parts(
                     tool_name: tool_name.clone(),
                     details: opencode_tool_details(&part, true),
                 });
+                saw_model_activity = true;
             }
             let status = part
                 .state
@@ -1805,6 +1817,7 @@ fn normalize_new_message_parts(
                     status,
                     details: opencode_tool_details(&part, false),
                 });
+                saw_model_activity = true;
             }
         } else if let Some(text) = part
             .text
@@ -1812,11 +1825,28 @@ fn normalize_new_message_parts(
             .or(part.content.as_deref())
             .filter(|text| !text.is_empty())
         {
+            let before = events.len();
             push_text_delta(&mut events, seen, format!("{base_key}:text"), text);
+            if events.len() > before && !text_is_prompt_echo(text, prompt_echo) {
+                saw_model_activity = true;
+            }
         }
     }
 
-    (events, tokens_used)
+    (events, tokens_used, saw_model_activity)
+}
+
+fn text_is_prompt_echo(text: &str, prompt: &str) -> bool {
+    let prompt = normalized_prompt_text(prompt);
+    if prompt.len() < 64 {
+        return false;
+    }
+    let text = normalized_prompt_text(text);
+    !text.is_empty() && (text == prompt || prompt.starts_with(text.as_str()))
+}
+
+fn normalized_prompt_text(text: &str) -> String {
+    text.trim().replace("\r\n", "\n").replace('\r', "\n")
 }
 
 fn push_text_delta(
@@ -2493,8 +2523,11 @@ mod tests {
         assert!(!progress.saw_activity());
 
         assert!(!progress.observe(true, false));
-        assert!(progress.saw_activity());
+        assert!(!progress.saw_activity());
         assert!(!progress.observe(false, false));
+        assert!(!progress.saw_activity());
+        assert!(!progress.observe(false, true));
+        assert!(progress.saw_activity());
         assert!(progress.observe(false, false));
     }
 
@@ -2853,25 +2886,47 @@ mod tests {
             ]
         });
 
-        let (events, tokens) = normalize_new_message_parts(&first, 0, &mut seen);
+        let (events, tokens, saw_activity) = normalize_new_message_parts(&first, 0, &mut seen, "");
         assert_eq!(tokens, 0);
+        assert!(saw_activity);
         assert_eq!(events.len(), 1);
         assert!(matches!(
             &events[0],
             AdapterEvent::Output { text, .. } if text == "first"
         ));
 
-        let (events, tokens) = normalize_new_message_parts(&second, 0, &mut seen);
+        let (events, tokens, saw_activity) = normalize_new_message_parts(&second, 0, &mut seen, "");
         assert_eq!(tokens, 0);
+        assert!(saw_activity);
         assert_eq!(events.len(), 1);
         assert!(matches!(
             &events[0],
             AdapterEvent::Output { text, .. } if text == " second"
         ));
 
-        let (events, tokens) = normalize_new_message_parts(&second, 0, &mut seen);
+        let (events, tokens, saw_activity) = normalize_new_message_parts(&second, 0, &mut seen, "");
         assert_eq!(tokens, 0);
+        assert!(!saw_activity);
         assert!(events.is_empty());
+    }
+
+    #[test]
+    fn test_normalize_new_message_parts_does_not_count_prompt_echo_as_activity() {
+        let mut seen = OpenCodeSeenMessageParts::default();
+        let prompt = "Review context\n".repeat(8);
+        let echoed_prompt = serde_json::json!({
+            "id": "msg-1",
+            "parts": [
+                {"id": "part-1", "type": "text", "text": prompt.clone()}
+            ]
+        });
+
+        let (events, tokens, saw_activity) =
+            normalize_new_message_parts(&echoed_prompt, 0, &mut seen, &prompt);
+
+        assert_eq!(tokens, 0);
+        assert_eq!(events.len(), 1);
+        assert!(!saw_activity);
     }
 
     #[test]
@@ -2914,7 +2969,8 @@ mod tests {
             ]
         });
 
-        let (events, _) = normalize_new_message_parts(&first, 0, &mut seen);
+        let (events, _, saw_activity) = normalize_new_message_parts(&first, 0, &mut seen, "");
+        assert!(saw_activity);
         assert!(events.iter().any(|event| matches!(
             event,
             AdapterEvent::ToolCallStarted { tool_name, .. } if tool_name == "bash"
@@ -2924,7 +2980,8 @@ mod tests {
             AdapterEvent::ToolCallCompleted { tool_name, .. } if tool_name == "bash"
         )));
 
-        let (events, _) = normalize_new_message_parts(&second, 0, &mut seen);
+        let (events, _, saw_activity) = normalize_new_message_parts(&second, 0, &mut seen, "");
+        assert!(saw_activity);
         assert_eq!(events.len(), 1);
         assert!(matches!(
             &events[0],
