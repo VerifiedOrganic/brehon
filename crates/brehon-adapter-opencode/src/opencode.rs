@@ -27,6 +27,8 @@ const SERVER_READY_HEALTH_TIMEOUT_MS: u64 = 1_000;
 const SERVER_PROCESS_EXIT_GRACE_MS: u64 = 100;
 const SERVER_PROCESS_OUTPUT_LINES: usize = 64;
 const SERVER_SPAWN_ATTEMPTS: usize = 3;
+const DEFAULT_TURN_START_TIMEOUT_MS: u64 = 30_000;
+const TURN_START_TIMEOUT_ENV: &str = "BREHON_OPENCODE_TURN_START_TIMEOUT_MS";
 const PROMPT_RESULT_POLL_MS: u64 = 50;
 const SESSION_STATUS_POLL_MS: u64 = 250;
 const SESSION_SETTLE_PASSES: usize = 2;
@@ -717,7 +719,9 @@ async fn run_prompt(
         .await
         .unwrap_or_default();
     let session_id = send_server_message(&inner, &opencode_session_id, &prompt.content).await?;
-    let mut settle_passes = 0usize;
+    let turn_started_at = tokio::time::Instant::now();
+    let turn_activity_timeout = turn_start_timeout();
+    let mut progress = OpenCodeTurnProgress::default();
 
     loop {
         let (events, saw_new_messages, tokens_delta) =
@@ -743,16 +747,14 @@ async fn run_prompt(
         }
 
         let session_busy = fetch_session_busy(&inner, &session_id).await?;
-        if session_busy {
-            settle_passes = 0;
-        } else if saw_new_messages {
-            settle_passes = 1;
-        } else {
-            settle_passes = settle_passes.saturating_add(1);
-        }
-
-        if !session_busy && settle_passes >= SESSION_SETTLE_PASSES {
+        if progress.observe(session_busy, saw_new_messages) {
             break;
+        }
+        if !progress.saw_activity() && turn_started_at.elapsed() >= turn_activity_timeout {
+            return Err(OpenCodeError::Turn(format!(
+                "OpenCode accepted prompt_async for session {session_id} but no assistant activity appeared within {}ms",
+                turn_activity_timeout.as_millis()
+            )));
         }
 
         sleep(Duration::from_millis(SESSION_STATUS_POLL_MS)).await;
@@ -785,6 +787,36 @@ async fn run_prompt(
     );
 
     Ok(())
+}
+
+#[derive(Default)]
+struct OpenCodeTurnProgress {
+    saw_activity: bool,
+    settle_passes: usize,
+}
+
+impl OpenCodeTurnProgress {
+    fn saw_activity(&self) -> bool {
+        self.saw_activity
+    }
+
+    fn observe(&mut self, session_busy: bool, saw_new_messages: bool) -> bool {
+        if session_busy || saw_new_messages {
+            self.saw_activity = true;
+        }
+
+        if session_busy {
+            self.settle_passes = 0;
+        } else if saw_new_messages {
+            self.settle_passes = 1;
+        } else if self.saw_activity {
+            self.settle_passes = self.settle_passes.saturating_add(1);
+        } else {
+            self.settle_passes = 0;
+        }
+
+        self.saw_activity && !session_busy && self.settle_passes >= SESSION_SETTLE_PASSES
+    }
 }
 
 async fn emit_event(inner: &Arc<OpenCodeServerSessionInner>, event: AdapterEvent) {
@@ -2339,6 +2371,18 @@ fn parse_server_ready_timeout_ms(value: &str) -> Option<u64> {
         .filter(|timeout_ms| *timeout_ms > 0)
 }
 
+fn turn_start_timeout() -> Duration {
+    let timeout_env = std::env::var(TURN_START_TIMEOUT_ENV).ok();
+    turn_start_timeout_from_env_value(timeout_env.as_deref())
+}
+
+fn turn_start_timeout_from_env_value(value: Option<&str>) -> Duration {
+    value
+        .and_then(parse_server_ready_timeout_ms)
+        .map(Duration::from_millis)
+        .unwrap_or_else(|| Duration::from_millis(DEFAULT_TURN_START_TIMEOUT_MS))
+}
+
 fn parse_host_port(server_url: &str) -> Result<(String, u16), OpenCodeError> {
     let stripped = server_url
         .strip_prefix("http://")
@@ -2413,6 +2457,54 @@ mod tests {
             server_ready_timeout_from_env_value(Some("invalid")),
             Duration::from_millis(DEFAULT_SERVER_READY_TIMEOUT_MS)
         );
+    }
+
+    #[test]
+    fn test_turn_start_timeout_uses_env_value_or_default() {
+        assert_eq!(
+            turn_start_timeout_from_env_value(Some("60000")),
+            Duration::from_millis(60_000)
+        );
+        assert_eq!(
+            turn_start_timeout_from_env_value(Some(" 1500 ")),
+            Duration::from_millis(1_500)
+        );
+        assert_eq!(
+            turn_start_timeout_from_env_value(None),
+            Duration::from_millis(DEFAULT_TURN_START_TIMEOUT_MS)
+        );
+        assert_eq!(
+            turn_start_timeout_from_env_value(Some("0")),
+            Duration::from_millis(DEFAULT_TURN_START_TIMEOUT_MS)
+        );
+        assert_eq!(
+            turn_start_timeout_from_env_value(Some("invalid")),
+            Duration::from_millis(DEFAULT_TURN_START_TIMEOUT_MS)
+        );
+    }
+
+    #[test]
+    fn test_turn_progress_does_not_complete_before_activity() {
+        let mut progress = OpenCodeTurnProgress::default();
+
+        assert!(!progress.observe(false, false));
+        assert!(!progress.observe(false, false));
+        assert!(!progress.observe(false, false));
+        assert!(!progress.saw_activity());
+
+        assert!(!progress.observe(true, false));
+        assert!(progress.saw_activity());
+        assert!(!progress.observe(false, false));
+        assert!(progress.observe(false, false));
+    }
+
+    #[test]
+    fn test_turn_progress_settles_after_new_messages() {
+        let mut progress = OpenCodeTurnProgress::default();
+
+        assert!(!progress.observe(false, true));
+        assert!(progress.saw_activity());
+        assert!(progress.observe(false, false));
     }
 
     #[test]
