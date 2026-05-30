@@ -1268,7 +1268,7 @@ fn test_built_in_override_codex_reviewer_rejects_unsupported_one_shot_contract()
 }
 
 #[test]
-fn test_kimi_worker_uses_acp_stdio_gateway_protocol() {
+fn test_kimi_worker_uses_kimi_acp_stdio_gateway_protocol() {
     let pane = Pane::worker(
         "worker-1",
         PathBuf::from("/tmp"),
@@ -1289,16 +1289,9 @@ fn test_kimi_worker_uses_acp_stdio_gateway_protocol() {
     let config = pane
         .gateway_spawn_config()
         .expect("gateway config should exist");
-    assert_eq!(config.protocol, GatewayProtocol::AcpStdio);
+    assert_eq!(config.protocol, GatewayProtocol::KimiAcpStdio);
     assert_eq!(config.command.as_deref(), Some("kimi"));
-    assert_eq!(
-        config.args,
-        vec![
-            "--work-dir".to_string(),
-            "/tmp".to_string(),
-            "acp".to_string(),
-        ]
-    );
+    assert_eq!(config.args, vec!["acp".to_string()]);
     assert!(
         config
             .env
@@ -1315,7 +1308,7 @@ fn test_kimi_worker_uses_acp_stdio_gateway_protocol() {
 }
 
 #[test]
-fn test_kimi_reviewer_uses_acp_stdio_gateway_protocol() {
+fn test_kimi_reviewer_uses_kimi_acp_stdio_gateway_protocol() {
     let pane = Pane::reviewer_with_agent_type(
         "reviewer-1",
         PathBuf::from("/tmp"),
@@ -1338,16 +1331,9 @@ fn test_kimi_reviewer_uses_acp_stdio_gateway_protocol() {
     let config = pane
         .gateway_spawn_config()
         .expect("gateway config should exist");
-    assert_eq!(config.protocol, GatewayProtocol::AcpStdio);
+    assert_eq!(config.protocol, GatewayProtocol::KimiAcpStdio);
     assert_eq!(config.command.as_deref(), Some("kimi"));
-    assert_eq!(
-        config.args,
-        vec![
-            "--work-dir".to_string(),
-            "/tmp".to_string(),
-            "acp".to_string(),
-        ]
-    );
+    assert_eq!(config.args, vec!["acp".to_string()]);
 }
 
 #[test]

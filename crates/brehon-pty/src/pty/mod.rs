@@ -2100,6 +2100,7 @@ key = "oauth/kimi-code"
         assert!(config_text.contains(r#"default_model = "kimi-code/kimi-for-coding""#));
         assert!(config_text.contains("default_thinking = true"));
         assert!(config_text.contains("default_yolo = false"));
+        assert!(config_text.contains("max_context_size = 240000"));
 
         let mcp_json: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(share_dir.join("mcp.json")).unwrap())
@@ -2176,14 +2177,7 @@ key = "oauth/kimi-code"
         );
 
         assert_eq!(config.command, "kimi");
-        assert_eq!(
-            config.args,
-            vec![
-                "--work-dir".to_string(),
-                workdir.to_string_lossy().to_string(),
-                "acp".to_string(),
-            ]
-        );
+        assert_eq!(config.args, vec!["acp".to_string()]);
         assert!(
             config
                 .env
@@ -2302,6 +2296,15 @@ key = "oauth/kimi-code"
         assert!(!config.args.contains(&"--yolo".to_string()));
         assert!(config.args.contains(&"--no-thinking".to_string()));
         assert!(config.args.contains(&"--prompt".to_string()));
+        let startup_prompt = config
+            .args
+            .windows(2)
+            .find_map(|window| (window[0] == "--prompt").then(|| window[1].as_str()))
+            .expect("kimi supervisor startup prompt");
+        assert!(startup_prompt.contains("agent action=session_start"));
+        assert!(startup_prompt.contains("task action=ready"));
+        assert!(startup_prompt.contains("factory action=assign_workers"));
+        assert!(!startup_prompt.contains("mcp_brehon_task"));
         assert!(
             config
                 .env

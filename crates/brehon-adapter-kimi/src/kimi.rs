@@ -18,8 +18,8 @@ use brehon_types::{
 use brehon_adapter_sdk::{
     process::AgentProcess,
     protocol::{
-        parse_message, serialize_notification, serialize_request, JsonRpcMessage, JsonRpcRequest,
-        JsonRpcResponse,
+        parse_message, serialize_notification, serialize_request, JsonRpcError, JsonRpcMessage,
+        JsonRpcRequest, JsonRpcResponse,
     },
     push_brehon_root_env,
     session_event::{normalize_session_update_value, session_event_to_adapter_event},
@@ -43,7 +43,9 @@ use crate::acp_types::{
 const KIMI_DEFAULT_MODEL_KEY: &str = "kimi-code/kimi-for-coding";
 const KIMI_DEFAULT_MODEL_NAME: &str = "kimi-for-coding";
 const KIMI_DEFAULT_BASE_URL: &str = "https://api.kimi.com/coding/v1";
-const KIMI_DEFAULT_MAX_CONTEXT_SIZE: u32 = 262_144;
+// Kimi's provider hard limit is 262144 tokens. Keep the CLI's configured
+// ceiling below that so tool-result/request overhead cannot cross the cap.
+const KIMI_DEFAULT_MAX_CONTEXT_SIZE: u32 = 240_000;
 const KIMI_DEFAULT_CAPABILITIES: &str = "thinking,image_in,video_in";
 
 const KIMI_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -178,6 +180,13 @@ fn desired_kimi_acp_mcp_servers_json(
     .unwrap_or_else(|_| "[]".to_string())
 }
 
+fn parse_kimi_acp_mcp_servers(env: &[(String, String)]) -> Vec<serde_json::Value> {
+    env.iter()
+        .find_map(|(key, value)| (key == "BREHON_ACP_MCP_SERVERS_JSON").then_some(value))
+        .and_then(|value| serde_json::from_str::<Vec<serde_json::Value>>(value).ok())
+        .unwrap_or_default()
+}
+
 /// Return the local Kimi share directory for a workspace.
 pub fn kimi_share_dir(cwd: &Path) -> PathBuf {
     cwd.join(".brehon/factory-runtime/kimi/share")
@@ -263,6 +272,43 @@ fn upsert_toml_assignment(content: &str, key: &str, value: &str) -> String {
     result
 }
 
+fn upsert_toml_assignment_in_table(
+    content: &str,
+    table_header: &str,
+    key: &str,
+    value: &str,
+) -> String {
+    let assignment = format!("{key} = {value}");
+    let mut lines = content.lines().map(ToString::to_string).collect::<Vec<_>>();
+    let Some(table_start) = lines.iter().position(|line| line.trim() == table_header) else {
+        return upsert_toml_assignment(content, key, value);
+    };
+
+    let mut insert_at = lines.len();
+    for idx in table_start + 1..lines.len() {
+        let trimmed = lines[idx].trim_start();
+        if trimmed.starts_with('[') {
+            insert_at = idx;
+            break;
+        }
+        if trimmed.starts_with(&format!("{key} =")) {
+            lines[idx] = assignment;
+            let mut result = lines.join("\n");
+            if content.ends_with('\n') || result.is_empty() {
+                result.push('\n');
+            }
+            return result;
+        }
+    }
+
+    lines.insert(insert_at, assignment);
+    let mut result = lines.join("\n");
+    if content.ends_with('\n') || result.is_empty() {
+        result.push('\n');
+    }
+    result
+}
+
 fn build_minimal_kimi_config(
     model_key: &str,
     raw_model_name: &str,
@@ -309,6 +355,12 @@ fn patch_existing_kimi_config(
         &patched,
         "default_yolo",
         if allow_yolo { "true" } else { "false" },
+    );
+    patched = upsert_toml_assignment_in_table(
+        &patched,
+        &format!("[models.{}]", quote_toml_string(model_key)),
+        "max_context_size",
+        &KIMI_DEFAULT_MAX_CONTEXT_SIZE.to_string(),
     );
     if let Some(reasoning_effort) = reasoning_effort {
         let thinking_enabled = kimi_thinking_enabled(reasoning_effort);
@@ -738,7 +790,7 @@ impl KimiSession {
 
         let new_session_response = send_request_sync(
             &process,
-            create_new_session_request(&spec.worktree_path, vec![]),
+            create_new_session_request(&spec.worktree_path, parse_kimi_acp_mcp_servers(env)),
             KIMI_BOOTSTRAP_TIMEOUT,
         )
         .await?;
@@ -1128,14 +1180,31 @@ async fn send_request_sync(
         if line.is_empty() {
             continue;
         }
-        match parse_message(&line) {
-            Ok(JsonRpcMessage::Response(response)) if response.id == request_id => {
+        match parse_kimi_message(&line) {
+            Ok(KimiParsedMessage::Typed(JsonRpcMessage::Response(response)))
+                if response.id == request_id =>
+            {
                 return Ok(response);
             }
-            Ok(JsonRpcMessage::Notification(_)) => continue,
-            Ok(JsonRpcMessage::Response(_)) => continue,
-            Ok(JsonRpcMessage::Request(request)) => {
-                debug!(method = %request.method, "Ignoring Kimi server request during bootstrap");
+            Ok(KimiParsedMessage::Typed(JsonRpcMessage::Notification(_))) => continue,
+            Ok(KimiParsedMessage::Typed(JsonRpcMessage::Response(_))) => continue,
+            Ok(KimiParsedMessage::Typed(JsonRpcMessage::Request(request))) => {
+                let response = response_for_kimi_server_request(&request);
+                let line =
+                    serialize_response(&response).map_err(|e| KimiError::Protocol(e.message))?;
+                process
+                    .send_line(&line)
+                    .await
+                    .map_err(|e| KimiError::Spawn(e.to_string()))?;
+                continue;
+            }
+            Ok(KimiParsedMessage::RawServerRequest(request)) => {
+                let line = serialize_raw_response(&response_for_raw_kimi_server_request(&request))
+                    .map_err(|e| KimiError::Protocol(e.message))?;
+                process
+                    .send_line(&line)
+                    .await
+                    .map_err(|e| KimiError::Spawn(e.to_string()))?;
                 continue;
             }
             Err(err) => {
@@ -1184,8 +1253,8 @@ fn spawn_reader(inner: Arc<KimiSessionInner>) -> JoinHandle<()> {
                 continue;
             }
 
-            match parse_message(&line) {
-                Ok(JsonRpcMessage::Response(response)) => {
+            match parse_kimi_message(&line) {
+                Ok(KimiParsedMessage::Typed(JsonRpcMessage::Response(response))) => {
                     let request_id = response.id.clone();
                     let pending_tx = inner.pending_requests.lock().await.remove(&request_id);
                     if let Some(tx) = pending_tx {
@@ -1245,7 +1314,7 @@ fn spawn_reader(inner: Arc<KimiSessionInner>) -> JoinHandle<()> {
                         },
                     );
                 }
-                Ok(JsonRpcMessage::Notification(notification)) => {
+                Ok(KimiParsedMessage::Typed(JsonRpcMessage::Notification(notification))) => {
                     forward_kimi_notification(
                         &inner,
                         &notification.method,
@@ -1253,8 +1322,11 @@ fn spawn_reader(inner: Arc<KimiSessionInner>) -> JoinHandle<()> {
                     )
                     .await;
                 }
-                Ok(JsonRpcMessage::Request(request)) => {
-                    debug!(method = %request.method, "Ignoring Kimi server request");
+                Ok(KimiParsedMessage::Typed(JsonRpcMessage::Request(request))) => {
+                    respond_to_kimi_server_request(&inner, request).await;
+                }
+                Ok(KimiParsedMessage::RawServerRequest(request)) => {
+                    respond_to_raw_kimi_server_request(&inner, request).await;
                 }
                 Err(err) => {
                     warn!(error = ?err, raw = %line, "Failed to parse Kimi ACP line");
@@ -1265,6 +1337,204 @@ fn spawn_reader(inner: Arc<KimiSessionInner>) -> JoinHandle<()> {
         inner.alive.store(false, Ordering::SeqCst);
         schedule_clear_session_snapshot(inner.session_id.as_str().to_string());
     })
+}
+
+#[derive(Debug, Clone)]
+enum KimiParsedMessage {
+    Typed(JsonRpcMessage),
+    RawServerRequest(KimiRawServerRequest),
+}
+
+#[derive(Debug, Clone)]
+struct KimiRawServerRequest {
+    id: serde_json::Value,
+    method: String,
+    params: Option<serde_json::Value>,
+}
+
+fn parse_kimi_message(line: &str) -> Result<KimiParsedMessage, JsonRpcError> {
+    if let Some(request) = parse_raw_kimi_server_request(line) {
+        return Ok(KimiParsedMessage::RawServerRequest(request));
+    }
+    match parse_message(line) {
+        Ok(message) => Ok(KimiParsedMessage::Typed(message)),
+        Err(err) => Err(err),
+    }
+}
+
+fn parse_raw_kimi_server_request(line: &str) -> Option<KimiRawServerRequest> {
+    let value = serde_json::from_str::<serde_json::Value>(line).ok()?;
+    let object = value.as_object()?;
+    let method = object.get("method")?.as_str()?.to_string();
+    let id = object.get("id")?.clone();
+    if !(id.is_string() || id.is_number()) {
+        return None;
+    }
+    Some(KimiRawServerRequest {
+        id,
+        method,
+        params: object.get("params").cloned(),
+    })
+}
+
+fn serialize_response(response: &JsonRpcResponse) -> Result<String, JsonRpcError> {
+    serde_json::to_string(response).map_err(|err| JsonRpcError {
+        code: -32603,
+        message: err.to_string(),
+        data: None,
+    })
+}
+
+fn serialize_raw_response(response: &serde_json::Value) -> Result<String, JsonRpcError> {
+    serde_json::to_string(response).map_err(|err| JsonRpcError {
+        code: -32603,
+        message: err.to_string(),
+        data: None,
+    })
+}
+
+async fn respond_to_kimi_server_request(inner: &Arc<KimiSessionInner>, request: JsonRpcRequest) {
+    let response = response_for_kimi_server_request(&request);
+    let line = match serialize_response(&response) {
+        Ok(line) => line,
+        Err(err) => {
+            warn!(error = %err.message, "Failed to serialize Kimi server request response");
+            return;
+        }
+    };
+
+    let process = inner.process.lock().await;
+    let Some(process) = process.as_ref() else {
+        warn!(method = %request.method, request_id = %request.id, "Kimi process unavailable while answering server request");
+        return;
+    };
+
+    if let Err(err) = process.send_line(&line).await {
+        warn!(error = %err, method = %request.method, request_id = %request.id, "Failed to answer Kimi server request");
+    }
+}
+
+async fn respond_to_raw_kimi_server_request(
+    inner: &Arc<KimiSessionInner>,
+    request: KimiRawServerRequest,
+) {
+    let response = response_for_raw_kimi_server_request(&request);
+    let line = match serialize_raw_response(&response) {
+        Ok(line) => line,
+        Err(err) => {
+            warn!(error = %err.message, "Failed to serialize raw Kimi server request response");
+            return;
+        }
+    };
+
+    let process = inner.process.lock().await;
+    let Some(process) = process.as_ref() else {
+        warn!(method = %request.method, request_id = ?request.id, "Kimi process unavailable while answering raw server request");
+        return;
+    };
+
+    if let Err(err) = process.send_line(&line).await {
+        warn!(error = %err, method = %request.method, request_id = ?request.id, "Failed to answer raw Kimi server request");
+    }
+}
+
+fn response_for_kimi_server_request(request: &JsonRpcRequest) -> JsonRpcResponse {
+    if is_kimi_permission_request(request) {
+        debug!(method = %request.method, request_id = %request.id, "Auto-approving Kimi permission request");
+        return JsonRpcResponse::success(
+            request.id.clone(),
+            kimi_permission_response_for_approved(request.params.as_ref()),
+        );
+    }
+
+    debug!(method = %request.method, request_id = %request.id, "Rejecting unsupported Kimi server request");
+    JsonRpcResponse::error(request.id.clone(), JsonRpcError::method_not_found())
+}
+
+fn response_for_raw_kimi_server_request(request: &KimiRawServerRequest) -> serde_json::Value {
+    if is_kimi_permission_method(&request.method) {
+        debug!(method = %request.method, request_id = ?request.id, "Auto-approving raw Kimi permission request");
+        return serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": request.id.clone(),
+            "result": kimi_permission_response_for_approved(request.params.as_ref()),
+        });
+    }
+
+    debug!(method = %request.method, request_id = ?request.id, "Rejecting unsupported raw Kimi server request");
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": request.id.clone(),
+        "error": {
+            "code": -32601,
+            "message": "Method not found",
+        },
+    })
+}
+
+fn is_kimi_permission_request(request: &JsonRpcRequest) -> bool {
+    is_kimi_permission_method(&request.method)
+}
+
+fn is_kimi_permission_method(method: &str) -> bool {
+    matches!(method, "requestPermission" | "session/request_permission")
+}
+
+fn kimi_permission_response_for_approved(params: Option<&serde_json::Value>) -> serde_json::Value {
+    let selected = params
+        .and_then(|params| params.get("options"))
+        .and_then(serde_json::Value::as_array)
+        .and_then(|options| select_kimi_approval_option(options));
+
+    match selected {
+        Some(option_id) => serde_json::json!({
+            "outcome": {
+                "outcome": "selected",
+                "optionId": option_id,
+            }
+        }),
+        None => serde_json::json!({
+            "outcome": {
+                "outcome": "cancelled",
+            }
+        }),
+    }
+}
+
+fn select_kimi_approval_option(options: &[serde_json::Value]) -> Option<String> {
+    options
+        .iter()
+        .find_map(|option| {
+            let kind = option.get("kind").and_then(serde_json::Value::as_str);
+            let name = option.get("name").and_then(serde_json::Value::as_str);
+            let is_approval = kind
+                .map(|kind| kind.starts_with("allow_") || kind == "allow" || kind == "approve")
+                .unwrap_or(false)
+                || name
+                    .map(|name| {
+                        let name = name.to_ascii_lowercase();
+                        name.contains("approve") || name.contains("allow")
+                    })
+                    .unwrap_or(false);
+            if is_approval {
+                option
+                    .get("optionId")
+                    .or_else(|| option.get("id"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToOwned::to_owned)
+            } else {
+                None
+            }
+        })
+        .or_else(|| {
+            options.iter().find_map(|option| {
+                option
+                    .get("optionId")
+                    .or_else(|| option.get("id"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToOwned::to_owned)
+            })
+        })
 }
 
 async fn forward_kimi_notification(
@@ -1627,6 +1897,9 @@ mod tests {
         assert!(config.contains("default_model = \"kimi-code/kimi-for-coding\""));
         assert!(config.contains("default_thinking = true"));
         assert!(config.contains("default_yolo = false"));
+        assert!(config.contains(&format!(
+            "max_context_size = {KIMI_DEFAULT_MAX_CONTEXT_SIZE}"
+        )));
 
         let config =
             build_minimal_kimi_config("kimi-code/kimi-for-coding", "kimi-for-coding", true, true);
@@ -1645,6 +1918,34 @@ mod tests {
     }
 
     #[test]
+    fn test_patch_existing_kimi_config_lowers_selected_model_context_ceiling() {
+        let content = r#"
+default_model = "kimi-code/kimi-for-coding"
+default_thinking = false
+default_yolo = false
+
+[models."kimi-code/kimi-for-coding"]
+provider = "managed:kimi-code"
+model = "kimi-for-coding"
+max_context_size = 262144
+capabilities = ["thinking"]
+
+[models."other/model"]
+provider = "managed:kimi-code"
+model = "other"
+max_context_size = 262144
+"#;
+
+        let patched =
+            patch_existing_kimi_config(content, "kimi-code/kimi-for-coding", Some("high"), false);
+
+        assert!(patched.contains(&format!(
+            "[models.\"kimi-code/kimi-for-coding\"]\nprovider = \"managed:kimi-code\"\nmodel = \"kimi-for-coding\"\nmax_context_size = {KIMI_DEFAULT_MAX_CONTEXT_SIZE}"
+        )));
+        assert!(patched.contains("[models.\"other/model\"]\nprovider = \"managed:kimi-code\"\nmodel = \"other\"\nmax_context_size = 262144"));
+    }
+
+    #[test]
     fn test_kimi_adapter_kind_is_acp() {
         let adapter = KimiAdapter::new(KimiConfig {
             command: "kimi".to_string(),
@@ -1652,6 +1953,82 @@ mod tests {
             env: vec![],
         });
         assert_eq!(adapter.kind(), brehon_types::AdapterKind::Acp);
+    }
+
+    #[test]
+    fn test_parse_kimi_acp_mcp_servers_reads_env_payload() {
+        let payload = serde_json::to_string(&vec![serde_json::json!({
+            "name": "brehon",
+            "command": "/tmp/brehon",
+            "args": ["serve"]
+        })])
+        .unwrap();
+        let servers =
+            parse_kimi_acp_mcp_servers(&[("BREHON_ACP_MCP_SERVERS_JSON".to_string(), payload)]);
+
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0]["name"], "brehon");
+        assert_eq!(servers[0]["command"], "/tmp/brehon");
+    }
+
+    #[test]
+    fn test_kimi_permission_response_prefers_allow_option() {
+        let request = JsonRpcRequest::new_with_id(
+            "perm-1",
+            "session/request_permission",
+            Some(serde_json::json!({
+                "options": [
+                    {"kind": "reject_once", "name": "Reject", "optionId": "reject"},
+                    {"kind": "allow_once", "name": "Approve once", "optionId": "approve"},
+                    {"kind": "allow_always", "name": "Approve for this session", "optionId": "approve_for_session"}
+                ]
+            })),
+        );
+
+        let response = response_for_kimi_server_request(&request);
+
+        assert!(response.error.is_none());
+        assert_eq!(response.result.unwrap()["outcome"]["optionId"], "approve");
+    }
+
+    #[test]
+    fn test_kimi_permission_response_falls_back_to_first_option_id() {
+        let response = kimi_permission_response_for_approved(Some(&serde_json::json!({
+            "options": [
+                {"kind": "custom", "optionId": "custom-first"},
+                {"kind": "custom", "optionId": "custom-second"}
+            ]
+        })));
+
+        assert_eq!(response["outcome"]["optionId"], "custom-first");
+    }
+
+    #[test]
+    fn test_kimi_raw_permission_response_preserves_numeric_request_id() {
+        let parsed = parse_kimi_message(
+            r#"{"jsonrpc":"2.0","id":0,"method":"session/request_permission","params":{"options":[{"kind":"allow_once","optionId":"approve"}]}}"#,
+        )
+        .unwrap();
+
+        let KimiParsedMessage::RawServerRequest(request) = parsed else {
+            panic!("expected raw server request");
+        };
+        let response = response_for_raw_kimi_server_request(&request);
+
+        assert_eq!(response["id"], 0);
+        assert_eq!(response["result"]["outcome"]["optionId"], "approve");
+    }
+
+    #[test]
+    fn test_kimi_unknown_server_request_returns_method_not_found() {
+        let request = JsonRpcRequest::new_with_id("req-1", "unknown/method", None);
+
+        let response = response_for_kimi_server_request(&request);
+
+        assert!(response.result.is_none());
+        let err = response.error.unwrap();
+        assert_eq!(err.code, -32601);
+        assert_eq!(err.message, "Method not found");
     }
 
     #[test]

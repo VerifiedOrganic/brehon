@@ -15,7 +15,15 @@ pub(crate) fn is_context_length_error_message(message: &str) -> bool {
     let mentions_context = lower.contains("maximum context length")
         || lower.contains("max context length")
         || lower.contains("exceeded max context length");
-    mentions_prompt && mentions_context
+    let direct_context_limit = lower.contains("context window exceeds")
+        || lower.contains("context window exceeded")
+        || lower.contains("context length exceeded")
+        || lower.contains("context limit exceeded")
+        || lower.contains("maximum context length");
+    let direct_token_limit = lower.contains("exceeded model token limit")
+        || lower.contains("model token limit")
+        || lower.contains("token limit exceeded");
+    (mentions_prompt && mentions_context) || direct_context_limit || direct_token_limit
 }
 
 pub(crate) fn is_stream_disconnect_error_message(message: &str) -> bool {

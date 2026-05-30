@@ -114,6 +114,14 @@ fn write_routing_overlay(project_root: &Path) {
     std::fs::write(
         brehon_dir.join("config.yaml"),
         r#"
+roles:
+  workers:
+    - lane: kimi-worker
+      min: 1
+      max: 1
+    - lane: gpt53-worker
+      min: 1
+      max: 1
 routing:
   default_worker_lane: kimi-worker
   rules:
@@ -126,6 +134,19 @@ routing:
         preferred_lane: gpt53-worker
         preferred_model: gpt-5.3
         strict: true
+"#,
+    )
+    .unwrap();
+}
+
+fn write_invalid_routing_overlay(project_root: &Path) {
+    let brehon_dir = project_root.join(".brehon");
+    std::fs::create_dir_all(&brehon_dir).unwrap();
+    std::fs::write(
+        brehon_dir.join("config.yaml"),
+        r#"
+routing:
+  default_worker_lane: missing-worker
 "#,
     )
     .unwrap();
@@ -654,6 +675,105 @@ async fn test_assign_workers_rejects_strict_preferred_lane_mismatch() {
     let text = extract_text(&result);
     assert!(text.contains("preferred_lane='codex-hardening'"), "{text}");
     let task = read_test_task(root.path(), "T-hardening");
+    assert_eq!(task["status"], "pending");
+    assert!(task["assignee"].is_null());
+}
+
+#[tokio::test]
+async fn test_assign_workers_cannot_force_final_hardening_to_wrong_lane() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let root = make_test_root();
+    write_test_task_with_policy(
+        root.path(),
+        "T-hardening",
+        serde_json::json!({
+            "work_class": "final_hardening",
+            "preferred_lane": "codex-hardening",
+            "preferred_model": "gpt-5.5",
+            "preferred_reasoning_effort": "xhigh",
+            "strict": true
+        }),
+    );
+    let _env = ScopedEnv::set(&[
+        ("BREHON_ROOT", root.path().to_str().unwrap()),
+        ("BREHON_AGENT_ROLE", "supervisor"),
+    ]);
+    crate::tools::agent::write_session_file_with_metadata(
+        "kimi-worker",
+        "worker",
+        "kimi-session",
+        Some("kimi-worker-kimi-for-coding"),
+        Some("kimi-for-coding"),
+        Some("high"),
+    );
+    let tool = FactoryTool::new();
+
+    let result = tool
+        .execute(serde_json::json!({
+            "action": "assign_workers",
+            "task_id": "T-hardening",
+            "worker": "kimi-worker",
+            "force_policy": true
+        }))
+        .await
+        .unwrap();
+
+    assert_eq!(result.is_error, Some(true));
+    let text = extract_text(&result);
+    assert!(
+        text.contains("Cannot force assign task T-hardening"),
+        "{text}"
+    );
+    assert!(text.contains("strict final_hardening"), "{text}");
+    assert!(text.contains("preferred_lane='codex-hardening'"), "{text}");
+    let task = read_test_task(root.path(), "T-hardening");
+    assert_eq!(task["status"], "pending");
+    assert!(task["assignee"].is_null());
+}
+
+#[tokio::test]
+async fn test_assign_workers_rejects_invalid_project_routing_config() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let project = make_test_root();
+    write_invalid_routing_overlay(project.path());
+    let brehon_root = project.path().join(".brehon");
+    let config_dir = project.path().join("xdg");
+    write_test_task(&brehon_root, "T-pending", "pending", "task");
+    let _env = ScopedEnv::set(&[
+        ("BREHON_ROOT", brehon_root.to_str().unwrap()),
+        ("BREHON_AGENT_ROLE", "supervisor"),
+        ("XDG_CONFIG_HOME", config_dir.to_str().unwrap()),
+    ]);
+    crate::tools::agent::write_session_file_with_metadata(
+        "worker-1",
+        "worker",
+        "worker-1-session",
+        Some("kimi-worker"),
+        Some("kimi-k2.6"),
+        None,
+    );
+    let tool = FactoryTool::new();
+
+    let result = tool
+        .execute(serde_json::json!({
+            "action": "assign_workers",
+            "task_id": "T-pending",
+            "worker": "worker-1"
+        }))
+        .await
+        .unwrap();
+
+    assert_eq!(result.is_error, Some(true));
+    let text = extract_text(&result);
+    assert!(
+        text.contains("Project config is invalid"),
+        "expected invalid config error, got: {text}"
+    );
+    assert!(
+        text.contains("routing.default_worker_lane"),
+        "expected routing lane detail, got: {text}"
+    );
+    let task = read_test_task(&brehon_root, "T-pending");
     assert_eq!(task["status"], "pending");
     assert!(task["assignee"].is_null());
 }

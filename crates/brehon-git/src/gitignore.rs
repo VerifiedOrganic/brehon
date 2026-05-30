@@ -72,7 +72,17 @@ pub fn is_legacy_brehon_dir_ignore(line: &str) -> bool {
         line.trim(),
         ".brehon"
             | "!/.brehon/"
+            | "!.brehon/"
             | "/.brehon/*"
+            | ".brehon/*"
+            | "!/.brehon/runtime/"
+            | "!.brehon/runtime/"
+            | "/.brehon/runtime/*"
+            | ".brehon/runtime/*"
+            | "!/.brehon/runtime/proof/"
+            | "!.brehon/runtime/proof/"
+            | "!/.brehon/runtime/proof/*.json"
+            | "!.brehon/runtime/proof/*.json"
             | "!/.brehon/worktrees/"
             | "/.brehon/worktrees/**"
             | "!/.brehon/worktrees/**/"
@@ -116,7 +126,13 @@ mod tests {
     fn gitignore_legacy_dir_ignore_detection() {
         assert!(is_legacy_brehon_dir_ignore(".brehon"));
         assert!(is_legacy_brehon_dir_ignore("!/.brehon/"));
+        assert!(is_legacy_brehon_dir_ignore("!.brehon/"));
         assert!(is_legacy_brehon_dir_ignore("/.brehon/*"));
+        assert!(is_legacy_brehon_dir_ignore(".brehon/*"));
+        assert!(is_legacy_brehon_dir_ignore("!.brehon/runtime/"));
+        assert!(is_legacy_brehon_dir_ignore(".brehon/runtime/*"));
+        assert!(is_legacy_brehon_dir_ignore("!.brehon/runtime/proof/"));
+        assert!(is_legacy_brehon_dir_ignore("!.brehon/runtime/proof/*.json"));
         assert!(is_legacy_brehon_dir_ignore("!/.brehon/worktrees/"));
         assert!(is_legacy_brehon_dir_ignore("/.brehon/worktrees/**"));
         assert!(is_legacy_brehon_dir_ignore("!/.brehon/worktrees/**/"));
@@ -127,7 +143,7 @@ mod tests {
 
     #[test]
     fn gitignore_remove_legacy_ignores_strips_blanket_patterns() {
-        let content = "target/\n.brehon\n*.log\n.brehon/\n!/.brehon/\n/.brehon/worktrees/**\n";
+        let content = "target/\n.brehon\n*.log\n.brehon/\n!/.brehon/\n/.brehon/worktrees/**\n!.brehon/\n.brehon/*\n!.brehon/runtime/\n.brehon/runtime/*\n!.brehon/runtime/proof/\n!.brehon/runtime/proof/*.json\n";
         let (updated, removed) = remove_legacy_brehon_dir_ignores(content);
         assert!(removed);
         let lines: Vec<_> = updated.lines().collect();
@@ -137,6 +153,9 @@ mod tests {
         assert!(!lines.iter().any(|l| l.trim() == ".brehon"));
         assert!(!lines.iter().any(|l| l.trim() == "!/.brehon/"));
         assert!(!lines.iter().any(|l| l.trim() == "/.brehon/worktrees/**"));
+        assert!(!lines
+            .iter()
+            .any(|l| l.trim() == "!.brehon/runtime/proof/*.json"));
     }
 
     #[test]

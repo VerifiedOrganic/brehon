@@ -35,9 +35,9 @@ pub fn build_supervisor_startup_prompt(
     task_cmd: &str,
     project_policy: Option<&str>,
 ) -> String {
-    let factory_cmd = agent_cmd.replace("_agent", "_factory");
-    let rules_cmd = agent_cmd.replace("_agent", "_search_rules");
-    let skills_cmd = agent_cmd.replace("_agent", "_search_skills");
+    let factory_cmd = sibling_tool_cmd(agent_cmd, "factory");
+    let rules_cmd = sibling_tool_cmd(agent_cmd, "search_rules");
+    let skills_cmd = sibling_tool_cmd(agent_cmd, "search_skills");
 
     append_project_policy(
         format!(
@@ -62,6 +62,13 @@ EXCEPTION: If a task is in a supervisor-owned integration conflict (`integration
         ),
         project_policy,
     )
+}
+
+fn sibling_tool_cmd(agent_cmd: &str, tool_name: &str) -> String {
+    agent_cmd
+        .strip_suffix("agent")
+        .map(|prefix| format!("{prefix}{tool_name}"))
+        .unwrap_or_else(|| format!("{agent_cmd}_{tool_name}"))
 }
 
 pub fn build_reviewer_startup_prompt(
@@ -222,6 +229,17 @@ mod tests {
         assert!(prompt.contains("mcp_brehon_task action=complete"));
         assert!(prompt.contains("Do NOT proactively call"));
         assert!(prompt.contains("The supervisor owns reviewer assignment"));
+    }
+
+    #[test]
+    fn supervisor_prompt_supports_raw_mcp_tool_names() {
+        let prompt = build_supervisor_startup_prompt("supervisor", "agent", "task", None);
+
+        assert!(prompt.contains("agent action=session_start"));
+        assert!(prompt.contains("search_skills query=\"\""));
+        assert!(prompt.contains("search_rules query=\"\""));
+        assert!(prompt.contains("factory action=assign_workers"));
+        assert!(!prompt.contains("_factory"));
     }
 
     #[test]

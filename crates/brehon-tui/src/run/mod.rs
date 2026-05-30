@@ -7865,6 +7865,36 @@ mod tests {
     }
 
     #[test]
+    fn test_is_worker_context_reset_candidate_matches_kimi_model_token_limit_error() {
+        let mut mux = Mux::new(24, 80);
+        mux.add_pane(make_builtin_worker_pane(
+            "worker-kimi",
+            "kimi-worker",
+            brehon_mux::SupervisorCli::Kimi,
+        ));
+
+        let entry = brehon_mux::ActivityEntry {
+            kind: brehon_mux::ActivityKind::Progress,
+            ingested_at: std::time::Instant::now(),
+            tool_id: None,
+            tool_name: None,
+            status: None,
+            message: Some(
+                "API Error: 400 Invalid request: Your request exceeded model token limit: 262144 (requested: 262328)"
+                    .to_string(),
+            ),
+            output_chunks: None,
+            duration: None,
+        };
+
+        assert!(is_worker_context_reset_candidate(
+            &mux,
+            "worker-kimi",
+            &entry
+        ));
+    }
+
+    #[test]
     fn test_is_worker_context_reset_candidate_matches_codex_stream_disconnect_error() {
         let mut mux = Mux::new(24, 80);
         let pane = brehon_mux::Pane::worker(

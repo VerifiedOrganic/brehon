@@ -1028,8 +1028,17 @@ pub(super) async fn execute_ready(args: &Value) -> Result<ToolResult, McpError> 
         return Ok(error_result(err));
     }
     let all_tasks = read_all_tasks();
-    let project_config =
-        project_root().and_then(|root| brehon_config::load_config(Some(&root)).ok());
+    let project_config = match project_root() {
+        Some(root) => match brehon_config::load_config(Some(&root)) {
+            Ok(config) => Some(config),
+            Err(err) => {
+                return Ok(error_result(format!(
+                    "Cannot compute ready tasks because project config is invalid: {err}"
+                )));
+            }
+        },
+        None => None,
+    };
     let active_worker_assignment_conflicts = active_worker_assignment_conflicts(&all_tasks);
     let integration_conflict_tasks = supervisor_integration_conflicts_from_tasks(&all_tasks);
     let blocked_handoff_tasks: Vec<Value> = all_tasks

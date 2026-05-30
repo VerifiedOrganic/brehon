@@ -87,9 +87,13 @@ struct WorkerAssignmentRoute {
     accepts: Vec<String>,
 }
 
-fn load_project_config() -> Option<brehon_types::BrehonConfig> {
-    let project_root = super::paths::project_root()?;
-    brehon_config::load_config(Some(&project_root)).ok()
+fn load_project_config() -> Result<Option<brehon_types::BrehonConfig>, String> {
+    let Some(project_root) = super::paths::project_root() else {
+        return Ok(None);
+    };
+    brehon_config::load_config(Some(&project_root))
+        .map(Some)
+        .map_err(|err| format!("Project config is invalid: {err}"))
 }
 
 fn assignment_mode_name(mode: WorkerAssignmentMode) -> &'static str {
@@ -259,15 +263,47 @@ fn validate_assignment_route(
     config: Option<&brehon_types::BrehonConfig>,
     force_policy: bool,
 ) -> Result<(), String> {
-    if force_policy {
-        return Ok(());
-    }
-
     let route = worker_route(worker_session, config);
     let resolved_policy = resolve_execution_policy(task, config);
     let policy = resolved_policy.policy.as_ref();
     let strict = execution_policy_is_strict(policy);
     let worker_lane = route.lane.as_deref().unwrap_or("<unknown>");
+
+    if force_policy {
+        if strict
+            && policy_work_classes(policy)
+                .iter()
+                .any(|class| class == "final_hardening")
+        {
+            if let Some(preferred_lane) = policy_string(policy, "preferred_lane") {
+                if Some(preferred_lane) != route.lane.as_deref() {
+                    return Err(format!(
+                        "Cannot force assign task {task_id} to worker '{assignee}': strict final_hardening requires execution_policy.preferred_lane='{preferred_lane}' \
+                         but worker lane is '{worker_lane}'. Route it to the configured hardening lane instead."
+                    ));
+                }
+            }
+            if let Some(preferred_model) = policy_string(policy, "preferred_model") {
+                if Some(preferred_model) != route.model.as_deref() {
+                    let actual = route.model.as_deref().unwrap_or("<unknown>");
+                    return Err(format!(
+                        "Cannot force assign task {task_id} to worker '{assignee}': strict final_hardening requires execution_policy.preferred_model='{preferred_model}' \
+                         but worker model is '{actual}'. Route it to the configured hardening lane instead."
+                    ));
+                }
+            }
+            if let Some(preferred_reasoning) = policy_string(policy, "preferred_reasoning_effort") {
+                if Some(preferred_reasoning) != route.reasoning_effort.as_deref() {
+                    let actual = route.reasoning_effort.as_deref().unwrap_or("<unknown>");
+                    return Err(format!(
+                        "Cannot force assign task {task_id} to worker '{assignee}': strict final_hardening requires execution_policy.preferred_reasoning_effort='{preferred_reasoning}' \
+                         but worker reasoning_effort is '{actual}'. Route it to the configured hardening lane instead."
+                    ));
+                }
+            }
+        }
+        return Ok(());
+    }
 
     if route.assignment_mode == WorkerAssignmentMode::Reserved {
         let preferred_lane = policy_string(policy, "preferred_lane");
@@ -450,7 +486,10 @@ impl Tool for FactoryTool {
             }
             "worker_status" => {
                 let sessions = read_sessions();
-                let project_config = load_project_config();
+                let project_config = match load_project_config() {
+                    Ok(config) => config,
+                    Err(err) => return Ok(error_result(err)),
+                };
                 let now = chrono::Utc::now();
                 let mut busy_workers = 0usize;
                 let mut idle_general_workers = 0usize;
@@ -698,7 +737,10 @@ impl Tool for FactoryTool {
                 let mut assigned = false;
                 let live_workers = live_worker_names();
                 let worker_sessions = read_sessions();
-                let project_config = load_project_config();
+                let project_config = match load_project_config() {
+                    Ok(config) => config,
+                    Err(err) => return Ok(error_result(err)),
+                };
                 let mut task_merge_target: Option<String> = None;
                 let mut merge_target_base_sync: Option<MergeTargetBaseSyncResult> = None;
                 let mut assignment_seed_sync: Option<AssignmentSeedSyncResult> = None;

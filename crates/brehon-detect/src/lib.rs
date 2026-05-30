@@ -330,6 +330,8 @@ pub fn default_rules() -> Vec<PatternRule> {
                 "context length exceeded",
                 "maximum context length",
                 "context limit exceeded",
+                "model token limit",
+                "exceeded model token limit",
                 "token limit",
             ],
         ),
@@ -405,6 +407,23 @@ mod tests {
         let detections = engine
             .observe(output_event(
                 "API Error: 400 invalid params, context window exceeds limit (2013)\n",
+            ))
+            .await
+            .expect("observe");
+
+        assert!(detections.iter().any(|event| matches!(
+            &event.kind,
+            RuntimeEventKind::DetectionEvent(detection)
+                if detection.rule_id == "usage_limit.warning"
+        )));
+    }
+
+    #[tokio::test]
+    async fn detects_model_token_limit_from_output_bytes() {
+        let engine = PatternDetectionEngine::default();
+        let detections = engine
+            .observe(output_event(
+                "API Error: 400 Invalid request: Your request exceeded model token limit: 262144 (requested: 262328)\n",
             ))
             .await
             .expect("observe");

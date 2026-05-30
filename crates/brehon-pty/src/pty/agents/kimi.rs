@@ -37,28 +37,24 @@ impl PtyConfig {
             let startup_prompt = build_worker_startup_prompt(
                 name,
                 supervisor_name.unwrap_or("supervisor"),
-                "mcp_brehon_agent",
-                "mcp_brehon_task",
+                "agent",
+                "task",
                 project_policy.as_deref(),
             );
             config.args.push("--prompt".to_string());
             config.args.push(startup_prompt);
         } else if role == "supervisor" {
             let project_policy = project_policy_for_role(brehon_root, role);
-            let startup_prompt = build_supervisor_startup_prompt(
-                name,
-                "mcp_brehon_agent",
-                "mcp_brehon_task",
-                project_policy.as_deref(),
-            );
+            let startup_prompt =
+                build_supervisor_startup_prompt(name, "agent", "task", project_policy.as_deref());
             config.args.push("--prompt".to_string());
             config.args.push(startup_prompt);
         } else if role == "reviewer" {
             let project_policy = project_policy_for_role(brehon_root, role);
             let startup_prompt = build_reviewer_startup_prompt(
                 name,
-                "mcp_brehon_agent",
-                "mcp_brehon_verification",
+                "agent",
+                "verification",
                 project_policy.as_deref(),
             );
             config.args.push("--prompt".to_string());
@@ -98,7 +94,6 @@ impl PtyConfig {
         reasoning_effort: Option<&str>,
         launch_policy: Option<&crate::pty::config::LaunchPolicy>,
     ) -> Self {
-        let work_dir = cwd.to_string_lossy().to_string();
         let mut config = Self::kimi(
             name,
             role,
@@ -109,7 +104,7 @@ impl PtyConfig {
             model,
             reasoning_effort,
         );
-        config.args = vec!["--work-dir".to_string(), work_dir, "acp".to_string()];
+        config.args = vec!["acp".to_string()];
         if let Some(policy) = launch_policy {
             config.env.push((
                 "BREHON_SANDBOX_PROFILE".to_string(),

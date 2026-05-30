@@ -63,7 +63,7 @@ fn gateway_protocol_for(cli_type: &AgentAdapter) -> GatewayProtocol {
         return match builtin {
             SupervisorCli::Codex => GatewayProtocol::CodexAppServerWs,
             SupervisorCli::Gemini => GatewayProtocol::GeminiAcpStdio,
-            SupervisorCli::Kimi => GatewayProtocol::AcpStdio,
+            SupervisorCli::Kimi => GatewayProtocol::KimiAcpStdio,
             SupervisorCli::OpenCode => GatewayProtocol::OpenCodeServer,
             _ => GatewayProtocol::AcpStdio,
         };

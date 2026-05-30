@@ -91,6 +91,7 @@ impl ValidationWarningKind {
                 | ValidationWarningKind::RuntimePolicyConflict
                 | ValidationWarningKind::SupervisorTerminalContract
                 | ValidationWarningKind::LauncherCapabilityConflict
+                | ValidationWarningKind::RoutingPolicyConflict
                 | ValidationWarningKind::InvalidContextConfig
                 | ValidationWarningKind::ResearchPolicyConflict
                 | ValidationWarningKind::ProfilePolicyConflict
@@ -1986,7 +1987,7 @@ rules:
             .collect();
         assert_eq!(routing_warnings.len(), 2, "{warnings:?}");
         assert!(
-            routing_warnings.iter().all(|warning| !warning.is_fatal),
+            routing_warnings.iter().all(|warning| warning.is_fatal),
             "{routing_warnings:?}"
         );
     }

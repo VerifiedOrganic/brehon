@@ -908,7 +908,7 @@ pub(crate) fn agent_to_adapter(name: &str, config: &BrehonConfig) -> brehon_mux:
                 one_shot: false,
                 uses_ink_prompt: false,
                 prompt_injection_strategy: PromptInjectionStrategy::ImmediateSubmit,
-                tool_prefix: std::borrow::Cow::Borrowed("mcp_brehon_"),
+                tool_prefix: std::borrow::Cow::Borrowed(""),
                 transport: HarnessTransport::AppServer,
                 preferred_control_plane: HarnessControlPlane::Acp,
             },
@@ -3304,6 +3304,7 @@ mod tests {
 
         let adapter = agent_to_adapter("kimi-worker", &config);
         assert_eq!(adapter.as_builtin(), Some(brehon_mux::SupervisorCli::Kimi));
+        assert_eq!(adapter.capabilities().tool_prefix.as_ref(), "");
     }
 
     #[test]

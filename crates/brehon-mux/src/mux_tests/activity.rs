@@ -1831,6 +1831,37 @@ fn test_provider_context_limit_output_detects_split_phrase_across_chunks() {
 }
 
 #[test]
+fn test_provider_context_limit_output_detects_kimi_model_token_limit() {
+    let (mut mux, generation) = mux_with_busy_worker_for_output("kimi-worker");
+
+    mux.event_tx
+        .try_send(MuxEvent::PaneOutput {
+            pane_id: "kimi-worker".to_string(),
+            data: b"API Error: 400 Invalid request: Your request exceeded model token limit: 262144 (requested: 262328)\r\n".to_vec(),
+            generation,
+        })
+        .expect("queue kimi context limit output");
+    let (_bytes, _events) = mux.poll_batch();
+
+    let pane = mux.get("kimi-worker").expect("worker pane exists");
+    match pane.pane_state() {
+        Some(PaneState::Blocked { info, .. }) => {
+            assert_eq!(
+                info.kind,
+                brehon_types::RuntimePaneBlockKind::ProviderContextLimit
+            );
+            assert_eq!(
+                info.command_or_tool.as_deref(),
+                Some(
+                    "API Error: 400 Invalid request: Your request exceeded model token limit: 262144"
+                )
+            );
+        }
+        other => panic!("expected blocked pane state, got {other:?}"),
+    }
+}
+
+#[test]
 fn test_context_usage_status_line_does_not_block_worker() {
     let (mut mux, generation) = mux_with_busy_worker_for_output("minimax-worker");
 

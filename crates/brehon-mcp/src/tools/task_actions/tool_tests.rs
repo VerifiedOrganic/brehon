@@ -1714,6 +1714,46 @@ async fn test_ready_excludes_control_plane_tasks() {
 }
 
 #[tokio::test]
+async fn test_ready_rejects_invalid_project_routing_config() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let project = make_test_root();
+    let brehon_root = project.path().join(".brehon");
+    let config_dir = project.path().join("xdg");
+    std::fs::create_dir_all(&brehon_root).unwrap();
+    std::fs::write(
+        brehon_root.join("config.yaml"),
+        r#"
+routing:
+  default_worker_lane: missing-worker
+"#,
+    )
+    .unwrap();
+    let _env = ScopedEnv::set_with_defaults(&[
+        ("BREHON_ROOT", brehon_root.to_str().unwrap()),
+        ("XDG_CONFIG_HOME", config_dir.to_str().unwrap()),
+    ]);
+    let tool = TaskActionsTool::new();
+
+    write_test_task(&brehon_root, "T-ready", "pending", "task");
+
+    let ready = tool
+        .execute(serde_json::json!({"action": "ready"}))
+        .await
+        .unwrap();
+
+    assert_eq!(ready.is_error, Some(true));
+    let text = extract_text(&ready);
+    assert!(
+        text.contains("project config is invalid"),
+        "expected invalid config error, got: {text}"
+    );
+    assert!(
+        text.contains("routing.default_worker_lane"),
+        "expected routing lane detail, got: {text}"
+    );
+}
+
+#[tokio::test]
 async fn test_conflicts_lists_supervisor_owned_integration_conflicts() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();

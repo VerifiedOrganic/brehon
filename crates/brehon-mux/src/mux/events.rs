@@ -164,6 +164,8 @@ impl Mux {
             "context length exceeded",
             "maximum context length",
             "context limit exceeded",
+            "model token limit",
+            "exceeded model token limit",
             "token limit exceeded",
         ]
     }
@@ -175,6 +177,8 @@ impl Mux {
             "context length exceeded",
             "context limit exceeded",
             "maximum context length",
+            "model token limit",
+            "exceeded model token limit",
             "token limit exceeded",
         ]
     }

@@ -345,7 +345,7 @@ impl SupervisorCli {
                 one_shot: false,
                 uses_ink_prompt: false,
                 prompt_injection_strategy: PromptInjectionStrategy::ImmediateSubmit,
-                tool_prefix: Cow::Borrowed("mcp_brehon_"),
+                tool_prefix: Cow::Borrowed(""),
                 transport: HarnessTransport::AppServer,
                 preferred_control_plane: HarnessControlPlane::Acp,
             },
@@ -580,6 +580,12 @@ mod tests {
                 strategy
             );
         }
+    }
+
+    #[test]
+    fn kimi_uses_raw_mcp_tool_names() {
+        let caps = SupervisorCli::Kimi.capabilities();
+        assert_eq!(caps.tool_prefix.as_ref(), "");
     }
 
     #[test]
