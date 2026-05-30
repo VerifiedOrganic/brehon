@@ -1070,7 +1070,9 @@ pub(super) fn verify_container_branch_ready(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ContainerMergeStrategy {
     Merge,
+    #[allow(dead_code)]
     Squash,
+    SquashWithLineage,
 }
 
 impl ContainerMergeStrategy {
@@ -1078,6 +1080,7 @@ impl ContainerMergeStrategy {
         match self {
             Self::Merge => "merge",
             Self::Squash => "squash",
+            Self::SquashWithLineage => "squash_with_lineage",
         }
     }
 }
@@ -1151,7 +1154,10 @@ pub(super) fn merge_container_branch_into_target_with_strategy(
         ));
     }
 
-    let squash_source_tip = if strategy == ContainerMergeStrategy::Squash {
+    let squash_source_tip = if matches!(
+        strategy,
+        ContainerMergeStrategy::Squash | ContainerMergeStrategy::SquashWithLineage
+    ) {
         Some(git_stdout_in(
             target_worktree,
             &["rev-parse", integration_branch],
@@ -1160,7 +1166,12 @@ pub(super) fn merge_container_branch_into_target_with_strategy(
         None
     };
 
-    if strategy == ContainerMergeStrategy::Squash {
+    if matches!(
+        strategy,
+        ContainerMergeStrategy::Squash | ContainerMergeStrategy::SquashWithLineage
+    ) {
+        reject_tracked_brehon_artifacts(target_worktree, integration_branch, container_type)?;
+
         let squash_result = crate::git_exec::run_git_allow_protected_branch_commit(
             target_worktree,
             &["merge", "--squash", integration_branch],
@@ -1193,6 +1204,41 @@ pub(super) fn merge_container_branch_into_target_with_strategy(
                 target_branch,
                 String::from_utf8_lossy(&commit_result.stderr)
             ));
+        }
+
+        if strategy == ContainerMergeStrategy::SquashWithLineage {
+            let lineage_message = lineage_commit_message(
+                container_id,
+                container_title,
+                container_type,
+                target_branch,
+            );
+            let lineage_result = crate::git_exec::run_git_allow_protected_branch_commit(
+                target_worktree,
+                &[
+                    "merge",
+                    "-s",
+                    "ours",
+                    "--no-ff",
+                    integration_branch,
+                    "-m",
+                    &lineage_message,
+                ],
+            )?;
+
+            if !lineage_result.status.success() {
+                reset_target_worktree_after_failed_merge(
+                    target_worktree,
+                    &target_head_before_merge,
+                );
+                return Err(format!(
+                    "Failed to record {} branch '{}' lineage on '{}': {}",
+                    container_type,
+                    integration_branch,
+                    target_branch,
+                    String::from_utf8_lossy(&lineage_result.stderr)
+                ));
+            }
         }
 
         let merge_commit = git_stdout_in(target_worktree, &["rev-parse", "HEAD"])?;
@@ -1249,6 +1295,67 @@ fn squash_commit_message(
     } else {
         format!("Merge {container_type} {container_id} into {target_branch}")
     }
+}
+
+fn lineage_commit_message(
+    container_id: &str,
+    container_title: Option<&str>,
+    container_type: &str,
+    target_branch: &str,
+) -> String {
+    if let Some(title) = container_title
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+    {
+        format!("Merge {container_type} {container_id} lineage: {title}")
+    } else {
+        format!("Merge {container_type} {container_id} lineage into {target_branch}")
+    }
+}
+
+fn reject_tracked_brehon_artifacts(
+    target_worktree: &Path,
+    integration_branch: &str,
+    container_type: &str,
+) -> Result<(), String> {
+    let output = crate::git_exec::run_git(
+        target_worktree,
+        &[
+            "ls-tree",
+            "-r",
+            "--name-only",
+            integration_branch,
+            "--",
+            ".brehon",
+        ],
+    )?;
+    if !output.status.success() {
+        return Err(format!(
+            "Failed to inspect {} branch '{}' for tracked .brehon artifacts: {}",
+            container_type,
+            integration_branch,
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let tracked = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .take(12)
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if tracked.is_empty() {
+        return Ok(());
+    }
+    let suffix = if tracked.len() == 12 { " ..." } else { "" };
+    Err(format!(
+        "Cannot squash merge {} branch '{}' because it tracks .brehon artifacts: {}{}. \
+         Remove them from git and ensure .brehon/ is ignored before closing this container.",
+        container_type,
+        integration_branch,
+        tracked.join(", "),
+        suffix
+    ))
 }
 
 fn reset_target_worktree_after_failed_merge(target_worktree: &Path, target_head: &str) {
@@ -1449,6 +1556,100 @@ fi
             run_git(root.path(), &["log", "-1", "--format=%s"]),
             "Merge initiative I-1: Test Program"
         );
+    }
+
+    #[test]
+    fn squash_with_lineage_records_source_branch_without_changing_tree() {
+        let root = tempfile::tempdir().unwrap();
+        init_repo(root.path());
+
+        run_git(root.path(), &["checkout", "-b", "initiative/test"]);
+        std::fs::write(root.path().join("initiative.txt"), "initiative\n").unwrap();
+        run_git(root.path(), &["add", "initiative.txt"]);
+        run_git(root.path(), &["commit", "-m", "initiative work"]);
+        let source_tip = run_git(root.path(), &["rev-parse", "HEAD"]);
+        let source_tree = run_git(root.path(), &["rev-parse", "HEAD^{tree}"]);
+        run_git(root.path(), &["checkout", "main"]);
+
+        let outcome = merge_container_branch_into_target_with_strategy(
+            "I-1",
+            Some("Test Program"),
+            "initiative",
+            "initiative/test",
+            "main",
+            root.path(),
+            ContainerMergeStrategy::SquashWithLineage,
+        )
+        .expect("squash-with-lineage merge should succeed");
+
+        assert_eq!(outcome.strategy, ContainerMergeStrategy::SquashWithLineage);
+        assert_eq!(
+            outcome.squash_source_tip.as_deref(),
+            Some(source_tip.as_str())
+        );
+        assert_eq!(run_git(root.path(), &["rev-parse", "HEAD"]), outcome.commit);
+        assert_eq!(
+            run_git(root.path(), &["log", "-1", "--format=%s"]),
+            "Merge initiative I-1 lineage: Test Program"
+        );
+        assert_eq!(
+            run_git(root.path(), &["diff", "--stat", "HEAD^1", "HEAD"]),
+            "",
+            "lineage merge should not change the squashed content tree"
+        );
+        assert_eq!(
+            run_git(root.path(), &["rev-parse", "HEAD^{tree}"]),
+            source_tree
+        );
+        let is_ancestor = Command::new("git")
+            .args(["merge-base", "--is-ancestor", "initiative/test", "main"])
+            .current_dir(root.path())
+            .status()
+            .unwrap();
+        assert!(
+            is_ancestor.success(),
+            "source branch should be ancestry-merged after lineage commit"
+        );
+    }
+
+    #[test]
+    fn squash_with_lineage_rejects_tracked_brehon_artifacts() {
+        let root = tempfile::tempdir().unwrap();
+        init_repo(root.path());
+
+        run_git(root.path(), &["checkout", "-b", "initiative/test"]);
+        std::fs::create_dir_all(root.path().join(".brehon/runtime/proof")).unwrap();
+        std::fs::write(root.path().join(".brehon/runtime/proof/leak.json"), "{}\n").unwrap();
+        run_git(root.path(), &["add", ".brehon/runtime/proof/leak.json"]);
+        run_git(root.path(), &["commit", "-m", "bad proof artifact"]);
+        let source_tip = run_git(root.path(), &["rev-parse", "HEAD"]);
+        run_git(root.path(), &["checkout", "main"]);
+
+        let err = merge_container_branch_into_target_with_strategy(
+            "I-1",
+            Some("Test Program"),
+            "initiative",
+            "initiative/test",
+            "main",
+            root.path(),
+            ContainerMergeStrategy::SquashWithLineage,
+        )
+        .expect_err("tracked .brehon artifacts should block final squash");
+
+        assert!(
+            err.contains("tracks .brehon artifacts"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.contains(".brehon/runtime/proof/leak.json"),
+            "error should name leaked artifact: {err}"
+        );
+        assert_eq!(
+            run_git(root.path(), &["rev-parse", "initiative/test"]),
+            source_tip
+        );
+        assert_eq!(run_git(root.path(), &["status", "--porcelain"]), "");
+        assert_eq!(run_git(root.path(), &["branch", "--show-current"]), "main");
     }
 
     #[test]

@@ -818,7 +818,7 @@ async fn import_plan_creates_initiative_epic_and_dependency_blocked_tasks() {
         .collect::<Vec<_>>();
     entries.sort_by_key(|entry| entry.file_name());
 
-    assert_eq!(entries.len(), 9);
+    assert_eq!(entries.len(), 10);
     let tasks = entries
         .iter()
         .map(|entry| {
@@ -881,6 +881,21 @@ async fn import_plan_creates_initiative_epic_and_dependency_blocked_tasks() {
     assert_eq!(phase_gate["blocked_by"][0], config_bus["task_id"]);
     assert_eq!(phase_gate["plan_import"]["is_phase_gate"], true);
     assert_eq!(phase_gate["completion_mode"], "merge");
+
+    let seam_steward = tasks
+        .iter()
+        .find(|task| task["plan_import"]["source_task_id"] == "brehon.phase.0.seam-steward")
+        .unwrap();
+    assert_eq!(
+        seam_steward["plan_import"]["source_epic_id"],
+        "brehon.integration"
+    );
+    assert_eq!(seam_steward["completion_mode"], "merge");
+    let seam_dependencies = seam_steward["dependencies"].as_array().unwrap();
+    assert!(seam_dependencies.contains(&scaffold["task_id"]));
+    assert!(seam_dependencies.contains(&config_bus["task_id"]));
+    assert!(seam_dependencies.contains(&phase_gate["task_id"]));
+    assert_eq!(seam_steward["status"], "blocked");
 }
 
 #[tokio::test]
@@ -923,7 +938,7 @@ async fn import_normalized_plan_json_creates_records() {
         .flatten()
         .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
         .count();
-    assert_eq!(entries, 9);
+    assert_eq!(entries, 10);
 }
 
 #[tokio::test]
@@ -1640,7 +1655,7 @@ async fn import_plan_succeeds_when_landed_commit_is_not_ancestor() {
         .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
         .count();
     assert_eq!(
-        entries, 9,
+        entries, 10,
         "plan with non-ancestor landed_commit should import normally"
     );
 }

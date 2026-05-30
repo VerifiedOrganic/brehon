@@ -321,13 +321,14 @@ pub(super) async fn execute(args: &Value) -> Result<ToolResult, McpError> {
                     let default_branch =
                         detect_default_branch().unwrap_or_else(|_| "main".to_string());
                     // Final initiative close is the public-history boundary:
-                    // preserve detailed commits on initiative/epic branches, but land one
-                    // audited squash commit on the default branch.
+                    // land one audited content commit, then record a no-content
+                    // lineage merge so git no longer reports the initiative and
+                    // its epics as stranded after main has the content.
                     let merge_strategy = if is_initiative(&task_type)
                         && parent_id.is_none()
                         && base_branch == default_branch
                     {
-                        ContainerMergeStrategy::Squash
+                        ContainerMergeStrategy::SquashWithLineage
                     } else {
                         ContainerMergeStrategy::Merge
                     };
@@ -469,14 +470,17 @@ pub(super) async fn execute(args: &Value) -> Result<ToolResult, McpError> {
                         result["warnings"] = Value::Array(vec![warning]);
                     }
                     let base_message = if is_initiative(&task_type)
-                        && merge_outcome.strategy == ContainerMergeStrategy::Squash
-                    {
+                        && matches!(
+                            merge_outcome.strategy,
+                            ContainerMergeStrategy::Squash
+                                | ContainerMergeStrategy::SquashWithLineage
+                        ) {
                         let source_tip = merge_outcome
                             .squash_source_tip
                             .as_deref()
                             .unwrap_or("unknown");
                         format!(
-                            "Initiative {} squash-merged into {} from integration branch '{}' at source tip {} with commit {}.",
+                            "Initiative {} squash-merged into {} from integration branch '{}' at source tip {} and recorded lineage with commit {}.",
                             id, default_branch, branch, source_tip, merge_commit
                         )
                     } else if is_initiative(&task_type) {

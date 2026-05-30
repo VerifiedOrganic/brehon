@@ -1892,7 +1892,7 @@ impl VerificationTool {
                     result["action_needed"] = serde_json::json!("request_review");
                     result["next_action"] = next_action_request_review(&resolved_task_id);
                     result["message"] = serde_json::json!(format!(
-                        "The current review round escalated without a complete quorum. \
+                        "The current review round escalated with incomplete quorum. \
                          Start a fresh round with: verification action=request_review task_id={resolved_task_id}"
                     ));
                 }

@@ -11919,13 +11919,13 @@ async fn test_initiative_close_merges_initiative_branch_to_main() {
     let result: Value = serde_json::from_str(&extract_text(&initiative_close)).unwrap();
     assert_eq!(result["action"], "merged");
     assert_eq!(result["merged_branch"], "main");
-    assert_eq!(result["merge_strategy"], "squash");
+    assert_eq!(result["merge_strategy"], "squash_with_lineage");
     assert_eq!(result["squash_source_tip"], squash_source_tip);
 
     let stored_initiative = read_test_task(&brehon_root, initiative_id);
     assert_eq!(stored_initiative["status"], "merged");
     assert_eq!(stored_initiative["merged_branch"], "main");
-    assert_eq!(stored_initiative["merge_strategy"], "squash");
+    assert_eq!(stored_initiative["merge_strategy"], "squash_with_lineage");
     assert_eq!(stored_initiative["squash_source_tip"], squash_source_tip);
     assert_eq!(
         run_git(workspace.path(), &["rev-parse", "main"]),
@@ -11937,6 +11937,13 @@ async fn test_initiative_close_merges_initiative_branch_to_main() {
     );
     assert_eq!(
         run_git(workspace.path(), &["log", "-1", "--format=%s"]),
+        format!("Merge initiative {initiative_id} lineage: Program")
+    );
+    assert_eq!(
+        run_git(workspace.path(), &["log", "-2", "--format=%s"])
+            .lines()
+            .nth(1)
+            .unwrap(),
         format!("Merge initiative {initiative_id}: Program")
     );
 
@@ -11946,8 +11953,8 @@ async fn test_initiative_close_merges_initiative_branch_to_main() {
         .status()
         .unwrap();
     assert!(
-        !on_main.success(),
-        "squash close should land content on main without preserving child commit ancestry"
+        on_main.success(),
+        "lineage close should make child epic commits reachable through the initiative branch"
     );
     let initiative_branch_is_ancestor = Command::new("git")
         .args(["merge-base", "--is-ancestor", initiative_branch, "main"])
@@ -11955,8 +11962,12 @@ async fn test_initiative_close_merges_initiative_branch_to_main() {
         .status()
         .unwrap();
     assert!(
-        !initiative_branch_is_ancestor.success(),
-        "initiative squash close should not require the source branch to become a main ancestor"
+        initiative_branch_is_ancestor.success(),
+        "initiative close should record lineage so git sees the source branch as merged"
+    );
+    assert!(
+        run_git(workspace.path(), &["diff", "--stat", "HEAD^1", "HEAD"]).is_empty(),
+        "lineage commit should not change the squashed content tree"
     );
     let initiative_tree_spec = format!("{initiative_branch}^{{tree}}");
     assert_eq!(
