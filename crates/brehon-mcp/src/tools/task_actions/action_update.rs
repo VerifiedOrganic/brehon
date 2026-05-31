@@ -18,6 +18,7 @@ use crate::tools::verification::{
 };
 use crate::tools::{error_result, text_result};
 
+use super::build_artifact_cleanup::cleanup_current_worktree_allowlisted_artifacts;
 use super::dependencies::{
     parse_task_id_list_arg, task_has_legacy_completed_worker_status,
     task_has_recoverable_worker_state_blocker_text, write_string_list_field,
@@ -629,9 +630,7 @@ pub(super) async fn execute_complete(
                 copy_proof_result(&mut result, &Value::Null, &checkpoint_json);
                 copy_checkpoint_warning(&mut result, &checkpoint_json);
                 result["worktree_cleanup"] =
-                    super::build_artifact_cleanup::cleanup_current_worker_build_artifacts(
-                        "after_task_complete",
-                    );
+                    cleanup_current_worktree_allowlisted_artifacts("after_worker_handoff");
                 return Ok(text_result(
                     serde_json::to_string_pretty(&result)
                         .map_err(|e| McpError::Serialization(e.to_string()))?,
@@ -696,9 +695,7 @@ pub(super) async fn execute_complete(
         result["already_handed_off"] = Value::Bool(true);
     }
     result["worktree_cleanup"] =
-        super::build_artifact_cleanup::cleanup_current_worker_build_artifacts(
-            "after_task_complete",
-        );
+        cleanup_current_worktree_allowlisted_artifacts("after_worker_handoff");
 
     Ok(text_result(
         serde_json::to_string_pretty(&result)
@@ -844,9 +841,7 @@ pub(super) async fn execute_progress(
             .await
             .attach_to_result(&mut result);
         result["worktree_cleanup"] =
-            super::build_artifact_cleanup::cleanup_current_worker_build_artifacts(
-                "after_task_complete",
-            );
+            cleanup_current_worktree_allowlisted_artifacts("after_worker_handoff");
         return Ok(text_result(
             serde_json::to_string_pretty(&result)
                 .map_err(|e| McpError::Serialization(e.to_string()))?,
@@ -991,16 +986,16 @@ pub(super) async fn execute_progress(
         } else {
             let _ = crate::tools::agent::try_deliver_message(&supervisor, &agent_name, &msg);
         }
-        result["worktree_cleanup"] =
-            super::build_artifact_cleanup::cleanup_current_worker_build_artifacts(
-                "after_task_complete",
-            );
     }
     if caller_role == "worker" && task_type == "task" {
         proof_recorder
             .record_progress(args, id, percent, current_commit.as_deref(), auto_review)
             .await
             .attach_to_result(&mut result);
+    }
+    if auto_review {
+        result["worktree_cleanup"] =
+            cleanup_current_worktree_allowlisted_artifacts("after_worker_handoff");
     }
 
     Ok(text_result(

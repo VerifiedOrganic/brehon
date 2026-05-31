@@ -49,6 +49,7 @@ pub use tool::TaskActionsTool;
 
 pub use final_hardening::{FINAL_HARDENING_EPIC_TITLE, FINAL_HARDENING_SEED_TASK_COUNT};
 
+pub(crate) use build_artifact_cleanup::cleanup_current_worktree_allowlisted_artifacts;
 pub(crate) use epic::{
     clear_task_supervisor_integration_conflict, mark_task_supervisor_integration_conflict,
     task_has_integration_conflict_recovery_marker, task_has_supervisor_integration_conflict,

@@ -1,16 +1,16 @@
-//! Worker-local build artifact cleanup.
+//! Brehon worktree allowlisted cleanup.
 //!
-//! This is intentionally narrow: remove only ignored, untracked top-level
-//! build directories from the current worker worktree. It must never become a
-//! general `git clean` replacement.
+//! Brehon worktrees are disposable execution sandboxes, but arbitrary
+//! untracked files can still contain copied scaffold or research. Mid-run
+//! cleanup therefore only executes explicitly allowlisted actions.
 
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
+use brehon_types::{WorktreeCleanupActionConfig, WorktreeCleanupConfig};
 use serde_json::Value;
 
-use super::paths::brehon_worktrees_root;
-
-const CLEANUP_DIRS: &[&str] = &["target"];
+use super::paths::{brehon_root_dir, brehon_worktrees_root, project_root};
 
 #[derive(Debug, Default)]
 struct CleanupReport {
@@ -51,30 +51,72 @@ impl CleanupReport {
             "noop"
         };
 
-        serde_json::json!({
+        let value = serde_json::json!({
             "status": status,
             "phase": self.phase,
             "workspace": self.workspace,
             "removed": self.removed,
             "skipped": self.skipped,
             "errors": self.errors,
-        })
+        });
+        record_cleanup_audit(&value);
+        value
     }
 }
 
-pub(super) fn cleanup_current_worker_build_artifacts(phase: &'static str) -> Value {
-    let mut report = CleanupReport::new(phase);
-
-    let workspace = match worker_workspace_from_env() {
-        Ok(workspace) => workspace,
-        Err(err) => {
-            report.skip("BREHON_WORKSPACE_ROOT", err);
-            return report.into_value();
-        }
+fn record_cleanup_audit(report: &Value) {
+    let Some(root) = brehon_root_dir() else {
+        return;
     };
+    let runtime_dir = root.join("runtime");
+    if std::fs::create_dir_all(&runtime_dir).is_err() {
+        return;
+    }
+    let path = runtime_dir.join("worktree-cleanup.jsonl");
+    let entry = serde_json::json!({
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "report": report,
+    });
+    let Ok(line) = serde_json::to_string(&entry) else {
+        return;
+    };
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    else {
+        return;
+    };
+    use std::io::Write;
+    let _ = writeln!(file, "{line}");
+}
+
+pub(crate) fn cleanup_current_worktree_allowlisted_artifacts(phase: &'static str) -> Value {
+    let Some(workspace) = std::env::var("BREHON_WORKSPACE_ROOT")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+    else {
+        let mut report = CleanupReport::new(phase);
+        report.skip(
+            "BREHON_WORKSPACE_ROOT",
+            "No worker/reviewer workspace root is configured.",
+        );
+        return report.into_value();
+    };
+
+    cleanup_brehon_worktree_allowlisted_artifacts(phase, &workspace)
+}
+
+pub(super) fn cleanup_brehon_worktree_allowlisted_artifacts(
+    phase: &'static str,
+    workspace: &Path,
+) -> Value {
+    let mut report = CleanupReport::new(phase);
     report.workspace = Some(workspace.display().to_string());
 
-    let canonical_workspace = match validate_worker_workspace(&workspace) {
+    let canonical_workspace = match validate_worker_workspace(workspace) {
         Ok(path) => path,
         Err(err) => {
             report.skip(workspace.display().to_string(), err);
@@ -82,32 +124,68 @@ pub(super) fn cleanup_current_worker_build_artifacts(phase: &'static str) -> Val
         }
     };
 
-    if let Ok(repo) = git2::Repository::open(&workspace) {
-        if repo.state() != git2::RepositoryState::Clean {
+    let repo = match git2::Repository::open(&workspace) {
+        Ok(repo) => repo,
+        Err(err) => {
             report.skip(
                 workspace.display().to_string(),
-                format!("repository is in mid-operation state {:?}", repo.state()),
+                format!("cannot open git worktree: {err}"),
             );
             return report.into_value();
         }
+    };
+    if repo.state() != git2::RepositoryState::Clean {
+        report.skip(
+            workspace.display().to_string(),
+            format!("repository is in mid-operation state {:?}", repo.state()),
+        );
+        return report.into_value();
     }
 
-    for dir in CLEANUP_DIRS {
-        cleanup_dir(&workspace, &canonical_workspace, dir, &mut report);
+    let actions = match cleanup_actions_for_phase(phase) {
+        Ok(actions) => actions,
+        Err(err) => {
+            report.skip("worktree_cleanup", err);
+            return report.into_value();
+        }
+    };
+    if actions.is_empty() {
+        report.skip("worktree_cleanup", "allowlisted cleanup is disabled");
+        return report.into_value();
+    }
+
+    for action in actions {
+        match action {
+            WorktreeCleanupActionConfig::CargoClean { min_size_mb } => {
+                cleanup_cargo_target(workspace, &canonical_workspace, min_size_mb, &mut report);
+            }
+        }
     }
 
     report.into_value()
 }
 
-fn worker_workspace_from_env() -> Result<PathBuf, String> {
-    std::env::var("BREHON_WORKSPACE_ROOT")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .ok_or_else(|| {
-            "BREHON_WORKSPACE_ROOT is not set; refusing build-artifact cleanup.".to_string()
-        })
+fn cleanup_actions_for_phase(phase: &str) -> Result<Vec<WorktreeCleanupActionConfig>, String> {
+    let config = configured_worktree_cleanup()?;
+    if !config.enabled {
+        return Ok(Vec::new());
+    }
+    let actions = match phase {
+        "after_worker_handoff" => &config.on_worker_handoff,
+        "after_review_submit" => &config.on_review_submit,
+        "after_task_integrated" | "after_container_closed" => &config.on_terminal_cleanup,
+        _ => &config.on_terminal_cleanup,
+    };
+    Ok(actions.clone())
+}
+
+fn configured_worktree_cleanup() -> Result<WorktreeCleanupConfig, String> {
+    let Some(root) = project_root() else {
+        return Ok(WorktreeCleanupConfig::default());
+    };
+    brehon_config::load_config(Some(&root))
+        .map(|config| config.orchestration.worktree_cleanup)
+        .map_err(|err| format!("Cannot load worktree cleanup config: {err}"))
 }
 
 fn validate_worker_workspace(workspace: &Path) -> Result<PathBuf, String> {
@@ -163,50 +241,102 @@ fn validate_worker_workspace(workspace: &Path) -> Result<PathBuf, String> {
     Ok(canonical_workspace)
 }
 
-fn cleanup_dir(
+fn cleanup_cargo_target(
     workspace: &Path,
     canonical_workspace: &Path,
-    relative_dir: &str,
+    min_size_mb: Option<u64>,
     report: &mut CleanupReport,
 ) {
-    let path = workspace.join(relative_dir);
-    let display_path = path.display().to_string();
-    if !path.exists() {
+    if !workspace.join("Cargo.toml").is_file() {
+        report.skip("cargo_clean", "Cargo.toml is not present in this worktree");
         return;
     }
 
-    let metadata = match std::fs::symlink_metadata(&path) {
+    let target = workspace.join("target");
+    if !target.exists() {
+        report.skip("target/", "no Cargo target directory is present");
+        return;
+    }
+
+    let metadata = match std::fs::symlink_metadata(&target) {
         Ok(metadata) => metadata,
         Err(err) => {
-            report.error(format!("Cannot inspect '{}': {err}", path.display()));
+            report.error(format!(
+                "Cannot inspect Cargo target directory '{}': {err}",
+                target.display()
+            ));
             return;
         }
     };
-
     if metadata.file_type().is_symlink() {
-        report.skip(display_path, "path is a symlink");
+        report.skip(
+            "target/",
+            "refusing cargo cleanup because target/ is a symlink",
+        );
         return;
     }
     if !metadata.is_dir() {
-        report.skip(display_path, "path is not a directory");
+        report.skip(
+            "target/",
+            "refusing cargo cleanup because target/ is not a directory",
+        );
         return;
     }
 
-    let canonical_path = match path.canonicalize() {
+    let canonical_target = match target.canonicalize() {
         Ok(path) => path,
         Err(err) => {
-            report.error(format!("Cannot canonicalize '{}': {err}", path.display()));
+            report.error(format!(
+                "Cannot canonicalize Cargo target directory '{}': {err}",
+                target.display()
+            ));
             return;
         }
     };
-    if !canonical_path.starts_with(canonical_workspace) {
-        report.skip(display_path, "canonical path escapes the worker workspace");
+    if !canonical_target.starts_with(canonical_workspace)
+        || canonical_target.parent() != Some(canonical_workspace)
+    {
+        report.skip(
+            "target/",
+            format!(
+                "refusing cargo cleanup because '{}' is not the worktree-local target directory",
+                canonical_target.display()
+            ),
+        );
         return;
     }
 
-    match path_has_tracked_files(workspace, relative_dir) {
+    let target_size_bytes = match directory_size_bytes(&target) {
+        Ok(size) => size,
+        Err(err) => {
+            report.error(format!(
+                "Cannot measure Cargo target directory '{}': {err}",
+                target.display()
+            ));
+            return;
+        }
+    };
+    if let Some(min_size_mb) = min_size_mb {
+        let min_size_bytes = min_size_mb.saturating_mul(1024 * 1024);
+        if target_size_bytes < min_size_bytes {
+            report.skip(
+                "target/",
+                format!(
+                    "target/ is below cleanup threshold: {} MiB < {} MiB",
+                    target_size_bytes / (1024 * 1024),
+                    min_size_mb
+                ),
+            );
+            return;
+        }
+    }
+
+    match git_path_has_tracked_files(workspace, "target") {
         Ok(true) => {
-            report.skip(display_path, "directory contains tracked files");
+            report.skip(
+                "target/",
+                "refusing cargo cleanup because target/ contains tracked files",
+            );
             return;
         }
         Ok(false) => {}
@@ -216,10 +346,13 @@ fn cleanup_dir(
         }
     }
 
-    match path_is_ignored(workspace, relative_dir) {
+    match git_path_is_ignored(workspace, "target/") {
         Ok(true) => {}
         Ok(false) => {
-            report.skip(display_path, "directory is not ignored by git");
+            report.skip(
+                "target/",
+                "refusing cargo cleanup because target/ is not ignored by git",
+            );
             return;
         }
         Err(err) => {
@@ -228,48 +361,110 @@ fn cleanup_dir(
         }
     }
 
-    match std::fs::remove_dir_all(&path) {
-        Ok(()) => {
-            report.removed.push(display_path);
-        }
+    let canonical_workspace_again = match workspace.canonicalize() {
+        Ok(path) => path,
         Err(err) => {
-            report.error(format!("Failed to remove '{}': {err}", path.display()));
+            report.error(format!(
+                "Cannot canonicalize worker workspace '{}': {err}",
+                workspace.display()
+            ));
+            return;
         }
+    };
+    if canonical_workspace_again != canonical_workspace {
+        report.skip(
+            workspace.display().to_string(),
+            "workspace canonical path changed during cleanup",
+        );
+        return;
     }
-}
 
-fn path_has_tracked_files(workspace: &Path, relative_dir: &str) -> Result<bool, String> {
-    let output = crate::git_exec::run_git(workspace, &["ls-files", "--", relative_dir])?;
+    let output = match Command::new("cargo")
+        .arg("clean")
+        .arg("--target-dir")
+        .arg(&target)
+        .current_dir(workspace)
+        .env_remove("CARGO_TARGET_DIR")
+        .output()
+    {
+        Ok(output) => output,
+        Err(err) => {
+            report.error(format!(
+                "Failed to run cargo clean in '{}': {err}",
+                workspace.display()
+            ));
+            return;
+        }
+    };
+
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(if stderr.is_empty() {
+        report.error(if stderr.is_empty() {
             format!(
-                "git ls-files -- {relative_dir} exited with {}",
-                output.status
+                "cargo clean exited with {} in '{}'",
+                output.status,
+                workspace.display()
             )
         } else {
             stderr
         });
+        return;
+    }
+
+    report.removed.push("target/".to_string());
+}
+
+fn directory_size_bytes(path: &Path) -> Result<u64, std::io::Error> {
+    let mut total = 0_u64;
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let metadata = std::fs::symlink_metadata(&current)?;
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        if metadata.is_dir() {
+            for entry in std::fs::read_dir(&current)? {
+                stack.push(entry?.path());
+            }
+        } else {
+            total = total.saturating_add(metadata.len());
+        }
+    }
+    Ok(total)
+}
+
+fn git_path_has_tracked_files(workspace: &Path, pathspec: &str) -> Result<bool, String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(workspace)
+        .args(["ls-files", "--"])
+        .arg(pathspec)
+        .output()
+        .map_err(|err| format!("Failed to inspect tracked files under {pathspec}: {err}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git ls-files failed for {pathspec}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
     }
     Ok(!String::from_utf8_lossy(&output.stdout).trim().is_empty())
 }
 
-fn path_is_ignored(workspace: &Path, relative_dir: &str) -> Result<bool, String> {
-    let output = crate::git_exec::run_git(workspace, &["check-ignore", "-q", "--", relative_dir])?;
+fn git_path_is_ignored(workspace: &Path, pathspec: &str) -> Result<bool, String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(workspace)
+        .args(["check-ignore", "-q", "--"])
+        .arg(pathspec)
+        .output()
+        .map_err(|err| format!("Failed to inspect git ignore status for {pathspec}: {err}"))?;
     match output.status.code() {
         Some(0) => Ok(true),
         Some(1) => Ok(false),
-        _ => {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            Err(if stderr.is_empty() {
-                format!(
-                    "git check-ignore -q -- {relative_dir} exited with {}",
-                    output.status
-                )
-            } else {
-                stderr
-            })
-        }
+        _ => Err(format!(
+            "git check-ignore failed for {pathspec}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )),
     }
 }
 
@@ -337,7 +532,17 @@ mod tests {
         run_git(root, &["config", "user.name", "Test User"]);
         std::fs::write(root.join(".gitignore"), "target/\n").unwrap();
         std::fs::write(root.join("README.md"), "seed\n").unwrap();
-        run_git(root, &["add", ".gitignore", "README.md"]);
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"cleanup-fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn fixture() {}\n").unwrap();
+        run_git(
+            root,
+            &["add", ".gitignore", "README.md", "Cargo.toml", "src/lib.rs"],
+        );
         run_git(root, &["commit", "-m", "seed"]);
     }
 
@@ -358,11 +563,24 @@ mod tests {
         worktree
     }
 
+    fn write_cleanup_config(root: &Path, worker_handoff_action: &str) {
+        let brehon_dir = root.join(".brehon");
+        std::fs::create_dir_all(&brehon_dir).unwrap();
+        std::fs::write(
+            brehon_dir.join("config.yaml"),
+            format!(
+                "orchestration:\n  worktree_cleanup:\n    enabled: true\n    on_worker_handoff:\n{worker_handoff_action}\n    on_review_submit: []\n    on_terminal_cleanup: []\n"
+            ),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn removes_ignored_untracked_target_in_worker_worktree() {
         let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         let root = tempfile::tempdir().unwrap();
         init_repo(root.path());
+        write_cleanup_config(root.path(), "      - kind: cargo_clean");
         let worktree = add_worker_worktree(root.path(), "worker-1");
         let target_file = worktree.join("target/debug/app");
         std::fs::create_dir_all(target_file.parent().unwrap()).unwrap();
@@ -374,10 +592,42 @@ mod tests {
             ("BREHON_WORKSPACE_ROOT", worktree.to_str().unwrap()),
         ]);
 
-        let report = cleanup_current_worker_build_artifacts("test");
+        let report =
+            cleanup_brehon_worktree_allowlisted_artifacts("after_worker_handoff", &worktree);
 
         assert_eq!(report["status"], "removed");
         assert!(!worktree.join("target").exists());
+    }
+
+    #[test]
+    fn skips_target_below_configured_size_threshold() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        init_repo(root.path());
+        write_cleanup_config(
+            root.path(),
+            "      - kind: cargo_clean\n        min_size_mb: 1",
+        );
+        let worktree = add_worker_worktree(root.path(), "worker-1");
+        let target_file = worktree.join("target/debug/app");
+        std::fs::create_dir_all(target_file.parent().unwrap()).unwrap();
+        std::fs::write(&target_file, "artifact").unwrap();
+
+        let _env = EnvGuard::set(&[
+            ("BREHON_ROOT", root.path().join(".brehon").to_str().unwrap()),
+            ("BREHON_PROJECT_ROOT", root.path().to_str().unwrap()),
+            ("BREHON_WORKSPACE_ROOT", worktree.to_str().unwrap()),
+        ]);
+
+        let report =
+            cleanup_brehon_worktree_allowlisted_artifacts("after_worker_handoff", &worktree);
+
+        assert_eq!(report["status"], "skipped");
+        assert!(worktree.join("target/debug/app").exists());
+        assert!(report["skipped"][0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("below cleanup threshold"));
     }
 
     #[test]
@@ -395,7 +645,8 @@ mod tests {
             ("BREHON_WORKSPACE_ROOT", root.path().to_str().unwrap()),
         ]);
 
-        let report = cleanup_current_worker_build_artifacts("test");
+        let report =
+            cleanup_brehon_worktree_allowlisted_artifacts("after_worker_handoff", root.path());
 
         assert_eq!(report["status"], "skipped");
         assert!(root.path().join("target").exists());
@@ -406,7 +657,7 @@ mod tests {
     }
 
     #[test]
-    fn skips_target_with_tracked_files() {
+    fn skips_target_when_it_contains_tracked_files() {
         let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         let root = tempfile::tempdir().unwrap();
         init_repo(root.path());
@@ -416,6 +667,9 @@ mod tests {
         std::fs::write(&tracked_target_file, "tracked").unwrap();
         run_git(&worktree, &["add", "-f", "target/keep.txt"]);
         run_git(&worktree, &["commit", "-m", "track target file"]);
+        let untracked_target_file = worktree.join("target/debug/app");
+        std::fs::create_dir_all(untracked_target_file.parent().unwrap()).unwrap();
+        std::fs::write(&untracked_target_file, "artifact").unwrap();
 
         let _env = EnvGuard::set(&[
             ("BREHON_ROOT", root.path().join(".brehon").to_str().unwrap()),
@@ -423,14 +677,12 @@ mod tests {
             ("BREHON_WORKSPACE_ROOT", worktree.to_str().unwrap()),
         ]);
 
-        let report = cleanup_current_worker_build_artifacts("test");
+        let report =
+            cleanup_brehon_worktree_allowlisted_artifacts("after_worker_handoff", &worktree);
 
         assert_eq!(report["status"], "skipped");
         assert!(worktree.join("target/keep.txt").exists());
-        assert_eq!(
-            report["skipped"][0]["reason"],
-            "directory contains tracked files"
-        );
+        assert!(worktree.join("target/debug/app").exists());
     }
 
     #[test]
@@ -441,7 +693,17 @@ mod tests {
         run_git(root.path(), &["config", "user.email", "test@example.com"]);
         run_git(root.path(), &["config", "user.name", "Test User"]);
         std::fs::write(root.path().join("README.md"), "seed\n").unwrap();
-        run_git(root.path(), &["add", "README.md"]);
+        std::fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname = \"cleanup-fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.path().join("src")).unwrap();
+        std::fs::write(root.path().join("src/lib.rs"), "pub fn fixture() {}\n").unwrap();
+        run_git(
+            root.path(),
+            &["add", "README.md", "Cargo.toml", "src/lib.rs"],
+        );
         run_git(root.path(), &["commit", "-m", "seed"]);
         let worktree = add_worker_worktree(root.path(), "worker-1");
         let target_file = worktree.join("target/debug/app");
@@ -454,13 +716,48 @@ mod tests {
             ("BREHON_WORKSPACE_ROOT", worktree.to_str().unwrap()),
         ]);
 
-        let report = cleanup_current_worker_build_artifacts("test");
+        let report =
+            cleanup_brehon_worktree_allowlisted_artifacts("after_worker_handoff", &worktree);
 
         assert_eq!(report["status"], "skipped");
         assert!(worktree.join("target/debug/app").exists());
-        assert_eq!(
-            report["skipped"][0]["reason"],
-            "directory is not ignored by git"
-        );
+    }
+
+    #[test]
+    fn cargo_allowlist_does_not_remove_scaffold_or_neighbor_junk() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        init_repo(root.path());
+        write_cleanup_config(root.path(), "      - kind: cargo_clean");
+        let worktree = add_worker_worktree(root.path(), "worker-1");
+        std::fs::create_dir_all(worktree.join(".agents")).unwrap();
+        std::fs::create_dir_all(worktree.join(".claude")).unwrap();
+        std::fs::write(worktree.join(".mcp.json"), "{}").unwrap();
+        std::fs::write(worktree.join("opencode.json"), "{}").unwrap();
+        std::fs::write(worktree.join(".agents/mcp_config.json"), "{}").unwrap();
+        std::fs::write(worktree.join(".agents/cache.bin"), "cache").unwrap();
+        std::fs::write(worktree.join(".claude/settings.local.json"), "{}").unwrap();
+        std::fs::write(worktree.join(".claude/cache.bin"), "cache").unwrap();
+        let target_file = worktree.join("target/debug/app");
+        std::fs::create_dir_all(target_file.parent().unwrap()).unwrap();
+        std::fs::write(&target_file, "artifact").unwrap();
+
+        let _env = EnvGuard::set(&[
+            ("BREHON_ROOT", root.path().join(".brehon").to_str().unwrap()),
+            ("BREHON_PROJECT_ROOT", root.path().to_str().unwrap()),
+            ("BREHON_WORKSPACE_ROOT", worktree.to_str().unwrap()),
+        ]);
+
+        let report =
+            cleanup_brehon_worktree_allowlisted_artifacts("after_worker_handoff", &worktree);
+
+        assert_eq!(report["status"], "removed");
+        assert!(worktree.join(".mcp.json").exists());
+        assert!(worktree.join("opencode.json").exists());
+        assert!(worktree.join(".agents/mcp_config.json").exists());
+        assert!(worktree.join(".claude/settings.local.json").exists());
+        assert!(worktree.join(".agents/cache.bin").exists());
+        assert!(worktree.join(".claude/cache.bin").exists());
+        assert!(!worktree.join("target").exists());
     }
 }

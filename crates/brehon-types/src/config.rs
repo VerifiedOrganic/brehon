@@ -1274,6 +1274,59 @@ pub struct OrchestrationConfig {
     /// default under the user's data directory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree_root: Option<String>,
+    /// Allowlisted cleanup actions for disposable Brehon worktrees.
+    #[serde(default, skip_serializing_if = "WorktreeCleanupConfig::is_default")]
+    pub worktree_cleanup: WorktreeCleanupConfig,
+}
+
+/// Allowlisted cleanup actions for disposable Brehon worktrees.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorktreeCleanupConfig {
+    /// Enable allowlisted cleanup actions.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Actions after a worker hands a task to review.
+    #[serde(default)]
+    pub on_worker_handoff: Vec<WorktreeCleanupActionConfig>,
+    /// Actions after a reviewer submits a review.
+    #[serde(default)]
+    pub on_review_submit: Vec<WorktreeCleanupActionConfig>,
+    /// Actions after supervisor integration or close finishes.
+    #[serde(default)]
+    pub on_terminal_cleanup: Vec<WorktreeCleanupActionConfig>,
+}
+
+impl WorktreeCleanupConfig {
+    pub fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+impl Default for WorktreeCleanupConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            on_worker_handoff: default_worktree_cleanup_actions(),
+            on_review_submit: default_worktree_cleanup_actions(),
+            on_terminal_cleanup: default_worktree_cleanup_actions(),
+        }
+    }
+}
+
+fn default_worktree_cleanup_actions() -> Vec<WorktreeCleanupActionConfig> {
+    vec![WorktreeCleanupActionConfig::CargoClean { min_size_mb: None }]
+}
+
+/// One allowlisted worktree cleanup action.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WorktreeCleanupActionConfig {
+    /// Run Cargo cleanup scoped to this worktree's own target directory.
+    CargoClean {
+        /// Skip cleanup when the worktree-local target dir is below this size.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        min_size_mb: Option<u64>,
+    },
 }
 
 impl OrchestrationConfig {
@@ -2390,6 +2443,7 @@ mod tests {
                 spawn_workers: None,
                 drain_timeout_secs: None,
                 worktree_root: None,
+                worktree_cleanup: WorktreeCleanupConfig::default(),
             },
             runtime: RuntimeConfig::default(),
             budget: BudgetConfig {
@@ -2658,6 +2712,7 @@ security:
                 spawn_workers: None,
                 drain_timeout_secs: None,
                 worktree_root: None,
+                worktree_cleanup: WorktreeCleanupConfig::default(),
             }
         };
         let resolved =
@@ -2768,6 +2823,7 @@ security:
                 spawn_workers: None,
                 drain_timeout_secs: None,
                 worktree_root: None,
+                worktree_cleanup: WorktreeCleanupConfig::default(),
             }
         };
         let resolved = config.resolve_worktree_root(std::path::Path::new("/project"), "repo-123");

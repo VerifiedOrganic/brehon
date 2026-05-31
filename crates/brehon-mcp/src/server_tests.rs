@@ -10,9 +10,23 @@ struct ScopedEnv {
 
 impl ScopedEnv {
     fn set(vars: &[(&'static str, &str)]) -> Self {
-        let mut saved = Vec::with_capacity(vars.len());
-        for (key, value) in vars {
-            saved.push((*key, std::env::var_os(key)));
+        let mut all_vars: Vec<(&'static str, &str)> = vars.to_vec();
+        let auto_clear = [
+            "BREHON_ROOT",
+            "BREHON_PROJECT_ROOT",
+            "BREHON_SESSION_NAME",
+            "BREHON_WORKSPACE_ROOT",
+            "BREHON_WORKTREE_BRANCH",
+        ];
+        for key in auto_clear {
+            if !all_vars.iter().any(|(existing, _)| *existing == key) {
+                all_vars.push((key, ""));
+            }
+        }
+
+        let mut saved = Vec::with_capacity(all_vars.len());
+        for (key, value) in all_vars {
+            saved.push((key, std::env::var_os(key)));
             std::env::set_var(key, value);
         }
         Self { saved }
@@ -379,8 +393,8 @@ fn test_configured_project_root_passes_through_non_dot_brehon_root() {
 async fn tool_panic_catches_panics_and_returns_internal_error() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _env = ScopedEnv::set(&[
-        ("BREHON_SESSION_ID", "sess-panic"),
-        ("BREHON_AGENT_NAME", "panic-agent"),
+        ("BREHON_SESSION_ID", "sess-tool-panic"),
+        ("BREHON_AGENT_NAME", "panic-boundary-agent"),
         ("BREHON_AGENT_ROLE", "worker"),
     ]);
     let mut server = McpServer::new("test-server", "1.0.0");
@@ -399,8 +413,11 @@ async fn tool_panic_catches_panics_and_returns_internal_error() {
             );
             assert_eq!(payload["error"]["code"], "mcp_tool_panic");
             assert_eq!(payload["error"]["tool"], "panic_tool");
-            assert_eq!(payload["error"]["caller"]["session_id"], "sess-panic");
-            assert_eq!(payload["error"]["caller"]["agent_name"], "panic-agent");
+            assert_eq!(payload["error"]["caller"]["session_id"], "sess-tool-panic");
+            assert_eq!(
+                payload["error"]["caller"]["agent_name"],
+                "panic-boundary-agent"
+            );
             assert_eq!(payload["error"]["caller"]["role"], "worker");
             assert!(payload["error"]["fields"]["panic"]
                 .as_str()
@@ -416,8 +433,8 @@ async fn input_size_rejects_oversized_arguments_with_caller_attribution() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _env = ScopedEnv::set(&[
         ("BREHON_MCP_MAX_REQUEST_BYTES", "64"),
-        ("BREHON_SESSION_ID", "sess-big"),
-        ("BREHON_AGENT_NAME", "big-agent"),
+        ("BREHON_SESSION_ID", "sess-oversize-test"),
+        ("BREHON_AGENT_NAME", "oversize-test-agent"),
         ("BREHON_AGENT_ROLE", "reviewer"),
     ]);
     let mut server = McpServer::new("test-server", "1.0.0");
@@ -444,8 +461,14 @@ async fn input_size_rejects_oversized_arguments_with_caller_attribution() {
             assert_eq!(payload["error"]["code"], "mcp_input_too_large");
             assert_eq!(payload["error"]["tool"], "echo_tool");
             assert_eq!(payload["error"]["fields"]["max_bytes"], 64);
-            assert_eq!(payload["error"]["caller"]["session_id"], "sess-big");
-            assert_eq!(payload["error"]["caller"]["agent_name"], "big-agent");
+            assert_eq!(
+                payload["error"]["caller"]["session_id"],
+                "sess-oversize-test"
+            );
+            assert_eq!(
+                payload["error"]["caller"]["agent_name"],
+                "oversize-test-agent"
+            );
             assert_eq!(payload["error"]["caller"]["role"], "reviewer");
         }
         other => panic!("expected oversized payload rejection, got {other:?}"),
@@ -465,8 +488,8 @@ async fn input_size_uses_cached_env_config_from_server_init() {
     server.register_tool(Box::new(EchoTool));
 
     std::env::set_var("BREHON_MCP_MAX_REQUEST_BYTES", "4096");
-    std::env::set_var("BREHON_SESSION_ID", "sess-updated");
-    std::env::set_var("BREHON_AGENT_NAME", "updated-agent");
+    std::env::set_var("BREHON_SESSION_ID", "sess-mutated-test");
+    std::env::set_var("BREHON_AGENT_NAME", "updated-test-agent");
     std::env::set_var("BREHON_AGENT_ROLE", "reviewer");
 
     let result = server
@@ -483,7 +506,10 @@ async fn input_size_uses_cached_env_config_from_server_init() {
             assert_eq!(payload["error"]["caller"]["session_id"], "sess-initial");
             assert_eq!(payload["error"]["caller"]["agent_name"], "initial-agent");
             assert_eq!(payload["error"]["caller"]["role"], "worker");
-            assert_ne!(payload["error"]["caller"]["session_id"], "sess-updated");
+            assert_ne!(
+                payload["error"]["caller"]["session_id"],
+                "sess-mutated-test"
+            );
         }
         other => panic!("expected cached oversized payload rejection, got {other:?}"),
     }

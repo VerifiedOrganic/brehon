@@ -15,6 +15,7 @@ use brehon_types::{
     infer_task_completion_mode, parse_task_completion_mode, WorkerBootstrapMode,
 };
 use serde_json::Value;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -147,16 +148,100 @@ pub(crate) fn current_runtime_session_name() -> Option<String> {
     brehon_root().and_then(|root| current_runtime_session_name_from_root(&root))
 }
 
+pub(crate) fn runtime_registered_agent_names_from_root(
+    root: &std::path::Path,
+    role: &str,
+) -> Option<HashSet<String>> {
+    let path = root.join("runtime").join("daemon").join("current.json");
+    let content = std::fs::read_to_string(path).ok()?;
+    let value: Value = serde_json::from_str(&content).ok()?;
+    let panes = value
+        .get("registry")
+        .and_then(|registry| registry.get("panes"))
+        .and_then(|panes| panes.as_array())?;
+    let names = panes
+        .iter()
+        .filter(|pane| pane.get("kind").and_then(|value| value.as_str()) == Some(role))
+        .filter(|pane| pane.get("state").and_then(|value| value.as_str()) != Some("dead"))
+        .filter_map(|pane| {
+            pane.get("pane_id")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .or_else(|| {
+                    pane.get("title")
+                        .and_then(|value| value.as_str())
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                })
+        })
+        .map(str::to_string)
+        .collect();
+    Some(names)
+}
+
+pub(crate) fn runtime_registered_agent_names(role: &str) -> Option<HashSet<String>> {
+    brehon_root().and_then(|root| runtime_registered_agent_names_from_root(&root, role))
+}
+
+fn agent_name_matches_current_runtime(role: &str, name: &str) -> bool {
+    let role = role.trim();
+    let name = name.trim();
+    if role.is_empty() || name.is_empty() {
+        return false;
+    }
+
+    runtime_registered_agent_names(role)
+        .map(|registered| registered.contains(name))
+        .unwrap_or(true)
+}
+
 pub(crate) fn session_matches_current_runtime(entry: &Value) -> bool {
     let Some(expected) = current_runtime_session_name() else {
+        if let (Some(role), Some(name)) = (
+            entry
+                .get("role")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty()),
+            entry
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty()),
+        ) {
+            if let Some(registered) = runtime_registered_agent_names(role) {
+                return registered.contains(name);
+            }
+        }
         return true;
     };
-    entry
+    let session_matches = entry
         .get("session_name")
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        == Some(expected.as_str())
+        == Some(expected.as_str());
+    if !session_matches {
+        return false;
+    }
+    if let (Some(role), Some(name)) = (
+        entry
+            .get("role")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty()),
+        entry
+            .get("name")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty()),
+    ) {
+        if let Some(registered) = runtime_registered_agent_names(role) {
+            return registered.contains(name);
+        }
+    }
+    true
 }
 
 fn session_path(agent_name: &str) -> Option<PathBuf> {
@@ -285,6 +370,14 @@ pub(crate) fn session_is_live(entry: &Value) -> bool {
 }
 
 pub(crate) fn refresh_current_session_file() {
+    if std::env::var("BREHON_ROOT")
+        .ok()
+        .map(|value| value.trim().is_empty())
+        .unwrap_or(true)
+    {
+        return;
+    }
+
     let agent_name = match std::env::var("BREHON_AGENT_NAME") {
         Ok(value) if !value.is_empty() => value,
         _ => return,
@@ -1045,6 +1138,10 @@ pub(crate) fn write_session_file_with_metadata(
     model: Option<&str>,
     reasoning_effort: Option<&str>,
 ) {
+    if !agent_name_matches_current_runtime(role, agent_name) {
+        return;
+    }
+
     let Some(path) = session_path(agent_name) else {
         return;
     };
@@ -1693,6 +1790,83 @@ mod tests {
             .to_string(),
         )
         .unwrap();
+    }
+
+    fn write_daemon_current(root: &std::path::Path, panes: Value) {
+        let daemon_dir = root.join("runtime").join("daemon");
+        std::fs::create_dir_all(&daemon_dir).unwrap();
+        std::fs::write(
+            daemon_dir.join("current.json"),
+            serde_json::json!({
+                "registry": {
+                    "panes": panes
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn session_matching_rejects_worker_absent_from_current_daemon_registry() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        let _env = ScopedEnv::set(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
+        write_daemon_current(
+            root.path(),
+            serde_json::json!([
+                {
+                    "pane_id": "worker-1",
+                    "kind": "worker",
+                    "state": "ready"
+                }
+            ]),
+        );
+
+        let leaked = serde_json::json!({
+            "name": "unregistered-worker",
+            "role": "worker",
+            "session_id": "sess-unregistered"
+        });
+        let registered = serde_json::json!({
+            "name": "worker-1",
+            "role": "worker",
+            "session_id": "sess-worker"
+        });
+
+        assert!(!session_matches_current_runtime(&leaked));
+        assert!(session_matches_current_runtime(&registered));
+    }
+
+    #[test]
+    fn write_session_file_skips_worker_absent_from_current_daemon_registry() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        let _env = ScopedEnv::set(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
+        write_daemon_current(
+            root.path(),
+            serde_json::json!([
+                {
+                    "pane_id": "worker-1",
+                    "kind": "worker",
+                    "state": "ready"
+                }
+            ]),
+        );
+
+        write_session_file(
+            "unregistered-worker",
+            "worker",
+            "sess-unregistered",
+            Some("opencode"),
+        );
+
+        assert!(!root
+            .path()
+            .join("runtime")
+            .join("sessions")
+            .join("unregistered-worker.json")
+            .exists());
     }
 
     #[tokio::test]

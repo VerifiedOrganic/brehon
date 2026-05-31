@@ -25,7 +25,7 @@ lanes:
     launcher: claude
     model:
       provider: anthropic
-      name: claude-sonnet-4-6
+      name: claude-opus-4-6
   codex-worker:
     launcher: codex
     model:
@@ -296,6 +296,18 @@ orchestration:
   #        ~/.local/share/brehon/worktrees/<repo-name-hash>/
   # Override with an absolute path when you need a fixed location:
   # worktree_root: /absolute/path/to/brehon-worktrees
+  worktree_cleanup:
+    enabled: true
+    # Allowlisted cleanup only. These actions never run through a shell and
+    # Cargo cleanup is pinned to the current Brehon worktree's own target dir.
+    on_worker_handoff:
+      - kind: cargo_clean
+        min_size_mb: 4096
+    on_review_submit:
+      - kind: cargo_clean
+        min_size_mb: 4096
+    on_terminal_cleanup:
+      - kind: cargo_clean
   worker_idle_behavior: SelfImprove
   allow_mutating_idle_work: false
   self_improve_tasks:

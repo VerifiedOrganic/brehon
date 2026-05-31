@@ -172,7 +172,7 @@ pub trait GitOperations: Send + Sync {
     ///
     /// Returns `PortError::Git` if:
     /// - The path doesn't exist or isn't a worktree
-    /// - The worktree has uncommitted changes
+    /// - The worktree has tracked uncommitted changes
     /// - Removal fails
     async fn remove_worktree(&self, path: &Path) -> Result<(), PortError>;
 

@@ -300,13 +300,15 @@ async fn test_help_action_returns_supported_actions() {
 #[tokio::test]
 async fn test_worker_status() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let root = make_test_root();
+    let repo_root = make_git_repo_with_brehon_root();
+    let brehon_root = repo_root.path().join(".brehon");
     let _env = ScopedEnv::set(&[
-        ("BREHON_ROOT", root.path().to_str().unwrap()),
+        ("BREHON_ROOT", brehon_root.to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
     ]);
+    create_worker_worktree(repo_root.path(), "worker-2", "worker-2-branch");
     write_test_task_with_assignee(
-        root.path(),
+        &brehon_root,
         "T-busy",
         "in_review",
         "task",
@@ -366,11 +368,13 @@ async fn test_worker_status() {
 #[tokio::test]
 async fn test_worker_status_reports_reserved_lane_metadata() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let root = make_test_root();
+    let repo_root = make_git_repo_with_brehon_root();
+    let brehon_root = repo_root.path().join(".brehon");
     let _env = ScopedEnv::set(&[
-        ("BREHON_ROOT", root.path().to_str().unwrap()),
+        ("BREHON_ROOT", brehon_root.to_str().unwrap()),
         ("BREHON_AGENT_ROLE", "supervisor"),
     ]);
+    create_worker_worktree(repo_root.path(), "hardener-1", "hardener-branch");
     crate::tools::agent::write_session_file_with_metadata(
         "hardener-1",
         "worker",
@@ -401,6 +405,41 @@ async fn test_worker_status_reports_reserved_lane_metadata() {
         .as_array()
         .unwrap()
         .contains(&Value::String("final_hardening".to_string())));
+    assert_eq!(v["idle_general_worker_count"], 0);
+}
+
+#[tokio::test]
+async fn test_worker_status_missing_worktree_is_not_assignable() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let root = make_test_root();
+    let _env = ScopedEnv::set(&[
+        ("BREHON_ROOT", root.path().to_str().unwrap()),
+        ("BREHON_AGENT_ROLE", "supervisor"),
+    ]);
+    crate::tools::agent::write_session_file(
+        "unregistered-worker",
+        "worker",
+        "unregistered-session",
+        Some("opencode"),
+    );
+
+    let tool = FactoryTool::new();
+    let result = tool
+        .execute(serde_json::json!({ "action": "worker_status" }))
+        .await
+        .unwrap();
+
+    assert!(result.is_error.is_none());
+    let v: Value = serde_json::from_str(&extract_text(&result)).unwrap();
+    let workers = v["workers"].as_array().unwrap();
+    let worker = workers
+        .iter()
+        .find(|worker| worker["name"] == "unregistered-worker")
+        .expect("worker missing");
+    assert_eq!(worker["availability"], "unavailable (missing worktree)");
+    assert_eq!(worker["available_for_assignment"], false);
+    assert_eq!(worker["available_for_general_assignment"], false);
+    assert_eq!(worker["worktree"]["worktree_exists"], false);
     assert_eq!(v["idle_general_worker_count"], 0);
 }
 
@@ -2378,7 +2417,7 @@ async fn test_worker_status_ignores_supervisor_conflict_but_keeps_completed_revi
     assert!(result.is_error.is_none());
     let payload: Value = serde_json::from_str(&extract_text(&result)).unwrap();
     assert_eq!(payload["busy_worker_count"], 1);
-    assert_eq!(payload["idle_worker_count"], 1);
+    assert_eq!(payload["idle_worker_count"], 0);
 
     let workers = payload["workers"].as_array().unwrap();
     let revision_worker = workers
@@ -2403,7 +2442,10 @@ async fn test_worker_status_ignores_supervisor_conflict_but_keeps_completed_revi
         .iter()
         .find(|worker| worker["name"] == "worker-2")
         .expect("worker-2 missing");
-    assert_eq!(conflict_worker["availability"], "idle");
+    assert_eq!(
+        conflict_worker["availability"],
+        "unavailable (missing worktree)"
+    );
 }
 
 #[tokio::test]
@@ -2451,7 +2493,7 @@ async fn test_worker_status_does_not_count_pending_or_blocked_tasks_as_busy() {
     assert!(result.is_error.is_none());
     let payload: Value = serde_json::from_str(&extract_text(&result)).unwrap();
     assert_eq!(payload["busy_worker_count"], 0, "{payload}");
-    assert_eq!(payload["idle_worker_count"], 2, "{payload}");
+    assert_eq!(payload["idle_worker_count"], 0, "{payload}");
 }
 
 #[tokio::test]
@@ -2752,7 +2794,10 @@ async fn test_worker_status_shows_task_status() {
         .iter()
         .find(|w| w["name"] == "idle-worker")
         .expect("idle-worker missing");
-    assert_eq!(idle_worker["availability"], "idle");
+    assert_eq!(
+        idle_worker["availability"],
+        "unavailable (missing worktree)"
+    );
 }
 
 #[tokio::test]

@@ -239,6 +239,19 @@ fn generate_config_for_agents(agents: &[DetectedAgent]) -> String {
         }
 
         lanes.insert(
+            "claude-supervisor".to_string(),
+            LaneConfig {
+                launcher: "claude".to_string(),
+                model: Some(ModelConfig {
+                    provider: "anthropic".to_string(),
+                    name: "claude-opus-4-6".to_string(),
+                }),
+                reasoning_effort: Some("high".to_string()),
+                system_prompt: None,
+                profile: None,
+            },
+        );
+        lanes.insert(
             "claude-reviewer".to_string(),
             LaneConfig {
                 launcher: "claude".to_string(),
@@ -1254,7 +1267,7 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .name,
-            "claude-sonnet-4-6"
+            "claude-opus-4-6"
         );
         assert_eq!(
             config.lanes["codex-worker"].model.as_ref().unwrap().name,

@@ -99,17 +99,17 @@ const DIM_RULE: (u8, u8, u8) = (0x4A, 0x4F, 0x66); // muted frame
 /// 10-frame braille spinner (standard).
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
-/// 6-row ASCII block logo — fixed 42 visible columns per row.
+/// 6-row ASCII block logo — fixed 51 visible columns per row.
 const LOGO: [&str; 6] = [
-    " █████╗  ██████╗  ██████╗ ██████╗  █████╗ ",
-    "██╔══██╗██╔════╝ ██╔═══██╗██╔══██╗██╔══██╗",
-    "███████║██║  ███╗██║   ██║██████╔╝███████║",
-    "██╔══██║██║   ██║██║   ██║██╔══██╗██╔══██║",
-    "██║  ██║╚██████╔╝╚██████╔╝██║  ██║██║  ██║",
-    "╚═╝  ╚═╝ ╚═════╝  ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝",
+    "██████╗ ██████╗ ███████╗██╗  ██╗ ██████╗ ███╗   ██╗",
+    "██╔══██╗██╔══██╗██╔════╝██║  ██║██╔═══██╗████╗  ██║",
+    "██████╔╝██████╔╝█████╗  ███████║██║   ██║██╔██╗ ██║",
+    "██╔══██╗██╔══██╗██╔══╝  ██╔══██║██║   ██║██║╚██╗██║",
+    "██████╔╝██║  ██║███████╗██║  ██║╚██████╔╝██║ ╚████║",
+    "╚═════╝ ╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═══╝",
 ];
-const LOGO_WIDTH: usize = 42;
-const TAGLINE: &str = "a gathering place for autonomous coding agents";
+const LOGO_WIDTH: usize = 51;
+const TAGLINE: &str = "multi-agent orchestration for AI coding agents";
 
 /// Linear interpolation between two bytes.
 fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
@@ -327,8 +327,8 @@ impl StartupSplash {
                 EnterAlternateScreen,
                 Hide,
                 DisableLineWrap,
-                Clear(ClearType::Purge),
                 Clear(ClearType::All),
+                Clear(ClearType::Purge),
                 MoveTo(0, 0)
             );
         }
@@ -398,7 +398,6 @@ impl StartupSplash {
                 Show,
                 EnableLineWrap,
                 MoveTo(0, 0),
-                Clear(ClearType::Purge),
                 Clear(ClearType::All),
                 LeaveAlternateScreen
             );
@@ -442,7 +441,6 @@ impl StartupSplash {
             let _ = execute!(
                 self.stdout,
                 MoveTo(0, 0),
-                Clear(ClearType::Purge),
                 Clear(ClearType::All),
                 MoveTo(0, 0)
             );
@@ -545,17 +543,16 @@ impl StartupSplash {
         self.write_line(format!("{}{}", tagline_pad, dim(&tagline)));
     }
 
-    /// Rounded frame around the gradient logo and Greek-label header.
+    /// Rounded frame around the gradient logo and brand-label header.
     fn render_logo_card(&mut self, width: usize) {
-        // Inner content width of 58 gives generous padding for the 42-wide logo.
+        // Inner content width of 58 gives breathing room for the 51-wide logo.
         let inner = 58usize;
         let outer = inner + 2; // plus 2 border chars
         let left_pad = " ".repeat(center_left_pad(width, outer));
 
-        // Top border with "BREHON" label embedded (5 visible chars).
-        // Using Latin letters (not the Greek "ΑΓΟΡΑ") so the header renders
-        // crisply in every monospace terminal font — many have weak Greek
-        // capital glyphs that read as fuzzy/unrecognizable at small sizes.
+        // Top border with "BREHON" label embedded.
+        // Use Latin letters so the header renders crisply in every monospace
+        // terminal font.
         let label = " BREHON ";
         let label_visible = label.chars().count();
         let left_run = (inner.saturating_sub(label_visible)) / 2;

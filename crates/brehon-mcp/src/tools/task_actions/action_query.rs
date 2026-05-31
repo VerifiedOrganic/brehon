@@ -890,16 +890,7 @@ pub(super) async fn execute_mine(args: &Value) -> Result<ToolResult, McpError> {
         })
         .chain(review_obligations.iter().cloned())
         .collect::<Vec<_>>();
-    let worktree_cleanup = if role == "worker" && task_count > 0 {
-        Some(
-            super::build_artifact_cleanup::cleanup_current_worker_build_artifacts(
-                "before_task_start",
-            ),
-        )
-    } else {
-        None
-    };
-    let mut result = serde_json::json!({
+    let result = serde_json::json!({
         "tasks": tasks,
         "review_obligations": review_obligations,
         "assignments": assignments,
@@ -910,9 +901,6 @@ pub(super) async fn execute_mine(args: &Value) -> Result<ToolResult, McpError> {
         "agent": agent_name,
         "role": role
     });
-    if let Some(cleanup) = worktree_cleanup {
-        result["worktree_cleanup"] = cleanup;
-    }
 
     Ok(text_result(
         serde_json::to_string_pretty(&result)

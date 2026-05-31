@@ -223,6 +223,7 @@ fn merge_orchestration(
         spawn_workers: overlay.spawn_workers.or(base.spawn_workers),
         drain_timeout_secs: overlay.drain_timeout_secs.or(base.drain_timeout_secs),
         worktree_root: overlay.worktree_root.or(base.worktree_root),
+        worktree_cleanup: overlay.worktree_cleanup,
     }
 }
 
@@ -456,6 +457,7 @@ mod tests {
                 spawn_workers: None,
                 drain_timeout_secs: None,
                 worktree_root: None,
+                worktree_cleanup: brehon_types::WorktreeCleanupConfig::default(),
             },
             runtime: RuntimeConfig::default(),
             budget: BudgetConfig {

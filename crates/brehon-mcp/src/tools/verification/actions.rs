@@ -50,9 +50,10 @@ use super::tasks::{
 use super::tool::{RejectionReason, VerificationTool};
 
 use crate::tools::task_actions::{
-    append_task_review_followups, clear_task_supervisor_integration_conflict,
-    dirty_primary_checkout_terminal_blocker, mark_task_supervisor_integration_conflict,
-    release_task_worker_to_review, restore_task_worker_from_review_owner, set_task_review_feedback,
+    append_task_review_followups, cleanup_current_worktree_allowlisted_artifacts,
+    clear_task_supervisor_integration_conflict, dirty_primary_checkout_terminal_blocker,
+    mark_task_supervisor_integration_conflict, release_task_worker_to_review,
+    restore_task_worker_from_review_owner, set_task_review_feedback,
     task_has_integration_conflict_recovery_marker, update_task_status_atomic,
 };
 
@@ -1461,7 +1462,7 @@ impl VerificationTool {
             .await;
 
             let progress = format!("{}/{}", state.submissions_received.len(), state.panel.len());
-            let result = serde_json::json!({
+            let mut result = serde_json::json!({
                 "status": "ok",
                 "review_id": review_id,
                 "task_id": task_id,
@@ -1474,6 +1475,8 @@ impl VerificationTool {
                     format!("Review submitted. Waiting for remaining reviewers ({progress}).")
                 }
             });
+            result["worktree_cleanup"] =
+                cleanup_current_worktree_allowlisted_artifacts("after_review_submit");
             return Ok(text_result(
                 serde_json::to_string_pretty(&result)
                     .map_err(|e| McpError::Serialization(e.to_string()))?,
@@ -1678,6 +1681,8 @@ impl VerificationTool {
             "message": "Panel complete. Consolidated report delivered to supervisor."
         });
         proof_outcome.attach_to_result(&mut result);
+        result["worktree_cleanup"] =
+            cleanup_current_worktree_allowlisted_artifacts("after_review_submit");
         Ok(text_result(
             serde_json::to_string_pretty(&result)
                 .map_err(|e| McpError::Serialization(e.to_string()))?,

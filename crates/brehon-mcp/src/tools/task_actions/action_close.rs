@@ -469,6 +469,11 @@ pub(super) async fn execute(args: &Value) -> Result<ToolResult, McpError> {
                     if let Some(warning) = recycle_outcome.warning {
                         result["warnings"] = Value::Array(vec![warning]);
                     }
+                    result["worktree_cleanup"] =
+                        super::build_artifact_cleanup::cleanup_brehon_worktree_allowlisted_artifacts(
+                            "after_container_closed",
+                            &integration_worktree,
+                        );
                     let base_message = if is_initiative(&task_type)
                         && matches!(
                             merge_outcome.strategy,

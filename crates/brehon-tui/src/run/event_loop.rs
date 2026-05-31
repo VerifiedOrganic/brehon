@@ -3148,6 +3148,7 @@ pub(super) fn new_headless_event_loop_ctx(
             spawn_workers: None,
             drain_timeout_secs: None,
             worktree_root: None,
+            worktree_cleanup: brehon_types::WorktreeCleanupConfig::default(),
         },
         tick_active: Duration::from_millis(50),
         tick_idle: Duration::from_millis(200),
@@ -4206,6 +4207,7 @@ mod tests {
             spawn_workers: None,
             drain_timeout_secs: None,
             worktree_root: None,
+            worktree_cleanup: brehon_types::WorktreeCleanupConfig::default(),
         }
     }
 

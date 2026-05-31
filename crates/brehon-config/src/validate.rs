@@ -1905,6 +1905,7 @@ mod tests {
                 spawn_workers: None,
                 drain_timeout_secs: None,
                 worktree_root: None,
+                worktree_cleanup: brehon_types::WorktreeCleanupConfig::default(),
             },
             runtime: RuntimeConfig::default(),
             budget: BudgetConfig {

@@ -14,6 +14,57 @@ fn current_runtime_session_name(brehon_root: &std::path::Path) -> Option<String>
         .map(str::to_string)
 }
 
+fn runtime_registered_agent_names(
+    brehon_root: &std::path::Path,
+    role: &str,
+) -> Option<std::collections::HashSet<String>> {
+    let path = brehon_root
+        .join("runtime")
+        .join("daemon")
+        .join("current.json");
+    let content = std::fs::read_to_string(path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&content).ok()?;
+    let panes = value
+        .get("registry")
+        .and_then(|registry| registry.get("panes"))
+        .and_then(|panes| panes.as_array())?;
+    let names = panes
+        .iter()
+        .filter(|pane| pane.get("kind").and_then(|value| value.as_str()) == Some(role))
+        .filter(|pane| pane.get("state").and_then(|value| value.as_str()) != Some("dead"))
+        .filter_map(|pane| {
+            pane.get("pane_id")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .or_else(|| {
+                    pane.get("title")
+                        .and_then(|value| value.as_str())
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                })
+        })
+        .map(str::to_string)
+        .collect();
+    Some(names)
+}
+
+fn session_name_matches_current_runtime(
+    brehon_root: &std::path::Path,
+    role: &str,
+    name: &str,
+) -> bool {
+    let role = role.trim();
+    let name = name.trim();
+    if role.is_empty() || name.is_empty() {
+        return false;
+    }
+
+    runtime_registered_agent_names(brehon_root, role)
+        .map(|names| names.contains(name))
+        .unwrap_or(true)
+}
+
 pub(crate) fn session_is_live(entry: &serde_json::Value) -> bool {
     let timestamp = entry
         .get("last_seen_at")
@@ -41,6 +92,10 @@ pub(crate) fn refresh_session_file(
     session_id: &str,
     agent_type: &str,
 ) {
+    if !session_name_matches_current_runtime(brehon_root, role, agent_name) {
+        return;
+    }
+
     let sessions_dir = brehon_root.join("runtime").join("sessions");
     if std::fs::create_dir_all(&sessions_dir).is_err() {
         return;
@@ -92,6 +147,9 @@ pub(crate) fn read_session_files(
 ) -> std::collections::HashMap<String, (String, String, String)> {
     let mut map = std::collections::HashMap::new();
     let expected_session = current_runtime_session_name(brehon_root);
+    let registered_workers = runtime_registered_agent_names(brehon_root, "worker");
+    let registered_reviewers = runtime_registered_agent_names(brehon_root, "reviewer");
+    let registered_supervisors = runtime_registered_agent_names(brehon_root, "supervisor");
     let sessions_dir = brehon_root.join("runtime").join("sessions");
     let Ok(entries) = std::fs::read_dir(&sessions_dir) else {
         return map;
@@ -124,6 +182,15 @@ pub(crate) fn read_session_files(
                     .or_else(|| v["registered_at"].as_str())
                     .unwrap_or_default()
                     .to_string();
+                let registered = match role.as_str() {
+                    "worker" => registered_workers.as_ref(),
+                    "reviewer" => registered_reviewers.as_ref(),
+                    "supervisor" => registered_supervisors.as_ref(),
+                    _ => None,
+                };
+                if registered.is_some_and(|names| !names.contains(&name)) {
+                    continue;
+                }
                 if !name.is_empty() {
                     map.insert(name, (role, session_id, last_seen_at));
                 }
@@ -131,4 +198,84 @@ pub(crate) fn read_session_files(
         }
     }
     map
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_daemon_current(root: &std::path::Path, panes: serde_json::Value) {
+        let daemon_dir = root.join("runtime").join("daemon");
+        std::fs::create_dir_all(&daemon_dir).unwrap();
+        std::fs::write(
+            daemon_dir.join("current.json"),
+            serde_json::json!({
+                "registry": {
+                    "panes": panes
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn refresh_session_file_skips_unregistered_runtime_pane() {
+        let root = tempfile::tempdir().unwrap();
+        let brehon_root = root.path().join(".brehon");
+        write_daemon_current(
+            &brehon_root,
+            serde_json::json!([
+                {
+                    "pane_id": "live-worker",
+                    "kind": "worker",
+                    "state": "ready"
+                }
+            ]),
+        );
+
+        refresh_session_file(
+            &brehon_root,
+            "unregistered-worker",
+            "worker",
+            "session-unregistered",
+            "opencode",
+        );
+
+        assert!(!brehon_root
+            .join("runtime")
+            .join("sessions")
+            .join("unregistered-worker.json")
+            .exists());
+    }
+
+    #[test]
+    fn refresh_session_file_keeps_registered_runtime_pane() {
+        let root = tempfile::tempdir().unwrap();
+        let brehon_root = root.path().join(".brehon");
+        write_daemon_current(
+            &brehon_root,
+            serde_json::json!([
+                {
+                    "pane_id": "live-worker",
+                    "kind": "worker",
+                    "state": "ready"
+                }
+            ]),
+        );
+
+        refresh_session_file(
+            &brehon_root,
+            "live-worker",
+            "worker",
+            "session-live",
+            "opencode",
+        );
+
+        assert!(brehon_root
+            .join("runtime")
+            .join("sessions")
+            .join("live-worker.json")
+            .exists());
+    }
 }

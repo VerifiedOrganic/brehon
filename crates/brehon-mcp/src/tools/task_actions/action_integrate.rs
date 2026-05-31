@@ -1040,6 +1040,11 @@ async fn finalize_integration(
         })
         .await;
     proof_outcome.attach_to_result(&mut result);
+    result["worktree_cleanup"] =
+        super::build_artifact_cleanup::cleanup_brehon_worktree_allowlisted_artifacts(
+            "after_task_integrated",
+            integration_worktree,
+        );
 
     Ok(text_result(
         serde_json::to_string_pretty(&result)

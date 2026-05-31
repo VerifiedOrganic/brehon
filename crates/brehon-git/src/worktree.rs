@@ -1,8 +1,9 @@
 //! Worktree management operations.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
-use git2::{BranchType, Repository};
+use git2::{BranchType, Repository, RepositoryState};
 use tracing::{debug, warn};
 
 use crate::error::GitError;
@@ -39,8 +40,37 @@ impl WorktreeStateCheck {
 }
 
 pub struct ArchiveReport {
-    pub archived_path: std::path::PathBuf,
-    pub metadata_path: std::path::PathBuf,
+    pub archived_path: PathBuf,
+    pub metadata_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorktreeCleanMode {
+    Final,
+    PreserveBrehonScaffold,
+}
+
+impl WorktreeCleanMode {
+    fn label(self) -> &'static str {
+        match self {
+            WorktreeCleanMode::Final => "allowlisted_target_final",
+            WorktreeCleanMode::PreserveBrehonScaffold => "allowlisted_target_preserve_all",
+        }
+    }
+
+    fn excludes(self) -> &'static [&'static str] {
+        match self {
+            WorktreeCleanMode::Final => &[],
+            WorktreeCleanMode::PreserveBrehonScaffold => &[],
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorktreeCleanReport {
+    mode: &'static str,
+    removed: Vec<String>,
+    preserved: Vec<String>,
 }
 
 /// Worktree operations.
@@ -134,7 +164,9 @@ impl<'a> WorktreeOps<'a> {
     /// Remove a worktree.
     ///
     /// Removes the worktree at the given path.
-    /// Only removes clean worktrees - will fail if worktree has uncommitted changes.
+    /// Only removes worktrees without tracked changes. The worktree-local
+    /// `target/` directory is cleaned first when it is ignored and untracked so
+    /// Rust build artifacts do not block lifecycle cleanup.
     pub fn remove_worktree(&self, path: &Path) -> Result<(), GitError> {
         debug!("Removing worktree at '{}'", path.display());
 
@@ -145,19 +177,20 @@ impl<'a> WorktreeOps<'a> {
         // Verify worktree state before attempting removal
         if let Ok(wt_path) = worktree.path().canonicalize() {
             let repo = Repository::open(&wt_path)?;
-            let recovery = RecoveryOps::new(&repo);
-            if recovery.is_dirty()? {
-                return Err(GitError::WorktreeRemovalFailed(
-                    "worktree has uncommitted changes - use archive_worktree instead".into(),
-                ));
-            }
-            // Check for mid-operation states
-            if let Some(state) = recovery.detect_state()? {
+            let tracked_changes = tracked_dirty_files(&repo)?;
+            if !tracked_changes.is_empty() {
+                let details = summarize_paths(&tracked_changes);
                 return Err(GitError::WorktreeRemovalFailed(format!(
-                    "worktree in mid-operation state: {} - abort operations first",
-                    state.display()
+                    "worktree has tracked changes ({details}) - use archive_worktree instead"
                 )));
             }
+            // Check for mid-operation states
+            if let Some(state) = repository_operation_state(&repo) {
+                return Err(GitError::WorktreeRemovalFailed(format!(
+                    "worktree in mid-operation state: {state} - abort operations first",
+                )));
+            }
+            self.clean_worktree_untracked_and_ignored(&wt_path, WorktreeCleanMode::Final)?;
         }
 
         worktree.prune(Some(&mut git2::WorktreePruneOptions::new().valid(true)))?;
@@ -377,7 +410,7 @@ impl<'a> WorktreeOps<'a> {
             .join("/")
     }
 
-    pub fn list_worktrees(&self) -> Result<Vec<(String, std::path::PathBuf)>, GitError> {
+    pub fn list_worktrees(&self) -> Result<Vec<(String, PathBuf)>, GitError> {
         let mut result = Vec::new();
 
         // First, get worktrees from git2's list (non-slashed names)
@@ -400,7 +433,7 @@ impl<'a> WorktreeOps<'a> {
     fn scan_and_list_worktrees(
         &self,
         dir: &Path,
-        result: &mut Vec<(String, std::path::PathBuf)>,
+        result: &mut Vec<(String, PathBuf)>,
     ) -> Result<(), GitError> {
         let entries = std::fs::read_dir(dir).map_err(|e| {
             GitError::WorktreeRemovalFailed(format!("failed to read worktrees dir: {}", e))
@@ -665,6 +698,11 @@ impl<'a> WorktreeOps<'a> {
             GitError::WorktreeRemovalFailed(format!("failed to create archive dir: {}", e))
         })?;
 
+        let cleanup_report = self.clean_worktree_untracked_and_ignored(
+            path,
+            WorktreeCleanMode::PreserveBrehonScaffold,
+        )?;
+
         // Write metadata about the archive BEFORE moving
         let metadata_path = archive_path.join(".brehon_archive_metadata.json");
         let metadata = serde_json::json!({
@@ -673,6 +711,11 @@ impl<'a> WorktreeOps<'a> {
             "task_id": task_id,
             "archived_at": chrono::Utc::now().to_rfc3339(),
             "archive_reason": "reassignment",
+            "cleanup": {
+                "mode": cleanup_report.mode,
+                "removed": cleanup_report.removed,
+                "preserved": cleanup_report.preserved,
+            },
         });
 
         // Move the worktree directory
@@ -701,10 +744,167 @@ impl<'a> WorktreeOps<'a> {
             metadata_path,
         })
     }
+
+    fn clean_worktree_untracked_and_ignored(
+        &self,
+        path: &Path,
+        mode: WorktreeCleanMode,
+    ) -> Result<WorktreeCleanReport, GitError> {
+        if !path.exists() {
+            return Ok(WorktreeCleanReport {
+                mode: mode.label(),
+                removed: Vec::new(),
+                preserved: mode
+                    .excludes()
+                    .iter()
+                    .map(|item| item.to_string())
+                    .collect(),
+            });
+        }
+
+        let target = path.join("target");
+        let mut removed = Vec::new();
+        if target.exists() {
+            let metadata = std::fs::symlink_metadata(&target).map_err(|err| {
+                GitError::WorktreeRemovalFailed(format!(
+                    "failed to inspect target dir '{}': {}",
+                    target.display(),
+                    err
+                ))
+            })?;
+            if !metadata.file_type().is_symlink()
+                && metadata.is_dir()
+                && !git_path_has_tracked_files(path, "target")?
+                && git_path_is_ignored(path, "target/")?
+            {
+                std::fs::remove_dir_all(&target).map_err(|err| {
+                    GitError::WorktreeRemovalFailed(format!(
+                        "failed to remove target dir '{}': {}",
+                        target.display(),
+                        err
+                    ))
+                })?;
+                removed.push("target/".to_string());
+            }
+        }
+
+        Ok(WorktreeCleanReport {
+            mode: mode.label(),
+            removed,
+            preserved: mode
+                .excludes()
+                .iter()
+                .map(|item| item.to_string())
+                .collect(),
+        })
+    }
+}
+
+fn git_path_has_tracked_files(workspace: &Path, pathspec: &str) -> Result<bool, GitError> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(workspace)
+        .args(["ls-files", "--"])
+        .arg(pathspec)
+        .output()
+        .map_err(|err| {
+            GitError::WorktreeRemovalFailed(format!(
+                "failed to inspect tracked files under {pathspec}: {err}"
+            ))
+        })?;
+    if !output.status.success() {
+        return Err(GitError::WorktreeRemovalFailed(format!(
+            "git ls-files failed for {pathspec}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(!String::from_utf8_lossy(&output.stdout).trim().is_empty())
+}
+
+fn git_path_is_ignored(workspace: &Path, pathspec: &str) -> Result<bool, GitError> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(workspace)
+        .args(["check-ignore", "-q", "--"])
+        .arg(pathspec)
+        .output()
+        .map_err(|err| {
+            GitError::WorktreeRemovalFailed(format!(
+                "failed to inspect git ignore status for {pathspec}: {err}"
+            ))
+        })?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(GitError::WorktreeRemovalFailed(format!(
+            "git check-ignore failed for {pathspec}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))),
+    }
 }
 
 struct WorktreeMetadata {
-    worktree_path: std::path::PathBuf,
+    worktree_path: PathBuf,
+}
+
+fn tracked_dirty_files(repo: &Repository) -> Result<Vec<String>, GitError> {
+    let mut options = git2::StatusOptions::new();
+    options.include_untracked(false);
+    options.include_ignored(false);
+
+    let statuses = repo.statuses(Some(&mut options))?;
+    let mut files = Vec::new();
+
+    for entry in statuses.iter() {
+        match entry.status() {
+            git2::Status::INDEX_NEW
+            | git2::Status::INDEX_MODIFIED
+            | git2::Status::INDEX_DELETED
+            | git2::Status::INDEX_RENAMED
+            | git2::Status::INDEX_TYPECHANGE
+            | git2::Status::WT_MODIFIED
+            | git2::Status::WT_DELETED
+            | git2::Status::WT_RENAMED
+            | git2::Status::WT_TYPECHANGE
+            | git2::Status::CONFLICTED => {
+                if let Some(path) = entry.path() {
+                    files.push(path.to_string());
+                }
+            }
+            git2::Status::CURRENT | git2::Status::WT_NEW | git2::Status::IGNORED => {}
+            _ => {}
+        }
+    }
+
+    Ok(files)
+}
+
+fn summarize_paths(paths: &[String]) -> String {
+    if paths.len() <= 5 {
+        paths.join(", ")
+    } else {
+        format!("{} files", paths.len())
+    }
+}
+
+fn repository_operation_state(repo: &Repository) -> Option<String> {
+    match repo.state() {
+        RepositoryState::Clean => None,
+        RepositoryState::Rebase
+        | RepositoryState::RebaseInteractive
+        | RepositoryState::RebaseMerge => Some("rebase in progress".to_string()),
+        RepositoryState::Merge => Some("merge in progress".to_string()),
+        RepositoryState::Revert | RepositoryState::RevertSequence => {
+            Some("revert in progress".to_string())
+        }
+        RepositoryState::CherryPick | RepositoryState::CherryPickSequence => {
+            Some("cherry-pick in progress".to_string())
+        }
+        RepositoryState::Bisect => Some("bisect in progress".to_string()),
+        RepositoryState::ApplyMailbox | RepositoryState::ApplyMailboxOrRebase => {
+            Some("mailbox apply in progress".to_string())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -717,8 +917,14 @@ mod tests {
         let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
         let repo = Repository::init(temp_dir.path()).expect("failed to init repo");
 
+        std::fs::write(temp_dir.path().join(".gitignore"), "target/\n")
+            .expect("failed to write gitignore");
         let sig = git2::Signature::now("Test", "test@example.com").expect("failed to create sig");
         let mut index = repo.index().expect("failed to get index");
+        index
+            .add_path(Path::new(".gitignore"))
+            .expect("failed to add gitignore");
+        index.write().expect("failed to write index");
         let oid = index.write_tree().expect("failed to write tree");
         let tree = repo.find_tree(oid).expect("failed to find tree");
         let commit = repo.commit(None, &sig, &sig, "initial commit\n\nThis is the first commit in the test repository,\ncreated to set up a known state for worktree tests.", &tree, &[]).expect("failed to commit");
@@ -726,7 +932,8 @@ mod tests {
             .expect("failed to create ref");
         repo.set_head("refs/heads/main")
             .expect("failed to set HEAD");
-        repo.checkout_head(None).expect("failed to checkout HEAD");
+        repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+            .expect("failed to checkout HEAD");
         drop(tree);
 
         (temp_dir, repo)
@@ -824,6 +1031,56 @@ mod tests {
         ops.remove_worktree(&worktree_path)
             .expect("remove should succeed");
         assert!(!worktree_path.exists());
+    }
+
+    #[test]
+    fn remove_worktree_cleans_generated_untracked_files() {
+        let (temp_dir, repo) = setup_test_repo();
+        let ops = WorktreeOps::new(&repo);
+        let branch_name = format!("test-{}", uuid::Uuid::new_v4());
+        let worktree_path = temp_dir.path().join("generated-worktree");
+
+        ops.create_worktree(&branch_name, &worktree_path)
+            .expect("create should succeed");
+        std::fs::create_dir_all(worktree_path.join("target/debug"))
+            .expect("failed to create target dir");
+        std::fs::write(worktree_path.join("target/debug/artifact"), "compiled")
+            .expect("failed to write artifact");
+        std::fs::write(worktree_path.join("scratch.txt"), "scratch")
+            .expect("failed to write scratch file");
+
+        ops.remove_worktree(&worktree_path)
+            .expect("remove should clean generated files and remove worktree");
+
+        assert!(!worktree_path.exists());
+    }
+
+    #[test]
+    fn remove_worktree_refuses_tracked_changes() {
+        let (temp_dir, repo) = setup_test_repo();
+        let ops = WorktreeOps::new(&repo);
+        let branch_name = format!("test-{}", uuid::Uuid::new_v4());
+        let worktree_path = temp_dir.path().join("tracked-dirty-worktree");
+
+        ops.create_worktree(&branch_name, &worktree_path)
+            .expect("create should succeed");
+        std::fs::write(worktree_path.join("tracked.txt"), "tracked")
+            .expect("failed to write tracked file");
+        let wt_repo = Repository::open(&worktree_path).expect("failed to open worktree repo");
+        let mut index = wt_repo.index().expect("failed to open worktree index");
+        index
+            .add_path(Path::new("tracked.txt"))
+            .expect("failed to stage tracked file");
+        index.write().expect("failed to write index");
+
+        let result = ops.remove_worktree(&worktree_path);
+
+        assert!(result.is_err(), "tracked changes should block removal");
+        assert!(
+            result.unwrap_err().to_string().contains("tracked changes"),
+            "error should explain tracked-change guard"
+        );
+        assert!(worktree_path.exists());
     }
 
     #[test]
@@ -1028,5 +1285,66 @@ mod tests {
         assert!(!worktree_path.exists(), "Original path should be removed");
         assert!(result.archived_path.exists(), "Archive path should exist");
         assert!(result.metadata_path.exists(), "Metadata file should exist");
+    }
+
+    #[test]
+    fn archive_worktree_cleans_generated_files_and_preserves_brehon_scaffold() {
+        let (temp_dir, repo) = setup_test_repo();
+        let ops = WorktreeOps::new(&repo);
+        let branch_name = format!("test-{}", uuid::Uuid::new_v4());
+        let worktree_path = temp_dir.path().join("to-archive-with-junk");
+        let archive_base = temp_dir.path().join("archived");
+
+        ops.create_worktree(&branch_name, &worktree_path)
+            .expect("create should succeed");
+        std::fs::create_dir_all(worktree_path.join("target/debug"))
+            .expect("failed to create target dir");
+        std::fs::create_dir_all(worktree_path.join(".agents"))
+            .expect("failed to create agents dir");
+        std::fs::create_dir_all(worktree_path.join(".claude"))
+            .expect("failed to create claude dir");
+        std::fs::write(worktree_path.join("target/debug/artifact"), "compiled")
+            .expect("failed to write artifact");
+        std::fs::write(worktree_path.join("scratch.txt"), "scratch")
+            .expect("failed to write scratch file");
+        std::fs::write(worktree_path.join(".mcp.json"), "{}").expect("failed to write mcp config");
+        std::fs::write(worktree_path.join("opencode.json"), "{}")
+            .expect("failed to write opencode config");
+        std::fs::write(worktree_path.join(".agents/mcp_config.json"), "{}")
+            .expect("failed to write agents config");
+        std::fs::write(worktree_path.join(".agents/cache.bin"), "cache")
+            .expect("failed to write agents cache");
+        std::fs::write(worktree_path.join(".claude/settings.local.json"), "{}")
+            .expect("failed to write claude config");
+        std::fs::write(worktree_path.join(".claude/cache.bin"), "cache")
+            .expect("failed to write claude cache");
+
+        let result = ops
+            .archive_worktree(&worktree_path, &archive_base, "T-test")
+            .expect("archive should succeed");
+
+        assert!(!result.archived_path.join("target").exists());
+        assert!(result.archived_path.join("scratch.txt").exists());
+        assert!(result.archived_path.join(".mcp.json").exists());
+        assert!(result.archived_path.join("opencode.json").exists());
+        assert!(result
+            .archived_path
+            .join(".agents/mcp_config.json")
+            .exists());
+        assert!(result
+            .archived_path
+            .join(".claude/settings.local.json")
+            .exists());
+        assert!(result.archived_path.join(".agents/cache.bin").exists());
+        assert!(result.archived_path.join(".claude/cache.bin").exists());
+
+        let metadata: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&result.metadata_path).expect("failed to read metadata"),
+        )
+        .expect("failed to parse metadata");
+        assert_eq!(
+            metadata["cleanup"]["mode"].as_str(),
+            Some("allowlisted_target_preserve_all")
+        );
     }
 }

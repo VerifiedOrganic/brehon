@@ -492,6 +492,7 @@ impl Tool for FactoryTool {
                 };
                 let now = chrono::Utc::now();
                 let mut busy_workers = 0usize;
+                let mut idle_workers = 0usize;
                 let mut idle_general_workers = 0usize;
                 let mut workers: Vec<Value> = Vec::new();
 
@@ -527,9 +528,21 @@ impl Tool for FactoryTool {
                     let health = agent_health(&worker_name);
                     let unavailable = agent_is_unavailable(&worker_name);
                     let route = worker_route(&worker, project_config.as_ref());
-                    let available_for_general_assignment = !unavailable
-                        && !has_active_tasks
-                        && route.assignment_mode != WorkerAssignmentMode::Reserved;
+                    let merge_target = active_tasks.first().and_then(|task| {
+                        task.get("merge_target")
+                            .and_then(|v| v.as_str())
+                            .map(String::from)
+                    });
+                    let worktree_info = inspect_worktree(&worker_name, merge_target.as_deref());
+                    let has_assignable_worktree = worktree_info
+                        .get("worktree_exists")
+                        .and_then(|value| value.as_bool())
+                        .unwrap_or(false)
+                        && worktree_info.get("error").is_none();
+                    let available_for_assignment =
+                        !unavailable && !has_active_tasks && has_assignable_worktree;
+                    let available_for_general_assignment =
+                        available_for_assignment && route.assignment_mode != WorkerAssignmentMode::Reserved;
                     if available_for_general_assignment {
                         idle_general_workers += 1;
                     }
@@ -537,7 +550,14 @@ impl Tool for FactoryTool {
                     let availability = if !has_active_tasks {
                         if unavailable {
                             "unavailable".to_string()
+                        } else if !has_assignable_worktree {
+                            worktree_info
+                                .get("error")
+                                .and_then(|value| value.as_str())
+                                .map(|err| format!("unavailable (worktree error: {err})"))
+                                .unwrap_or_else(|| "unavailable (missing worktree)".to_string())
                         } else {
+                            idle_workers += 1;
                             "idle".to_string()
                         }
                     } else {
@@ -610,21 +630,13 @@ impl Tool for FactoryTool {
                         })
                     };
 
-                    // Worktree inspection
-                    let merge_target = active_tasks.first().and_then(|task| {
-                        task.get("merge_target")
-                            .and_then(|v| v.as_str())
-                            .map(String::from)
-                    });
-                    let worktree_info = inspect_worktree(&worker_name, merge_target.as_deref());
-
                     if let Some(obj) = worker.as_object_mut() {
                         obj.insert("active_tasks".into(), Value::Array(active_task_summaries));
                         obj.insert("active_task_count".into(), serde_json::json!(active_task_count));
                         obj.insert("availability".into(), Value::String(availability));
                         obj.insert(
                             "available_for_assignment".into(),
-                            Value::Bool(!unavailable && !has_active_tasks),
+                            Value::Bool(available_for_assignment),
                         );
                         obj.insert(
                             "available_for_general_assignment".into(),
@@ -679,7 +691,7 @@ impl Tool for FactoryTool {
                     "status": "ok",
                     "workers": workers,
                     "worker_count": workers.len(),
-                    "idle_worker_count": workers.len().saturating_sub(busy_workers),
+                    "idle_worker_count": idle_workers,
                     "idle_general_worker_count": idle_general_workers,
                     "busy_worker_count": busy_workers,
                     "reviewers": reviewers,

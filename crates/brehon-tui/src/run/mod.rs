@@ -163,6 +163,7 @@ pub fn run_tui(shutdown: Arc<AtomicBool>, mux: Mux, rt: tokio::runtime::Handle) 
             spawn_workers: None,
             drain_timeout_secs: None,
             worktree_root: None,
+            worktree_cleanup: brehon_types::WorktreeCleanupConfig::default(),
         },
     )
 }
@@ -225,6 +226,7 @@ pub fn run_dashboard_tui(
             spawn_workers: None,
             drain_timeout_secs: None,
             worktree_root: None,
+            worktree_cleanup: brehon_types::WorktreeCleanupConfig::default(),
         },
         None,
         None,
