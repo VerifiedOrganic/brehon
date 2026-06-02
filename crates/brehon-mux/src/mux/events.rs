@@ -26,6 +26,23 @@ impl Mux {
         self.active_gateway_operations.remove(pane_id);
     }
 
+    fn is_gateway_turn_completion(entry: &ActivityEntry) -> bool {
+        if entry.kind != ActivityKind::Operation {
+            return false;
+        }
+        if !matches!(
+            entry.status.as_deref(),
+            Some("completed" | "failed" | "cancelled" | "success" | "ok")
+        ) {
+            return false;
+        }
+        let Some(message) = entry.message.as_deref() else {
+            return false;
+        };
+        let normalized = message.trim().to_ascii_lowercase();
+        normalized == "turn" || normalized.ends_with(" turn")
+    }
+
     /// Clear stale structured-activity locks that would otherwise keep a pane
     /// marked as tool-executing forever after a missed completion event.
     ///
@@ -934,6 +951,18 @@ impl Mux {
                                 buf.push(entry.clone());
                                 tools_active = buf.has_in_flight_tools();
                             }
+                        }
+                        if Self::is_gateway_turn_completion(entry) {
+                            let orphaned_tools = buf.clear_active_tools();
+                            if !orphaned_tools.is_empty() {
+                                tracing::warn!(
+                                    pane = %pane_id,
+                                    generation = generation.0,
+                                    orphaned_tools = ?orphaned_tools,
+                                    "Cleared orphaned tool activity when gateway turn completed"
+                                );
+                            }
+                            tools_active = buf.has_in_flight_tools();
                         }
                     }
                     if permission_blocked.is_none() {

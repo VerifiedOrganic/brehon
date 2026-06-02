@@ -897,6 +897,10 @@ pub(super) async fn execute_progress(
     if let Some(worker) = worker_caller_name.as_deref() {
         mark_task_assignment_progress_started(&mut task, worker, "task action=progress");
     }
+    task.insert(
+        "updated_at".into(),
+        Value::String(chrono::Utc::now().to_rfc3339()),
+    );
 
     // Auto-transition: a worker reporting 100% from an active work gate
     // should enter review in the same call. Without this, a rereview fix

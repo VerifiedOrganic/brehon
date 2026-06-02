@@ -11,7 +11,10 @@ use brehon_ports::{EventStore, ProofStore};
 use brehon_review::scoring::{ScoreCollector, ThresholdEvaluator};
 use brehon_review::FeedbackConsolidator;
 use brehon_review::PriorityQueue;
-use brehon_types::config::{ReviewConfig, ReviewLeaseMode, ReviewPanelConfig, ReviewPanelMode};
+use brehon_types::config::{
+    ContextCompressionConfig, ContextCompressionTarget, ReviewConfig, ReviewLeaseMode,
+    ReviewPanelConfig, ReviewPanelMode,
+};
 use brehon_types::{
     normalize_task_status, Event, EventKind, Priority, ReviewFinding, ReviewScore,
     TaskCompletionMode,
@@ -21,6 +24,7 @@ use crate::error::McpError;
 use crate::server::{ContentBlock, ToolResult};
 use crate::tools::agent::try_deliver_message;
 use crate::tools::assignment_observability::AssignmentPropagation;
+use crate::tools::context_efficiency::compact_model_context_with_notice;
 use crate::tools::{error_result, text_result, Tool};
 
 use super::helpers::{brehon_root, current_git_head_short, reviews_dir, workspace_root};
@@ -1696,6 +1700,23 @@ impl VerificationTool {
         } else {
             String::new()
         };
+        let default_compression = ContextCompressionConfig::default();
+        let compression = project_config
+            .as_ref()
+            .map(|config| &config.context.compression)
+            .unwrap_or(&default_compression);
+        let reassignment_context_for_prompt = compact_model_context_with_notice(
+            &reassignment_context,
+            compression,
+            ContextCompressionTarget::ReviewHandoff,
+            "round request metadata field `context`",
+        );
+        let research_context_for_prompt = compact_model_context_with_notice(
+            &research_context,
+            compression,
+            ContextCompressionTarget::ReviewResearch,
+            "task research_context artifacts",
+        );
 
         let mut rendered_review_prompts = Vec::new();
         for reviewer in &new_reviewers {
@@ -1704,7 +1725,7 @@ impl VerificationTool {
                 task_id,
                 title: &title,
                 description: &description,
-                context: &reassignment_context,
+                context: &reassignment_context_for_prompt,
                 panel_id: &state.panel_id,
                 round: state.current_round,
                 reviewer,
@@ -1714,7 +1735,7 @@ impl VerificationTool {
                 merge_target: Some(&merge_target),
                 review_fingerprint: Some(&request.review_fingerprint),
                 proof_summary: proof_summary.as_ref(),
-                research_context: Some(&research_context),
+                research_context: Some(&research_context_for_prompt),
             });
             request
                 .reviewer_prompts

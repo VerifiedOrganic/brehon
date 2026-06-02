@@ -287,6 +287,7 @@ pub fn describe(
             info!("  compression:");
             info!("    enabled: {}", config.context.compression.enabled);
             info!("    mode: {:?}", config.context.compression.mode);
+            info!("    min_tokens: {}", config.context.compression.min_tokens);
             info!("    store_raw: {}", config.context.compression.store_raw);
             info!(
                 "    compact_memories: {}",
@@ -299,6 +300,20 @@ pub fn describe(
             info!(
                 "    compact_tasks: {}",
                 config.context.compression.compact_tasks
+            );
+            info!(
+                "    prompt_contexts: {:?}",
+                config.context.compression.prompt_contexts
+            );
+            info!(
+                "    never_compress: {:?}",
+                config.context.compression.never_compress
+            );
+            info!(
+                "    headroom: {} {:?} timeout_ms={}",
+                config.context.compression.headroom.command,
+                config.context.compression.headroom.args,
+                config.context.compression.headroom.timeout_ms
             );
         }
 

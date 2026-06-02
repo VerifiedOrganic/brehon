@@ -296,6 +296,10 @@ orchestration:
   #        ~/.local/share/brehon/worktrees/<repo-name-hash>/
   # Override with an absolute path when you need a fixed location:
   # worktree_root: /absolute/path/to/brehon-worktrees
+  # Optional per-agent Cargo target cache root. When set, Brehon assigns each
+  # pane its own CARGO_TARGET_DIR under this root, avoiding one shared Cargo
+  # lock while preserving Rust build artifacts across pane/worktree recycling.
+  # cargo_target_root: /absolute/path/to/brehon-cargo-targets
   worktree_cleanup:
     enabled: true
     # Allowlisted cleanup only. These actions never run through a shell and
@@ -358,10 +362,17 @@ context:
   compression:
     enabled: false
     mode: deterministic_terse
+    min_tokens: 2000
     store_raw: true
     compact_memories: true
     compact_rules: true
     compact_tasks: true
+    prompt_contexts: []
+    never_compress: []
+    headroom:
+      command: headroom
+      args: ["compress", "--stdin"]
+      timeout_ms: 10000
 
 tui:
   default_layout: Balanced

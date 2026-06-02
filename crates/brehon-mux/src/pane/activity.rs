@@ -227,6 +227,13 @@ impl ActivityBuffer {
         !self.active_tools.is_empty()
     }
 
+    /// Clear active tool calls that never produced completion events.
+    pub fn clear_active_tools(&mut self) -> Vec<String> {
+        let ids = self.active_tools.keys().cloned().collect::<Vec<_>>();
+        self.active_tools.clear();
+        ids
+    }
+
     /// Returns the most recent operation that has started and not yet completed.
     pub fn active_operation(&self) -> Option<&str> {
         for entry in self.entries.iter().rev() {

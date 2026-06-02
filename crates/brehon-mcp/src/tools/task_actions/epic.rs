@@ -1172,6 +1172,44 @@ pub(super) fn merge_container_branch_into_target_with_strategy(
     ) {
         reject_tracked_brehon_artifacts(target_worktree, integration_branch, container_type)?;
 
+        if strategy == ContainerMergeStrategy::SquashWithLineage {
+            if git_commit_is_ancestor_in(target_worktree, integration_branch, "HEAD")? {
+                let merge_commit = recorded_container_lineage_commit(
+                    container_id,
+                    container_title,
+                    container_type,
+                    target_branch,
+                    target_worktree,
+                )?
+                .unwrap_or(git_stdout_in(target_worktree, &["rev-parse", "HEAD"])?);
+                return Ok(ContainerMergeOutcome {
+                    commit: merge_commit,
+                    strategy,
+                    squash_source_tip,
+                });
+            }
+
+            let target_tree = rev_parse_tree_in(target_worktree, "HEAD")?;
+            let integration_tree = rev_parse_tree_in(target_worktree, integration_branch)?;
+            if target_tree == integration_tree {
+                record_container_lineage_merge(
+                    container_id,
+                    container_title,
+                    container_type,
+                    integration_branch,
+                    target_branch,
+                    target_worktree,
+                    &target_head_before_merge,
+                )?;
+                let merge_commit = git_stdout_in(target_worktree, &["rev-parse", "HEAD"])?;
+                return Ok(ContainerMergeOutcome {
+                    commit: merge_commit,
+                    strategy,
+                    squash_source_tip,
+                });
+            }
+        }
+
         let squash_result = crate::git_exec::run_git_allow_protected_branch_commit(
             target_worktree,
             &["merge", "--squash", integration_branch],
@@ -1207,38 +1245,15 @@ pub(super) fn merge_container_branch_into_target_with_strategy(
         }
 
         if strategy == ContainerMergeStrategy::SquashWithLineage {
-            let lineage_message = lineage_commit_message(
+            record_container_lineage_merge(
                 container_id,
                 container_title,
                 container_type,
+                integration_branch,
                 target_branch,
-            );
-            let lineage_result = crate::git_exec::run_git_allow_protected_branch_commit(
                 target_worktree,
-                &[
-                    "merge",
-                    "-s",
-                    "ours",
-                    "--no-ff",
-                    integration_branch,
-                    "-m",
-                    &lineage_message,
-                ],
+                &target_head_before_merge,
             )?;
-
-            if !lineage_result.status.success() {
-                reset_target_worktree_after_failed_merge(
-                    target_worktree,
-                    &target_head_before_merge,
-                );
-                return Err(format!(
-                    "Failed to record {} branch '{}' lineage on '{}': {}",
-                    container_type,
-                    integration_branch,
-                    target_branch,
-                    String::from_utf8_lossy(&lineage_result.stderr)
-                ));
-            }
         }
 
         let merge_commit = git_stdout_in(target_worktree, &["rev-parse", "HEAD"])?;
@@ -1279,6 +1294,90 @@ pub(super) fn merge_container_branch_into_target_with_strategy(
         strategy,
         squash_source_tip,
     })
+}
+
+fn rev_parse_tree_in(target_worktree: &Path, rev: &str) -> Result<String, String> {
+    let tree_spec = format!("{rev}^{{tree}}");
+    git_stdout_in(target_worktree, &["rev-parse", &tree_spec])
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_container_lineage_merge(
+    container_id: &str,
+    container_title: Option<&str>,
+    container_type: &str,
+    integration_branch: &str,
+    target_branch: &str,
+    target_worktree: &Path,
+    target_head_on_failure: &str,
+) -> Result<(), String> {
+    let lineage_message =
+        lineage_commit_message(container_id, container_title, container_type, target_branch);
+    let lineage_result = crate::git_exec::run_git_allow_protected_branch_commit(
+        target_worktree,
+        &[
+            "merge",
+            "-s",
+            "ours",
+            "--no-ff",
+            integration_branch,
+            "-m",
+            &lineage_message,
+        ],
+    )?;
+
+    if !lineage_result.status.success() {
+        reset_target_worktree_after_failed_merge(target_worktree, target_head_on_failure);
+        return Err(format!(
+            "Failed to record {} branch '{}' lineage on '{}': {}",
+            container_type,
+            integration_branch,
+            target_branch,
+            String::from_utf8_lossy(&lineage_result.stderr)
+        ));
+    }
+
+    Ok(())
+}
+
+fn recorded_container_lineage_commit(
+    container_id: &str,
+    container_title: Option<&str>,
+    container_type: &str,
+    target_branch: &str,
+    target_worktree: &Path,
+) -> Result<Option<String>, String> {
+    let lineage_message =
+        lineage_commit_message(container_id, container_title, container_type, target_branch);
+    let output = crate::git_exec::run_git(
+        target_worktree,
+        &[
+            "log",
+            "--merges",
+            "--format=%H",
+            "--fixed-strings",
+            "--grep",
+            &lineage_message,
+            "-n",
+            "1",
+            "HEAD",
+        ],
+    )?;
+    if !output.status.success() {
+        return Err(format!(
+            "Failed to inspect existing {} lineage commit on '{}': {}",
+            container_type,
+            target_branch,
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .next()
+        .map(str::trim)
+        .filter(|commit| !commit.is_empty())
+        .map(str::to_string))
 }
 
 fn squash_commit_message(
@@ -1609,6 +1708,182 @@ fi
         assert!(
             is_ancestor.success(),
             "source branch should be ancestry-merged after lineage commit"
+        );
+    }
+
+    #[test]
+    fn squash_with_lineage_recovers_after_squash_commit_before_lineage() {
+        let root = tempfile::tempdir().unwrap();
+        init_repo(root.path());
+
+        run_git(root.path(), &["checkout", "-b", "initiative/test"]);
+        std::fs::write(root.path().join("initiative.txt"), "initiative\n").unwrap();
+        run_git(root.path(), &["add", "initiative.txt"]);
+        run_git(root.path(), &["commit", "-m", "initiative work"]);
+        let source_tip = run_git(root.path(), &["rev-parse", "HEAD"]);
+        let source_tree = run_git(root.path(), &["rev-parse", "HEAD^{tree}"]);
+        run_git(root.path(), &["checkout", "main"]);
+
+        run_git(root.path(), &["merge", "--squash", "initiative/test"]);
+        run_git(
+            root.path(),
+            &["commit", "-m", "Merge initiative I-1: Test Program"],
+        );
+        let squash_only_head = run_git(root.path(), &["rev-parse", "HEAD"]);
+        let not_ancestor = Command::new("git")
+            .args(["merge-base", "--is-ancestor", "initiative/test", "main"])
+            .current_dir(root.path())
+            .status()
+            .unwrap();
+        assert!(
+            !not_ancestor.success(),
+            "manual squash commit should not record source branch lineage yet"
+        );
+
+        let outcome = merge_container_branch_into_target_with_strategy(
+            "I-1",
+            Some("Test Program"),
+            "initiative",
+            "initiative/test",
+            "main",
+            root.path(),
+            ContainerMergeStrategy::SquashWithLineage,
+        )
+        .expect("retry should record missing lineage without another squash commit");
+
+        assert_eq!(outcome.strategy, ContainerMergeStrategy::SquashWithLineage);
+        assert_eq!(
+            outcome.squash_source_tip.as_deref(),
+            Some(source_tip.as_str())
+        );
+        assert_ne!(
+            outcome.commit, squash_only_head,
+            "retry should add the missing lineage commit"
+        );
+        assert_eq!(run_git(root.path(), &["rev-parse", "HEAD"]), outcome.commit);
+        assert_eq!(
+            run_git(root.path(), &["log", "-1", "--format=%s"]),
+            "Merge initiative I-1 lineage: Test Program"
+        );
+        assert_eq!(
+            run_git(root.path(), &["log", "-2", "--format=%s"])
+                .lines()
+                .nth(1)
+                .unwrap(),
+            "Merge initiative I-1: Test Program"
+        );
+        assert_eq!(
+            run_git(root.path(), &["rev-parse", "HEAD^{tree}"]),
+            source_tree
+        );
+        let is_ancestor = Command::new("git")
+            .args(["merge-base", "--is-ancestor", "initiative/test", "main"])
+            .current_dir(root.path())
+            .status()
+            .unwrap();
+        assert!(
+            is_ancestor.success(),
+            "retry should finish the ancestry merge"
+        );
+    }
+
+    #[test]
+    fn squash_with_lineage_retry_after_lineage_commit_is_noop() {
+        let root = tempfile::tempdir().unwrap();
+        init_repo(root.path());
+
+        run_git(root.path(), &["checkout", "-b", "initiative/test"]);
+        std::fs::write(root.path().join("initiative.txt"), "initiative\n").unwrap();
+        run_git(root.path(), &["add", "initiative.txt"]);
+        run_git(root.path(), &["commit", "-m", "initiative work"]);
+        let source_tip = run_git(root.path(), &["rev-parse", "HEAD"]);
+        run_git(root.path(), &["checkout", "main"]);
+
+        let first = merge_container_branch_into_target_with_strategy(
+            "I-1",
+            Some("Test Program"),
+            "initiative",
+            "initiative/test",
+            "main",
+            root.path(),
+            ContainerMergeStrategy::SquashWithLineage,
+        )
+        .expect("initial final merge should succeed");
+        std::fs::write(root.path().join("after.txt"), "later main work\n").unwrap();
+        run_git(root.path(), &["add", "after.txt"]);
+        run_git(root.path(), &["commit", "-m", "later main work"]);
+        let later_head = run_git(root.path(), &["rev-parse", "HEAD"]);
+        let commit_count_before = run_git(root.path(), &["rev-list", "--count", "HEAD"]);
+
+        let second = merge_container_branch_into_target_with_strategy(
+            "I-1",
+            Some("Test Program"),
+            "initiative",
+            "initiative/test",
+            "main",
+            root.path(),
+            ContainerMergeStrategy::SquashWithLineage,
+        )
+        .expect("retry after recorded lineage should be idempotent");
+
+        assert_eq!(second.commit, first.commit);
+        assert_ne!(
+            second.commit, later_head,
+            "retry should report the recorded lineage commit, not a later HEAD"
+        );
+        assert_eq!(
+            second.squash_source_tip.as_deref(),
+            Some(source_tip.as_str())
+        );
+        assert_eq!(
+            run_git(root.path(), &["rev-list", "--count", "HEAD"]),
+            commit_count_before,
+            "idempotent retry must not create another merge commit"
+        );
+    }
+
+    #[test]
+    fn merge_container_branch_rejects_untracked_files_hidden_by_status_config() {
+        let root = tempfile::tempdir().unwrap();
+        init_repo(root.path());
+
+        run_git(root.path(), &["checkout", "-b", "initiative/test"]);
+        std::fs::write(root.path().join("initiative.txt"), "initiative\n").unwrap();
+        run_git(root.path(), &["add", "initiative.txt"]);
+        run_git(root.path(), &["commit", "-m", "initiative work"]);
+        run_git(root.path(), &["checkout", "main"]);
+        run_git(root.path(), &["config", "status.showUntrackedFiles", "no"]);
+        std::fs::create_dir_all(root.path().join("vendor/ghostty")).unwrap();
+        std::fs::write(root.path().join("vendor/ghostty/build.zig"), "artifact\n").unwrap();
+
+        let err = merge_container_branch_into_target_with_strategy(
+            "I-1",
+            Some("Test Program"),
+            "initiative",
+            "initiative/test",
+            "main",
+            root.path(),
+            ContainerMergeStrategy::SquashWithLineage,
+        )
+        .expect_err("untracked artifacts must block final merge even when git config hides them");
+
+        assert!(
+            err.contains("Target worktree") && err.contains("dirty"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.contains("vendor/ghostty/build.zig"),
+            "error should name the untracked artifact: {err}"
+        );
+        assert_eq!(
+            run_git(root.path(), &["rev-parse", "HEAD"]),
+            run_git(root.path(), &["rev-parse", "main"]),
+            "failed merge must not move main"
+        );
+        assert_eq!(
+            run_git(root.path(), &["log", "-1", "--format=%s"]),
+            "seed",
+            "failed merge must leave HEAD at the original main commit"
         );
     }
 

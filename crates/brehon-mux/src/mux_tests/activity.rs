@@ -1664,6 +1664,213 @@ fn test_gateway_delivery_busy_does_not_set_tool_flag_on_blocked_pane() {
 }
 
 #[test]
+fn test_gateway_turn_operation_keeps_pane_busy_after_tool_completion() {
+    let pane_id = "kimi-worker";
+    let mut mux = Mux::new(24, 80);
+    let mut pane = Pane::worker(
+        pane_id,
+        PathBuf::from("/tmp"),
+        None,
+        "supervisor",
+        &AgentAdapter::BuiltIn(SupervisorCli::Kimi),
+        None,
+        None,
+        24,
+        80,
+        None,
+        None,
+        None,
+    )
+    .expect("create kimi worker pane");
+    pane.register_gateway_session_spawn("session-1".to_string());
+    let generation = pane.current_generation();
+    let now = std::time::Instant::now();
+    pane.set_pane_state(PaneState::Busy {
+        prompt_id: brehon_types::PromptId::new("prompt-1"),
+        generation,
+        delivered_at: now,
+        last_activity_at: now,
+    });
+    mux.add_pane(pane);
+
+    mux.event_tx
+        .try_send(MuxEvent::ActivityEvent {
+            pane_id: pane_id.to_string(),
+            generation,
+            entry: ActivityEntry {
+                kind: ActivityKind::Operation,
+                ingested_at: now,
+                tool_id: None,
+                tool_name: None,
+                status: Some("started".to_string()),
+                message: Some("turn".to_string()),
+                output_chunks: None,
+                duration: None,
+            },
+        })
+        .expect("queue turn start");
+    let _ = mux.poll_batch();
+
+    mux.event_tx
+        .try_send(MuxEvent::ActivityEvent {
+            pane_id: pane_id.to_string(),
+            generation,
+            entry: ActivityEntry {
+                kind: ActivityKind::ToolCall,
+                ingested_at: now,
+                tool_id: Some("tool-1".to_string()),
+                tool_name: Some("Shell".to_string()),
+                status: Some("started".to_string()),
+                message: None,
+                output_chunks: None,
+                duration: None,
+            },
+        })
+        .expect("queue tool start");
+    let _ = mux.poll_batch();
+
+    mux.event_tx
+        .try_send(MuxEvent::ActivityEvent {
+            pane_id: pane_id.to_string(),
+            generation,
+            entry: ActivityEntry {
+                kind: ActivityKind::ToolCall,
+                ingested_at: now,
+                tool_id: Some("tool-1".to_string()),
+                tool_name: Some("Shell".to_string()),
+                status: Some("completed".to_string()),
+                message: None,
+                output_chunks: None,
+                duration: None,
+            },
+        })
+        .expect("queue tool completion");
+    let _ = mux.poll_batch();
+
+    assert_eq!(mux.active_gateway_operations.get(pane_id).copied(), Some(1));
+    let pane = mux.get(pane_id).expect("pane exists");
+    assert!(pane.is_tool_executing());
+    assert!(matches!(pane.pane_state(), Some(PaneState::Busy { .. })));
+
+    mux.event_tx
+        .try_send(MuxEvent::ActivityEvent {
+            pane_id: pane_id.to_string(),
+            generation,
+            entry: ActivityEntry {
+                kind: ActivityKind::Operation,
+                ingested_at: now,
+                tool_id: None,
+                tool_name: None,
+                status: Some("completed".to_string()),
+                message: Some("turn".to_string()),
+                output_chunks: None,
+                duration: None,
+            },
+        })
+        .expect("queue turn completion");
+    let _ = mux.poll_batch();
+
+    assert!(!mux.active_gateway_operations.contains_key(pane_id));
+    let pane = mux.get(pane_id).expect("pane exists");
+    assert!(!pane.is_tool_executing());
+    assert!(matches!(pane.pane_state(), Some(PaneState::Ready { .. })));
+}
+
+#[test]
+fn test_gateway_turn_completion_clears_orphaned_tool_lock() {
+    let pane_id = "kimi-worker";
+    let mut mux = Mux::new(24, 80);
+    let mut pane = Pane::worker(
+        pane_id,
+        PathBuf::from("/tmp"),
+        None,
+        "supervisor",
+        &AgentAdapter::BuiltIn(SupervisorCli::Kimi),
+        None,
+        None,
+        24,
+        80,
+        None,
+        None,
+        None,
+    )
+    .expect("create kimi worker pane");
+    pane.register_gateway_session_spawn("session-1".to_string());
+    let generation = pane.current_generation();
+    let now = std::time::Instant::now();
+    pane.set_pane_state(PaneState::Busy {
+        prompt_id: brehon_types::PromptId::new("prompt-1"),
+        generation,
+        delivered_at: now,
+        last_activity_at: now,
+    });
+    mux.add_pane(pane);
+
+    mux.event_tx
+        .try_send(MuxEvent::ActivityEvent {
+            pane_id: pane_id.to_string(),
+            generation,
+            entry: ActivityEntry {
+                kind: ActivityKind::Operation,
+                ingested_at: now,
+                tool_id: None,
+                tool_name: None,
+                status: Some("started".to_string()),
+                message: Some("turn".to_string()),
+                output_chunks: None,
+                duration: None,
+            },
+        })
+        .expect("queue turn start");
+    let _ = mux.poll_batch();
+
+    mux.event_tx
+        .try_send(MuxEvent::ActivityEvent {
+            pane_id: pane_id.to_string(),
+            generation,
+            entry: ActivityEntry {
+                kind: ActivityKind::ToolCall,
+                ingested_at: now,
+                tool_id: Some("tool-orphaned".to_string()),
+                tool_name: Some("task".to_string()),
+                status: Some("started".to_string()),
+                message: None,
+                output_chunks: None,
+                duration: None,
+            },
+        })
+        .expect("queue tool start");
+    let _ = mux.poll_batch();
+
+    let pane = mux.get(pane_id).expect("pane exists");
+    assert!(pane.is_tool_executing());
+    assert!(matches!(pane.pane_state(), Some(PaneState::Busy { .. })));
+
+    mux.event_tx
+        .try_send(MuxEvent::ActivityEvent {
+            pane_id: pane_id.to_string(),
+            generation,
+            entry: ActivityEntry {
+                kind: ActivityKind::Operation,
+                ingested_at: now,
+                tool_id: None,
+                tool_name: None,
+                status: Some("completed".to_string()),
+                message: Some("turn".to_string()),
+                output_chunks: None,
+                duration: None,
+            },
+        })
+        .expect("queue turn completion");
+    let _ = mux.poll_batch();
+
+    assert!(!mux.active_gateway_operations.contains_key(pane_id));
+    let pane = mux.get(pane_id).expect("pane exists");
+    assert!(!pane.is_tool_executing());
+    assert!(matches!(pane.pane_state(), Some(PaneState::Ready { .. })));
+}
+
+#[test]
 fn test_terminal_prompt_output_detects_split_keyword_across_chunks() {
     let mut mux = Mux::new(24, 80);
     let pane = Pane::worker(

@@ -4727,6 +4727,7 @@ async fn test_progress_acknowledges_assignment_without_prior_mine() {
 
     write_test_task(root.path(), "T-progress-ack", "assigned", "task");
     let mut task = read_test_task(root.path(), "T-progress-ack");
+    task["updated_at"] = Value::String("2026-05-24T00:59:00Z".to_string());
     task["assignment_propagation"] = serde_json::json!({
         "owner": "worker-1",
         "assignment_kind": "task",
@@ -4765,6 +4766,10 @@ async fn test_progress_acknowledges_assignment_without_prior_mine() {
     assert!(result.is_error.is_none(), "{}", extract_text(&result));
 
     let stored = read_test_task(root.path(), "T-progress-ack");
+    let updated_at = stored["updated_at"]
+        .as_str()
+        .expect("progress should bump updated_at");
+    assert_ne!(updated_at, "2026-05-24T00:59:00Z");
     assert_eq!(
         stored["assignment_propagation"]["acknowledged_by"],
         "worker-1"

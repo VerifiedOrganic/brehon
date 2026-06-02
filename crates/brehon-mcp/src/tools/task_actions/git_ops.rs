@@ -206,7 +206,8 @@ impl MergeStatus {
 }
 
 pub(super) fn git_status_porcelain_in(cwd: &Path) -> Result<String, String> {
-    let output = crate::git_exec::run_git(cwd, &["status", "--porcelain"])?;
+    let output =
+        crate::git_exec::run_git(cwd, &["status", "--porcelain", "--untracked-files=all"])?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         return Err(if stderr.is_empty() {

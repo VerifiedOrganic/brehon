@@ -34,6 +34,20 @@ pub(crate) fn is_stream_disconnect_error_message(message: &str) -> bool {
                 || lower.contains("contact us through our help center")))
 }
 
+pub(crate) fn is_kimi_invalid_tool_history_error_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("kimi provider/runtime failure")
+        && lower.contains("tool_calls")
+        && (lower.contains("must be followed by tool messages")
+            || lower.contains("did not have response messages"))
+}
+
+pub(crate) fn is_provider_runtime_error_message(message: &str) -> bool {
+    is_context_length_error_message(message)
+        || is_stream_disconnect_error_message(message)
+        || is_kimi_invalid_tool_history_error_message(message)
+}
+
 pub(crate) fn supervisor_viewport_contains_runtime_crash(viewport: &str) -> bool {
     let lower = viewport.to_ascii_lowercase();
     let has_cli_stack = lower.contains("/bunfs/root/src/entrypoints/cli.js:")
@@ -219,7 +233,7 @@ pub(crate) fn is_worker_context_reset_candidate(
     let Some(message) = entry.message.as_deref() else {
         return false;
     };
-    if !(is_context_length_error_message(message) || is_stream_disconnect_error_message(message)) {
+    if !is_provider_runtime_error_message(message) {
         return false;
     }
     let Some(pane) = mux.get(pane_id) else {

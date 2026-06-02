@@ -3,6 +3,7 @@
 //! Tools for searching and creating durable project coding rules/conventions.
 
 use async_trait::async_trait;
+use brehon_types::config::ContextCompressionTarget;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -14,7 +15,7 @@ use std::time::{Duration, Instant};
 use crate::error::McpError;
 use crate::server::ToolResult;
 use crate::tools::context_efficiency::{
-    compact_text_if_enabled, load_context_tool_options, truncate_snippet, ContextToolOptions,
+    compact_text_with_config, load_context_tool_options, truncate_snippet, ContextToolOptions,
 };
 use crate::tools::{error_result, text_result, Tool};
 
@@ -194,9 +195,13 @@ fn default_rule_name(content: &str) -> String {
 }
 
 fn compact_rule_content(content: &str, options: &ContextToolOptions) -> Option<String> {
-    options
-        .should_compact_rules()
-        .then(|| compact_text_if_enabled(content, true, options.compression.mode))
+    options.should_compact_rules().then(|| {
+        compact_text_with_config(
+            content,
+            &options.compression,
+            ContextCompressionTarget::Rule,
+        )
+    })
 }
 
 fn model_rule_content<'a>(
@@ -211,10 +216,10 @@ fn model_rule_content<'a>(
         .as_deref()
         .map(std::borrow::Cow::Borrowed)
         .unwrap_or_else(|| {
-            std::borrow::Cow::Owned(compact_text_if_enabled(
+            std::borrow::Cow::Owned(compact_text_with_config(
                 &rule.content,
-                true,
-                options.compression.mode,
+                &options.compression,
+                ContextCompressionTarget::Rule,
             ))
         })
 }

@@ -873,11 +873,22 @@ fn can_auto_transition_to_review_ready(raw: &serde_json::Map<String, serde_json:
 
 // ── Worker recovery ─────────────────────────────────────────────────────────
 
+fn recovery_worktrees_root(brehon_root: &std::path::Path) -> PathBuf {
+    if let Ok(root) = std::env::var("BREHON_WORKTREE_ROOT") {
+        let root = root.trim();
+        if !root.is_empty() {
+            return PathBuf::from(root);
+        }
+    }
+
+    brehon_root.join("worktrees")
+}
+
 pub(crate) fn candidate_worker_worktree_paths(
     brehon_root: &std::path::Path,
     worker_name: &str,
 ) -> Vec<PathBuf> {
-    let worktrees_dir = brehon_root.join("worktrees");
+    let worktrees_dir = recovery_worktrees_root(brehon_root);
     let mut candidates = Vec::new();
 
     let legacy = worktrees_dir.join(worker_name);
@@ -1882,8 +1893,43 @@ pub(crate) fn task_info_to_task(task: &TaskInfo) -> Task {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
     use std::path::Path;
+    use std::sync::Mutex;
     use tempfile::TempDir;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct ScopedEnv {
+        saved: Vec<(&'static str, Option<OsString>)>,
+    }
+
+    impl ScopedEnv {
+        fn set(vars: &[(&'static str, &str)]) -> Self {
+            let mut saved = Vec::with_capacity(vars.len());
+            for (key, value) in vars {
+                saved.push((*key, std::env::var_os(key)));
+                if value.is_empty() {
+                    std::env::remove_var(key);
+                } else {
+                    std::env::set_var(key, value);
+                }
+            }
+            Self { saved }
+        }
+    }
+
+    impl Drop for ScopedEnv {
+        fn drop(&mut self) {
+            for (key, value) in self.saved.iter().rev() {
+                if let Some(value) = value {
+                    std::env::set_var(key, value);
+                } else {
+                    std::env::remove_var(key);
+                }
+            }
+        }
+    }
 
     fn write_test_task(brehon_root: &Path, task_id: &str, task: serde_json::Value) {
         let tasks_dir = brehon_root.join("runtime").join("tasks");
@@ -1906,6 +1952,26 @@ mod tests {
             reason: "nonrecoverable prompt delivery failure".to_string(),
             dead_lettered_at: "2026-04-23T00:00:00Z".to_string(),
         }
+    }
+
+    #[test]
+    fn candidate_worker_worktree_paths_honors_external_worktree_root() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let brehon = TempDir::new().expect("brehon root");
+        let external = TempDir::new().expect("external worktree root");
+        let worker = external.path().join("runs/run-1/worker-1");
+        std::fs::create_dir_all(&worker).expect("external worker worktree");
+        let legacy = brehon.path().join("worktrees/runs/run-1/worker-1");
+        std::fs::create_dir_all(&legacy).expect("legacy worker worktree");
+        let _env = ScopedEnv::set(&[(
+            "BREHON_WORKTREE_ROOT",
+            external.path().to_str().expect("utf8 external path"),
+        )]);
+
+        assert_eq!(
+            candidate_worker_worktree_paths(brehon.path(), "worker-1"),
+            vec![worker]
+        );
     }
 
     #[test]

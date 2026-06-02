@@ -11,6 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
+use brehon_types::config::ContextCompressionTarget;
 use brehon_types::{
     BrehonConfig, ResearchConfig, ResearchJobTemplateConfig, ResearchOutputSchema,
     ResearchPoolConfig, ResearchRouteConfig, ResearchRouteMatchConfig, ResearchTrigger,
@@ -23,6 +24,9 @@ use crate::error::McpError;
 use crate::server::ToolResult;
 use crate::tools::agent::{
     resolve_supervisor_name, session_is_live, session_matches_current_runtime, try_deliver_message,
+};
+use crate::tools::context_efficiency::{
+    compact_model_context_with_notice, load_context_tool_options,
 };
 use crate::tools::{error_result, text_result, Tool};
 
@@ -807,7 +811,14 @@ fn deliver_research_handoff(
 
     let existing_targets = existing_research_handoff_targets(task, &entry.artifact_id);
     let mut seen_targets = HashSet::new();
-    let message = build_research_handoff_message(task_id, task, entry);
+    let raw_message = build_research_handoff_message(task_id, task, entry);
+    let options = load_context_tool_options();
+    let message = compact_model_context_with_notice(
+        &raw_message,
+        &options.compression,
+        ContextCompressionTarget::ResearchHandoff,
+        "task research_context artifact files",
+    );
     let from = caller_name();
 
     for (target_role, target) in targets {

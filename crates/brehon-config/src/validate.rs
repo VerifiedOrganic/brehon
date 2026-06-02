@@ -14,6 +14,9 @@ use std::{collections::HashSet, sync::LazyLock};
 use brehon_adapter_sdk::harness::{
     builtin_cli_from_launcher_shape, HarnessControlPlane, HarnessTransport, SupervisorCli,
 };
+use brehon_types::config::ContextCompressionMode;
+#[cfg(test)]
+use brehon_types::config::ContextCompressionTarget;
 use brehon_types::{
     BrehonConfig, PermissionProfile, ResearchPermissions, RoleKind, RuntimeTerminalHostKind,
     RuntimeTerminalHostPaneOwnership,
@@ -181,7 +184,7 @@ pub fn validate(config: &BrehonConfig) -> Vec<ValidationWarning> {
     warnings.extend(validate_retention(config));
     warnings.extend(validate_context(config));
     warnings.extend(validate_profiles(config));
-    warnings.extend(validate_worktree_root(config));
+    warnings.extend(validate_worktree_roots(config));
 
     warnings
 }
@@ -703,21 +706,37 @@ fn validate_context(config: &BrehonConfig) -> Vec<ValidationWarning> {
         ));
     }
 
-    let compression = config.context.compression;
+    let compression = &config.context.compression;
     if compression.enabled && !compression.store_raw {
         warnings.push(ValidationWarning::non_fatal(
             ValidationWarningKind::InvalidContextConfig,
             "context.compression.store_raw=false discards raw memory/rule prose; raw retrieval can only return the stored compact form",
         ));
     }
+    if compression.enabled && compression.min_tokens == 0 {
+        warnings.push(ValidationWarning::non_fatal(
+            ValidationWarningKind::InvalidContextConfig,
+            "context.compression.min_tokens=0 can send small prompts through compression and increase latency/cost",
+        ));
+    }
+    if compression.enabled
+        && matches!(compression.mode, ContextCompressionMode::Headroom)
+        && compression.headroom.command.trim().is_empty()
+    {
+        warnings.push(ValidationWarning::new(
+            ValidationWarningKind::InvalidContextConfig,
+            "context.compression.headroom.command must be set when mode=headroom",
+        ));
+    }
     if compression.enabled
         && !compression.compact_memories
         && !compression.compact_rules
         && !compression.compact_tasks
+        && compression.prompt_contexts.is_empty()
     {
         warnings.push(ValidationWarning::non_fatal(
             ValidationWarningKind::InvalidContextConfig,
-            "context.compression.enabled=true has no effect because all compact_* toggles are false",
+            "context.compression.enabled=true has no effect because all compact_* toggles are false and prompt_contexts is empty",
         ));
     }
 
@@ -805,16 +824,29 @@ fn validate_profiles(config: &BrehonConfig) -> Vec<ValidationWarning> {
     warnings
 }
 
-fn validate_worktree_root(config: &BrehonConfig) -> Vec<ValidationWarning> {
+fn validate_worktree_roots(config: &BrehonConfig) -> Vec<ValidationWarning> {
     let mut warnings = Vec::new();
-    let Some(root) = config.orchestration.worktree_root.as_deref() else {
+    warnings.extend(validate_absolute_path_root(
+        config.orchestration.worktree_root.as_deref(),
+        "orchestration.worktree_root",
+    ));
+    warnings.extend(validate_absolute_path_root(
+        config.orchestration.cargo_target_root.as_deref(),
+        "orchestration.cargo_target_root",
+    ));
+    warnings
+}
+
+fn validate_absolute_path_root(root: Option<&str>, field: &'static str) -> Vec<ValidationWarning> {
+    let mut warnings = Vec::new();
+    let Some(root) = root else {
         return warnings;
     };
 
     if root.trim().is_empty() {
         warnings.push(ValidationWarning::new(
             ValidationWarningKind::InvalidWorktreeRoot,
-            "orchestration.worktree_root must not be empty",
+            format!("{field} must not be empty"),
         ));
         return warnings;
     }
@@ -827,14 +859,14 @@ fn validate_worktree_root(config: &BrehonConfig) -> Vec<ValidationWarning> {
     {
         warnings.push(ValidationWarning::new(
             ValidationWarningKind::InvalidWorktreeRoot,
-            format!("orchestration.worktree_root '{root}' contains path traversal ('..')"),
+            format!("{field} '{root}' contains path traversal ('..')"),
         ));
     }
 
     if root.contains('\0') {
         warnings.push(ValidationWarning::new(
             ValidationWarningKind::InvalidWorktreeRoot,
-            format!("orchestration.worktree_root '{root}' contains invalid null bytes"),
+            format!("{field} '{root}' contains invalid null bytes"),
         ));
     }
 
@@ -842,7 +874,7 @@ fn validate_worktree_root(config: &BrehonConfig) -> Vec<ValidationWarning> {
     if !path.is_absolute() {
         warnings.push(ValidationWarning::new(
             ValidationWarningKind::InvalidWorktreeRoot,
-            format!("orchestration.worktree_root '{root}' must be an absolute path"),
+            format!("{field} '{root}' must be an absolute path"),
         ));
     }
 
@@ -1905,6 +1937,7 @@ mod tests {
                 spawn_workers: None,
                 drain_timeout_secs: None,
                 worktree_root: None,
+                cargo_target_root: None,
                 worktree_cleanup: brehon_types::WorktreeCleanupConfig::default(),
             },
             runtime: RuntimeConfig::default(),
@@ -2165,6 +2198,27 @@ rooms:
                     && w.message.contains("has no effect")
             }),
             "Expected no-effect compression warning, got: {:?}",
+            warnings
+        );
+    }
+
+    #[test]
+    fn context_compression_prompt_context_counts_as_target() {
+        let mut config = minimal_valid_config();
+        config.context.compression.enabled = true;
+        config.context.compression.compact_memories = false;
+        config.context.compression.compact_rules = false;
+        config.context.compression.compact_tasks = false;
+        config
+            .context
+            .compression
+            .prompt_contexts
+            .push(ContextCompressionTarget::ReviewHandoff);
+
+        let warnings = validate(&config);
+        assert!(
+            !warnings.iter().any(|w| w.message.contains("has no effect")),
+            "Expected prompt context to count as a compression target, got: {:?}",
             warnings
         );
     }
@@ -4122,5 +4176,18 @@ rooms:
         assert!(!warnings
             .iter()
             .any(|w| w.kind == ValidationWarningKind::InvalidWorktreeRoot));
+    }
+
+    #[test]
+    fn cargo_target_root_validation_uses_same_absolute_path_rules() {
+        let mut config = minimal_valid_config();
+        config.orchestration.cargo_target_root = Some("relative/cargo-targets".into());
+        let warnings = validate(&config);
+        assert!(warnings.iter().any(|w| {
+            w.kind == ValidationWarningKind::InvalidWorktreeRoot
+                && w.is_fatal
+                && w.message.contains("orchestration.cargo_target_root")
+                && w.message.contains("must be an absolute path")
+        }));
     }
 }

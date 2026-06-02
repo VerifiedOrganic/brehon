@@ -3148,6 +3148,7 @@ pub(super) fn new_headless_event_loop_ctx(
             spawn_workers: None,
             drain_timeout_secs: None,
             worktree_root: None,
+            cargo_target_root: None,
             worktree_cleanup: brehon_types::WorktreeCleanupConfig::default(),
         },
         tick_active: Duration::from_millis(50),
@@ -4207,6 +4208,7 @@ mod tests {
             spawn_workers: None,
             drain_timeout_secs: None,
             worktree_root: None,
+            cargo_target_root: None,
             worktree_cleanup: brehon_types::WorktreeCleanupConfig::default(),
         }
     }
@@ -6420,6 +6422,59 @@ TypeError: Cannot read properties of undefined"#,
                     && text.contains("Shell output, prose, and local edits do not update Brehon state")
                     && text.contains("action=complete")
         ));
+        assert!(harness
+            .ctx
+            .active_worker_recovery_nudges_sent
+            .contains_key(&("worker-1".to_string(), "T-owned".to_string())));
+    }
+
+    #[test]
+    fn stale_dirty_assigned_worker_gets_handoff_nudge_despite_recent_runtime_prompt_activity() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let brehon_root = temp.path().join(".brehon");
+        write_active_assigned_task_with_assignment_fixture(
+            &brehon_root,
+            chrono::Utc::now() - chrono::Duration::seconds(120),
+            true,
+        );
+        let worktree = write_worker_worktree_fixture(&brehon_root, "worker-1");
+        std::fs::write(worktree.join("dirty.txt"), "pending changes\n").expect("dirty worktree");
+
+        let mut mux = Mux::new(24, 80);
+        mux.add_pane(make_worker_pane("worker-1"));
+        let mut harness = harness_with_mux(mux);
+        let now = Instant::now();
+        harness.ctx.auto_recover_threshold = Duration::from_secs(60);
+        harness.ctx.post_checkpoint_nudge_threshold = Duration::from_secs(300);
+        harness.ctx.stall_check_interval = Duration::ZERO;
+        harness.ctx.last_stall_check = now - Duration::from_secs(60);
+        harness
+            .ctx
+            .last_activity
+            .insert("worker-1".to_string(), now);
+        harness
+            .ctx
+            .dashboard_data
+            .lock()
+            .expect("dashboard")
+            .brehon_root = Some(brehon_root.clone());
+
+        crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
+
+        let routed = recv_route(&harness.rx);
+        assert_eq!(routed.command.target.pane_id.as_deref(), Some("worker-1"));
+        assert!(matches!(
+            routed.command.kind,
+            RuntimeCommandKind::SendPrompt { ref text, .. }
+                if text.contains("Dirty worktree handoff required")
+                    && text.contains("without a lifecycle handoff")
+                    && text.contains("action=checkpoint")
+                    && text.contains("action=complete")
+        ));
+        assert!(
+            harness.rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "dirty lifecycle-stale worker should get exactly one handoff nudge"
+        );
         assert!(harness
             .ctx
             .active_worker_recovery_nudges_sent

@@ -1642,14 +1642,14 @@ fn send_dirty_worktree_handoff_nudge(
     worker_id: &str,
     task: &TaskInfo,
     reason: &str,
-    idle_secs: u64,
+    stale_secs: u64,
     now: std::time::Instant,
 ) -> bool {
     let Some(pane) = ctx.mux.get(worker_id) else {
         return false;
     };
     let task_cmd = format!("{}task", pane.cli_type().capabilities().tool_prefix);
-    let prompt = build_dirty_worktree_handoff_nudge_message(task, &task_cmd, reason, idle_secs);
+    let prompt = build_dirty_worktree_handoff_nudge_message(task, &task_cmd, reason, stale_secs);
     if !dispatch_runtime_prompt(ctx, worker_id, prompt, None) {
         return false;
     }
@@ -1658,7 +1658,7 @@ fn send_dirty_worktree_handoff_nudge(
     push_dashboard_event(
         &ctx.dashboard_data,
         format!(
-            "nudged {worker_id} to checkpoint, complete, or block {} after dirty worktree handoff gap ({idle_secs}s idle)",
+            "nudged {worker_id} to checkpoint, complete, or block {} after dirty worktree handoff gap ({stale_secs}s stale)",
             task.id
         ),
     );
@@ -1723,6 +1723,49 @@ fn parse_rfc3339_utc(value: Option<&str>) -> Option<chrono::DateTime<chrono::Utc
     chrono::DateTime::parse_from_rfc3339(value?)
         .ok()
         .map(|timestamp| timestamp.with_timezone(&chrono::Utc))
+}
+
+fn keep_latest_timestamp(latest: &mut Option<chrono::DateTime<chrono::Utc>>, value: Option<&str>) {
+    let Some(timestamp) = parse_rfc3339_utc(value) else {
+        return;
+    };
+    if latest
+        .as_ref()
+        .is_none_or(|current| timestamp > current.clone())
+    {
+        *latest = Some(timestamp);
+    }
+}
+
+fn task_lifecycle_stale_age(
+    brehon_root: &std::path::Path,
+    task: &TaskInfo,
+    now_utc: chrono::DateTime<chrono::Utc>,
+) -> Option<std::time::Duration> {
+    let mut latest = None;
+    keep_latest_timestamp(&mut latest, task.updated_at.as_deref());
+    if let Some(raw) = read_raw_task_file(brehon_root, &task.id) {
+        keep_latest_timestamp(
+            &mut latest,
+            raw.get("updated_at").and_then(|value| value.as_str()),
+        );
+        if let Some(propagation) = raw
+            .get("assignment_propagation")
+            .and_then(|value| value.as_object())
+        {
+            keep_latest_timestamp(
+                &mut latest,
+                propagation
+                    .get("progress_started_at")
+                    .and_then(|value| value.as_str()),
+            );
+        }
+    }
+    let age = now_utc.signed_duration_since(latest?);
+    if age < chrono::Duration::zero() {
+        return None;
+    }
+    age.to_std().ok()
 }
 
 fn recover_assigned_workers_without_task_progress(
@@ -1814,13 +1857,13 @@ pub(crate) fn build_dirty_worktree_handoff_nudge_message(
     task: &TaskInfo,
     task_cmd: &str,
     reason: &str,
-    idle_secs: u64,
+    stale_secs: u64,
 ) -> String {
     format!(
         "[brehon] Dirty worktree handoff required for {task_id}: {title}\n\n\
          Brehon sees uncommitted work in your assigned worktree ({reason}) and the task is still \
-         status `{status}` after {idle_secs}s idle. Shell output, prose, and local edits do not \
-         update Brehon state. Make exactly one Brehon task call now:\n\n\
+         status `{status}` after {stale_secs}s without a lifecycle handoff. Shell output, prose, \
+         and local edits do not update Brehon state. Make exactly one Brehon task call now:\n\n\
          - Ready for review: `{task_cmd} action=complete id={task_id} notes=\"<summary>\" activity=testing`\n\
          - Still working but need to preserve this revision: `{task_cmd} action=checkpoint id={task_id} message=\"<summary>\"`, then `{task_cmd} action=progress id={task_id} percent=<n> notes=\"<status>\" activity=<reading|editing|testing|reviewing>`\n\
          - Blocked: `{task_cmd} action=update id={task_id} status=blocked blockers=\"<reason>\"`\n\n\
@@ -3008,12 +3051,14 @@ pub(crate) fn send_post_checkpoint_handoff_nudges(
 }
 
 /// Detect assigned workers that have uncommitted work in their dedicated
-/// worktree but have not made a Brehon lifecycle call.
+/// worktree but have not handed task state back to Brehon recently enough.
 ///
 /// This covers the no-MCP handoff failure mode: the agent edited and tested
 /// locally, then ended the turn with prose instead of `action=complete`,
-/// `action=checkpoint`, or `action=progress`. A dirty assigned worktree must
-/// not be reset; the worker needs an explicit handoff prompt first.
+/// `action=checkpoint`, or `action=progress`. It also covers the runtime-prompt
+/// failure mode where Brehon's own prompts keep terminal activity fresh while
+/// the assigned task and dirty worktree are stale. A dirty assigned worktree
+/// must not be reset; the worker needs an explicit handoff prompt first.
 pub(crate) fn send_dirty_worktree_handoff_nudges(
     ctx: &mut super::event_loop::EventLoopCtx,
     brehon_root: &std::path::Path,
@@ -3041,6 +3086,7 @@ pub(crate) fn send_dirty_worktree_handoff_nudges(
         .map(|pane| pane.id().to_string())
         .collect();
 
+    let now_utc = chrono::Utc::now();
     for task in tasks {
         let Some(worker_id) = task.assignee.as_deref() else {
             continue;
@@ -3054,7 +3100,9 @@ pub(crate) fn send_dirty_worktree_handoff_nudges(
         let worker_idle = now
             .checked_duration_since(ctx.last_activity.get(worker_id).copied().unwrap_or(now))
             .unwrap_or_default();
-        if worker_idle < ctx.post_checkpoint_nudge_threshold {
+        let task_stale_enough = task_lifecycle_stale_age(brehon_root, task, now_utc)
+            .filter(|age| *age >= ctx.auto_recover_threshold);
+        if worker_idle < ctx.post_checkpoint_nudge_threshold && task_stale_enough.is_none() {
             continue;
         }
         let key = active_worker_recovery_key(worker_id, &task.id);
@@ -3075,7 +3123,7 @@ pub(crate) fn send_dirty_worktree_handoff_nudges(
                 worker_id,
                 task,
                 &reason,
-                worker_idle.as_secs(),
+                task_stale_enough.unwrap_or(worker_idle).as_secs(),
                 now,
             );
         }

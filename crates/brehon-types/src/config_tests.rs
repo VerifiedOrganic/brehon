@@ -102,6 +102,7 @@ fn test_config() -> BrehonConfig {
             spawn_workers: None,
             drain_timeout_secs: None,
             worktree_root: None,
+            cargo_target_root: None,
             worktree_cleanup: WorktreeCleanupConfig::default(),
         },
         runtime: RuntimeConfig::default(),

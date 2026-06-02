@@ -163,6 +163,7 @@ pub fn run_tui(shutdown: Arc<AtomicBool>, mux: Mux, rt: tokio::runtime::Handle) 
             spawn_workers: None,
             drain_timeout_secs: None,
             worktree_root: None,
+            cargo_target_root: None,
             worktree_cleanup: brehon_types::WorktreeCleanupConfig::default(),
         },
     )
@@ -226,6 +227,7 @@ pub fn run_dashboard_tui(
             spawn_workers: None,
             drain_timeout_secs: None,
             worktree_root: None,
+            cargo_target_root: None,
             worktree_cleanup: brehon_types::WorktreeCleanupConfig::default(),
         },
         None,
@@ -7883,6 +7885,36 @@ mod tests {
             status: None,
             message: Some(
                 "API Error: 400 Invalid request: Your request exceeded model token limit: 262144 (requested: 262328)"
+                    .to_string(),
+            ),
+            output_chunks: None,
+            duration: None,
+        };
+
+        assert!(is_worker_context_reset_candidate(
+            &mux,
+            "worker-kimi",
+            &entry
+        ));
+    }
+
+    #[test]
+    fn test_is_worker_context_reset_candidate_matches_kimi_invalid_tool_history_error() {
+        let mut mux = Mux::new(24, 80);
+        mux.add_pane(make_builtin_worker_pane(
+            "worker-kimi",
+            "kimi-worker",
+            brehon_mux::SupervisorCli::Kimi,
+        ));
+
+        let entry = brehon_mux::ActivityEntry {
+            kind: brehon_mux::ActivityKind::Progress,
+            ingested_at: std::time::Instant::now(),
+            tool_id: None,
+            tool_name: None,
+            status: None,
+            message: Some(
+                "Kimi provider/runtime failure: an assistant message with 'tool_calls' must be followed by tool messages responding to each 'tool_call_id'. The following tool_call_ids did not have response messages: Shell:25"
                     .to_string(),
             ),
             output_chunks: None,

@@ -610,6 +610,10 @@ orchestration:
   #        ~/.local/share/brehon/worktrees/<repo-name-hash>/
   # Override with an absolute path when you need a fixed location:
   # worktree_root: /absolute/path/to/brehon-worktrees
+  # Optional per-agent Cargo target cache root. When set, Brehon assigns each
+  # pane its own CARGO_TARGET_DIR under this root, avoiding one shared Cargo
+  # lock while preserving Rust build artifacts across pane/worktree recycling.
+  # cargo_target_root: /absolute/path/to/brehon-cargo-targets
   worker_idle_behavior: SelfImprove
   allow_mutating_idle_work: false
   self_improve_tasks: []

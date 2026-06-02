@@ -296,6 +296,31 @@ scoring policy are all configured under their respective sections; see the
 defaults file and the schema validator (`brehon-config/src/validate/`) for the
 authoritative form.
 
+Brehon can optionally compress selected model-facing context before it is
+queued to agents. Compression is disabled by default. External Headroom-style
+compression is fail-closed: if the command is missing, times out, returns
+invalid UTF-8, returns empty text, or does not reduce the estimated token count,
+Brehon sends the original context.
+
+```yaml
+context:
+  compression:
+    enabled: true
+    mode: headroom
+    min_tokens: 2000
+    store_raw: true
+    prompt_contexts: [review_handoff, review_research, research_handoff]
+    never_compress: []
+    headroom:
+      command: headroom
+      args: ["compress", "--stdin"]
+      timeout_ms: 10000
+```
+
+`prompt_contexts` is an allow list for prompt surfaces. Existing
+`compact_memories`, `compact_rules`, and `compact_tasks` continue to control
+MCP context-tool output separately.
+
 ## CLI Reference
 
 | Command                       | Purpose                                                              |

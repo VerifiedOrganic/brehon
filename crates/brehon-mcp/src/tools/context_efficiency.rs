@@ -1,13 +1,19 @@
 //! Shared token-efficiency helpers for MCP context tools.
 
+use std::io::{Read, Write};
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
+
 use brehon_types::config::{
-    ContextCompressionConfig, ContextCompressionMode, ContextRetrievalConfig,
+    ContextCompressionConfig, ContextCompressionMode, ContextCompressionTarget,
+    ContextRetrievalConfig, HeadroomCompressionConfig,
 };
 
 use crate::server::configured_project_root;
 
 /// Effective context retrieval/compression settings.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct ContextToolOptions {
     pub(crate) retrieval: ContextRetrievalConfig,
     pub(crate) compression: ContextCompressionConfig,
@@ -92,17 +98,227 @@ pub(crate) fn compact_deterministic_terse(input: &str) -> String {
     output
 }
 
-pub(crate) fn compact_text_if_enabled(
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ModelContextCompressionOutcome {
+    pub(crate) text: String,
+    pub(crate) applied: bool,
+    pub(crate) original_tokens: usize,
+    pub(crate) compressed_tokens: usize,
+    pub(crate) reason: Option<String>,
+}
+
+impl ModelContextCompressionOutcome {
+    fn skipped(input: &str, original_tokens: usize, reason: impl Into<String>) -> Self {
+        Self {
+            text: input.to_string(),
+            applied: false,
+            original_tokens,
+            compressed_tokens: original_tokens,
+            reason: Some(reason.into()),
+        }
+    }
+}
+
+pub(crate) fn compact_text_with_config(
     input: &str,
-    enabled: bool,
-    mode: ContextCompressionMode,
+    config: &ContextCompressionConfig,
+    target: ContextCompressionTarget,
 ) -> String {
-    if !enabled {
-        return input.to_string();
+    compact_model_context(input, config, target).text
+}
+
+pub(crate) fn compact_model_context(
+    input: &str,
+    config: &ContextCompressionConfig,
+    target: ContextCompressionTarget,
+) -> ModelContextCompressionOutcome {
+    let original_tokens = estimate_tokens(input);
+    if !config.enabled {
+        return ModelContextCompressionOutcome::skipped(input, original_tokens, "disabled");
+    }
+    if input.trim().is_empty() {
+        return ModelContextCompressionOutcome::skipped(input, original_tokens, "empty");
+    }
+    if !target_allowed(config, target) {
+        return ModelContextCompressionOutcome::skipped(
+            input,
+            original_tokens,
+            "target_not_allowed",
+        );
     }
 
+    let candidate = match config.mode {
+        ContextCompressionMode::DeterministicTerse => Ok(compact_deterministic_terse(input)),
+        ContextCompressionMode::Headroom => {
+            if original_tokens < config.min_tokens {
+                return ModelContextCompressionOutcome::skipped(
+                    input,
+                    original_tokens,
+                    "below_min_tokens",
+                );
+            }
+            run_headroom_command(input, &config.headroom)
+        }
+    };
+
+    let candidate = match candidate {
+        Ok(candidate) => candidate,
+        Err(reason) => {
+            return ModelContextCompressionOutcome::skipped(input, original_tokens, reason);
+        }
+    };
+    if candidate.trim().is_empty() {
+        return ModelContextCompressionOutcome::skipped(input, original_tokens, "empty_output");
+    }
+
+    let compressed_tokens = estimate_tokens(&candidate);
+    if compressed_tokens >= original_tokens {
+        return ModelContextCompressionOutcome::skipped(input, original_tokens, "not_smaller");
+    }
+
+    ModelContextCompressionOutcome {
+        text: candidate,
+        applied: true,
+        original_tokens,
+        compressed_tokens,
+        reason: None,
+    }
+}
+
+pub(crate) fn compact_model_context_with_notice(
+    input: &str,
+    config: &ContextCompressionConfig,
+    target: ContextCompressionTarget,
+    original_ref: &str,
+) -> String {
+    let outcome = compact_model_context(input, config, target);
+    if !outcome.applied {
+        return outcome.text;
+    }
+
+    format!(
+        "[Brehon context compression: mode={} target={} approx_tokens={}->{}; original retained in {}]\n{}",
+        compression_mode_label(config.mode),
+        compression_target_label(target),
+        outcome.original_tokens,
+        outcome.compressed_tokens,
+        original_ref,
+        outcome.text.trim()
+    )
+}
+
+fn target_allowed(config: &ContextCompressionConfig, target: ContextCompressionTarget) -> bool {
+    if config.never_compress.contains(&target) {
+        return false;
+    }
+
+    match target {
+        ContextCompressionTarget::Memory => config.compact_memories,
+        ContextCompressionTarget::Rule => config.compact_rules,
+        ContextCompressionTarget::TaskContext => config.compact_tasks,
+        ContextCompressionTarget::ReviewHandoff
+        | ContextCompressionTarget::ReviewResearch
+        | ContextCompressionTarget::ResearchHandoff => config.prompt_contexts.contains(&target),
+    }
+}
+
+fn estimate_tokens(input: &str) -> usize {
+    let chars = input.chars().count();
+    (chars + 3) / 4
+}
+
+fn run_headroom_command(input: &str, config: &HeadroomCompressionConfig) -> Result<String, String> {
+    let command = config.command.trim();
+    if command.is_empty() {
+        return Err("headroom_command_empty".to_string());
+    }
+
+    let mut child = Command::new(command)
+        .args(&config.args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| format!("headroom_spawn_failed: {err}"))?;
+
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "headroom_stdout_unavailable".to_string())?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "headroom_stderr_unavailable".to_string())?;
+    let stdout_handle = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).map(|_| bytes)
+    });
+    let stderr_handle = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stderr.read_to_end(&mut bytes).map(|_| bytes)
+    });
+
+    if let Some(mut stdin) = child.stdin.take() {
+        if let Err(err) = stdin.write_all(input.as_bytes()) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("headroom_stdin_failed: {err}"));
+        }
+    }
+
+    let timeout = Duration::from_millis(config.timeout_ms.max(1));
+    let start = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if start.elapsed() >= timeout => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("headroom_timeout".to_string());
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(10)),
+            Err(err) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("headroom_wait_failed: {err}"));
+            }
+        }
+    };
+
+    let stdout = stdout_handle
+        .join()
+        .map_err(|_| "headroom_stdout_thread_failed".to_string())?
+        .map_err(|err| format!("headroom_stdout_failed: {err}"))?;
+    let stderr = stderr_handle
+        .join()
+        .map_err(|_| "headroom_stderr_thread_failed".to_string())?
+        .map_err(|err| format!("headroom_stderr_failed: {err}"))?;
+
+    if !status.success() {
+        return Err(format!(
+            "headroom_exit_failed: status={status} stderr={}",
+            truncate_snippet(&String::from_utf8_lossy(&stderr), 240)
+        ));
+    }
+
+    String::from_utf8(stdout).map_err(|err| format!("headroom_utf8_failed: {err}"))
+}
+
+fn compression_mode_label(mode: ContextCompressionMode) -> &'static str {
     match mode {
-        ContextCompressionMode::DeterministicTerse => compact_deterministic_terse(input),
+        ContextCompressionMode::DeterministicTerse => "deterministic_terse",
+        ContextCompressionMode::Headroom => "headroom",
+    }
+}
+
+fn compression_target_label(target: ContextCompressionTarget) -> &'static str {
+    match target {
+        ContextCompressionTarget::Memory => "memory",
+        ContextCompressionTarget::Rule => "rule",
+        ContextCompressionTarget::TaskContext => "task_context",
+        ContextCompressionTarget::ReviewHandoff => "review_handoff",
+        ContextCompressionTarget::ReviewResearch => "review_research",
+        ContextCompressionTarget::ResearchHandoff => "research_handoff",
     }
 }
 
@@ -301,5 +517,110 @@ mod tests {
         assert!(!options.should_compact_memories());
         assert!(!options.should_compact_rules());
         assert!(!options.should_compact_tasks());
+    }
+
+    #[test]
+    fn prompt_contexts_are_allow_listed() {
+        let input = "The authentication middleware uses configuration because context matters.";
+        let config = ContextCompressionConfig {
+            enabled: true,
+            prompt_contexts: Vec::new(),
+            ..ContextCompressionConfig::default()
+        };
+
+        let outcome =
+            compact_model_context(input, &config, ContextCompressionTarget::ReviewHandoff);
+
+        assert!(!outcome.applied);
+        assert_eq!(outcome.text, input);
+        assert_eq!(outcome.reason.as_deref(), Some("target_not_allowed"));
+    }
+
+    #[test]
+    fn never_compress_wins_over_prompt_allow_list() {
+        let input = "The authentication middleware uses configuration because context matters.";
+        let config = ContextCompressionConfig {
+            enabled: true,
+            prompt_contexts: vec![ContextCompressionTarget::ReviewHandoff],
+            never_compress: vec![ContextCompressionTarget::ReviewHandoff],
+            ..ContextCompressionConfig::default()
+        };
+
+        let outcome =
+            compact_model_context(input, &config, ContextCompressionTarget::ReviewHandoff);
+
+        assert!(!outcome.applied);
+        assert_eq!(outcome.text, input);
+        assert_eq!(outcome.reason.as_deref(), Some("target_not_allowed"));
+    }
+
+    #[test]
+    fn headroom_mode_fails_closed_when_command_is_unavailable() {
+        let input = "repeated verbose context ".repeat(200);
+        let config = ContextCompressionConfig {
+            enabled: true,
+            mode: ContextCompressionMode::Headroom,
+            min_tokens: 1,
+            prompt_contexts: vec![ContextCompressionTarget::ReviewHandoff],
+            headroom: HeadroomCompressionConfig {
+                command: "/no/such/headroom".to_string(),
+                args: Vec::new(),
+                timeout_ms: 100,
+            },
+            ..ContextCompressionConfig::default()
+        };
+
+        let outcome =
+            compact_model_context(&input, &config, ContextCompressionTarget::ReviewHandoff);
+
+        assert!(!outcome.applied);
+        assert_eq!(outcome.text, input);
+        assert!(outcome
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.starts_with("headroom_spawn_failed")));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn headroom_mode_applies_external_command_and_keeps_original_notice() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let script = temp.path().join("headroom-test");
+        fs::write(&script, "#!/bin/sh\nsed 's/repeated verbose context/x/g'\n").unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).unwrap();
+
+        let input = "repeated verbose context ".repeat(200);
+        let config = ContextCompressionConfig {
+            enabled: true,
+            mode: ContextCompressionMode::Headroom,
+            min_tokens: 1,
+            prompt_contexts: vec![ContextCompressionTarget::ReviewHandoff],
+            headroom: HeadroomCompressionConfig {
+                command: script.to_string_lossy().into_owned(),
+                args: Vec::new(),
+                timeout_ms: 1_000,
+            },
+            ..ContextCompressionConfig::default()
+        };
+
+        let outcome =
+            compact_model_context(&input, &config, ContextCompressionTarget::ReviewHandoff);
+        assert!(outcome.applied);
+        assert!(outcome.compressed_tokens < outcome.original_tokens);
+        assert!(!outcome.text.contains("repeated verbose context"));
+
+        let with_notice = compact_model_context_with_notice(
+            &input,
+            &config,
+            ContextCompressionTarget::ReviewHandoff,
+            "round request metadata field `context`",
+        );
+        assert!(with_notice.contains("mode=headroom target=review_handoff"));
+        assert!(with_notice.contains("original retained in round request metadata field `context`"));
     }
 }

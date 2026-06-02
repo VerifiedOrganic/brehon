@@ -1274,6 +1274,13 @@ pub struct OrchestrationConfig {
     /// default under the user's data directory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree_root: Option<String>,
+    /// Optional root for per-agent Cargo target directories.
+    ///
+    /// When set, launched agents receive a role/slot-specific `CARGO_TARGET_DIR`
+    /// below this root. That preserves Rust build artifacts across recycled
+    /// worktrees without forcing every worker through one shared Cargo lock.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cargo_target_root: Option<String>,
     /// Allowlisted cleanup actions for disposable Brehon worktrees.
     #[serde(default, skip_serializing_if = "WorktreeCleanupConfig::is_default")]
     pub worktree_cleanup: WorktreeCleanupConfig,
@@ -1712,15 +1719,18 @@ fn default_context_retrieval_snippet_chars() -> usize {
     240
 }
 
-/// Deterministic compression controls for model-facing context.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+/// Compression controls for model-facing context.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct ContextCompressionConfig {
-    /// Enable deterministic compact context.
+    /// Enable compact model-facing context.
     #[serde(default)]
     pub enabled: bool,
     /// Compression algorithm/mode.
     #[serde(default)]
     pub mode: ContextCompressionMode,
+    /// Minimum estimated token count before external prompt compression runs.
+    #[serde(default = "default_context_compression_min_tokens")]
+    pub min_tokens: usize,
     /// Preserve raw content alongside compact content.
     #[serde(default = "default_true")]
     pub store_raw: bool,
@@ -1733,6 +1743,15 @@ pub struct ContextCompressionConfig {
     /// Return compact task context when compression is enabled.
     #[serde(default = "default_true")]
     pub compact_tasks: bool,
+    /// Explicit prompt surfaces allowed to use model-facing compression.
+    #[serde(default)]
+    pub prompt_contexts: Vec<ContextCompressionTarget>,
+    /// Explicit prompt surfaces that must never be compressed.
+    #[serde(default)]
+    pub never_compress: Vec<ContextCompressionTarget>,
+    /// Headroom command integration settings.
+    #[serde(default)]
+    pub headroom: HeadroomCompressionConfig,
 }
 
 impl Default for ContextCompressionConfig {
@@ -1740,12 +1759,20 @@ impl Default for ContextCompressionConfig {
         Self {
             enabled: false,
             mode: ContextCompressionMode::DeterministicTerse,
+            min_tokens: default_context_compression_min_tokens(),
             store_raw: true,
             compact_memories: true,
             compact_rules: true,
             compact_tasks: true,
+            prompt_contexts: Vec::new(),
+            never_compress: Vec::new(),
+            headroom: HeadroomCompressionConfig::default(),
         }
     }
+}
+
+fn default_context_compression_min_tokens() -> usize {
+    2_000
 }
 
 fn default_true() -> bool {
@@ -1759,6 +1786,62 @@ pub enum ContextCompressionMode {
     /// Deterministic rule-based prose compaction.
     #[default]
     DeterministicTerse,
+    /// Invoke an external Headroom-compatible command on stdin/stdout.
+    Headroom,
+}
+
+/// Model-facing context surfaces that may opt into compression.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextCompressionTarget {
+    /// Stored memory content returned through memory tools.
+    Memory,
+    /// Stored rule content returned through rule tools.
+    Rule,
+    /// Task context summaries returned through task tools.
+    TaskContext,
+    /// Historical handoff context included in reviewer prompts.
+    ReviewHandoff,
+    /// Research context included in reviewer prompts.
+    ReviewResearch,
+    /// Research artifact handoff notifications sent to workers/supervisors.
+    ResearchHandoff,
+}
+
+/// External Headroom command integration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct HeadroomCompressionConfig {
+    /// Command invoked when `mode=headroom`.
+    #[serde(default = "default_headroom_command")]
+    pub command: String,
+    /// Arguments passed before writing source text to stdin.
+    #[serde(default = "default_headroom_args")]
+    pub args: Vec<String>,
+    /// Maximum wall-clock time allowed for one compression call.
+    #[serde(default = "default_headroom_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+impl Default for HeadroomCompressionConfig {
+    fn default() -> Self {
+        Self {
+            command: default_headroom_command(),
+            args: default_headroom_args(),
+            timeout_ms: default_headroom_timeout_ms(),
+        }
+    }
+}
+
+fn default_headroom_command() -> String {
+    "headroom".to_string()
+}
+
+fn default_headroom_args() -> Vec<String> {
+    vec!["compress".to_string(), "--stdin".to_string()]
+}
+
+fn default_headroom_timeout_ms() -> u64 {
+    10_000
 }
 
 /// AGENTS.md handling mode.
@@ -2208,10 +2291,54 @@ mod tests {
         let parsed: ContextCompressionConfig = serde_json::from_str("{}").unwrap();
 
         assert!(!parsed.enabled);
+        assert_eq!(parsed.mode, ContextCompressionMode::DeterministicTerse);
+        assert_eq!(parsed.min_tokens, 2_000);
         assert!(parsed.store_raw);
         assert!(parsed.compact_memories);
         assert!(parsed.compact_rules);
         assert!(parsed.compact_tasks);
+        assert!(parsed.prompt_contexts.is_empty());
+        assert!(parsed.never_compress.is_empty());
+        assert_eq!(parsed.headroom.command, "headroom");
+        assert_eq!(parsed.headroom.args, ["compress", "--stdin"]);
+        assert_eq!(parsed.headroom.timeout_ms, 10_000);
+    }
+
+    #[test]
+    fn context_compression_accepts_headroom_prompt_allow_list() {
+        let parsed: ContextCompressionConfig = serde_json::from_str(
+            r#"{
+                "enabled": true,
+                "mode": "headroom",
+                "min_tokens": 64,
+                "prompt_contexts": ["review_handoff", "review_research"],
+                "never_compress": ["research_handoff"],
+                "headroom": {
+                    "command": "headroom-local",
+                    "args": ["compact", "--stdin"],
+                    "timeout_ms": 250
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert!(parsed.enabled);
+        assert_eq!(parsed.mode, ContextCompressionMode::Headroom);
+        assert_eq!(parsed.min_tokens, 64);
+        assert_eq!(
+            parsed.prompt_contexts,
+            vec![
+                ContextCompressionTarget::ReviewHandoff,
+                ContextCompressionTarget::ReviewResearch
+            ]
+        );
+        assert_eq!(
+            parsed.never_compress,
+            vec![ContextCompressionTarget::ResearchHandoff]
+        );
+        assert_eq!(parsed.headroom.command, "headroom-local");
+        assert_eq!(parsed.headroom.args, ["compact", "--stdin"]);
+        assert_eq!(parsed.headroom.timeout_ms, 250);
     }
 
     #[test]
@@ -2443,6 +2570,7 @@ mod tests {
                 spawn_workers: None,
                 drain_timeout_secs: None,
                 worktree_root: None,
+                cargo_target_root: None,
                 worktree_cleanup: WorktreeCleanupConfig::default(),
             },
             runtime: RuntimeConfig::default(),
@@ -2712,6 +2840,7 @@ security:
                 spawn_workers: None,
                 drain_timeout_secs: None,
                 worktree_root: None,
+                cargo_target_root: None,
                 worktree_cleanup: WorktreeCleanupConfig::default(),
             }
         };
@@ -2823,6 +2952,7 @@ security:
                 spawn_workers: None,
                 drain_timeout_secs: None,
                 worktree_root: None,
+                cargo_target_root: None,
                 worktree_cleanup: WorktreeCleanupConfig::default(),
             }
         };

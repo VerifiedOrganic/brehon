@@ -74,6 +74,14 @@ pub fn build_worker_protocol(
             "Use Brehon MCP tools for task/state coordination, and normal shell/CLI commands \
              for repo work — always within the current worktree (see worktree rules above)."
         ),
+        "Rust/Cargo command rule: `cargo check`, `cargo test`, `cargo build`, `cargo clippy`, \
+         and `cargo doc` can exceed short shell defaults in fresh or external-drive worktrees. \
+         When a shell tool supports an explicit timeout, use at least 900 seconds for Cargo \
+         commands, and at least 1200 seconds for workspace-wide or all-targets Cargo commands. \
+         For background shell tasks, use the same timeout for the blocking output wait. A \
+         120s/300s Cargo timeout is not test evidence and is not a task failure; rerun with a \
+         proper timeout or report the real blocker after the longer timeout."
+            .to_string(),
         "Do NOT use host or built-in task tools such as `TaskList`, `TaskUpdate`, `TaskCreate`, \
          `TaskGet`, or `TaskOutput` for Brehon work. They are not Brehon lifecycle tools and can \
          bypass checkpoint, review, and integration state."
@@ -170,6 +178,8 @@ mod tests {
         assert!(protocol.contains("Do NOT wait for approval"));
         assert!(protocol.contains("Do NOT use host or built-in task tools"));
         assert!(protocol.contains("`TaskUpdate`"));
+        assert!(protocol.contains("use at least 900 seconds for Cargo commands"));
+        assert!(protocol.contains("120s/300s Cargo timeout is not test evidence"));
     }
 
     #[test]

@@ -4,6 +4,7 @@
 
 use async_trait::async_trait;
 use brehon_ports::{EventStore, ProofStore, RunStore};
+use brehon_types::config::ContextCompressionTarget;
 use brehon_types::{normalize_task_status, Event, EventId, EventKind, RunRecord, TaskId};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -12,7 +13,7 @@ use std::sync::Arc;
 
 use crate::error::McpError;
 use crate::tools::context_efficiency::{
-    compact_text_if_enabled, load_context_tool_options, ContextToolOptions,
+    compact_text_with_config, load_context_tool_options, ContextToolOptions,
 };
 use crate::tools::freshness::ToolFreshness;
 use crate::tools::proof_summary::ProofSummary;
@@ -506,7 +507,11 @@ fn resolve_task_record(task_id: Option<&str>) -> Option<serde_json::Map<String, 
 
 fn compact_task_context_text(content: String, options: &ContextToolOptions) -> String {
     if options.should_compact_tasks() {
-        compact_text_if_enabled(&content, true, options.compression.mode)
+        compact_text_with_config(
+            &content,
+            &options.compression,
+            ContextCompressionTarget::TaskContext,
+        )
     } else {
         content
     }

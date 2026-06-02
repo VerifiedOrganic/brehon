@@ -7,6 +7,7 @@ use std::collections::HashMap;
 
 use serde_json::Value;
 
+use brehon_types::config::{ContextCompressionConfig, ContextCompressionTarget};
 use brehon_types::{is_terminal_task_status, normalize_task_status, EventKind, TaskCompletionMode};
 
 use crate::error::McpError;
@@ -16,6 +17,7 @@ use crate::tools::assignment_observability::{
     acknowledge_propagation, build_assignment_observability, mark_progress_started,
     AssignmentPropagation,
 };
+use crate::tools::context_efficiency::compact_model_context_with_notice;
 use crate::tools::{error_result, text_result};
 
 use super::commits::{preview_commit_integration_conflicts, resolve_review_commit_set};
@@ -1041,6 +1043,23 @@ impl VerificationTool {
         } else {
             String::new()
         };
+        let default_compression = ContextCompressionConfig::default();
+        let compression = project_config
+            .as_ref()
+            .map(|config| &config.context.compression)
+            .unwrap_or(&default_compression);
+        let review_context_for_prompt = compact_model_context_with_notice(
+            &context,
+            compression,
+            ContextCompressionTarget::ReviewHandoff,
+            "round request metadata field `context`",
+        );
+        let research_context_for_prompt = compact_model_context_with_notice(
+            &research_context,
+            compression,
+            ContextCompressionTarget::ReviewResearch,
+            "task research_context artifacts",
+        );
 
         let mut rendered_review_prompts = Vec::new();
         let mut reviewer_prompt_map = std::collections::BTreeMap::new();
@@ -1050,7 +1069,7 @@ impl VerificationTool {
                 task_id,
                 title,
                 description,
-                context: &context,
+                context: &review_context_for_prompt,
                 panel_id: &new_state.panel_id,
                 round,
                 reviewer,
@@ -1060,7 +1079,7 @@ impl VerificationTool {
                 merge_target: Some(&merge_target),
                 review_fingerprint: Some(&review_fingerprint),
                 proof_summary: proof_summary.as_ref(),
-                research_context: Some(&research_context),
+                research_context: Some(&research_context_for_prompt),
             });
             reviewer_prompt_map.insert(reviewer.clone(), review_prompt.clone());
             rendered_review_prompts.push((reviewer.clone(), review_prompt));

@@ -4,6 +4,7 @@
 
 use async_trait::async_trait;
 use brehon_ports::{EventStore, SearchIndex};
+use brehon_types::config::ContextCompressionTarget;
 use brehon_types::{Event, EventKind, SearchEntry};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -19,7 +20,7 @@ use tracing::warn;
 use crate::error::McpError;
 use crate::server::ToolResult;
 use crate::tools::context_efficiency::{
-    compact_text_if_enabled, load_context_tool_options, truncate_snippet, ContextToolOptions,
+    compact_text_with_config, load_context_tool_options, truncate_snippet, ContextToolOptions,
 };
 use crate::tools::freshness::ToolFreshness;
 use crate::tools::{error_result, text_result, Tool};
@@ -217,9 +218,13 @@ async fn memory_freshness(
 }
 
 fn compact_memory_content(content: &str, options: &ContextToolOptions) -> Option<String> {
-    options
-        .should_compact_memories()
-        .then(|| compact_text_if_enabled(content, true, options.compression.mode))
+    options.should_compact_memories().then(|| {
+        compact_text_with_config(
+            content,
+            &options.compression,
+            ContextCompressionTarget::Memory,
+        )
+    })
 }
 
 fn model_memory_content<'a>(
@@ -235,10 +240,10 @@ fn model_memory_content<'a>(
         .as_deref()
         .map(std::borrow::Cow::Borrowed)
         .unwrap_or_else(|| {
-            std::borrow::Cow::Owned(compact_text_if_enabled(
+            std::borrow::Cow::Owned(compact_text_with_config(
                 &memory.content,
-                true,
-                options.compression.mode,
+                &options.compression,
+                ContextCompressionTarget::Memory,
             ))
         })
 }
