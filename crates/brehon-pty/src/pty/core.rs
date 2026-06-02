@@ -259,8 +259,7 @@ impl Pty {
                     let exit_code = child
                         .lock()
                         .ok()
-                        .and_then(|mut c| c.try_wait().ok().flatten())
-                        .map(|status| status.exit_code() as i32);
+                        .and_then(|mut c| collect_child_exit_code_after_eof(c.as_mut()));
                     let _ = try_send_pty_event(
                         &event_tx,
                         PtyEvent::Exited(exit_code),
@@ -520,6 +519,7 @@ pub(crate) fn kill_child(child: &mut dyn portable_pty::Child) -> Result<()> {
     Ok(())
 }
 
+include!("core_exit_status.rs");
 #[cfg(unix)]
 fn kill_descendant_enumeration(root_pid: u32) -> Result<Vec<u32>> {
     list_descendant_process_ids(root_pid)
