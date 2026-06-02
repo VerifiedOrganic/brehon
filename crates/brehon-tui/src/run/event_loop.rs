@@ -4004,9 +4004,9 @@ mod tests {
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum TestRouteRejection {
-        SendPromptTo(String),
-        RecyclePaneTo(String),
-        ResetPaneTo(String),
+        SendPrompt(String),
+        RecyclePane(String),
+        ResetPane(String),
     }
 
     struct SelectiveRecordingRouter {
@@ -4114,21 +4114,21 @@ mod tests {
     impl SelectiveRecordingRouter {
         fn should_reject(&self, command: &RuntimeCommand) -> bool {
             self.rejections.iter().any(|rejection| match rejection {
-                TestRouteRejection::SendPromptTo(target) => {
+                TestRouteRejection::SendPrompt(target) => {
                     matches!(
                         &command.kind,
                         RuntimeCommandKind::SendPrompt { .. }
                             if command.target.pane_id.as_deref() == Some(target.as_str())
                     )
                 }
-                TestRouteRejection::RecyclePaneTo(target) => {
+                TestRouteRejection::RecyclePane(target) => {
                     matches!(
                         &command.kind,
                         RuntimeCommandKind::RecyclePane { .. }
                             if command.target.pane_id.as_deref() == Some(target.as_str())
                     )
                 }
-                TestRouteRejection::ResetPaneTo(target) => {
+                TestRouteRejection::ResetPane(target) => {
                     matches!(
                         &command.kind,
                         RuntimeCommandKind::ResetPane { .. }
@@ -5561,7 +5561,7 @@ TypeError: Cannot read properties of undefined"#,
         let mut harness = harness_with_selective_router(
             mux,
             false,
-            vec![TestRouteRejection::ResetPaneTo("supervisor".to_string())],
+            vec![TestRouteRejection::ResetPane("supervisor".to_string())],
         );
 
         assert!(perform_manual_reset_request(&mut harness.ctx, "supervisor"));
@@ -5614,7 +5614,7 @@ TypeError: Cannot read properties of undefined"#,
         let mut harness = harness_with_selective_router(
             mux,
             false,
-            vec![TestRouteRejection::RecyclePaneTo("worker-1".to_string())],
+            vec![TestRouteRejection::RecyclePane("worker-1".to_string())],
         );
         let now = Instant::now();
         harness.ctx.auto_recover_threshold = Duration::from_secs(1);
@@ -5995,7 +5995,7 @@ TypeError: Cannot read properties of undefined"#,
         let mut harness = harness_with_selective_router(
             mux,
             false,
-            vec![TestRouteRejection::RecyclePaneTo("worker-1".to_string())],
+            vec![TestRouteRejection::RecyclePane("worker-1".to_string())],
         );
         harness.ctx.stall_check_interval = Duration::ZERO;
         harness.ctx.last_stall_check = Instant::now() - Duration::from_secs(60);
@@ -6068,7 +6068,7 @@ TypeError: Cannot read properties of undefined"#,
         let mut harness = harness_with_selective_router(
             mux,
             false,
-            vec![TestRouteRejection::RecyclePaneTo("worker-1".to_string())],
+            vec![TestRouteRejection::RecyclePane("worker-1".to_string())],
         );
         harness.ctx.stall_check_interval = Duration::ZERO;
         harness.ctx.last_stall_check = Instant::now() - Duration::from_secs(60);
@@ -6172,7 +6172,7 @@ TypeError: Cannot read properties of undefined"#,
         let mut harness = harness_with_selective_router(
             mux,
             false,
-            vec![TestRouteRejection::RecyclePaneTo("worker-1".to_string())],
+            vec![TestRouteRejection::RecyclePane("worker-1".to_string())],
         );
         harness.ctx.stall_check_interval = Duration::ZERO;
         harness.ctx.last_stall_check = Instant::now() - Duration::from_secs(60);
@@ -6236,7 +6236,7 @@ TypeError: Cannot read properties of undefined"#,
         let mut harness = harness_with_selective_router(
             mux,
             false,
-            vec![TestRouteRejection::RecyclePaneTo("worker-1".to_string())],
+            vec![TestRouteRejection::RecyclePane("worker-1".to_string())],
         );
         harness.ctx.stall_check_interval = Duration::ZERO;
         harness.ctx.last_stall_check = Instant::now() - Duration::from_secs(60);
@@ -8158,7 +8158,7 @@ TypeError: Cannot read properties of undefined"#,
         let mut harness = harness_with_selective_router(
             mux,
             true,
-            vec![TestRouteRejection::SendPromptTo("reviewer-1".to_string())],
+            vec![TestRouteRejection::SendPrompt("reviewer-1".to_string())],
         );
         let now = Instant::now();
         harness.ctx.review_obligation_nudge_threshold = Duration::from_secs(1);

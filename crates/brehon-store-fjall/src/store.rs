@@ -227,12 +227,10 @@ impl FjallEventStore {
         path: &Path,
     ) -> Result<KeyspaceOpen, StoreError> {
         match Config::new(path).open() {
-            Ok(keyspace) => {
-                return Ok(KeyspaceOpen {
-                    keyspace,
-                    proof_projection_quarantined: false,
-                });
-            }
+            Ok(keyspace) => Ok(KeyspaceOpen {
+                keyspace,
+                proof_projection_quarantined: false,
+            }),
             Err(err) => {
                 let original_error = err.to_string();
                 let proof_path = path.join("partitions").join(PROOFS_PARTITION);

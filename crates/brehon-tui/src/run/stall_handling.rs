@@ -1389,7 +1389,7 @@ fn recover_prompt_blocked_worker(
                     worker_id,
                     &failure,
                 );
-                return match blocked_task_result {
+                match blocked_task_result {
                     Ok(()) => {
                         clear_agent_health_marker(brehon_root, worker_id);
                         push_dashboard_event(
@@ -1417,14 +1417,14 @@ fn recover_prompt_blocked_worker(
                             None,
                         )
                     }
-                };
+                }
             } else {
-                return terminally_mark_taskless_prompt_block_recovery_failure(
+                terminally_mark_taskless_prompt_block_recovery_failure(
                     ctx,
                     brehon_root,
                     worker_id,
                     &failure,
-                );
+                )
             }
         }
     }
@@ -1729,10 +1729,7 @@ fn keep_latest_timestamp(latest: &mut Option<chrono::DateTime<chrono::Utc>>, val
     let Some(timestamp) = parse_rfc3339_utc(value) else {
         return;
     };
-    if latest
-        .as_ref()
-        .is_none_or(|current| timestamp > current.clone())
-    {
+    if latest.as_ref().is_none_or(|current| timestamp > *current) {
         *latest = Some(timestamp);
     }
 }

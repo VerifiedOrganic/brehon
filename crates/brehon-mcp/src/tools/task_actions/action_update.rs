@@ -1138,7 +1138,7 @@ pub(super) async fn execute_update(
         worker_state_review_recovery = supervisor_worker_state_review_recovery_allowed(
             &caller_role,
             current_status,
-            &normalized,
+            normalized,
             &task,
         );
         if normalize_task_status(current_status) == Some("blocked")

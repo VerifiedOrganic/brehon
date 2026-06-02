@@ -904,6 +904,7 @@ fn lock_env() -> MutexGuard<'static, ()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::await_holding_lock)]
 async fn soak_unattended_lifecycle_multiple_providers() {
     let _lock = lock_env();
     assert!(

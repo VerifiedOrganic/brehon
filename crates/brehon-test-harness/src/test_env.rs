@@ -29,11 +29,11 @@ impl ScopedEnv {
         Self { saved }
     }
 
-    /// Like [`set`], but also clears `DEFAULT_EMPTY_VARS` to empty strings
+    /// Like [`Self::set`], but also clears `DEFAULT_EMPTY_VARS` to empty strings
     /// unless they are explicitly present in `vars`.
     ///
     /// # Safety
-    /// Same thread-safety requirements as [`set`]: callers must hold
+    /// Same thread-safety requirements as [`Self::set`]: callers must hold
     /// `TEST_ENV_LOCK`.
     pub fn set_with_defaults(vars: &[(&'static str, &str)]) -> Self {
         let mut all_vars: Vec<(&'static str, &str)> = vars.to_vec();

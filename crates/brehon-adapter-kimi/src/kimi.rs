@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -58,6 +58,7 @@ const KIMI_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const KIMI_PROMPT_ACCEPT_TIMEOUT: Duration = Duration::from_millis(1500);
 const KIMI_LOG_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const KIMI_FATAL_LOG_MAX_CHARS: usize = 700;
+const KIMI_MAX_CACHED_PROMPT_RESULTS: usize = 32;
 
 // =============================================================================
 // Kimi runtime preparation helpers (moved from brehon-pty)
@@ -853,6 +854,8 @@ pub fn build_kimi_spawn_config(
 
 type PendingRequests = Arc<Mutex<HashMap<String, oneshot::Sender<JsonRpcResponse>>>>;
 type PromptResults = Arc<Mutex<HashMap<String, Result<AcpPromptResult, String>>>>;
+type PromptResultKeys = Arc<Mutex<VecDeque<String>>>;
+type PromptWaiters = Arc<Mutex<HashSet<String>>>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum KimiError {
@@ -875,6 +878,8 @@ pub struct KimiSessionInner {
     event_tx: Mutex<Option<mpsc::Sender<AdapterEvent>>>,
     pending_requests: PendingRequests,
     prompt_results: PromptResults,
+    prompt_result_keys: PromptResultKeys,
+    prompt_waiters: PromptWaiters,
     prompt_wait_notify: Notify,
     active_prompt_ids: Mutex<HashSet<String>>,
     remote_session_id: Mutex<String>,
@@ -909,6 +914,8 @@ impl KimiSession {
         let process = Arc::new(Mutex::new(Some(process)));
         let pending_requests = Arc::new(Mutex::new(HashMap::new()));
         let prompt_results = Arc::new(Mutex::new(HashMap::new()));
+        let prompt_result_keys = Arc::new(Mutex::new(VecDeque::new()));
+        let prompt_waiters = Arc::new(Mutex::new(HashSet::new()));
 
         let metadata = SessionMetadata {
             role: Some(spec.role.clone()),
@@ -952,6 +959,8 @@ impl KimiSession {
             event_tx: Mutex::new(event_tx),
             pending_requests: Arc::clone(&pending_requests),
             prompt_results: Arc::clone(&prompt_results),
+            prompt_result_keys: Arc::clone(&prompt_result_keys),
+            prompt_waiters: Arc::clone(&prompt_waiters),
             prompt_wait_notify: Notify::new(),
             active_prompt_ids: Mutex::new(HashSet::new()),
             remote_session_id: Mutex::new(remote_session_id),
@@ -1009,7 +1018,7 @@ impl KimiSession {
     pub async fn stability_counters(&self) -> brehon_types::StabilityCounters {
         brehon_types::StabilityCounters {
             pending_requests: self.inner.pending_requests.lock().await.len(),
-            pending_prompt_waiters: self.inner.prompt_results.lock().await.len(),
+            pending_prompt_waiters: self.inner.prompt_waiters.lock().await.len(),
             ..Default::default()
         }
     }
@@ -1021,7 +1030,7 @@ impl KimiSession {
                 inner.session_id.as_str().to_string(),
                 brehon_types::StabilityCounters {
                     pending_requests: inner.pending_requests.lock().await.len(),
-                    pending_prompt_waiters: inner.prompt_results.lock().await.len(),
+                    pending_prompt_waiters: inner.prompt_waiters.lock().await.len(),
                     ..Default::default()
                 },
             );
@@ -1034,7 +1043,7 @@ impl KimiSession {
         }
         let remote_session_id = self.inner.remote_session_id.lock().await.clone();
         let prompt_id = prompt.prompt_id.as_str().to_string();
-        self.inner.prompt_results.lock().await.remove(&prompt_id);
+        let _ = pop_kimi_prompt_result(&self.inner, &prompt_id).await;
         self.inner
             .active_prompt_ids
             .lock()
@@ -1066,11 +1075,7 @@ impl KimiSession {
                     return Err(KimiError::Protocol(err));
                 }
             };
-            self.inner
-                .prompt_results
-                .lock()
-                .await
-                .insert(prompt_id.clone(), Ok(prompt_result));
+            cache_kimi_prompt_result(&self.inner, prompt_id.clone(), Ok(prompt_result)).await;
             self.inner.prompt_wait_notify.notify_waiters();
             self.persist_runtime_stability();
             emit_kimi_turn_completed_if_active(&self.inner, &prompt_id, true).await;
@@ -1093,6 +1098,23 @@ impl KimiSession {
         let deadline = Duration::from_millis(timeout_ms);
         let prompt_id_str = prompt_id.as_str().to_string();
 
+        if let Some(result) = pop_kimi_prompt_result(&self.inner, &prompt_id_str).await {
+            return result.map_err(KimiError::Protocol);
+        }
+
+        {
+            let mut waiters = self.inner.prompt_waiters.lock().await;
+            if !self.inner.alive.load(Ordering::SeqCst) {
+                return Err(KimiError::NotRunning);
+            }
+            if !waiters.insert(prompt_id_str.clone()) {
+                return Err(KimiError::Protocol(format!(
+                    "already waiting for response to {prompt_id_str}"
+                )));
+            }
+        }
+        self.persist_runtime_stability();
+
         match timeout(deadline, async {
             loop {
                 if let Some(error) = self.inner.fatal_error.lock().await.clone() {
@@ -1105,13 +1127,7 @@ impl KimiSession {
                 if let Some(error) = self.inner.fatal_error.lock().await.clone() {
                     return Err(error);
                 }
-                if let Some(result) = self
-                    .inner
-                    .prompt_results
-                    .lock()
-                    .await
-                    .remove(&prompt_id_str)
-                {
+                if let Some(result) = pop_kimi_prompt_result(&self.inner, &prompt_id_str).await {
                     return result;
                 }
                 notified.as_mut().await;
@@ -1119,11 +1135,35 @@ impl KimiSession {
         })
         .await
         {
-            Ok(Ok(result)) => Ok(result),
-            Ok(Err(msg)) => Err(KimiError::Protocol(msg)),
-            Err(_) => Err(KimiError::Timeout(format!(
-                "timeout waiting for response to {prompt_id_str}"
-            ))),
+            Ok(Ok(result)) => {
+                self.inner
+                    .prompt_waiters
+                    .lock()
+                    .await
+                    .remove(&prompt_id_str);
+                self.persist_runtime_stability();
+                Ok(result)
+            }
+            Ok(Err(msg)) => {
+                self.inner
+                    .prompt_waiters
+                    .lock()
+                    .await
+                    .remove(&prompt_id_str);
+                self.persist_runtime_stability();
+                Err(KimiError::Protocol(msg))
+            }
+            Err(_) => {
+                self.inner
+                    .prompt_waiters
+                    .lock()
+                    .await
+                    .remove(&prompt_id_str);
+                self.persist_runtime_stability();
+                Err(KimiError::Timeout(format!(
+                    "timeout waiting for response to {prompt_id_str}"
+                )))
+            }
         }
     }
 
@@ -1219,6 +1259,23 @@ impl KimiSession {
         let deadline = Duration::from_millis(timeout_ms);
         let prompt_id_str = prompt_id.as_str().to_string();
 
+        if let Some(result) = pop_kimi_prompt_result(&self.inner, &prompt_id_str).await {
+            return result.map_err(KimiError::Protocol);
+        }
+
+        {
+            let mut waiters = self.inner.prompt_waiters.lock().await;
+            if !self.inner.alive.load(Ordering::SeqCst) {
+                return Err(KimiError::NotRunning);
+            }
+            if !waiters.insert(prompt_id_str.clone()) {
+                return Err(KimiError::Protocol(format!(
+                    "already waiting for response to {prompt_id_str}"
+                )));
+            }
+        }
+        self.persist_runtime_stability();
+
         match timeout(deadline, async {
             loop {
                 if let Some(error) = self.inner.fatal_error.lock().await.clone() {
@@ -1231,13 +1288,7 @@ impl KimiSession {
                 if let Some(error) = self.inner.fatal_error.lock().await.clone() {
                     return Err(error);
                 }
-                if let Some(result) = self
-                    .inner
-                    .prompt_results
-                    .lock()
-                    .await
-                    .remove(&prompt_id_str)
-                {
+                if let Some(result) = pop_kimi_prompt_result(&self.inner, &prompt_id_str).await {
                     return result;
                 }
                 notified.as_mut().await;
@@ -1245,11 +1296,35 @@ impl KimiSession {
         })
         .await
         {
-            Ok(Ok(result)) => Ok(result),
-            Ok(Err(msg)) => Err(KimiError::Protocol(msg)),
-            Err(_) => Err(KimiError::Timeout(format!(
-                "timeout waiting for response to {prompt_id_str}"
-            ))),
+            Ok(Ok(result)) => {
+                self.inner
+                    .prompt_waiters
+                    .lock()
+                    .await
+                    .remove(&prompt_id_str);
+                self.persist_runtime_stability();
+                Ok(result)
+            }
+            Ok(Err(msg)) => {
+                self.inner
+                    .prompt_waiters
+                    .lock()
+                    .await
+                    .remove(&prompt_id_str);
+                self.persist_runtime_stability();
+                Err(KimiError::Protocol(msg))
+            }
+            Err(_) => {
+                self.inner
+                    .prompt_waiters
+                    .lock()
+                    .await
+                    .remove(&prompt_id_str);
+                self.persist_runtime_stability();
+                Err(KimiError::Timeout(format!(
+                    "timeout waiting for response to {prompt_id_str}"
+                )))
+            }
         }
     }
 
@@ -1449,6 +1524,40 @@ async fn emit_kimi_turn_completed_if_active(
     was_active
 }
 
+async fn pop_kimi_prompt_result(
+    inner: &Arc<KimiSessionInner>,
+    prompt_id: &str,
+) -> Option<Result<AcpPromptResult, String>> {
+    let mut prompt_results = inner.prompt_results.lock().await;
+    let mut prompt_result_keys = inner.prompt_result_keys.lock().await;
+    let result = prompt_results.remove(prompt_id);
+    if result.is_some() {
+        prompt_result_keys.retain(|key| key != prompt_id);
+    }
+    result
+}
+
+async fn cache_kimi_prompt_result(
+    inner: &Arc<KimiSessionInner>,
+    prompt_id: String,
+    result: Result<AcpPromptResult, String>,
+) {
+    let mut prompt_results = inner.prompt_results.lock().await;
+    let mut prompt_result_keys = inner.prompt_result_keys.lock().await;
+
+    if !prompt_results.contains_key(&prompt_id) {
+        prompt_result_keys.push_back(prompt_id.clone());
+    }
+    prompt_results.insert(prompt_id, result);
+
+    while prompt_results.len() > KIMI_MAX_CACHED_PROMPT_RESULTS {
+        let Some(oldest_prompt_id) = prompt_result_keys.pop_front() else {
+            break;
+        };
+        prompt_results.remove(&oldest_prompt_id);
+    }
+}
+
 fn spawn_reader(inner: Arc<KimiSessionInner>) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -1508,11 +1617,8 @@ fn spawn_reader(inner: Arc<KimiSessionInner>) -> JoinHandle<()> {
                                     warn!(response_id = %request_id, error = %err, "Kimi orphaned prompt response error");
                                 }
                                 let success = prompt_result.is_ok();
-                                inner
-                                    .prompt_results
-                                    .lock()
-                                    .await
-                                    .insert(request_id.clone(), prompt_result);
+                                cache_kimi_prompt_result(&inner, request_id.clone(), prompt_result)
+                                    .await;
                                 inner.prompt_wait_notify.notify_waiters();
                                 emit_kimi_turn_completed_if_active(&inner, &request_id, success)
                                     .await;
@@ -1532,16 +1638,12 @@ fn spawn_reader(inner: Arc<KimiSessionInner>) -> JoinHandle<()> {
                             warn!(response_id = %request_id, error = %err, "Kimi prompt response error");
                         }
                         let success = prompt_result.is_ok();
-                        inner
-                            .prompt_results
-                            .lock()
-                            .await
-                            .insert(request_id.clone(), prompt_result);
+                        cache_kimi_prompt_result(&inner, request_id.clone(), prompt_result).await;
                         inner.prompt_wait_notify.notify_waiters();
                         emit_kimi_turn_completed_if_active(&inner, &request_id, success).await;
                     }
                     let pending_requests_len = inner.pending_requests.lock().await.len();
-                    let pending_prompt_waiters_len = inner.prompt_results.lock().await.len();
+                    let pending_prompt_waiters_len = inner.prompt_waiters.lock().await.len();
                     schedule_persist_session_snapshot(
                         inner.session_id.as_str().to_string(),
                         brehon_types::StabilityCounters {
@@ -2325,6 +2427,8 @@ mod tests {
             event_tx: Mutex::new(Some(tx)),
             pending_requests: Arc::new(Mutex::new(HashMap::new())),
             prompt_results: Arc::new(Mutex::new(HashMap::new())),
+            prompt_result_keys: Arc::new(Mutex::new(VecDeque::new())),
+            prompt_waiters: Arc::new(Mutex::new(HashSet::new())),
             prompt_wait_notify: Notify::new(),
             active_prompt_ids: Mutex::new(HashSet::new()),
             remote_session_id: Mutex::new("remote-session-id".to_string()),
@@ -2525,6 +2629,8 @@ max_context_size = 262144
                 event_tx: Mutex::new(None),
                 pending_requests: Arc::new(Mutex::new(HashMap::new())),
                 prompt_results: Arc::new(Mutex::new(HashMap::new())),
+                prompt_result_keys: Arc::new(Mutex::new(VecDeque::new())),
+                prompt_waiters: Arc::new(Mutex::new(HashSet::new())),
                 prompt_wait_notify: Notify::new(),
                 active_prompt_ids: Mutex::new(HashSet::new()),
                 remote_session_id: Mutex::new("remote-session-id".to_string()),

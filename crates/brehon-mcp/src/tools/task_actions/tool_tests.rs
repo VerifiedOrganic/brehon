@@ -2396,7 +2396,10 @@ async fn test_recover_handoff_returns_structured_error_without_commit() {
     assert_eq!(payload["current_state"]["status"], "blocked");
     assert!(payload["current_state"]["latest_commit"].is_null());
     assert_eq!(payload["next_action"]["args"]["action"], "ready");
-    assert!(payload["allowed_next_actions"].as_array().unwrap().len() >= 1);
+    assert!(!payload["allowed_next_actions"]
+        .as_array()
+        .unwrap()
+        .is_empty());
     assert_eq!(
         read_test_task(root.path(), "T-no-commit-action")["status"],
         "blocked"

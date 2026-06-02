@@ -1727,6 +1727,7 @@ async fn test_deliver_prompt_buffers_second_codex_pty_prompt_until_first_submits
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn test_deliver_prompt_buffers_gateway_prompt_while_tool_executing() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");

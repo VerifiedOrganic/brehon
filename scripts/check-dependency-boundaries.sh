@@ -35,10 +35,11 @@ allowed_dependencies() {
   case "$1" in
     brehon-types) echo "" ;;
     brehon-ports) echo "brehon-types" ;;
-    brehon-config) echo "brehon-types" ;;
+    brehon-config) echo "brehon-types brehon-adapter-sdk" ;;
     brehon-protocol) echo "brehon-types" ;;
     brehon-recording) echo "" ;;
     brehon-adapter-sdk) echo "brehon-types" ;;
+    brehon-adapter-agy) echo "brehon-adapter-sdk brehon-types brehon-ports brehon-config" ;;
     brehon-adapter-claude) echo "brehon-adapter-sdk brehon-types" ;;
     brehon-adapter-codex) echo "brehon-adapter-sdk brehon-types brehon-ports" ;;
     brehon-adapter-copilot) echo "brehon-adapter-sdk brehon-types brehon-ports" ;;
@@ -56,10 +57,10 @@ allowed_dependencies() {
     brehon-workflow) echo "brehon-types brehon-ports" ;;
     brehon-host) echo "brehon-types brehon-ports" ;;
     brehon-supervisor) echo "brehon-types brehon-ports" ;;
-    brehon-doctor) echo "brehon-types" ;;
+    brehon-doctor) echo "brehon-types brehon-config" ;;
     brehon-daemon) echo "brehon-ports brehon-runtime brehon-types brehon-detect brehon-workflow" ;;
-    brehon-acp) echo "brehon-types brehon-ports brehon-adapter-sdk brehon-adapter-opencode brehon-adapter-gemini brehon-adapter-kimi brehon-adapter-codex brehon-adapter-copilot brehon-adapter-junie brehon-adapter-openai" ;;
-    brehon-pty) echo "brehon-adapter-claude brehon-adapter-copilot brehon-adapter-junie brehon-adapter-kimi brehon-adapter-sdk brehon-config brehon-types" ;;
+    brehon-acp) echo "brehon-types brehon-ports brehon-adapter-sdk brehon-adapter-opencode brehon-adapter-gemini brehon-adapter-kimi brehon-adapter-codex brehon-adapter-copilot brehon-adapter-junie brehon-adapter-agy brehon-adapter-openai" ;;
+    brehon-pty) echo "brehon-adapter-agy brehon-adapter-claude brehon-adapter-copilot brehon-adapter-junie brehon-adapter-kimi brehon-adapter-sdk brehon-config brehon-types" ;;
     brehon-mux) echo "brehon-recording brehon-protocol brehon-pty brehon-ports brehon-acp brehon-adapter-sdk brehon-types" ;;
     brehon-review) echo "brehon-types brehon-ports brehon-mux brehon-test-harness" ;;
     brehon-mcp) echo "brehon-config brehon-mux brehon-types brehon-ports brehon-review brehon-git" ;;

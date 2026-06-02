@@ -2100,7 +2100,7 @@ key = "oauth/kimi-code"
         assert!(config_text.contains(r#"default_model = "kimi-code/kimi-for-coding""#));
         assert!(config_text.contains("default_thinking = true"));
         assert!(config_text.contains("default_yolo = false"));
-        assert!(config_text.contains("max_context_size = 240000"));
+        assert!(config_text.contains("max_context_size = 262144"));
 
         let mcp_json: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(share_dir.join("mcp.json")).unwrap())

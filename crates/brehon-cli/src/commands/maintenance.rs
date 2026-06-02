@@ -224,11 +224,10 @@ fn brehon_worktree_roots(
         .filter(|path| !path.as_os_str().is_empty())
         .unwrap_or(project_path);
     let project_root = super::run::normalize_project_root(project_root);
-    let mut roots = Vec::new();
-    roots.push(effective_worktree_root(&project_root, config));
-    roots.push(brehon_types::OrchestrationConfig::legacy_worktree_root(
-        &project_root,
-    ));
+    let roots = vec![
+        effective_worktree_root(&project_root, config),
+        brehon_types::OrchestrationConfig::legacy_worktree_root(&project_root),
+    ];
 
     let mut seen = HashSet::new();
     roots
@@ -411,8 +410,8 @@ fn analyze_branches(
 
         // Strip the configured prefix so runs/<session>/... parsing is
         // independent of prefix depth (e.g. "brehon/" vs "acme/team/").
-        let relative = if branch.starts_with(configured_prefix) {
-            &branch[configured_prefix.len()..]
+        let relative = if let Some(stripped) = branch.strip_prefix(configured_prefix) {
+            stripped
         } else {
             branch.as_str()
         };

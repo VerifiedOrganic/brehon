@@ -746,7 +746,7 @@ fn validate_context(config: &BrehonConfig) -> Vec<ValidationWarning> {
 fn validate_profiles(config: &BrehonConfig) -> Vec<ValidationWarning> {
     let mut warnings = Vec::new();
 
-    for (role_kind, _profile) in &config.profiles.defaults {
+    for role_kind in config.profiles.defaults.keys() {
         if !VALID_ROLE_KINDS.contains(role_kind.as_str()) {
             warnings.push(ValidationWarning::new(
                 ValidationWarningKind::ProfilePolicyConflict,

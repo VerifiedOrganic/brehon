@@ -124,7 +124,7 @@ pub(super) fn cleanup_brehon_worktree_allowlisted_artifacts(
         }
     };
 
-    let repo = match git2::Repository::open(&workspace) {
+    let repo = match git2::Repository::open(workspace) {
         Ok(repo) => repo,
         Err(err) => {
             report.skip(

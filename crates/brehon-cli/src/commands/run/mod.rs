@@ -4261,6 +4261,7 @@ mod tests {
     static EXECUTE_DOTBREHON_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn execute_normalizes_dotbrehon_cwd_for_all_project_root_helpers() {
         let _guard = EXECUTE_DOTBREHON_TEST_LOCK.lock().unwrap();
 

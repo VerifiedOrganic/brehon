@@ -283,7 +283,7 @@ impl Mux {
         tail.chars().rev().collect()
     }
 
-    fn terminal_prompt_signal_line<'a>(text: &'a str) -> Option<&'a str> {
+    fn terminal_prompt_signal_line(text: &str) -> Option<&str> {
         text.lines().rev().map(str::trim).find(|line| {
             !line.is_empty()
                 && !Self::terminal_prompt_status_line_is_informational(line)
@@ -673,22 +673,22 @@ impl Mux {
         now: Instant,
     ) {
         let mut state_change = None;
-        if let Some(pane) = self.panes.get_mut(pane_id) {
-            if !matches!(
+        if let Some(pane) = self.panes.get_mut(pane_id)
+            && !matches!(
                 pane.pane_state(),
                 Some(PaneState::Blocked { .. } | PaneState::Dead { .. })
-            ) {
-                let previous = pane.pane_state().map(Self::runtime_pane_state_for_state);
-                pane.set_tool_executing(true);
-                if !matches!(pane.pane_state(), Some(PaneState::Busy { .. })) {
-                    pane.set_pane_busy(prompt_id.clone(), generation, now);
-                }
-                state_change = Self::runtime_state_change(
-                    previous,
-                    pane.pane_state(),
-                    "gateway reported active prompt",
-                );
+            )
+        {
+            let previous = pane.pane_state().map(Self::runtime_pane_state_for_state);
+            pane.set_tool_executing(true);
+            if !matches!(pane.pane_state(), Some(PaneState::Busy { .. })) {
+                pane.set_pane_busy(prompt_id.clone(), generation, now);
             }
+            state_change = Self::runtime_state_change(
+                previous,
+                pane.pane_state(),
+                "gateway reported active prompt",
+            );
         }
         if let Some((previous, current, reason, blocked)) = state_change {
             self.publish_runtime_pane_state_changed(

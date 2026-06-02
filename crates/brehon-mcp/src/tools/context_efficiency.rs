@@ -224,7 +224,7 @@ fn target_allowed(config: &ContextCompressionConfig, target: ContextCompressionT
 
 fn estimate_tokens(input: &str) -> usize {
     let chars = input.chars().count();
-    (chars + 3) / 4
+    chars.div_ceil(4)
 }
 
 fn run_headroom_command(input: &str, config: &HeadroomCompressionConfig) -> Result<String, String> {

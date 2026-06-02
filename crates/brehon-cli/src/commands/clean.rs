@@ -222,6 +222,7 @@ pub(crate) fn is_git_repo(project_path: &Path) -> bool {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
 

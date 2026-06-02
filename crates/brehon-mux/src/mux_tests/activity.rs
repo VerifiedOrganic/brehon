@@ -335,6 +335,7 @@ async fn test_shutdown_all_clears_gateway_runtime_state() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn test_reset_reviewer_session_clears_assignment_snapshot_file() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");
@@ -2958,6 +2959,7 @@ async fn test_reset_worker_gateway_session_rejects_missing_isolated_cwd() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn test_deliver_prompt_preserves_explicit_sender_for_claude_teams() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");

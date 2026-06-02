@@ -541,10 +541,11 @@ fn report_stale_mcp_processes(brehon_root: &Path, runtime_dir: &Path, report: &m
 
 fn report_bad_routing_lanes(brehon_root: &Path, report: &mut RepairReport) {
     let project_root = brehon_root.parent().unwrap_or(brehon_root);
-    let Ok(config) = brehon_config::load_config(Some(project_root)) else {
+    let Ok((_config, warnings)) = brehon_config::load_config_for_diagnostics(Some(project_root))
+    else {
         return;
     };
-    for warning in brehon_config::validate(&config) {
+    for warning in warnings {
         if warning.kind == brehon_config::ValidationWarningKind::RoutingPolicyConflict {
             report.push(RepairAction::skipped(
                 "bad_routing_lane",

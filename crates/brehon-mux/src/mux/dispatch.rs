@@ -52,14 +52,13 @@ pub(super) fn opencode_model_candidates(spawn_config: &GatewaySpawnConfig) -> Ve
     };
 
     let mut candidates = Vec::new();
-    if spawn_config.protocol != brehon_acp::GatewayProtocol::OpenCodeServer {
-        if let Some(reasoning_effort) =
+    if spawn_config.protocol != brehon_acp::GatewayProtocol::OpenCodeServer
+        && let Some(reasoning_effort) =
             gateway_env_value(&spawn_config.env, "BREHON_REASONING_EFFORT")
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
-        {
-            candidates.push(format!("{model}/{reasoning_effort}"));
-        }
+    {
+        candidates.push(format!("{model}/{reasoning_effort}"));
     }
     candidates.push(model.to_string());
     candidates

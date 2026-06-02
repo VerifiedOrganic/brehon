@@ -50,6 +50,36 @@ pub fn load_config(project_path: Option<&Path>) -> Result<BrehonConfig, ConfigEr
     load_config_with_override(project_path, None)
 }
 
+/// Load configuration for diagnostics and return validation warnings without
+/// rejecting fatal warnings.
+pub fn load_config_for_diagnostics(
+    project_path: Option<&Path>,
+) -> Result<(BrehonConfig, Vec<ValidationWarning>), ConfigError> {
+    let mut merged_value = parse_defaults_value()?;
+
+    if let Some(global) = load_global_config_value()? {
+        merge_yaml_overlay(&mut merged_value, global);
+    }
+
+    let project_config = match project_path {
+        Some(path) => load_project_config_value(path)?,
+        None => None,
+    };
+    if let Some(project) = project_config {
+        merge_yaml_overlay(&mut merged_value, project);
+    }
+
+    let mut merged = deserialize_config_value(merged_value, "merged config")?;
+    resolve_launcher_env_placeholders(&mut merged)?;
+
+    let warnings = validate(&merged);
+    for warning in &warnings {
+        tracing::warn!("Config validation: {}", warning);
+    }
+
+    Ok((merged, warnings))
+}
+
 /// Load configuration with layering: defaults → global → project/override.
 ///
 /// If `config_override_path` is provided, that file is treated as the project

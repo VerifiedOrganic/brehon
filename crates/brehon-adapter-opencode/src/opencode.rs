@@ -679,7 +679,7 @@ fn launch_has_port(args: &[String]) -> bool {
 }
 
 fn set_launch_loopback_port(
-    args: &mut Vec<String>,
+    args: &mut [String],
     env: &mut Vec<(String, String)>,
     port: u16,
 ) -> bool {

@@ -453,7 +453,7 @@ impl Pane {
     ) {
         let resume = self.blocked_resume_state.take();
         self.terminal_prompt_prefilter_tail.clear();
-        let tool_executing = resume.as_ref().map_or(true, |snapshot| {
+        let tool_executing = resume.as_ref().is_none_or(|snapshot| {
             snapshot.tool_executing || matches!(snapshot.pane_state, Some(PaneState::Busy { .. }))
         });
         let (prompt_id, generation) = match resume.as_ref() {

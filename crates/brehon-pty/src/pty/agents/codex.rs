@@ -271,6 +271,7 @@ fn push_codex_permission_args(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn push_codex_common_args(
     args: &mut Vec<String>,
     cwd: &Path,

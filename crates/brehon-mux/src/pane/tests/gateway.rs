@@ -674,7 +674,7 @@ fn test_kimi_worker_safe_profile_propagates_sandbox_env() {
     )
     .expect("create kimi worker pane");
     let config = pane.gateway_spawn_config().expect("gateway config");
-    assert_gateway_sandbox_env(&config, "os_default", "false");
+    assert_gateway_sandbox_env(config, "os_default", "false");
 }
 
 #[test]
@@ -695,7 +695,7 @@ fn test_kimi_worker_unsafe_profile_propagates_sandbox_env() {
     )
     .expect("create kimi worker pane");
     let config = pane.gateway_spawn_config().expect("gateway config");
-    assert_gateway_sandbox_env(&config, "unsafe", "true");
+    assert_gateway_sandbox_env(config, "unsafe", "true");
 }
 
 #[test]
@@ -716,7 +716,7 @@ fn test_opencode_worker_safe_profile_propagates_sandbox_env() {
     )
     .expect("create opencode worker pane");
     let config = pane.gateway_spawn_config().expect("gateway config");
-    assert_gateway_sandbox_env(&config, "os_default", "false");
+    assert_gateway_sandbox_env(config, "os_default", "false");
 }
 
 #[test]
@@ -737,7 +737,7 @@ fn test_opencode_worker_unsafe_profile_propagates_sandbox_env() {
     )
     .expect("create opencode worker pane");
     let config = pane.gateway_spawn_config().expect("gateway config");
-    assert_gateway_sandbox_env(&config, "unsafe", "true");
+    assert_gateway_sandbox_env(config, "unsafe", "true");
 }
 
 #[test]
@@ -758,7 +758,7 @@ fn test_grok_worker_safe_profile_propagates_sandbox_env() {
     )
     .expect("create grok worker pane");
     let config = pane.gateway_spawn_config().expect("gateway config");
-    assert_gateway_sandbox_env(&config, "os_default", "false");
+    assert_gateway_sandbox_env(config, "os_default", "false");
 }
 
 #[test]
@@ -779,7 +779,7 @@ fn test_grok_worker_unsafe_profile_propagates_sandbox_env() {
     )
     .expect("create grok worker pane");
     let config = pane.gateway_spawn_config().expect("gateway config");
-    assert_gateway_sandbox_env(&config, "unsafe", "true");
+    assert_gateway_sandbox_env(config, "unsafe", "true");
 }
 
 #[test]
@@ -800,7 +800,7 @@ fn test_custom_acp_worker_safe_profile_propagates_sandbox_env() {
     )
     .expect("create custom acp worker pane");
     let config = pane.gateway_spawn_config().expect("gateway config");
-    assert_gateway_sandbox_env(&config, "os_default", "false");
+    assert_gateway_sandbox_env(config, "os_default", "false");
 }
 
 #[test]
@@ -821,7 +821,7 @@ fn test_custom_acp_worker_unsafe_profile_propagates_sandbox_env() {
     )
     .expect("create custom acp worker pane");
     let config = pane.gateway_spawn_config().expect("gateway config");
-    assert_gateway_sandbox_env(&config, "unsafe", "true");
+    assert_gateway_sandbox_env(config, "unsafe", "true");
 }
 
 #[test]
@@ -844,7 +844,7 @@ fn test_kimi_reviewer_safe_profile_propagates_sandbox_env() {
     )
     .expect("create kimi reviewer pane");
     let config = pane.gateway_spawn_config().expect("gateway config");
-    assert_gateway_sandbox_env(&config, "os_default", "false");
+    assert_gateway_sandbox_env(config, "os_default", "false");
 }
 
 #[test]
@@ -867,7 +867,7 @@ fn test_kimi_reviewer_unsafe_profile_propagates_sandbox_env() {
     )
     .expect("create kimi reviewer pane");
     let config = pane.gateway_spawn_config().expect("gateway config");
-    assert_gateway_sandbox_env(&config, "unsafe", "true");
+    assert_gateway_sandbox_env(config, "unsafe", "true");
 }
 
 #[test]
@@ -886,7 +886,7 @@ fn test_opencode_reviewer_safe_profile_propagates_sandbox_env() {
     )
     .expect("create opencode reviewer pane");
     let config = pane.gateway_spawn_config().expect("gateway config");
-    assert_gateway_sandbox_env(&config, "os_default", "false");
+    assert_gateway_sandbox_env(config, "os_default", "false");
 }
 
 #[test]
@@ -905,7 +905,7 @@ fn test_opencode_reviewer_unsafe_profile_propagates_sandbox_env() {
     )
     .expect("create opencode reviewer pane");
     let config = pane.gateway_spawn_config().expect("gateway config");
-    assert_gateway_sandbox_env(&config, "unsafe", "true");
+    assert_gateway_sandbox_env(config, "unsafe", "true");
 }
 
 #[test]
@@ -928,7 +928,7 @@ fn test_grok_reviewer_safe_profile_propagates_sandbox_env() {
     )
     .expect("create grok reviewer pane");
     let config = pane.gateway_spawn_config().expect("gateway config");
-    assert_gateway_sandbox_env(&config, "os_default", "false");
+    assert_gateway_sandbox_env(config, "os_default", "false");
 }
 
 #[test]
@@ -951,7 +951,7 @@ fn test_grok_reviewer_unsafe_profile_propagates_sandbox_env() {
     )
     .expect("create grok reviewer pane");
     let config = pane.gateway_spawn_config().expect("gateway config");
-    assert_gateway_sandbox_env(&config, "unsafe", "true");
+    assert_gateway_sandbox_env(config, "unsafe", "true");
 }
 
 #[test]
@@ -970,7 +970,7 @@ fn test_custom_acp_reviewer_safe_profile_propagates_sandbox_env() {
     )
     .expect("create custom acp reviewer pane");
     let config = pane.gateway_spawn_config().expect("gateway config");
-    assert_gateway_sandbox_env(&config, "os_default", "false");
+    assert_gateway_sandbox_env(config, "os_default", "false");
 }
 
 #[test]
@@ -989,7 +989,7 @@ fn test_custom_acp_reviewer_unsafe_profile_propagates_sandbox_env() {
     )
     .expect("create custom acp reviewer pane");
     let config = pane.gateway_spawn_config().expect("gateway config");
-    assert_gateway_sandbox_env(&config, "unsafe", "true");
+    assert_gateway_sandbox_env(config, "unsafe", "true");
 }
 
 #[test]

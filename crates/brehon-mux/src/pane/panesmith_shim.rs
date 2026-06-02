@@ -292,14 +292,14 @@ impl BrehonPanesmithShim {
                 self.brehon_ids.get(&panesmith_id).is_some_and(|brehon_id| {
                     snapshot_panes.is_none_or(|panes| panes.contains(brehon_id))
                 });
-            if should_refresh_snapshot {
-                if let Err(err) = self.refresh_cached_view_by_panesmith_id(panesmith_id) {
-                    tracing::warn!(
-                        pane_id = panesmith_id.get(),
-                        error = %err,
-                        "Failed to refresh Panesmith cached view after event drain"
-                    );
-                }
+            if should_refresh_snapshot
+                && let Err(err) = self.refresh_cached_view_by_panesmith_id(panesmith_id)
+            {
+                tracing::warn!(
+                    pane_id = panesmith_id.get(),
+                    error = %err,
+                    "Failed to refresh Panesmith cached view after event drain"
+                );
             }
             match self.manager.last_seq(panesmith_id) {
                 Ok(seq) => {

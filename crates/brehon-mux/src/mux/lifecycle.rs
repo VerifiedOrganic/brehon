@@ -1296,7 +1296,8 @@ impl Mux {
         let panesmith_panes = self
             .panes
             .iter()
-            .filter_map(|(pane_id, pane)| pane.is_panesmith_managed().then(|| pane_id.clone()))
+            .filter(|&(_pane_id, pane)| pane.is_panesmith_managed())
+            .map(|(pane_id, _pane)| pane_id.clone())
             .collect::<Vec<_>>();
 
         for pane_id in panesmith_panes {

@@ -917,7 +917,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
         let repo = Repository::init(temp_dir.path()).expect("failed to init repo");
 
-        std::fs::write(temp_dir.path().join(".gitignore"), "target/\n")
+        std::fs::write(temp_dir.path().join(".gitignore"), "target/\n.brehon/\n")
             .expect("failed to write gitignore");
         let sig = git2::Signature::now("Test", "test@example.com").expect("failed to create sig");
         let mut index = repo.index().expect("failed to get index");
@@ -939,6 +939,12 @@ mod tests {
         (temp_dir, repo)
     }
 
+    fn test_worktree_path(temp_dir: &TempDir, name: &str) -> PathBuf {
+        let root = temp_dir.path().join(".brehon").join("worktrees");
+        std::fs::create_dir_all(&root).expect("failed to create test worktree root");
+        root.join(name)
+    }
+
     #[test]
     fn list_empty_worktrees() {
         let (_temp_dir, repo) = setup_test_repo();
@@ -952,7 +958,7 @@ mod tests {
         let (temp_dir, repo) = setup_test_repo();
         let ops = WorktreeOps::new(&repo);
         let branch_name = format!("test-{}", uuid::Uuid::new_v4());
-        let worktree_path = temp_dir.path().join("test-worktree");
+        let worktree_path = test_worktree_path(&temp_dir, "test-worktree");
 
         let result = ops.create_worktree(&branch_name, &worktree_path);
 
@@ -965,8 +971,8 @@ mod tests {
         let (temp_dir, repo) = setup_test_repo();
         let ops = WorktreeOps::new(&repo);
         let branch_name = format!("test-{}", uuid::Uuid::new_v4());
-        let path1 = temp_dir.path().join("worktree1");
-        let path2 = temp_dir.path().join("worktree2");
+        let path1 = test_worktree_path(&temp_dir, "worktree1");
+        let path2 = test_worktree_path(&temp_dir, "worktree2");
 
         ops.create_worktree(&branch_name, &path1)
             .expect("first create should succeed");
@@ -980,7 +986,7 @@ mod tests {
         let (temp_dir, repo) = setup_test_repo();
         let ops = WorktreeOps::new(&repo);
 
-        let worktree_path = temp_dir.path().join("existing-dir");
+        let worktree_path = test_worktree_path(&temp_dir, "existing-dir");
         std::fs::create_dir_all(&worktree_path).expect("failed to create dir");
 
         let result = ops.create_worktree("test-branch-existing", &worktree_path);
@@ -992,7 +998,7 @@ mod tests {
         let (temp_dir, repo) = setup_test_repo();
         let ops = WorktreeOps::new(&repo);
         let branch_name = "brehon/worker-1";
-        let worktree_path = temp_dir.path().join("nested-worktree");
+        let worktree_path = test_worktree_path(&temp_dir, "nested-worktree");
 
         let result = ops.create_worktree(branch_name, &worktree_path);
 
@@ -1010,7 +1016,7 @@ mod tests {
             .expect("failed to create branch");
 
         let ops = WorktreeOps::new(&repo);
-        let worktree_path = temp_dir.path().join("existing-branch-worktree");
+        let worktree_path = test_worktree_path(&temp_dir, "existing-branch-worktree");
         let result = ops.create_worktree(branch_name, &worktree_path);
 
         assert!(result.is_ok(), "should reuse existing branch: {result:?}");
@@ -1022,7 +1028,7 @@ mod tests {
         let (temp_dir, repo) = setup_test_repo();
         let ops = WorktreeOps::new(&repo);
         let branch_name = format!("test-{}", uuid::Uuid::new_v4());
-        let worktree_path = temp_dir.path().join("deleteme-worktree");
+        let worktree_path = test_worktree_path(&temp_dir, "deleteme-worktree");
 
         ops.create_worktree(&branch_name, &worktree_path)
             .expect("create should succeed");
@@ -1038,7 +1044,7 @@ mod tests {
         let (temp_dir, repo) = setup_test_repo();
         let ops = WorktreeOps::new(&repo);
         let branch_name = format!("test-{}", uuid::Uuid::new_v4());
-        let worktree_path = temp_dir.path().join("generated-worktree");
+        let worktree_path = test_worktree_path(&temp_dir, "generated-worktree");
 
         ops.create_worktree(&branch_name, &worktree_path)
             .expect("create should succeed");
@@ -1060,7 +1066,7 @@ mod tests {
         let (temp_dir, repo) = setup_test_repo();
         let ops = WorktreeOps::new(&repo);
         let branch_name = format!("test-{}", uuid::Uuid::new_v4());
-        let worktree_path = temp_dir.path().join("tracked-dirty-worktree");
+        let worktree_path = test_worktree_path(&temp_dir, "tracked-dirty-worktree");
 
         ops.create_worktree(&branch_name, &worktree_path)
             .expect("create should succeed");
@@ -1088,7 +1094,7 @@ mod tests {
         let (temp_dir, repo) = setup_test_repo();
         let ops = WorktreeOps::new(&repo);
         let branch_name = "brehon/worker-1";
-        let worktree_path = temp_dir.path().join("slashed-worktree");
+        let worktree_path = test_worktree_path(&temp_dir, "slashed-worktree");
 
         ops.create_worktree(branch_name, &worktree_path)
             .expect("create should succeed");
@@ -1107,7 +1113,7 @@ mod tests {
         let (temp_dir, repo) = setup_test_repo();
         let ops = WorktreeOps::new(&repo);
         let branch_name = format!("test-{}", uuid::Uuid::new_v4());
-        let worktree_path = temp_dir.path().join("deleted-worktree");
+        let worktree_path = test_worktree_path(&temp_dir, "deleted-worktree");
 
         ops.create_worktree(&branch_name, &worktree_path)
             .expect("create should succeed");
@@ -1127,8 +1133,8 @@ mod tests {
         let ops = WorktreeOps::new(&repo);
         let branch_name1 = format!("test-{}", uuid::Uuid::new_v4());
         let branch_name2 = format!("test-{}", uuid::Uuid::new_v4());
-        let worktree_path1 = temp_dir.path().join("worktree1");
-        let worktree_path2 = temp_dir.path().join("worktree2");
+        let worktree_path1 = test_worktree_path(&temp_dir, "worktree1");
+        let worktree_path2 = test_worktree_path(&temp_dir, "worktree2");
 
         ops.create_worktree(&branch_name1, &worktree_path1)
             .expect("create should succeed");
@@ -1164,7 +1170,7 @@ mod tests {
         let (temp_dir, repo) = setup_test_repo();
         let ops = WorktreeOps::new(&repo);
         let branch_name = format!("test-{}", uuid::Uuid::new_v4());
-        let worktree_path = temp_dir.path().join("orphan-worktree");
+        let worktree_path = test_worktree_path(&temp_dir, "orphan-worktree");
 
         ops.create_worktree(&branch_name, &worktree_path)
             .expect("create should succeed");
@@ -1189,7 +1195,7 @@ mod tests {
             .map(|i| {
                 (
                     format!("test-{}", uuid::Uuid::new_v4()),
-                    temp_dir.path().join(format!("worktree-{}", i)),
+                    test_worktree_path(&temp_dir, &format!("worktree-{}", i)),
                 )
             })
             .collect();
@@ -1216,7 +1222,7 @@ mod tests {
         let (temp_dir, repo) = setup_test_repo();
         let ops = WorktreeOps::new(&repo);
         let branch_name = format!("test-{}", uuid::Uuid::new_v4());
-        let worktree_path = temp_dir.path().join("clean-worktree");
+        let worktree_path = test_worktree_path(&temp_dir, "clean-worktree");
 
         ops.create_worktree(&branch_name, &worktree_path)
             .expect("create should succeed");
@@ -1236,7 +1242,7 @@ mod tests {
         let (temp_dir, repo) = setup_test_repo();
         let ops = WorktreeOps::new(&repo);
         let branch_name = format!("test-{}", uuid::Uuid::new_v4());
-        let worktree_path = temp_dir.path().join("dirty-worktree");
+        let worktree_path = test_worktree_path(&temp_dir, "dirty-worktree");
 
         ops.create_worktree(&branch_name, &worktree_path)
             .expect("create should succeed");
@@ -1270,7 +1276,7 @@ mod tests {
         let (temp_dir, repo) = setup_test_repo();
         let ops = WorktreeOps::new(&repo);
         let branch_name = format!("test-{}", uuid::Uuid::new_v4());
-        let worktree_path = temp_dir.path().join("to-archive");
+        let worktree_path = test_worktree_path(&temp_dir, "to-archive");
         let archive_base = temp_dir.path().join("archived");
 
         ops.create_worktree(&branch_name, &worktree_path)
@@ -1292,7 +1298,7 @@ mod tests {
         let (temp_dir, repo) = setup_test_repo();
         let ops = WorktreeOps::new(&repo);
         let branch_name = format!("test-{}", uuid::Uuid::new_v4());
-        let worktree_path = temp_dir.path().join("to-archive-with-junk");
+        let worktree_path = test_worktree_path(&temp_dir, "to-archive-with-junk");
         let archive_base = temp_dir.path().join("archived");
 
         ops.create_worktree(&branch_name, &worktree_path)
