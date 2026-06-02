@@ -13,8 +13,6 @@ on:
 
 permissions:
   contents: read
-  issues: write  # rustsec/audit-check opens an issue when a new advisory lands
-  checks: write  # required to post advisory annotations as a check run
 
 concurrency:
   group: audit-${{ github.ref }}
@@ -26,6 +24,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: rustsec/audit-check@v2.0.0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          shared-key: audit
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --version 0.22.1 --locked
+
+      - name: cargo audit
+        run: cargo audit

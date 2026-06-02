@@ -30,9 +30,9 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - uses: mlugg/setup-zig@v2
-        with:
-          version: ${{ env.ZIG_VERSION }}
+      - name: Install Zig
+        shell: bash
+        run: bash .github/scripts/install-zig.sh
 
       - uses: Swatinem/rust-cache@v2
         with:
