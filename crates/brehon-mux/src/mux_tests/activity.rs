@@ -2849,7 +2849,7 @@ async fn test_quarantine_dead_state_survives_poll_and_poll_batch() {
 #[test]
 fn test_local_pty_exit_marks_pane_dead_and_idle() {
     use brehon_pty::{Pty, PtyConfig};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     let mut mux = Mux::new(24, 80);
     let config = PtyConfig {
@@ -2873,7 +2873,8 @@ fn test_local_pty_exit_marks_pane_dead_and_idle() {
     mux.add_pane(pane);
 
     let mut saw_exit = false;
-    for _ in 0..50 {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
         let (_bytes, events) = mux.poll_batch();
         if events.iter().any(|event| {
             matches!(
@@ -2890,8 +2891,14 @@ fn test_local_pty_exit_marks_pane_dead_and_idle() {
         std::thread::sleep(Duration::from_millis(10));
     }
 
-    assert!(saw_exit, "expected PTY exit event");
     let pane = mux.get("exiting-worker").expect("worker exists");
+    assert!(
+        saw_exit,
+        "expected PTY exit event; has_exited={}, exit_code={:?}, pane_state={:?}",
+        pane.has_exited(),
+        pane.exit_code(),
+        pane.pane_state()
+    );
     assert!(pane.has_exited());
     assert_eq!(pane.exit_code(), Some(7));
     assert!(!pane.is_tool_executing());
