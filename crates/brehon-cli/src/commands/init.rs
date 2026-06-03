@@ -1,7 +1,7 @@
+use std::collections::HashSet;
 use std::path::Path;
 
 use anyhow::Result;
-use serde_yaml::{Mapping, Value};
 
 use crate::ui;
 
@@ -45,889 +45,446 @@ fn detect_agents() -> Vec<DetectedAgent> {
         .collect()
 }
 
-/// Generate a complete project config tailored to detected agents.
-///
-/// Loads defaults, modifies agent/role sections based on detected agents,
-/// and serializes to YAML with a header comment.
-fn generate_config_for_agents(agents: &[DetectedAgent]) -> String {
-    use brehon_config::parse_defaults;
-    use brehon_types::agent::AdapterKind;
-    use brehon_types::{
-        AgentConnectionConfig, LaneConfig, ModelConfig, ReviewPanelConfig, ReviewerPoolConfig,
-        WorkerAssignmentMode, WorkerPoolConfig,
-    };
-    use std::collections::HashMap;
+/// Catalog entry describing how to spawn an agent CLI and which models its
+/// supervisor/worker/reviewer lanes should use. The generator emits a launcher
+/// plus all three lanes for Claude (always) and for every other agent detected
+/// on PATH. Only Claude is wired into the active roles; the rest sit ready to
+/// be flipped on. Keep the model defaults in sync with `defaults.yaml`.
+struct AgentTemplate {
+    /// KNOWN_AGENTS config name used for PATH detection.
+    detect_name: &'static str,
+    /// Launcher key and lane prefix (e.g. `codex` -> `codex-worker`).
+    launcher: &'static str,
+    adapter: &'static str,
+    command: &'static str,
+    args: &'static [&'static str],
+    provider: &'static str,
+    supervisor_model: &'static str,
+    worker_model: &'static str,
+    reviewer_model: &'static str,
+    /// Reasoning effort per role; `None` omits the field (e.g. Gemini, Antigravity).
+    supervisor_effort: Option<&'static str>,
+    worker_effort: Option<&'static str>,
+    reviewer_effort: Option<&'static str>,
+}
 
-    fn arg_list(values: &[&str]) -> Vec<String> {
-        values.iter().map(|value| (*value).to_string()).collect()
+const CATALOG: &[AgentTemplate] = &[
+    AgentTemplate {
+        detect_name: "claude-code",
+        launcher: "claude",
+        adapter: "Acp",
+        command: "claude",
+        args: &[],
+        provider: "anthropic",
+        supervisor_model: "claude-opus-4-6",
+        worker_model: "claude-sonnet-4-6",
+        reviewer_model: "claude-opus-4-6",
+        supervisor_effort: Some("high"),
+        worker_effort: Some("medium"),
+        reviewer_effort: Some("high"),
+    },
+    AgentTemplate {
+        detect_name: "codex",
+        launcher: "codex",
+        adapter: "Acp",
+        command: "codex",
+        args: &["app-server"],
+        provider: "openai",
+        supervisor_model: "gpt-5.4",
+        worker_model: "gpt-5.3-codex",
+        reviewer_model: "gpt-5.4",
+        supervisor_effort: Some("high"),
+        worker_effort: Some("medium"),
+        reviewer_effort: Some("high"),
+    },
+    AgentTemplate {
+        detect_name: "copilot",
+        launcher: "copilot",
+        adapter: "Acp",
+        command: "copilot",
+        args: &[],
+        provider: "github-copilot",
+        supervisor_model: "gpt-5",
+        worker_model: "gpt-5",
+        reviewer_model: "gpt-5",
+        supervisor_effort: Some("high"),
+        worker_effort: Some("medium"),
+        reviewer_effort: Some("high"),
+    },
+    AgentTemplate {
+        detect_name: "gemini",
+        launcher: "gemini",
+        adapter: "Acp",
+        command: "gemini",
+        args: &["--acp"],
+        provider: "google",
+        supervisor_model: "gemini-3.1-pro-preview",
+        worker_model: "gemini-3.1-pro-preview",
+        reviewer_model: "gemini-3.1-pro-preview",
+        supervisor_effort: None,
+        worker_effort: None,
+        reviewer_effort: None,
+    },
+    AgentTemplate {
+        detect_name: "kimi",
+        launcher: "kimi",
+        adapter: "Acp",
+        command: "kimi",
+        args: &["acp"],
+        provider: "kimi-code",
+        supervisor_model: "kimi-for-coding",
+        worker_model: "kimi-for-coding",
+        reviewer_model: "kimi-for-coding",
+        supervisor_effort: Some("high"),
+        worker_effort: Some("medium"),
+        reviewer_effort: Some("high"),
+    },
+    AgentTemplate {
+        detect_name: "opencode",
+        launcher: "opencode",
+        adapter: "Acp",
+        command: "opencode",
+        args: &["acp", "--cwd", "."],
+        provider: "ollama-cloud",
+        supervisor_model: "glm-5.1",
+        worker_model: "glm-5.1",
+        reviewer_model: "glm-5.1",
+        supervisor_effort: Some("high"),
+        worker_effort: Some("medium"),
+        reviewer_effort: Some("high"),
+    },
+    AgentTemplate {
+        detect_name: "agy",
+        launcher: "agy",
+        adapter: "Agy",
+        command: "agy",
+        args: &[],
+        provider: "google",
+        supervisor_model: "antigravity-2.0",
+        worker_model: "antigravity-2.0",
+        reviewer_model: "antigravity-2.0",
+        supervisor_effort: None,
+        worker_effort: None,
+        reviewer_effort: None,
+    },
+    AgentTemplate {
+        detect_name: "grok",
+        launcher: "grok",
+        adapter: "Acp",
+        command: "grok",
+        args: &["agent", "--always-approve", "stdio"],
+        provider: "xai",
+        supervisor_model: "grok-build",
+        worker_model: "grok-build",
+        reviewer_model: "grok-build",
+        supervisor_effort: Some("high"),
+        worker_effort: Some("medium"),
+        reviewer_effort: Some("high"),
+    },
+];
+
+/// Inline prompt for the active Claude worker lane. (Other agents' worker lanes
+/// are left promptless — workers lean on the `brehon-worker` skill — until the
+/// user activates and tunes them.)
+const WORKER_PROMPT: &str = "\
+You are an implementation worker on a Brehon team.
+Execute the single task assigned to you, working only inside your own git
+worktree, never the shared repo root. Make the change, add or update its tests,
+and run them before you hand off. Keep the diff tight: no drive-by refactors.
+Report real progress, and complete the task through the Brehon task tool so it
+enters review. If you get stuck, mark it blocked and message the supervisor.";
+
+/// Inline prompt applied to every reviewer lane (active or not) so flipping a
+/// reviewer on is a one-line roles edit with no missing review behavior.
+const REVIEWER_PROMPT: &str = "\
+You are a reviewer. Evaluate the submitted work; do not implement it.
+Judge correctness, test coverage, and clarity against the task's intent, and
+attach every concern as a structured finding (real nitpicks at nitpick
+severity). Treat missing tests as a real gap unless the task waives them.
+A review is complete only after a successful structured review submission.";
+
+/// Top-of-file comment block. Dynamic "detected on PATH" lines are appended
+/// after this, then the generated YAML body.
+const CONFIG_HEADER: &str = "\
+# Brehon Project Configuration
+# =============================
+#
+# This is a partial overlay. Settings here win over the built-in defaults and
+# your global ~/.config/brehon/config.yaml. Run `brehon config list` to see the
+# fully resolved config.
+#
+# Layering (lowest to highest precedence):
+#   baked-in defaults  <  ~/.config/brehon/config.yaml  <  this file
+#
+# Budget-safe by default: exactly ONE active Claude worker, a single-member
+# Claude review panel, and a Claude supervisor. Every agent CLI found on your
+# PATH also gets a launcher + supervisor/worker/reviewer lanes defined below,
+# but INACTIVE -- turning one on is a few lines in `roles`/`review`. See the
+# TURN ON ANOTHER AGENT section near the bottom.
+#
+";
+
+/// Static roles/review/orchestration block — Claude is the only active role.
+const ACTIVE_ROLES_BLOCK: &str = "
+# --- Roles (active) ---------------------------------------------------------
+# Who actually runs. Only Claude is wired in; the other lanes above are idle
+# until you add them here. See TURN ON ANOTHER AGENT below.
+roles:
+  supervisor:
+    name: claude-supervisor
+  workers:
+    # One active worker. Raise `max` (and orchestration.max_active_workers) to
+    # run several in parallel; each gets its own git worktree.
+    - lane: claude-worker
+      min: 1
+      max: 1
+  reviewers:
+    - lane: claude-reviewer
+      min: 1
+      max: 1
+
+# --- Review -----------------------------------------------------------------
+review:
+  policy:
+    # One reviewer -> one approval. Raise this in lockstep with panel size.
+    min_approvals: 1
+  default_reviewers:
+    - claude-reviewer
+  panels:
+    - id: primary
+      reviewers:
+        - claude-reviewer
+
+# --- Orchestration ----------------------------------------------------------
+orchestration:
+  # Hard ceiling on workers running at once. Keep this >= the worker pool `max`.
+  max_active_workers: 1
+";
+
+/// Commented routing example — appended to every generated config.
+const ROUTING_BLOCK: &str = "
+# ----------------------------------------------------------------------------
+# ROUTING - send specific tasks to specific worker lanes at assignment time.
+# An explicit per-task policy always wins; otherwise the first matching rule
+# supplies the lane. Handy for sending scary work to a stronger/pricier lane.
+# ----------------------------------------------------------------------------
+#
+#   routing:
+#     default_worker_lane: claude-worker
+#     escalation_lane: codex-worker
+#     rules:
+#       - id: high-risk-or-large
+#         match:
+#           text_any: [\"security\", \"release\", \"migration\", \"Imported size estimate: L\"]
+#         policy:
+#           preferred_lane: codex-worker
+#           strict: false
+";
+
+fn push_launcher(out: &mut String, template: &AgentTemplate) {
+    out.push_str(&format!(
+        "  {}:\n    adapter: {}\n    command: {}\n",
+        template.launcher, template.adapter, template.command
+    ));
+    if !template.args.is_empty() {
+        out.push_str("    args:\n");
+        for arg in template.args {
+            out.push_str(&format!("      - \"{arg}\"\n"));
+        }
     }
+}
 
-    fn env_map(values: &[(&str, &str)]) -> HashMap<String, String> {
-        values
+fn push_lane(
+    out: &mut String,
+    name: &str,
+    launcher: &str,
+    provider: &str,
+    model: &str,
+    effort: Option<&str>,
+    prompt: Option<&str>,
+) {
+    out.push_str(&format!(
+        "  {name}:\n    launcher: {launcher}\n    model:\n      provider: {provider}\n      name: {model}\n"
+    ));
+    if let Some(effort) = effort {
+        out.push_str(&format!("    reasoning_effort: {effort}\n"));
+    }
+    if let Some(prompt) = prompt {
+        out.push_str("    system_prompt: |\n");
+        for line in prompt.lines() {
+            out.push_str(&format!("      {line}\n"));
+        }
+    }
+}
+
+fn push_lanes(out: &mut String, template: &AgentTemplate) {
+    let is_claude = template.launcher == "claude";
+    push_lane(
+        out,
+        &format!("{}-supervisor", template.launcher),
+        template.launcher,
+        template.provider,
+        template.supervisor_model,
+        template.supervisor_effort,
+        None,
+    );
+    push_lane(
+        out,
+        &format!("{}-worker", template.launcher),
+        template.launcher,
+        template.provider,
+        template.worker_model,
+        template.worker_effort,
+        is_claude.then_some(WORKER_PROMPT),
+    );
+    push_lane(
+        out,
+        &format!("{}-reviewer", template.launcher),
+        template.launcher,
+        template.provider,
+        template.reviewer_model,
+        template.reviewer_effort,
+        Some(REVIEWER_PROMPT),
+    );
+}
+
+/// Append the "how to activate another agent" guidance. When other agents were
+/// detected, list their ready-to-flip lanes and the exact edits. Otherwise show
+/// a from-scratch example so single-Claude users learn the pattern too.
+fn push_turn_on(out: &mut String, others: &[&AgentTemplate]) {
+    out.push_str(
+        "\n# ============================================================================\n",
+    );
+    if let Some(example) = others.first() {
+        let x = example.launcher;
+        let ready: Vec<String> = others
             .iter()
-            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
-            .collect()
-    }
-
-    fn launcher(
-        command: &str,
-        launcher_args: &[&str],
-        env: &[(&str, &str)],
-    ) -> AgentConnectionConfig {
-        AgentConnectionConfig {
-            adapter: AdapterKind::Acp,
-            command: Some(command.to_string()),
-            args: arg_list(launcher_args),
-            provider: None,
-            transport: None,
-            control_plane: None,
-            base_url: None,
-            api_key_env: None,
-            permission_mode: None,
-            profile: None,
-            max_parallel_tool_calls: None,
-            assistant_message_passthrough_fields: Vec::new(),
-            reasoning_effort_param: None,
-            extra_body: None,
-            env: env_map(env),
-            headers: HashMap::new(),
-        }
-    }
-
-    fn insert_lane(
-        lanes: &mut HashMap<String, LaneConfig>,
-        lane: &str,
-        launcher: &str,
-        provider: &str,
-        model: &str,
-        reasoning_effort: Option<&str>,
-        system_prompt: Option<String>,
-    ) {
-        lanes.insert(
-            lane.to_string(),
-            LaneConfig {
-                launcher: launcher.to_string(),
-                model: Some(ModelConfig {
-                    provider: provider.to_string(),
-                    name: model.to_string(),
-                }),
-                reasoning_effort: reasoning_effort.map(str::to_string),
-                system_prompt,
-                profile: None,
-            },
-        );
-    }
-
-    fn template_launchers() -> HashMap<String, AgentConnectionConfig> {
-        HashMap::from([
-            ("claude".to_string(), launcher("claude", &[], &[])),
-            (
-                "claude-ollama-cloud".to_string(),
-                launcher(
-                    "claude",
-                    &[],
-                    &[
-                        ("ANTHROPIC_AUTH_TOKEN", "${OLLAMA_API_KEY:-ollama}"),
-                        ("ANTHROPIC_API_KEY", "${OLLAMA_API_KEY:-}"),
-                        (
-                            "ANTHROPIC_BASE_URL",
-                            "${OLLAMA_ANTHROPIC_BASE_URL:-https://ollama.com}",
-                        ),
-                    ],
-                ),
-            ),
-            ("copilot".to_string(), launcher("copilot", &[], &[])),
-            ("codex".to_string(), launcher("codex", &["app-server"], &[])),
-            (
-                "codex-ollama-cloud".to_string(),
-                launcher(
-                    "codex",
-                    &[
-                        "-c",
-                        "model_provider=\"ollama_cloud\"",
-                        "-c",
-                        "model_providers.ollama_cloud={name=\"Ollama Cloud\", base_url=\"https://ollama.com/v1\", env_key=\"OLLAMA_API_KEY\", wire_api=\"responses\"}",
-                        "app-server",
-                    ],
-                    &[],
-                ),
-            ),
-            ("gemini".to_string(), launcher("gemini", &["--acp"], &[])),
-            ("kimi".to_string(), launcher("kimi", &["acp"], &[])),
-            (
-                "opencode".to_string(),
-                launcher("opencode", &["acp", "--cwd", "."], &[]),
-            ),
-            (
-                "grok".to_string(),
-                launcher("grok", &["agent", "--always-approve", "stdio"], &[]),
-            ),
-            (
-                "agy".to_string(),
-                AgentConnectionConfig {
-                    adapter: AdapterKind::Agy,
-                    command: Some("agy".to_string()),
-                    args: Vec::new(),
-                    provider: None,
-                    transport: None,
-                    control_plane: None,
-                    base_url: None,
-                    api_key_env: None,
-                    permission_mode: None,
-                    profile: None,
-                    max_parallel_tool_calls: None,
-                    assistant_message_passthrough_fields: Vec::new(),
-                    reasoning_effort_param: None,
-                    extra_body: None,
-                    env: HashMap::new(),
-                    headers: HashMap::new(),
-                },
-            ),
-        ])
-    }
-
-    fn template_lanes(default_reviewer_prompt: Option<&str>) -> HashMap<String, LaneConfig> {
-        let mut lanes = HashMap::new();
-        let reviewer_prompt = default_reviewer_prompt.map(str::to_string);
-
-        let lane_effort = |launcher: &str, role: &str| -> Option<&'static str> {
-            match launcher {
-                "gemini" | "agy" => None,
-                _ => Some(if role == "worker" { "medium" } else { "high" }),
-            }
-        };
-
-        for (launcher, provider, default_model) in [
-            ("claude", "anthropic", "claude-sonnet-4-6"),
-            ("claude-ollama-cloud", "ollama-cloud", "glm-5.1"),
-            ("copilot", "github-copilot", "gpt-5"),
-            ("codex", "openai", "gpt-5.4"),
-            ("codex-ollama-cloud", "ollama-cloud", "glm-5.1:cloud"),
-            ("gemini", "google", "gemini-3.1-pro-preview"),
-            ("kimi", "kimi-code", "kimi-for-coding"),
-            ("opencode", "ollama-cloud", "glm-5.1"),
-            ("agy", "google", "antigravity-2.0"),
-            ("grok", "xai", "grok-build"),
-        ] {
-            insert_lane(
-                &mut lanes,
-                &format!("{launcher}-supervisor"),
-                launcher,
-                provider,
-                default_model,
-                lane_effort(launcher, "supervisor"),
-                None,
-            );
-            insert_lane(
-                &mut lanes,
-                &format!("{launcher}-worker"),
-                launcher,
-                provider,
-                default_model,
-                lane_effort(launcher, "worker"),
-                None,
-            );
-            insert_lane(
-                &mut lanes,
-                &format!("{launcher}-reviewer"),
-                launcher,
-                provider,
-                default_model,
-                lane_effort(launcher, "reviewer"),
-                reviewer_prompt.clone(),
-            );
-        }
-
-        lanes.insert(
-            "claude-supervisor".to_string(),
-            LaneConfig {
-                launcher: "claude".to_string(),
-                model: Some(ModelConfig {
-                    provider: "anthropic".to_string(),
-                    name: "claude-opus-4-6".to_string(),
-                }),
-                reasoning_effort: Some("high".to_string()),
-                system_prompt: None,
-                profile: None,
-            },
-        );
-        lanes.insert(
-            "claude-reviewer".to_string(),
-            LaneConfig {
-                launcher: "claude".to_string(),
-                model: Some(ModelConfig {
-                    provider: "anthropic".to_string(),
-                    name: "claude-opus-4-6".to_string(),
-                }),
-                reasoning_effort: Some("high".to_string()),
-                system_prompt: reviewer_prompt.clone(),
-                profile: None,
-            },
-        );
-        lanes.insert(
-            "codex-worker".to_string(),
-            LaneConfig {
-                launcher: "codex".to_string(),
-                model: Some(ModelConfig {
-                    provider: "openai".to_string(),
-                    name: "gpt-5.3-codex".to_string(),
-                }),
-                reasoning_effort: Some("medium".to_string()),
-                system_prompt: None,
-                profile: None,
-            },
-        );
-        lanes.insert(
-            "codex-hardening".to_string(),
-            LaneConfig {
-                launcher: "codex".to_string(),
-                model: Some(ModelConfig {
-                    provider: "openai".to_string(),
-                    name: "gpt-5.5".to_string(),
-                }),
-                reasoning_effort: Some("xhigh".to_string()),
-                system_prompt: None,
-                profile: None,
-            },
-        );
-        lanes.insert(
-            "codex-reviewer".to_string(),
-            LaneConfig {
-                launcher: "codex".to_string(),
-                model: Some(ModelConfig {
-                    provider: "openai".to_string(),
-                    name: "gpt-5.4".to_string(),
-                }),
-                reasoning_effort: Some("high".to_string()),
-                system_prompt: reviewer_prompt.clone(),
-                profile: None,
-            },
-        );
-
-        lanes
-    }
-
-    fn sort_mapping_keys(mapping: &Mapping, preferred_keys: &[&str]) -> Mapping {
-        let mut ordered = Mapping::new();
-        for key in preferred_keys {
-            let value_key = Value::String((*key).to_string());
-            if let Some(value) = mapping.get(&value_key) {
-                ordered.insert(value_key, value.clone());
-            }
-        }
-
-        let mut remaining: Vec<(String, Value)> = mapping
-            .iter()
-            .filter_map(|(key, value)| match key {
-                Value::String(string_key) if !preferred_keys.contains(&string_key.as_str()) => {
-                    Some((string_key.clone(), value.clone()))
-                }
-                _ => None,
-            })
+            .map(|template| format!("{0}-supervisor/{0}-worker/{0}-reviewer", template.launcher))
             .collect();
-        remaining.sort_by(|left, right| left.0.cmp(&right.0));
+        out.push_str(&format!(
+            "# TURN ON ANOTHER AGENT\n\
+             # The lanes for every CLI on your PATH are defined above but inactive. To\n\
+             # activate one (example: {x}), make these edits:\n\
+             #   roles.workers:                add `- {{ lane: {x}-worker, min: 1, max: 1 }}`\n\
+             #   review.panels[0].reviewers:   add `{x}-reviewer`\n\
+             #   review.default_reviewers:     add `{x}-reviewer`\n\
+             #   review.policy.min_approvals:  raise to match the panel size (2 reviewers -> 2)\n\
+             #   orchestration.max_active_workers: raise if you added parallel workers\n\
+             #   (optional) roles.supervisor.name: {x}-supervisor   # swap the coordinator\n\
+             #\n\
+             # Defined and ready to flip on: {ready}\n\
+             # Reviewer lanes already carry a review prompt; add a system_prompt to a\n\
+             # worker lane if you want one (copy claude-worker's above).\n",
+            ready = ready.join(", ")
+        ));
+    } else {
+        out.push_str(
+            "# ADD ANOTHER AGENT\n\
+             # Only the `claude` CLI was found on your PATH, so only Claude lanes are\n\
+             # defined. Install another agent CLI and re-run `brehon init`, or add one by\n\
+             # hand -- uncomment and adapt:\n\
+             #\n\
+             #   launchers:\n\
+             #     codex: { adapter: Acp, command: codex, args: [\"app-server\"] }\n\
+             #   lanes:\n\
+             #     codex-worker:\n\
+             #       launcher: codex\n\
+             #       model: { provider: openai, name: gpt-5.4 }\n\
+             #       reasoning_effort: medium\n\
+             #     codex-reviewer:\n\
+             #       launcher: codex\n\
+             #       model: { provider: openai, name: gpt-5.4 }\n\
+             #       reasoning_effort: high\n\
+             #       system_prompt: |\n\
+             #         You are a reviewer. Evaluate the submitted work; do not implement it.\n\
+             #   roles:\n\
+             #     workers:   [ { lane: claude-worker, min: 1, max: 1 }, { lane: codex-worker, min: 1, max: 1 } ]\n\
+             #     reviewers: [ { lane: claude-reviewer, min: 1, max: 1 }, { lane: codex-reviewer, min: 1, max: 1 } ]\n\
+             #   review:\n\
+             #     policy: { min_approvals: 2 }\n\
+             #     default_reviewers: [claude-reviewer, codex-reviewer]\n\
+             #     panels: [ { id: primary, reviewers: [claude-reviewer, codex-reviewer] } ]\n",
+        );
+    }
+    out.push_str(
+        "# ============================================================================\n",
+    );
+}
 
-        for (key, value) in remaining {
-            ordered.insert(Value::String(key), value);
-        }
+/// Generate a starter overlay: Claude is the only active role, while every
+/// agent CLI detected on PATH also gets launcher + lanes defined (inactive) so
+/// it can be turned on with a small `roles`/`review` edit.
+fn generate_config_for_agents(agents: &[DetectedAgent]) -> String {
+    let found: HashSet<&str> = agents
+        .iter()
+        .filter(|agent| agent.check.found)
+        .map(|agent| agent.check.name.as_str())
+        .collect();
 
-        ordered
+    // Active catalog: Claude always, plus any detected agent, in catalog order.
+    let active: Vec<&AgentTemplate> = CATALOG
+        .iter()
+        .filter(|template| template.launcher == "claude" || found.contains(template.detect_name))
+        .collect();
+    let others: Vec<&AgentTemplate> = active
+        .iter()
+        .copied()
+        .filter(|template| template.launcher != "claude")
+        .collect();
+
+    let mut out = String::new();
+    out.push_str(CONFIG_HEADER);
+
+    let detected: Vec<&str> = CATALOG
+        .iter()
+        .map(|template| template.detect_name)
+        .filter(|name| found.contains(name))
+        .collect();
+    if detected.is_empty() {
+        out.push_str("# Agent CLIs detected on PATH: none.\n");
+    } else {
+        out.push_str(&format!(
+            "# Agent CLIs detected on PATH: {}.\n",
+            detected.join(", ")
+        ));
+    }
+    if !found.contains("claude-code") {
+        out.push_str(
+            "# NOTE: the `claude` CLI was not found on PATH. Install it before running\n\
+             #       `brehon`, or point the `claude` launcher below at your CLI.\n",
+        );
     }
 
-    fn reorder_yaml_catalogs(document: &mut Value) {
-        let launcher_order = [
-            "claude",
-            "claude-ollama-cloud",
-            "copilot",
-            "codex",
-            "codex-ollama-cloud",
-            "gemini",
-            "kimi",
-            "opencode",
-            "agy",
-            "grok",
-        ];
-        let lane_order = [
-            "claude-supervisor",
-            "claude-worker",
-            "claude-reviewer",
-            "claude-ollama-cloud-supervisor",
-            "claude-ollama-cloud-worker",
-            "claude-ollama-cloud-reviewer",
-            "copilot-supervisor",
-            "copilot-worker",
-            "copilot-reviewer",
-            "codex-supervisor",
-            "codex-worker",
-            "codex-hardening",
-            "codex-reviewer",
-            "codex-ollama-cloud-supervisor",
-            "codex-ollama-cloud-worker",
-            "codex-ollama-cloud-reviewer",
-            "gemini-supervisor",
-            "gemini-worker",
-            "gemini-reviewer",
-            "kimi-supervisor",
-            "kimi-worker",
-            "kimi-reviewer",
-            "opencode-supervisor",
-            "opencode-worker",
-            "opencode-reviewer",
-            "agy-supervisor",
-            "agy-worker",
-            "agy-reviewer",
-            "grok-supervisor",
-            "grok-worker",
-            "grok-reviewer",
-        ];
+    out.push_str("\nversion: 1\n");
 
-        let Some(root) = document.as_mapping_mut() else {
-            return;
-        };
-
-        for field in ["launchers", "lanes"] {
-            let Some(value) = root.get_mut(Value::String(field.to_string())) else {
-                continue;
-            };
-            let Some(mapping) = value.as_mapping() else {
-                continue;
-            };
-
-            let ordered = match field {
-                "launchers" => sort_mapping_keys(mapping, &launcher_order),
-                "lanes" => sort_mapping_keys(mapping, &lane_order),
-                _ => unreachable!(),
-            };
-            *value = Value::Mapping(ordered);
-        }
+    out.push_str(
+        "\n# --- Launchers --------------------------------------------------------------\n\
+         # A launcher is HOW to spawn an agent CLI.\n\
+         launchers:\n",
+    );
+    for template in &active {
+        push_launcher(&mut out, template);
     }
 
-    fn put_str(mapping: &mut Mapping, key: &str, value: Value) {
-        mapping.insert(Value::String(key.to_string()), value);
+    out.push_str(
+        "\n# --- Lanes ------------------------------------------------------------------\n\
+         # A lane bundles a launcher + model + reasoning effort + (optional) system\n\
+         # prompt. Roles point at lanes, so you can swap the model behind a role\n\
+         # without touching the role. Non-Claude lanes below are defined but unused.\n\
+         lanes:\n",
+    );
+    for (index, template) in active.iter().enumerate() {
+        if index > 0 {
+            out.push('\n');
+        }
+        push_lanes(&mut out, template);
     }
 
-    fn worker_pool_overlay(pool_config: &WorkerPoolConfig) -> Value {
-        let mut pool = Mapping::new();
-        put_str(
-            &mut pool,
-            "lane",
-            Value::String(pool_config.lane.to_string()),
-        );
-        if pool_config.assignment_mode != WorkerAssignmentMode::Normal {
-            put_str(
-                &mut pool,
-                "assignment_mode",
-                serde_yaml::to_value(pool_config.assignment_mode).unwrap(),
-            );
-        }
-        if !pool_config.accepts.is_empty() {
-            put_str(
-                &mut pool,
-                "accepts",
-                serde_yaml::to_value(&pool_config.accepts).unwrap(),
-            );
-        }
-        put_str(
-            &mut pool,
-            "min",
-            serde_yaml::to_value(pool_config.min).unwrap(),
-        );
-        put_str(
-            &mut pool,
-            "max",
-            serde_yaml::to_value(pool_config.max).unwrap(),
-        );
-        Value::Mapping(pool)
-    }
+    out.push_str(ACTIVE_ROLES_BLOCK);
+    push_turn_on(&mut out, &others);
+    out.push_str(ROUTING_BLOCK);
 
-    fn pool_overlay(lane: &str, min: u32, max: u32) -> Value {
-        let mut pool = Mapping::new();
-        put_str(&mut pool, "lane", Value::String(lane.to_string()));
-        put_str(&mut pool, "min", serde_yaml::to_value(min).unwrap());
-        put_str(&mut pool, "max", serde_yaml::to_value(max).unwrap());
-        Value::Mapping(pool)
-    }
-
-    fn lane_overlay(lane: &LaneConfig, include_system_prompt: bool) -> Value {
-        let mut value = Mapping::new();
-        put_str(
-            &mut value,
-            "launcher",
-            Value::String(lane.launcher.to_string()),
-        );
-        if let Some(model) = &lane.model {
-            put_str(&mut value, "model", serde_yaml::to_value(model).unwrap());
-        }
-        if let Some(effort) = &lane.reasoning_effort {
-            put_str(
-                &mut value,
-                "reasoning_effort",
-                Value::String(effort.clone()),
-            );
-        }
-        if include_system_prompt {
-            if let Some(prompt) = &lane.system_prompt {
-                put_str(&mut value, "system_prompt", Value::String(prompt.clone()));
-            }
-        }
-        Value::Mapping(value)
-    }
-
-    fn safe_default_profiles() -> brehon_types::ProfilesConfig {
-        use brehon_types::{
-            CredentialClass, EnvPolicy, NetworkClass, PermissionProfile, SandboxBackend,
-            SandboxSpec,
-        };
-        let mut defaults = std::collections::BTreeMap::new();
-        defaults.insert("supervisor".to_string(), PermissionProfile::Operator);
-        defaults.insert("worker".to_string(), PermissionProfile::Workspace);
-        defaults.insert("reviewer".to_string(), PermissionProfile::Reviewer);
-
-        let mut specs = std::collections::BTreeMap::new();
-        specs.insert(
-            "observe".to_string(),
-            SandboxSpec {
-                backend: SandboxBackend::OsDefault,
-                read_roots: vec![],
-                write_roots: vec![],
-                denied_roots: vec![],
-                network_class: NetworkClass::Denied,
-                credential_class: CredentialClass::None,
-                env_policy: EnvPolicy::Minimal,
-                unsafe_marker: false,
-            },
-        );
-        specs.insert(
-            "dependency".to_string(),
-            SandboxSpec {
-                backend: SandboxBackend::OsDefault,
-                read_roots: vec![],
-                write_roots: vec![],
-                denied_roots: vec![],
-                network_class: NetworkClass::Allowlisted,
-                credential_class: CredentialClass::EnvAllowlist,
-                env_policy: EnvPolicy::Minimal,
-                unsafe_marker: false,
-            },
-        );
-        specs.insert(
-            "integrator".to_string(),
-            SandboxSpec {
-                backend: SandboxBackend::OsDefault,
-                read_roots: vec![],
-                write_roots: vec![],
-                denied_roots: vec![],
-                network_class: NetworkClass::ModelOnly,
-                credential_class: CredentialClass::EnvAllowlist,
-                env_policy: EnvPolicy::Minimal,
-                unsafe_marker: false,
-            },
-        );
-        specs.insert(
-            "workspace".to_string(),
-            SandboxSpec {
-                backend: SandboxBackend::OsDefault,
-                read_roots: vec![],
-                write_roots: vec![],
-                denied_roots: vec![],
-                network_class: NetworkClass::ModelOnly,
-                credential_class: CredentialClass::EnvAllowlist,
-                env_policy: EnvPolicy::Minimal,
-                unsafe_marker: false,
-            },
-        );
-        specs.insert(
-            "reviewer".to_string(),
-            SandboxSpec {
-                backend: SandboxBackend::OsDefault,
-                read_roots: vec![],
-                write_roots: vec![],
-                denied_roots: vec![],
-                network_class: NetworkClass::ModelOnly,
-                credential_class: CredentialClass::EnvAllowlist,
-                env_policy: EnvPolicy::Minimal,
-                unsafe_marker: false,
-            },
-        );
-        specs.insert(
-            "operator".to_string(),
-            SandboxSpec {
-                backend: SandboxBackend::OsDefault,
-                read_roots: vec![],
-                write_roots: vec![],
-                denied_roots: vec![],
-                network_class: NetworkClass::ModelOnly,
-                credential_class: CredentialClass::EnvAllowlist,
-                env_policy: EnvPolicy::Minimal,
-                unsafe_marker: false,
-            },
-        );
-        specs.insert(
-            "unsafe".to_string(),
-            SandboxSpec {
-                backend: SandboxBackend::None,
-                read_roots: vec![],
-                write_roots: vec![],
-                denied_roots: vec![],
-                network_class: NetworkClass::Unrestricted,
-                credential_class: CredentialClass::Unrestricted,
-                env_policy: EnvPolicy::Inherit,
-                unsafe_marker: true,
-            },
-        );
-
-        brehon_types::ProfilesConfig { defaults, specs }
-    }
-
-    fn active_overlay(
-        config: &brehon_types::BrehonConfig,
-        defaults: &brehon_types::BrehonConfig,
-    ) -> Value {
-        let mut root = Mapping::new();
-        put_str(
-            &mut root,
-            "version",
-            serde_yaml::to_value(config.version).unwrap(),
-        );
-
-        let active_lanes: std::collections::BTreeSet<String> =
-            std::iter::once(config.roles.supervisor.name.clone())
-                .chain(
-                    config
-                        .roles
-                        .workers
-                        .iter()
-                        .map(|worker| worker.lane.clone()),
-                )
-                .chain(
-                    config
-                        .roles
-                        .reviewers
-                        .iter()
-                        .map(|reviewer| reviewer.lane.clone()),
-                )
-                .collect();
-
-        let mut launchers = Mapping::new();
-        let mut lanes = Mapping::new();
-        for lane_name in &active_lanes {
-            let Some(lane) = config.lanes.get(lane_name) else {
-                continue;
-            };
-            let include_system_prompt = lane_name != &config.roles.supervisor.name;
-            let needs_lane_overlay = match defaults.lanes.get(lane_name) {
-                Some(default_lane) => {
-                    default_lane.launcher != lane.launcher
-                        || default_lane.model != lane.model
-                        || (include_system_prompt
-                            && default_lane.system_prompt != lane.system_prompt)
-                }
-                None => true,
-            };
-            if needs_lane_overlay {
-                put_str(
-                    &mut lanes,
-                    lane_name,
-                    lane_overlay(lane, include_system_prompt),
-                );
-            }
-            if let Some(launcher) = config.launchers.get(&lane.launcher) {
-                if defaults.launchers.get(&lane.launcher) != Some(launcher) {
-                    put_str(
-                        &mut launchers,
-                        &lane.launcher,
-                        serde_yaml::to_value(launcher).unwrap(),
-                    );
-                }
-            }
-        }
-        if !launchers.is_empty() {
-            put_str(&mut root, "launchers", Value::Mapping(launchers));
-        }
-        if !lanes.is_empty() {
-            put_str(&mut root, "lanes", Value::Mapping(lanes));
-        }
-
-        let mut roles = Mapping::new();
-        let mut supervisor = Mapping::new();
-        put_str(
-            &mut supervisor,
-            "name",
-            Value::String(config.roles.supervisor.name.clone()),
-        );
-        put_str(&mut roles, "supervisor", Value::Mapping(supervisor));
-        put_str(
-            &mut roles,
-            "workers",
-            Value::Sequence(
-                config
-                    .roles
-                    .workers
-                    .iter()
-                    .map(worker_pool_overlay)
-                    .collect(),
-            ),
-        );
-        put_str(
-            &mut roles,
-            "reviewers",
-            Value::Sequence(
-                config
-                    .roles
-                    .reviewers
-                    .iter()
-                    .map(|reviewer| pool_overlay(&reviewer.lane, reviewer.min, reviewer.max))
-                    .collect(),
-            ),
-        );
-        put_str(&mut root, "roles", Value::Mapping(roles));
-
-        let mut policy = Mapping::new();
-        put_str(
-            &mut policy,
-            "min_approvals",
-            serde_yaml::to_value(config.review.policy.min_approvals).unwrap(),
-        );
-        let mut review = Mapping::new();
-        put_str(&mut review, "policy", Value::Mapping(policy));
-        put_str(
-            &mut review,
-            "default_reviewers",
-            serde_yaml::to_value(&config.review.default_reviewers).unwrap(),
-        );
-        put_str(
-            &mut review,
-            "panels",
-            serde_yaml::to_value(&config.review.panels).unwrap(),
-        );
-        put_str(&mut root, "review", Value::Mapping(review));
-
-        let mut orchestration = Mapping::new();
-        put_str(
-            &mut orchestration,
-            "max_active_workers",
-            serde_yaml::to_value(config.orchestration.max_active_workers).unwrap(),
-        );
-        put_str(&mut root, "orchestration", Value::Mapping(orchestration));
-
-        if !config.profiles.is_default() {
-            put_str(
-                &mut root,
-                "profiles",
-                serde_yaml::to_value(&config.profiles).expect("profiles should serialize"),
-            );
-        }
-
-        Value::Mapping(root)
-    }
-
-    // Start from the full defaults config (without triggering validation warnings)
-    let defaults = parse_defaults().expect("Failed to load default config");
-    let mut config = defaults.clone();
-
-    let found: Vec<&DetectedAgent> = agents.iter().filter(|a| a.check.found).collect();
-    let default_reviewer_prompt = config.roles.reviewers.iter().find_map(|reviewer| {
-        config
-            .lane_system_prompt(&reviewer.lane, reviewer.system_prompt.as_deref())
-            .map(str::to_string)
-    });
-
-    let launcher_key = |detected_name: &str| match detected_name {
-        "claude-code" => "claude".to_string(),
-        other => other.to_string(),
-    };
-    let supervisor_lane = |launcher: &str| format!("{launcher}-supervisor");
-    let worker_lane = |launcher: &str| format!("{launcher}-worker");
-    let reviewer_lane = |launcher: &str| format!("{launcher}-reviewer");
-    let found_launcher =
-        |name: &str| -> bool { found.iter().any(|agent| agent.check.name == name) };
-    config.launchers = template_launchers();
-    config.lanes = template_lanes(default_reviewer_prompt.as_deref());
-
-    // Tailor supervisor: prefer CLIs with a supervisor-capable Brehon contract.
-    let supervisor_choice = [
-        "claude-code",
-        "codex",
-        "copilot",
-        "opencode",
-        "kimi",
-        "gemini",
-        "agy",
-    ]
-    .iter()
-    .find(|name| found_launcher(name))
-    .and_then(|name| found.iter().find(|agent| agent.check.name == **name));
-    if let Some(sup) = supervisor_choice {
-        let launcher = launcher_key(&sup.check.name);
-        let lane = supervisor_lane(&launcher);
-        let model = config
-            .lanes
-            .get(&lane)
-            .and_then(|lane| lane.model.clone())
-            .expect("template supervisor lane should have a model");
-        let reasoning_effort = config
-            .lanes
-            .get(&lane)
-            .and_then(|lane| lane.reasoning_effort.clone());
-        config.supervisor.model = Some(model);
-        config.supervisor.reasoning_effort = reasoning_effort;
-        config.roles.supervisor.name = lane.clone();
-        if let Some(supervisor_lane) = config.lanes.get_mut(&lane) {
-            supervisor_lane.system_prompt = config.roles.supervisor.system_prompt.clone();
-        }
-    }
-
-    // Tailor workers: prefer stronger ACP/headless workers, then first detected.
-    let worker_choice = [
-        "codex",
-        "copilot",
-        "grok",
-        "opencode",
-        "kimi",
-        "claude-code",
-        "gemini",
-        "agy",
-    ]
-    .iter()
-    .find(|name| found_launcher(name))
-    .and_then(|name| found.iter().find(|agent| agent.check.name == **name))
-    .or(found.first());
-    if let Some(worker) = worker_choice {
-        let launcher = launcher_key(&worker.check.name);
-        let lane = worker_lane(&launcher);
-        let template_lane = config
-            .lanes
-            .get(&lane)
-            .cloned()
-            .expect("template worker lane should exist");
-        config.roles.workers = vec![WorkerPoolConfig {
-            lane,
-            model: template_lane.model,
-            reasoning_effort: template_lane.reasoning_effort,
-            assignment_mode: WorkerAssignmentMode::Normal,
-            accepts: Vec::new(),
-            min: 1,
-            max: 5,
-        }];
-        if found_launcher("codex") {
-            let hardening_lane = "codex-hardening".to_string();
-            let template_lane = config
-                .lanes
-                .get(&hardening_lane)
-                .cloned()
-                .expect("template hardening lane should exist");
-            config.roles.workers.push(WorkerPoolConfig {
-                lane: hardening_lane,
-                model: template_lane.model,
-                reasoning_effort: template_lane.reasoning_effort,
-                assignment_mode: WorkerAssignmentMode::Reserved,
-                accepts: vec!["final_hardening".to_string()],
-                min: 1,
-                max: 1,
-            });
-        }
-        config.orchestration.max_active_workers = 5;
-    }
-
-    // Tailor reviewers using canonical role lanes, not leftovers from supervisor/worker selection.
-    {
-        let reviewer_candidates = [
-            "claude-code",
-            "codex",
-            "copilot",
-            "grok",
-            "gemini",
-            "kimi",
-            "opencode",
-            "agy",
-        ];
-        let mut reviewers = Vec::new();
-        for candidate in reviewer_candidates {
-            if reviewers.len() >= 3 {
-                break;
-            }
-            let Some(agent) = found.iter().find(|agent| agent.check.name == candidate) else {
-                continue;
-            };
-            let launcher = launcher_key(&agent.check.name);
-            let lane = reviewer_lane(&launcher);
-            let template_lane = config
-                .lanes
-                .get(&lane)
-                .cloned()
-                .expect("template reviewer lane should exist");
-            reviewers.push(ReviewerPoolConfig {
-                lane,
-                model: template_lane.model,
-                reasoning_effort: template_lane.reasoning_effort,
-                system_prompt: template_lane.system_prompt,
-                min: 1,
-                max: 3,
-            });
-        }
-        if !reviewers.is_empty() {
-            config.roles.reviewers = reviewers;
-            // Update default_reviewers to match
-            config.review.default_reviewers = config
-                .roles
-                .reviewers
-                .iter()
-                .map(|reviewer| reviewer.lane.clone())
-                .collect();
-            config.review.panels = vec![ReviewPanelConfig {
-                id: "primary".to_string(),
-                reviewers: config.review.default_reviewers.clone(),
-            }];
-            config.review.policy.min_approvals = config
-                .review
-                .policy
-                .min_approvals
-                .min(config.review.default_reviewers.len().max(1) as u8);
-        }
-    }
-
-    config.profiles = safe_default_profiles();
-
-    // Serialize a small project overlay, not the full resolved config. Built-in
-    // defaults supply the advanced sections.
-    let mut yaml_value = active_overlay(&config, &defaults);
-    reorder_yaml_catalogs(&mut yaml_value);
-    let yaml = serde_yaml::to_string(&yaml_value).expect("Failed to serialize config");
-
-    format!(
-        r#"# Brehon Project Configuration
-# Layers: baked-in defaults < ~/.config/brehon/config.yaml < this file
-#
-# This is a partial overlay. Keep it small: omit anything that should use the
-# built-in defaults. Run `brehon config list` to inspect the resolved config.
-#
-# Common edits:
-# - roles.workers / roles.reviewers: choose lanes and pool sizes.
-# - review.policy.min_approvals: how many review approvals are required.
-# - orchestration.max_active_workers: concurrent active worker tasks.
-# - permissions: allow/deny common tool actions.
-#
-# Optional research scaffold (uncomment and rename lanes/pools):
-# research:
-#   enabled: false
-#   pools:
-#   - id: spec-research
-#     lane: cheap-worker
-#     instruction_profile: "Cite primary sources and summarize task-relevant facts."
-#     role: normative_requirements
-#     min: 0
-#     max: 2
-#   routes:
-#   - id: specs-for-protocol-work
-#     trigger: before_assignment
-#     match: {{ text_any: [RFC, protocol, PFCP] }}
-#     jobs:
-#     - id: normative-requirements
-#       pool: spec-research
-#       prompt_template: "Task {{{{task_id}}}}: {{{{title}}}}\nSummarize requirements and cite sources."
-
-{yaml}"#
-    )
+    out
 }
 
 fn gitignore_pattern_present(lines: &[&str], pattern: &str) -> bool {
@@ -1040,23 +597,38 @@ pub fn execute(project_path: &Path) -> Result<()> {
     let checks: Vec<&ui::AgentCheck> = agents.iter().map(|a| &a.check).collect();
     ui::print_agent_checks(&checks);
 
-    let found_count = agents.iter().filter(|a| a.check.found).count();
+    let claude_found = agents
+        .iter()
+        .any(|agent| agent.check.name == "claude-code" && agent.check.found);
+    let other_found = agents
+        .iter()
+        .filter(|agent| agent.check.found && agent.check.name != "claude-code")
+        .count();
     println!();
-    if found_count == 0 {
-        ui::print_warning("No agents detected on PATH. Generating a minimal default overlay.");
+    if claude_found {
         println!(
             "    {}",
             ui::dim(
-                "Install an agent CLI and re-run 'brehon init', or add launchers and lanes manually."
+                "Active roster: one Claude worker, one Claude reviewer, one Claude supervisor."
             )
         );
     } else {
+        ui::print_warning("The 'claude' CLI was not found on PATH.");
+        println!(
+            "    {}",
+            ui::dim(
+                "A Claude-active starter config will still be written. Install the claude CLI, or \
+                 edit .brehon/config.yaml to activate an agent you have."
+            )
+        );
+    }
+    if other_found > 0 {
         println!(
             "    {}",
             ui::dim(&format!(
-                "{} agent{} detected, configuration will be tailored.",
-                found_count,
-                if found_count == 1 { "" } else { "s" }
+                "{} other CLI{} also templated (inactive) -- see 'TURN ON ANOTHER AGENT' in the config.",
+                other_found,
+                if other_found == 1 { "" } else { "s" }
             ))
         );
     }
@@ -1089,8 +661,7 @@ pub fn execute(project_path: &Path) -> Result<()> {
     std::fs::create_dir_all(&brehon_dir)?;
     ui::print_success(&format!("Created {}", ui::dim(".brehon/")));
 
-    // Write config (temporarily suppress tracing since load_config emits warnings
-    // about default config validation, which is expected during init)
+    // Write config
     let config_content = generate_config_for_agents(&agents);
     std::fs::write(&config_path, &config_content)?;
     ui::print_success(&format!("Created {}", ui::dim(".brehon/config.yaml")));
@@ -1149,7 +720,7 @@ pub fn execute(project_path: &Path) -> Result<()> {
 
     ui::print_steps(&[
         &format!(
-            "Edit {} to configure agents and roles",
+            "Read {} - Claude is active; other agents are templated and ready to flip on",
             ui::bold(".brehon/config.yaml")
         ),
         &format!("Run {} to verify your setup", ui::cyan("brehon doctor")),
@@ -1164,7 +735,6 @@ pub fn execute(project_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use brehon_types::agent::AdapterKind;
 
     fn load_generated_config(yaml: &str) -> brehon_types::BrehonConfig {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -1173,8 +743,7 @@ mod tests {
         brehon_config::load_config_with_override(None, Some(&path)).expect("load generated config")
     }
 
-    fn detected_agent(name: &str, command: &str, provider: &str, model: &str) -> DetectedAgent {
-        let _ = (provider, model);
+    fn detected_agent(name: &str, command: &str) -> DetectedAgent {
         DetectedAgent {
             check: ui::AgentCheck {
                 name: name.to_string(),
@@ -1186,79 +755,84 @@ mod tests {
         }
     }
 
-    #[test]
-    fn generated_config_includes_default_reviewer_system_prompt() {
-        let agents = vec![
-            detected_agent("claude-code", "claude", "anthropic", "claude-sonnet-4-6"),
-            detected_agent("codex", "codex", "openai", "gpt-5.3-codex"),
-        ];
-
-        let yaml = generate_config_for_agents(&agents);
-        let config = load_generated_config(&yaml);
-
-        assert!(yaml.contains("roles:"));
-        assert!(yaml.contains("reviewers:"));
-        assert!(
-            !yaml.contains("system_prompt:"),
-            "generated overlay should not inline the default reviewer prompt"
-        );
-        let prompt = config
-            .lane_system_prompt("claude-reviewer", None)
-            .expect("default reviewer prompt");
-        assert!(prompt.contains("You are a reviewer."));
-        assert!(prompt.contains("evaluate"));
-        assert!(prompt.contains("Treat active review obligations as your source of truth"));
-        assert!(prompt.contains("Review panels are leased to tasks"));
+    fn active_lines(yaml: &str) -> Vec<&str> {
+        yaml.lines()
+            .filter(|line| !line.trim_start().starts_with('#'))
+            .collect()
     }
 
     #[test]
-    fn generated_config_excludes_primary_worker_and_supervisor_from_default_panel_when_possible() {
-        let agents = vec![
-            detected_agent("claude-code", "claude", "anthropic", "claude-sonnet-4-6"),
-            detected_agent("codex", "codex", "openai", "gpt-5.3-codex"),
-            detected_agent("gemini", "gemini", "google", "gemini-3.1-pro-preview"),
-            detected_agent("opencode", "opencode", "ollama-cloud", "glm-5.1"),
-        ];
-
-        let yaml = generate_config_for_agents(&agents);
+    fn claude_is_the_only_active_role() {
+        let yaml = generate_config_for_agents(&[
+            detected_agent("claude-code", "claude"),
+            detected_agent("codex", "codex"),
+            detected_agent("gemini", "gemini"),
+        ]);
         let config = load_generated_config(&yaml);
 
         assert_eq!(config.roles.supervisor.name, "claude-supervisor");
-        assert_eq!(config.roles.workers[0].lane, "codex-worker");
-        assert!(config.roles.workers.iter().any(|worker| {
-            worker.lane == "codex-hardening"
-                && worker.assignment_mode == brehon_types::WorkerAssignmentMode::Reserved
-                && worker.accepts == vec!["final_hardening".to_string()]
-        }));
+        assert_eq!(config.roles.workers.len(), 1);
+        assert_eq!(config.roles.workers[0].lane, "claude-worker");
+        assert_eq!(config.roles.reviewers.len(), 1);
+        assert_eq!(config.roles.reviewers[0].lane, "claude-reviewer");
+
         assert_eq!(
             config.review.default_reviewers,
-            vec![
-                "claude-reviewer".to_string(),
-                "codex-reviewer".to_string(),
-                "gemini-reviewer".to_string()
-            ]
+            vec!["claude-reviewer".to_string()]
         );
         assert_eq!(config.review.panels.len(), 1);
         assert_eq!(config.review.panels[0].id, "primary");
         assert_eq!(
             config.review.panels[0].reviewers,
-            vec![
-                "claude-reviewer".to_string(),
-                "codex-reviewer".to_string(),
-                "gemini-reviewer".to_string()
-            ]
+            vec!["claude-reviewer".to_string()]
+        );
+        assert_eq!(config.review.policy.min_approvals, 1);
+        assert_eq!(config.orchestration.max_active_workers, 1);
+    }
+
+    #[test]
+    fn detected_agents_are_templated_but_inactive() {
+        let yaml = generate_config_for_agents(&[
+            detected_agent("claude-code", "claude"),
+            detected_agent("codex", "codex"),
+        ]);
+        let config = load_generated_config(&yaml);
+
+        // Codex lanes + launcher are defined and uncommented...
+        for lane in ["codex-supervisor", "codex-worker", "codex-reviewer"] {
+            assert!(config.lanes.contains_key(lane), "missing lane {lane}");
+        }
+        assert!(config.launchers.contains_key("codex"));
+        assert!(active_lines(&yaml)
+            .iter()
+            .any(|line| line.contains("codex-worker:")));
+
+        // ...but not wired into any active role.
+        assert!(config
+            .roles
+            .workers
+            .iter()
+            .all(|w| w.lane != "codex-worker"));
+        assert!(config
+            .roles
+            .reviewers
+            .iter()
+            .all(|r| r.lane != "codex-reviewer"));
+
+        // Codex models match the catalog.
+        assert_eq!(
+            config.lanes["codex-worker"].model.as_ref().unwrap().name,
+            "gpt-5.3-codex"
+        );
+        assert_eq!(
+            config.lanes["codex-reviewer"].model.as_ref().unwrap().name,
+            "gpt-5.4"
         );
     }
 
     #[test]
-    fn generated_config_uses_role_specific_models() {
-        let agents = vec![
-            detected_agent("claude-code", "claude", "anthropic", "claude-sonnet-4-6"),
-            detected_agent("codex", "codex", "openai", "gpt-5.3-codex"),
-            detected_agent("gemini", "gemini", "google", "gemini-3.1-pro-preview"),
-        ];
-
-        let yaml = generate_config_for_agents(&agents);
+    fn claude_lanes_use_expected_models() {
+        let yaml = generate_config_for_agents(&[detected_agent("claude-code", "claude")]);
         let config = load_generated_config(&yaml);
 
         assert_eq!(
@@ -1270,247 +844,67 @@ mod tests {
             "claude-opus-4-6"
         );
         assert_eq!(
-            config.lanes["codex-worker"].model.as_ref().unwrap().name,
-            "gpt-5.3-codex"
-        );
-        assert_eq!(
-            config.lanes["codex-hardening"].model.as_ref().unwrap().name,
-            "gpt-5.5"
-        );
-        assert_eq!(
-            config.lanes["codex-hardening"].reasoning_effort.as_deref(),
-            Some("xhigh")
+            config.lanes["claude-worker"].model.as_ref().unwrap().name,
+            "claude-sonnet-4-6"
         );
         assert_eq!(
             config.lanes["claude-reviewer"].model.as_ref().unwrap().name,
             "claude-opus-4-6"
         );
-        assert_eq!(
-            config.lanes["codex-reviewer"].model.as_ref().unwrap().name,
-            "gpt-5.4"
-        );
-        assert_eq!(config.orchestration.max_active_workers, 5);
     }
 
     #[test]
-    fn generated_config_only_includes_needed_custom_catalog_entries() {
-        let agents = vec![detected_agent(
-            "kimi",
-            "kimi",
-            "kimi-code",
-            "kimi-for-coding",
-        )];
-        let yaml = generate_config_for_agents(&agents);
+    fn worker_and_reviewer_prompts_are_inlined() {
+        let yaml = generate_config_for_agents(&[
+            detected_agent("claude-code", "claude"),
+            detected_agent("codex", "codex"),
+        ]);
         let config = load_generated_config(&yaml);
 
-        assert!(
-            yaml.contains("  kimi:"),
-            "active non-default launcher should be included"
-        );
-        assert!(
-            yaml.contains("  kimi-worker:"),
-            "active non-default lane should be included"
-        );
-        assert!(
-            !yaml.contains("claude-ollama-cloud"),
-            "unused template catalog entries should not be generated"
-        );
-        assert!(config.launchers.contains_key("kimi"));
-        assert!(config.lanes.contains_key("kimi-worker"));
-        assert_eq!(config.roles.workers[0].lane, "kimi-worker");
+        let worker_prompt = config
+            .lane_system_prompt("claude-worker", None)
+            .expect("worker prompt");
+        assert!(worker_prompt.contains("implementation worker"));
+        assert!(worker_prompt.contains("worktree"));
+
+        // Every reviewer lane (active or not) carries the review prompt.
+        for lane in ["claude-reviewer", "codex-reviewer"] {
+            let prompt = config
+                .lane_system_prompt(lane, None)
+                .unwrap_or_else(|| panic!("reviewer prompt for {lane}"));
+            assert!(prompt.contains("You are a reviewer."));
+            assert!(prompt.contains("structured review submission"));
+        }
     }
 
     #[test]
-    fn generated_config_is_compact_overlay() {
+    fn no_agents_defines_only_claude_and_warns() {
         let yaml = generate_config_for_agents(&[]);
-
-        // Profiles section adds safe default profile specs; allow room for them.
-        assert!(yaml.lines().count() < 140, "{yaml}");
-        assert!(!yaml.contains("budget:"));
-        assert!(!yaml.contains("retention:"));
-        assert!(!yaml.contains("terminal_host:"));
         let config = load_generated_config(&yaml);
+
         assert_eq!(config.version, 1);
         assert!(config.launchers.contains_key("claude"));
+
+        // No detected agents -> only Claude lanes are emitted (codex appears only
+        // inside the commented ADD example).
+        assert!(!active_lines(&yaml)
+            .iter()
+            .any(|line| line.contains("codex-worker:")));
+        assert!(yaml.contains("`claude` CLI was not found"));
     }
 
     #[test]
-    fn generated_config_includes_safe_permission_profiles() {
-        let yaml = generate_config_for_agents(&[]);
-        let config = load_generated_config(&yaml);
+    fn header_lists_detected_agents() {
+        let yaml = generate_config_for_agents(&[
+            detected_agent("claude-code", "claude"),
+            detected_agent("codex", "codex"),
+        ]);
 
+        assert!(yaml.contains("Agent CLIs detected on PATH: claude-code, codex."));
         assert!(
-            yaml.contains("profiles:"),
-            "generated config should include profiles section"
+            !yaml.contains("`claude` CLI was not found"),
+            "no missing-claude warning when claude is present"
         );
-        assert!(
-            yaml.contains("defaults:"),
-            "generated config should include profiles.defaults"
-        );
-        assert!(
-            yaml.contains("specs:"),
-            "generated config should include profiles.specs"
-        );
-
-        assert_eq!(
-            config.profiles.defaults.get("supervisor"),
-            Some(&brehon_types::PermissionProfile::Operator)
-        );
-        assert_eq!(
-            config.profiles.defaults.get("worker"),
-            Some(&brehon_types::PermissionProfile::Workspace)
-        );
-        assert_eq!(
-            config.profiles.defaults.get("reviewer"),
-            Some(&brehon_types::PermissionProfile::Reviewer)
-        );
-
-        assert!(
-            config.profiles.specs.contains_key("observe"),
-            "observe spec should be present"
-        );
-        assert!(
-            config.profiles.specs.contains_key("dependency"),
-            "dependency spec should be present"
-        );
-        assert!(
-            config.profiles.specs.contains_key("integrator"),
-            "integrator spec should be present"
-        );
-        assert!(
-            config.profiles.specs.contains_key("workspace"),
-            "workspace spec should be present"
-        );
-        assert!(
-            config.profiles.specs.contains_key("reviewer"),
-            "reviewer spec should be present"
-        );
-        assert!(
-            config.profiles.specs.contains_key("operator"),
-            "operator spec should be present"
-        );
-        assert!(
-            config.profiles.specs.contains_key("unsafe"),
-            "unsafe spec should be present"
-        );
-
-        let observe_spec = config.profiles.specs.get("observe").unwrap();
-        assert_eq!(
-            observe_spec.backend,
-            brehon_types::SandboxBackend::OsDefault
-        );
-        assert_eq!(
-            observe_spec.network_class,
-            brehon_types::NetworkClass::Denied
-        );
-        assert_eq!(
-            observe_spec.credential_class,
-            brehon_types::CredentialClass::None
-        );
-        assert!(!observe_spec.unsafe_marker);
-
-        let dependency_spec = config.profiles.specs.get("dependency").unwrap();
-        assert_eq!(
-            dependency_spec.network_class,
-            brehon_types::NetworkClass::Allowlisted
-        );
-        assert_eq!(
-            dependency_spec.credential_class,
-            brehon_types::CredentialClass::EnvAllowlist
-        );
-        assert!(!dependency_spec.unsafe_marker);
-
-        let integrator_spec = config.profiles.specs.get("integrator").unwrap();
-        assert_eq!(
-            integrator_spec.network_class,
-            brehon_types::NetworkClass::ModelOnly
-        );
-        assert_eq!(
-            integrator_spec.credential_class,
-            brehon_types::CredentialClass::EnvAllowlist
-        );
-        assert!(!integrator_spec.unsafe_marker);
-
-        let workspace_spec = config.profiles.specs.get("workspace").unwrap();
-        assert_eq!(
-            workspace_spec.backend,
-            brehon_types::SandboxBackend::OsDefault
-        );
-        assert_eq!(
-            workspace_spec.network_class,
-            brehon_types::NetworkClass::ModelOnly
-        );
-        assert_eq!(
-            workspace_spec.credential_class,
-            brehon_types::CredentialClass::EnvAllowlist
-        );
-        assert!(!workspace_spec.unsafe_marker);
-
-        let unsafe_spec = config.profiles.specs.get("unsafe").unwrap();
-        assert_eq!(unsafe_spec.backend, brehon_types::SandboxBackend::None);
-        assert_eq!(
-            unsafe_spec.network_class,
-            brehon_types::NetworkClass::Unrestricted
-        );
-        assert_eq!(
-            unsafe_spec.credential_class,
-            brehon_types::CredentialClass::Unrestricted
-        );
-        assert!(unsafe_spec.unsafe_marker);
-    }
-
-    #[test]
-    fn generated_config_tailors_agy() {
-        let agents = vec![detected_agent(
-            "agy",
-            "agy",
-            "antigravity",
-            "antigravity-2.0",
-        )];
-        let yaml = generate_config_for_agents(&agents);
-        let config = load_generated_config(&yaml);
-
-        assert_eq!(config.roles.supervisor.name, "agy-supervisor");
-        assert_eq!(config.roles.workers[0].lane, "agy-worker");
-        assert_eq!(
-            config.review.default_reviewers,
-            vec!["agy-reviewer".to_string()]
-        );
-        assert_eq!(config.launchers["agy"].adapter, AdapterKind::Agy);
-        assert_eq!(config.launchers["agy"].command, Some("agy".to_string()));
-        assert!(config.launchers["agy"].args.is_empty());
-        assert_eq!(
-            config.lanes["agy-worker"].model.as_ref().unwrap().name,
-            "antigravity-2.0"
-        );
-    }
-
-    #[test]
-    fn generated_config_tailors_grok_worker_and_reviewer() {
-        let agents = vec![detected_agent("grok", "grok", "xai", "grok-build")];
-        let yaml = generate_config_for_agents(&agents);
-        let config = load_generated_config(&yaml);
-
-        assert_eq!(config.roles.workers[0].lane, "grok-worker");
-        assert_eq!(
-            config.review.default_reviewers,
-            vec!["grok-reviewer".to_string()]
-        );
-        assert_eq!(config.launchers["grok"].adapter, AdapterKind::Acp);
-        assert_eq!(config.launchers["grok"].command, Some("grok".to_string()));
-        assert_eq!(
-            config.launchers["grok"].args,
-            vec![
-                "agent".to_string(),
-                "--always-approve".to_string(),
-                "stdio".to_string()
-            ]
-        );
-        assert_eq!(
-            config.lanes["grok-worker"].model.as_ref().unwrap().name,
-            "grok-build"
-        );
-        assert_ne!(config.roles.supervisor.name, "grok-supervisor");
     }
 
     #[test]
@@ -1560,7 +954,7 @@ mod tests {
             .count();
         assert_eq!(header_count, 1, "duplicate header found:\n{gitignore}");
 
-        // Patterns should land contiguously under the existing header — no blank
+        // Patterns should land contiguously under the existing header - no blank
         // line gap between the already-present `.brehon/` and newly appended lines.
         let all_lines: Vec<_> = gitignore.lines().collect();
         let header_idx = all_lines

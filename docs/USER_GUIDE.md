@@ -183,10 +183,12 @@ it sounds.*
 > Want a single reviewer and two cheap workers? That's a config edit. Want a
 > seven-judge supreme court on a frontier-model bench? Also a config edit, and
 > may God have mercy on your invoice. The author runs the setup you're about to
-> see because it suits *their* work; your `brehon init` will generate something
-> smaller, shaped by the agents you actually have installed. The expensive
-> defaults in this guide are an *illustration of the maximum*, not a starting
-> requirement. Brehon is the machine; the dial settings are yours.
+> see because it suits *their* work; your `brehon init` generates something far
+> smaller — one *active* Claude worker judged by a single-member Claude panel,
+> with lanes for every other agent CLI you have installed written in alongside it
+> (inactive) so flipping one on is a one-line edit. The expensive defaults in
+> this guide are an *illustration of the maximum*, not a starting requirement.
+> Brehon is the machine; the dial settings are yours.
 
 ### The shape of the spend
 

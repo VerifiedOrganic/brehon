@@ -173,8 +173,13 @@ run — start there.
 
 ## Configuration
 
-Configuration lives at `.brehon/config.yaml`. `brehon init` generates a starter
-config shaped by the agent CLIs it finds on your `PATH`. The schema (see
+Configuration lives at `.brehon/config.yaml`. `brehon init` generates a clean,
+budget-safe starter: a single **active** Claude worker, judged by a
+single-member Claude review panel, coordinated by a Claude supervisor. Every
+other agent CLI it finds on your `PATH` also gets a launcher plus
+supervisor/worker/reviewer lanes written into the file — *inactive* — so turning
+one on is a one-line edit under `roles`/`review` (see the `TURN ON ANOTHER AGENT`
+section the generated file prints). The schema (see
 `crates/brehon-config/src/defaults.yaml` for the full version) is built around
 two concepts:
 
@@ -195,10 +200,6 @@ launchers:
   claude:
     adapter: Acp
     command: claude
-  codex:
-    adapter: Acp
-    command: codex
-    args: ["app-server"]
 
 lanes:
   claude-supervisor:
@@ -206,11 +207,11 @@ lanes:
     model:
       provider: anthropic
       name: claude-opus-4-6
-  codex-worker:
-    launcher: codex
+  claude-worker:
+    launcher: claude
     model:
-      provider: openai
-      name: gpt-5.4
+      provider: anthropic
+      name: claude-sonnet-4-6
   claude-reviewer:
     launcher: claude
     model:
@@ -219,6 +220,12 @@ lanes:
     system_prompt: |
       You are a reviewer. Evaluate submitted work; do not implement it.
 ```
+
+That's the active roster (shown here Claude-only for brevity). If you also have
+Codex, Gemini, etc. on your `PATH`, `brehon init` writes their launchers and
+lanes too — defined but unused. Bringing one into a two-vote panel is then a
+matter of adding its `*-worker`/`*-reviewer` lane to `roles`/`review` and bumping
+`min_approvals`, not authoring config from scratch.
 
 Panel composition, worker pool sizing, review scoring policy, routing, research,
 and budget caps all live under their respective sections. **Every one of them is
