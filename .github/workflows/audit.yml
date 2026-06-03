@@ -1,0 +1,38 @@
+name: Audit
+
+on:
+  schedule:
+    # Mondays 06:00 UTC. Pinned to a weekly cadence so transient advisories
+    # don't churn CI on every PR; on-demand runs are available via dispatch.
+    - cron: "0 6 * * 1"
+  push:
+    paths:
+      - "Cargo.lock"
+      - ".github/workflows/audit.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: audit-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cargo-audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: audit
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --version 0.22.1 --locked
+
+      - name: cargo audit
+        run: cargo audit

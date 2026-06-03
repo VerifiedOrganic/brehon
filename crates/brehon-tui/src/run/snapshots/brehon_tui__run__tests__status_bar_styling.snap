@@ -1,0 +1,6 @@
+---
+source: crates/brehon-tui/src/run/mod.rs
+assertion_line: 6304
+expression: status_row
+---
+ C-q:Quit  •  C-]:Next  •  C-d:Dash  •  C-o:Compose  •  C-t:Runtime  •  C-a:Adv  •  C-y:Res  •  C-w:Work  •  C-e:Rev  •  C-s:Sup  •  C-v:Struct  •  C-r:Reset  •  1 panes  •  reviewer-opus (copilot-reviewer-opus)

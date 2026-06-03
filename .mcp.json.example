@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "brehon": {
+      "command": "brehon",
+      "args": ["serve"]
+    }
+  }
+}

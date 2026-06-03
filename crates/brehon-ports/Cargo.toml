@@ -1,0 +1,16 @@
+[package]
+name = "brehon-ports"
+version = "0.1.0"
+edition = "2021"
+description = "Port trait definitions (hexagonal architecture boundaries) for Brehon"
+license = "MIT"
+
+[dependencies]
+brehon-types = { path = "../brehon-types" }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

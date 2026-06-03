@@ -1,0 +1,19 @@
+[package]
+name = "brehon-adapter-claude"
+version = "0.1.0"
+edition = "2024"
+description = "Claude CLI adapter for Brehon — PTY-native hooks path"
+license = "MIT"
+
+[dependencies]
+brehon-adapter-sdk = { path = "../brehon-adapter-sdk" }
+brehon-types = { path = "../brehon-types" }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+brehon-config = { path = "../brehon-config" }
+tokio = { workspace = true, features = ["test-util"] }

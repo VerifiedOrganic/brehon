@@ -1,0 +1,5 @@
+---
+source: crates/agora-tui/src/components.rs
+expression: "snapshot_row(terminal.backend().buffer(), 5)"
+---
+[╰─]@rgb(60,60,70)[ error ]@rgb(160,160,170)[────────────────────────────────────────╯]@rgb(60,60,70)

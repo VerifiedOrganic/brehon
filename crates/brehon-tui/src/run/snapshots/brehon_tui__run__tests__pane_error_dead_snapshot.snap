@@ -1,0 +1,9 @@
+---
+source: crates/brehon-tui/src/run/mod.rs
+assertion_line: 5364
+expression: snapshot
+---
+╭─ BREHON / ▰ worker-panic ──────────────────────────────────────────────────────────────────── codex / codex  [reset]─╮
+│retry unavailable                                                                                                     │
+│                                                                                                                      │
+╰─ exited with error: panicked-agent fixture ──────────────────────────────────────────────────────────────────────────╯

@@ -1,0 +1,20 @@
+[package]
+name = "brehon-types"
+version = "0.1.0"
+edition = "2021"
+description = "Core domain types and value objects for Brehon"
+license = "MIT"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+thiserror = { workspace = true }
+strum = { workspace = true }
+libc = "0.2"
+directories = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+serde_yaml = { workspace = true }

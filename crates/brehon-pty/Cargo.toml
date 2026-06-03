@@ -1,0 +1,28 @@
+[package]
+name = "brehon-pty"
+version = "0.1.0"
+edition = "2024"
+description = "PTY management for Brehon factory mode"
+license = "MIT"
+
+[dependencies]
+brehon-adapter-agy = { path = "../brehon-adapter-agy" }
+brehon-adapter-claude = { path = "../brehon-adapter-claude" }
+brehon-adapter-copilot = { path = "../brehon-adapter-copilot" }
+brehon-adapter-junie = { path = "../brehon-adapter-junie" }
+brehon-adapter-kimi = { path = "../brehon-adapter-kimi" }
+brehon-adapter-sdk = { path = "../brehon-adapter-sdk" }
+brehon-config = { path = "../brehon-config" }
+brehon-types = { path = "../brehon-types" }
+portable-pty = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+dirs = "6"
+uuid = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tempfile = "3"

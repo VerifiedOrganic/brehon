@@ -1,0 +1,36 @@
+[package]
+name = "brehon-acp"
+version = "0.1.0"
+edition = "2021"
+description = "Agent Communication Protocol (ACP) implementation for agent lifecycle management"
+license = "MIT"
+
+[dependencies]
+brehon-types = { path = "../brehon-types" }
+brehon-ports = { path = "../brehon-ports" }
+brehon-adapter-sdk = { path = "../brehon-adapter-sdk" }
+brehon-adapter-opencode = { path = "../brehon-adapter-opencode" }
+brehon-adapter-gemini = { path = "../brehon-adapter-gemini" }
+brehon-adapter-kimi = { path = "../brehon-adapter-kimi" }
+brehon-adapter-codex = { path = "../brehon-adapter-codex" }
+brehon-adapter-copilot = { path = "../brehon-adapter-copilot" }
+brehon-adapter-junie = { path = "../brehon-adapter-junie" }
+brehon-adapter-agy = { path = "../brehon-adapter-agy" }
+brehon-adapter-openai = { path = "../brehon-adapter-openai" }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+base64 = "0.22"
+futures-util = "0.3"
+tokio-tungstenite = "0.28"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+libc = "0.2"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+tempfile = "3"

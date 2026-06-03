@@ -1,0 +1,19 @@
+[package]
+name = "brehon-config"
+version = "0.1.0"
+edition = "2021"
+description = "Configuration loading and validation for Brehon"
+license = "MIT"
+
+[dependencies]
+brehon-types = { path = "../brehon-types" }
+brehon-adapter-sdk = { path = "../brehon-adapter-sdk" }
+serde = { workspace = true }
+serde_yaml = { workspace = true }
+thiserror = { workspace = true }
+directories = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tempfile = "3"

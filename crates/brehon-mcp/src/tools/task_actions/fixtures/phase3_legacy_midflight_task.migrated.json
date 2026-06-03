@@ -1,0 +1,48 @@
+{
+  "activity": "integration_conflict",
+  "assignee": "worker-7",
+  "blockers": "Blocked on supervisor integration conflict for reviewed commit deadbeef against 'epic/test-feature'. Conflicting files: src/conflict.txt. Resolve conflicts in the integration worktree, then retry integration.",
+  "completion_mode": "merge",
+  "description": "Production-shaped legacy task fixture for phase 3 migration.",
+  "integration": {
+    "attempts": 1,
+    "cherry_pick_base_head": "",
+    "conflicting_files": [
+      "src/conflict.txt"
+    ],
+    "epic_branch": "epic/test-feature",
+    "last_transition_at": "2026-04-22T14:32:01Z",
+    "phase": "cherry_picking",
+    "resolution": null,
+    "reviewed_commits": [
+      "abc123",
+      "deadbeef"
+    ],
+    "started_at": "2026-04-22T14:32:01Z",
+    "worktree_path": ""
+  },
+  "integration_conflict": {
+    "conflicting_files": [
+      "src/conflict.txt"
+    ],
+    "merge_target": "epic/test-feature",
+    "owner": "supervisor",
+    "previous_worker": "worker-7",
+    "recorded_at": "2026-04-22T14:32:01Z",
+    "reviewed_commit": "deadbeef",
+    "reviewed_commits": [
+      "abc123",
+      "deadbeef"
+    ],
+    "source": "approved_integration"
+  },
+  "integration_status": "pending",
+  "merge_target": "epic/test-feature",
+  "parent_id": "T-epic-phase-3",
+  "review_owner": "worker-7",
+  "status": "changes_requested",
+  "task_id": "T-legacy-phase-3",
+  "task_type": "task",
+  "title": "Legacy conflicting integration",
+  "updated_at": "2026-04-23T00:00:00Z"
+}

@@ -1,0 +1,13 @@
+[package]
+name = "brehon-runtime"
+version = "0.1.0"
+edition = "2024"
+description = "Runtime side-channel primitives for Brehon"
+license = "MIT"
+
+[dependencies]
+brehon-ports = { path = "../brehon-ports" }
+brehon-types = { path = "../brehon-types" }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }

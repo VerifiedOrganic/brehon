@@ -1,0 +1,6 @@
+---
+source: crates/agora-tui/src/run/layout.rs
+assertion_line: 575
+expression: "snapshot_rows(terminal.backend().buffer(), 0..1)"
+---
+[  ]@reset[Dash]@rgb(160,160,170)[   ]@reset[Runtime]@rgb(160,160,170)[   ]@reset[Advisors]@rgb(160,160,170)[   ]@reset[Research]@rgb(160,160,170)[   ]@reset[◆ ]@rgb(60,211,255)[Work (2)]@white[   ]@reset[Review (1)]@rgb(160,160,170)

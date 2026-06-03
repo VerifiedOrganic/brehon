@@ -1,0 +1,894 @@
+//! Git operations helpers: branch checks, merge-base, commit ancestry, status, worktree utilities.
+
+use std::path::{Path, PathBuf};
+
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use super::paths::{project_root, workspace_root};
+use crate::tools::agent::current_runtime_session_name;
+
+use brehon_git::WORKTREE_AWARE_BREHON_IGNORE_PATTERNS;
+
+/// Test-only: counts invocations of `dirty_primary_checkout_terminal_blocker`
+/// within the current process. Reset via `reset_test_dirty_check_invocation`.
+#[cfg(test)]
+static TEST_DIRTY_CHECK_INVOCATION: AtomicUsize = AtomicUsize::new(0);
+
+/// Test-only: when set to a specific invocation number (0-indexed), that
+/// invocation of `dirty_primary_checkout_terminal_blocker` will artificially
+/// return a dirty-root error. This lets tests deterministically exercise the
+/// rollback path that runs after a submission has already been persisted.
+#[cfg(test)]
+static TEST_FORCE_DIRTY_ON_INVOCATION: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+#[cfg(test)]
+pub(crate) fn reset_test_dirty_check_invocation() {
+    TEST_DIRTY_CHECK_INVOCATION.store(0, Ordering::SeqCst);
+}
+
+#[cfg(test)]
+pub(crate) fn set_test_force_dirty_on_invocation(n: usize) {
+    TEST_FORCE_DIRTY_ON_INVOCATION.store(n, Ordering::SeqCst);
+}
+
+#[cfg(test)]
+pub(crate) fn clear_test_force_dirty_on_invocation() {
+    TEST_FORCE_DIRTY_ON_INVOCATION.store(usize::MAX, Ordering::SeqCst);
+}
+
+pub(super) fn git_stdout_in(cwd: &Path, args: &[&str]) -> Result<String, String> {
+    let output = crate::git_exec::run_git(cwd, args)?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let detail = if stderr.is_empty() {
+            format!(
+                "git {} exited with status {}",
+                args.join(" "),
+                output.status
+            )
+        } else {
+            stderr
+        };
+        return Err(detail);
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if stdout.is_empty() {
+        return Err(format!("git {} returned empty output", args.join(" ")));
+    }
+    Ok(stdout)
+}
+
+pub(super) fn git_stdout(args: &[&str]) -> Result<String, String> {
+    let root = workspace_root()
+        .ok_or_else(|| "No workspace root available for git merge verification.".to_string())?;
+    git_stdout_in(&root, args)
+}
+
+pub(super) fn current_git_head() -> Option<String> {
+    git_stdout(&["rev-parse", "HEAD"]).ok()
+}
+
+pub(super) fn current_git_branch() -> Option<String> {
+    git_stdout(&["branch", "--show-current"]).ok()
+}
+
+pub(super) fn expected_worktree_branch() -> Option<String> {
+    std::env::var("BREHON_WORKTREE_BRANCH")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+pub(super) fn ensure_worker_branch_safe_for_task(
+    task_id: &str,
+    task_data: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), String> {
+    let Some(current_branch) = current_git_branch() else {
+        return Ok(());
+    };
+
+    let merge_target = task_data
+        .get("merge_target")
+        .and_then(|v| v.as_str())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let expected_branch = expected_worktree_branch();
+
+    if let Some(ref expected_branch) = expected_branch {
+        if &current_branch != expected_branch {
+            let mut detail = format!(
+                "Worker branch mismatch for task {task_id}: current branch is '{current_branch}', \
+                 but this pane was launched on '{expected_branch}'."
+            );
+            if merge_target.as_deref() == Some(current_branch.as_str()) {
+                detail.push_str(&format!(
+                    " '{current_branch}' is the task's merge_target/integration branch; \
+                     workers must stay on their dedicated branch and let supervisor/epic integration land work there."
+                ));
+            } else {
+                detail.push_str(
+                    " Workers must stay on their dedicated branch/worktree instead of checking out other refs in place.",
+                );
+            }
+            return Err(detail);
+        }
+    }
+
+    if let Some(ref merge_target) = merge_target {
+        if &current_branch == merge_target {
+            return Err(format!(
+                "Worker cannot report progress for task {task_id} while checked out on merge_target '{merge_target}'. \
+                 Stay on the dedicated worker branch and merge/rebase '{merge_target}' into it if you need the latest base."
+            ));
+        }
+    }
+
+    let default_branch = detect_default_branch().unwrap_or_else(|_| "main".to_string());
+    if current_branch == default_branch {
+        return Err(format!(
+            "Worker cannot report progress for task {task_id} while checked out on default branch '{default_branch}'. \
+             Workers must not work directly on the landing branch."
+        ));
+    }
+
+    Ok(())
+}
+
+pub(super) fn git_commit_is_ancestor(commit: &str, reference: &str) -> Result<bool, String> {
+    let root = workspace_root()
+        .ok_or_else(|| "No workspace root available for git merge verification.".to_string())?;
+    git_commit_is_ancestor_in(&root, commit, reference)
+}
+
+pub(super) fn git_commit_is_ancestor_in(
+    cwd: &Path,
+    commit: &str,
+    reference: &str,
+) -> Result<bool, String> {
+    let output =
+        crate::git_exec::run_git(cwd, &["merge-base", "--is-ancestor", commit, reference])?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            Err(if stderr.is_empty() {
+                format!(
+                    "git merge-base --is-ancestor exited with status {}",
+                    output.status
+                )
+            } else {
+                stderr
+            })
+        }
+    }
+}
+
+pub(super) fn git_branch_exists_in(cwd: &Path, branch: &str) -> Result<bool, String> {
+    let ref_path = format!("refs/heads/{branch}");
+    let output = crate::git_exec::run_git(cwd, &["rev-parse", "--verify", &ref_path])?;
+    Ok(output.status.success())
+}
+
+pub(super) fn git_run_ok_in(cwd: &Path, args: &[&str]) -> Result<(), String> {
+    let output = crate::git_exec::run_git(cwd, args)?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    Err(if stderr.is_empty() {
+        format!(
+            "git {} exited with status {}",
+            args.join(" "),
+            output.status
+        )
+    } else {
+        stderr
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum MergeStatus {
+    MergedLocally,
+    MergedRemotely,
+    RemoteStatusUnknown,
+}
+
+impl MergeStatus {
+    pub(super) fn display(&self) -> &'static str {
+        match self {
+            MergeStatus::MergedLocally => "merged locally, not yet on remote",
+            MergeStatus::MergedRemotely => "merged locally and remotely",
+            MergeStatus::RemoteStatusUnknown => "merged locally, remote status unknown",
+        }
+    }
+}
+
+pub(super) fn git_status_porcelain_in(cwd: &Path) -> Result<String, String> {
+    let output =
+        crate::git_exec::run_git(cwd, &["status", "--porcelain", "--untracked-files=all"])?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if stderr.is_empty() {
+            format!(
+                "git status --porcelain exited with status {}",
+                output.status
+            )
+        } else {
+            stderr
+        });
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+pub(super) fn non_brehon_status_entries(status: &str) -> Vec<&str> {
+    status
+        .lines()
+        .filter(|line| {
+            let path = line.get(3..).unwrap_or("").trim();
+            !path.is_empty() && !path.starts_with(".brehon/")
+        })
+        .collect()
+}
+
+pub(crate) fn dirty_primary_checkout_terminal_blocker(action: &str) -> Option<String> {
+    #[cfg(test)]
+    {
+        let invocation = TEST_DIRTY_CHECK_INVOCATION.fetch_add(1, Ordering::SeqCst);
+        let target = TEST_FORCE_DIRTY_ON_INVOCATION.load(Ordering::SeqCst);
+        if invocation == target {
+            return Some(format!(
+                "Cannot {action}: shared repo root is dirty (forced by test hook on invocation {invocation}). \
+                 Refusing terminal transition while run integrity is compromised. \
+                 Recovery: inspect the dirty files with `git status` in the shared repo root, \
+                 then commit, stash, or discard the changes before retrying."
+            ));
+        }
+    }
+
+    let project = project_root()?;
+    if !project.join(".git").exists() {
+        return None;
+    }
+
+    let output = match crate::git_exec::run_git(
+        &project,
+        &["status", "--porcelain", "--untracked-files=all"],
+    ) {
+        Ok(output) => output,
+        Err(err) => {
+            return Some(format!(
+                "Cannot {action}: failed to inspect shared repo root '{}' before a terminal task transition: {err}",
+                project.display()
+            ));
+        }
+    };
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Some(format!(
+            "Cannot {action}: failed to inspect shared repo root '{}' before a terminal task transition: {}",
+            project.display(),
+            if stderr.is_empty() {
+                format!("git status exited with {}", output.status)
+            } else {
+                stderr
+            }
+        ));
+    }
+
+    let status = String::from_utf8_lossy(&output.stdout);
+    let entries = non_brehon_status_entries(&status);
+    if entries.is_empty() {
+        return None;
+    }
+
+    let preview_limit = 5;
+    let preview = entries
+        .iter()
+        .take(preview_limit)
+        .copied()
+        .collect::<Vec<_>>()
+        .join(", ");
+    let suffix = if entries.len() > preview_limit {
+        ", ..."
+    } else {
+        ""
+    };
+    let session = current_runtime_session_name();
+    let session_line = match session {
+        Some(name) => format!(" Current runtime session: {name}."),
+        None => String::new(),
+    };
+    Some(format!(
+        "Cannot {action}: shared repo root '{}' is dirty outside .brehon/ ({}{}). \
+         Refusing terminal transition while run integrity is compromised.{session_line} \
+         Recovery: inspect the dirty files with `git status` in the shared repo root, \
+         then commit, stash, or discard the changes before retrying.",
+        project.display(),
+        preview,
+        suffix
+    ))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct PrimaryCheckoutWarning {
+    pub project_root: String,
+    pub branch: Option<String>,
+    pub entries: Vec<String>,
+    pub truncated_count: usize,
+    pub inspect_error: Option<String>,
+}
+
+fn explicit_project_root() -> Option<PathBuf> {
+    std::env::var("BREHON_PROJECT_ROOT")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+pub(super) fn primary_checkout_status_warning(cwd: &Path) -> Option<PrimaryCheckoutWarning> {
+    let project = explicit_project_root()?;
+    let canonical_project = project.canonicalize().ok()?;
+    let canonical_cwd = cwd.canonicalize().ok()?;
+    if canonical_project == canonical_cwd || !canonical_project.join(".git").exists() {
+        return None;
+    }
+
+    let status = match git_status_porcelain_in(&canonical_project) {
+        Ok(status) => status,
+        Err(err) => {
+            return Some(PrimaryCheckoutWarning {
+                project_root: canonical_project.display().to_string(),
+                branch: git_stdout_in(&canonical_project, &["branch", "--show-current"]).ok(),
+                entries: Vec::new(),
+                truncated_count: 0,
+                inspect_error: Some(err),
+            });
+        }
+    };
+    let entries = non_brehon_status_entries(&status);
+    if entries.is_empty() {
+        return None;
+    }
+
+    let preview_limit = 12;
+    Some(PrimaryCheckoutWarning {
+        project_root: canonical_project.display().to_string(),
+        branch: git_stdout_in(&canonical_project, &["branch", "--show-current"]).ok(),
+        entries: entries
+            .iter()
+            .take(preview_limit)
+            .map(|entry| (*entry).to_string())
+            .collect(),
+        truncated_count: entries.len().saturating_sub(preview_limit),
+        inspect_error: None,
+    })
+}
+
+pub(super) fn current_workspace_root() -> Result<PathBuf, String> {
+    std::env::var("BREHON_WORKSPACE_ROOT")
+        .ok()
+        .and_then(|root| {
+            let root = root.trim();
+            (!root.is_empty()).then(|| PathBuf::from(root))
+        })
+        .ok_or_else(|| {
+            "No BREHON_WORKSPACE_ROOT available. This action must run from a worker worktree."
+                .to_string()
+        })
+}
+
+pub(super) fn commit_workspace_checkpoint(
+    cwd: &Path,
+    message: &str,
+) -> Result<(String, bool), String> {
+    let message = message.trim();
+    if message.is_empty() {
+        return Err("Checkpoint message must be non-empty.".to_string());
+    }
+
+    ensure_checkpoint_cwd_is_isolated(cwd)?;
+
+    let status_before = git_status_porcelain_in(cwd)?;
+    let had_changes = !status_before.trim().is_empty();
+    if !had_changes {
+        let head = git_stdout_in(cwd, &["rev-parse", "HEAD"])?;
+        return Ok((head, false));
+    }
+
+    git_run_ok_in(cwd, &["add", "-A"])
+        .map_err(|err| format!("Failed to stage workspace changes for checkpoint: {err}"))?;
+    git_run_ok_in(cwd, &["commit", "-m", message])
+        .map_err(|err| format!("Failed to commit workspace checkpoint: {err}"))?;
+    let head = git_stdout_in(cwd, &["rev-parse", "HEAD"])?;
+    Ok((head, true))
+}
+
+/// Refuses a checkpoint `cwd` that would mutate the shared project checkout
+/// or the project's default branch. Worker checkpoints must always run inside
+/// an isolated worktree on a dedicated branch; if `BREHON_WORKSPACE_ROOT` is
+/// ever pointed at the primary checkout (or a worker is somehow checked out
+/// on `main`), `git add -A` would silently stage the wrong tree into the
+/// shared index — see the post-mortem in worker.rs for the failure mode this
+/// guards against.
+pub(super) fn ensure_checkpoint_cwd_is_isolated(cwd: &Path) -> Result<(), String> {
+    // Path-equality check: only fires when BREHON_PROJECT_ROOT is explicitly
+    // set (which the brehon worker spawn paths always do — see
+    // brehon-cli/src/commands/task.rs and brehon-adapter-sdk). This is the
+    // primary failure-mode guard: it directly catches a worker whose
+    // BREHON_WORKSPACE_ROOT was misconfigured to the same path as
+    // BREHON_PROJECT_ROOT.
+    if std::env::var("BREHON_PROJECT_ROOT")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .is_some()
+    {
+        if let (Some(project), Ok(canonical_cwd)) = (
+            project_root().and_then(|p| p.canonicalize().ok()),
+            cwd.canonicalize(),
+        ) {
+            if canonical_cwd == project {
+                return Err(format!(
+                    "Refusing to checkpoint at the primary project checkout '{}'. \
+                     Workers must commit from an isolated worktree under '.brehon/worktrees/'; \
+                     something pointed BREHON_WORKSPACE_ROOT at the shared repo root.",
+                    cwd.display()
+                ));
+            }
+        }
+    }
+
+    let current_branch = git_stdout_in(cwd, &["branch", "--show-current"]).ok();
+    let default_branch = detect_default_branch_in(cwd).unwrap_or_else(|_| "main".to_string());
+    if let Some(branch) = current_branch.as_deref() {
+        if branch == default_branch {
+            return Err(format!(
+                "Refusing to checkpoint while '{}' is checked out on default branch '{}'. \
+                 Workers must operate on a dedicated worker branch in an isolated worktree.",
+                cwd.display(),
+                default_branch
+            ));
+        }
+        if matches!(branch, "main" | "master") {
+            return Err(format!(
+                "Refusing to checkpoint while '{}' is checked out on '{}'. \
+                 Workers must operate on a dedicated worker branch.",
+                cwd.display(),
+                branch
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+pub(super) fn detect_default_branch() -> Result<String, String> {
+    match workspace_root() {
+        Some(root) => detect_default_branch_in(&root),
+        None => Ok("main".to_string()),
+    }
+}
+
+pub(super) fn detect_default_branch_in(cwd: &Path) -> Result<String, String> {
+    if let Ok(branch) = git_stdout_in(cwd, &["symbolic-ref", "refs/remotes/origin/HEAD"]) {
+        if let Some(stripped) = branch.strip_prefix("refs/remotes/origin/") {
+            return Ok(stripped.to_string());
+        }
+    }
+
+    for candidate in ["main", "master", "develop"] {
+        let ref_path = format!("refs/heads/{candidate}");
+        if git_stdout_in(cwd, &["rev-parse", "--verify", &ref_path]).is_ok() {
+            return Ok(candidate.to_string());
+        }
+    }
+
+    Ok("main".to_string())
+}
+
+pub(super) fn ensure_brehon_ignored_in_repo(root: &Path) -> Result<(), String> {
+    let info_dir = brehon_git::resolve_git_info_dir(root)
+        .map_err(|err| format!("Failed to resolve git info directory: {err}"))?;
+    let exclude_path = info_dir.join("exclude");
+    let parent = exclude_path
+        .parent()
+        .ok_or_else(|| format!("Invalid git exclude path '{}'.", exclude_path.display()))?;
+    std::fs::create_dir_all(parent).map_err(|err| {
+        format!(
+            "Failed to create git exclude directory '{}': {err}",
+            parent.display()
+        )
+    })?;
+
+    let existing = std::fs::read_to_string(&exclude_path).unwrap_or_default();
+    let (mut updated, removed_legacy) = brehon_git::remove_legacy_brehon_dir_ignores(&existing);
+    let existing_patterns = updated.lines().map(str::trim).collect::<Vec<_>>();
+    let missing = WORKTREE_AWARE_BREHON_IGNORE_PATTERNS
+        .iter()
+        .filter(|pattern| !existing_patterns.contains(pattern))
+        .copied()
+        .collect::<Vec<_>>();
+
+    if missing.is_empty() && !removed_legacy {
+        return Ok(());
+    }
+
+    if !updated.is_empty() && !updated.ends_with('\n') {
+        updated.push('\n');
+    }
+    if !updated
+        .lines()
+        .any(|l| l.trim() == "# Brehon orchestration data")
+    {
+        updated.push_str("# Brehon orchestration data\n");
+    }
+    for pattern in missing {
+        updated.push_str(pattern);
+        updated.push('\n');
+    }
+    std::fs::write(&exclude_path, updated).map_err(|err| {
+        format!(
+            "Failed to update git exclude file '{}': {err}",
+            exclude_path.display()
+        )
+    })
+}
+
+pub(super) fn detect_remote_merge_status(commit: &str, default_branch: &str) -> MergeStatus {
+    if !git_commit_is_ancestor(commit, "HEAD").unwrap_or(false) {
+        return MergeStatus::RemoteStatusUnknown;
+    }
+
+    let remote_ref = format!("origin/{default_branch}");
+    if git_stdout(&["rev-parse", "--verify", &remote_ref]).is_err() {
+        return MergeStatus::RemoteStatusUnknown;
+    }
+
+    if git_commit_is_ancestor(commit, &remote_ref).unwrap_or(false) {
+        MergeStatus::MergedRemotely
+    } else {
+        MergeStatus::MergedLocally
+    }
+}
+
+pub(super) fn unmerged_files(cwd: &Path) -> Result<Vec<String>, String> {
+    let output = crate::git_exec::run_git(cwd, &["diff", "--name-only", "--diff-filter=U"])?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if stderr.is_empty() {
+            format!(
+                "git diff --name-only --diff-filter=U exited with status {}",
+                output.status
+            )
+        } else {
+            stderr
+        });
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+/// Check whether a cherry-pick is in progress by looking for `CHERRY_PICK_HEAD`.
+pub(super) fn cherry_pick_in_progress_in(wt: &Path) -> bool {
+    cherry_pick_sha_in(wt).is_some()
+}
+
+/// Read the SHA from `.git/CHERRY_PICK_HEAD` if it exists.
+pub(super) fn cherry_pick_sha_in(wt: &Path) -> Option<String> {
+    let git_path = match git_stdout_in(wt, &["rev-parse", "--git-path", "CHERRY_PICK_HEAD"]) {
+        Ok(p) => p,
+        Err(_) => return None,
+    };
+    let path = PathBuf::from(&git_path);
+    let path = if path.is_absolute() {
+        path
+    } else {
+        wt.join(path)
+    };
+    std::fs::read_to_string(&path)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Compute the stable patch-id for a commit in a worktree.
+pub(super) fn git_patch_id(wt: &Path, sha: &str) -> Result<Option<String>, String> {
+    let diff_output = crate::git_exec::run_git(wt, &["diff-tree", "-p", sha])?;
+    if !diff_output.status.success() {
+        return Err(format!(
+            "git diff-tree failed: {}",
+            String::from_utf8_lossy(&diff_output.stderr)
+        ));
+    }
+
+    let output =
+        crate::git_exec::run_git_with_stdin(wt, &["patch-id", "--stable"], &diff_output.stdout)?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+
+    let line = String::from_utf8_lossy(&output.stdout);
+    let patch_id = line.split_whitespace().next().map(str::to_string);
+    Ok(patch_id)
+}
+
+/// Walk backwards from `branch` tip up to `window` commits and compare
+/// patch-ids to `sha`. Returns `true` on first match.
+///
+/// Uses `--max-count={window}` rather than `{branch}~{window}..{branch}` so
+/// the probe works on branches shorter than `window` commits (e.g. a fresh
+/// epic branch with only a handful of commits on top of main).
+pub(super) fn is_patch_equivalent_in_window_in(
+    wt: &Path,
+    sha: &str,
+    branch: &str,
+    window: usize,
+) -> Result<bool, String> {
+    if window == 0 {
+        return Ok(false);
+    }
+
+    let target_id = match git_patch_id(wt, sha)? {
+        Some(id) => id,
+        None => return Ok(false),
+    };
+
+    let max_count = format!("--max-count={window}");
+    let output = crate::git_exec::run_git(wt, &["rev-list", &max_count, branch])?;
+
+    if !output.status.success() {
+        return Ok(false);
+    }
+
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let commit_sha = line.trim();
+        if commit_sha.is_empty() {
+            continue;
+        }
+        if let Ok(Some(candidate_id)) = git_patch_id(wt, commit_sha) {
+            if candidate_id == target_id {
+                return Ok(true);
+            }
+        }
+    }
+
+    Ok(false)
+}
+
+/// Check whether the tree changes introduced by `sha` are already present
+/// on `branch` in `wt`.
+///
+/// This compares the blob contents at every path changed by `sha`. A commit
+/// message trailer or a path-only diff is not sufficient proof that the branch
+/// contains the reviewed content.
+pub(super) fn tree_matches_after(wt: &Path, sha: &str, branch: &str) -> Result<bool, String> {
+    // Fast path: if sha is already an ancestor, its changes are present.
+    if git_commit_is_ancestor_in(wt, sha, branch).unwrap_or(false) {
+        return Ok(true);
+    }
+
+    // Compute the diff from sha's parent → sha (the changes we expect).
+    let parent_commit = match git_stdout_in(wt, &["rev-parse", &format!("{sha}^")]) {
+        Ok(commit) => commit,
+        Err(_) => {
+            // Root commit or unreachable; fall back to ancestry check only.
+            return Ok(false);
+        }
+    };
+
+    let diff_expected = crate::git_exec::run_git(
+        wt,
+        &[
+            "diff-tree",
+            "--no-commit-id",
+            "--name-only",
+            "-r",
+            &parent_commit,
+            sha,
+        ],
+    )?;
+
+    if !diff_expected.status.success() {
+        return Ok(false);
+    }
+
+    let expected_files: Vec<String> = String::from_utf8_lossy(&diff_expected.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect();
+
+    if expected_files.is_empty() {
+        // Empty commit; by definition it matches.
+        return Ok(true);
+    }
+
+    let mut exact_match = true;
+    let mut content_present = true;
+    for file in &expected_files {
+        let expected = blob_bytes_at(wt, sha, file)?;
+        let actual = blob_bytes_at(wt, branch, file)?;
+        if expected != actual {
+            exact_match = false;
+            content_present &= match (expected.as_deref(), actual.as_deref()) {
+                (Some(expected), Some(actual)) => bytes_contains(actual, expected),
+                (None, None) => true,
+                _ => false,
+            };
+        }
+    }
+
+    if exact_match {
+        return Ok(true);
+    }
+
+    let branch_head = git_stdout_in(wt, &["rev-parse", branch])?;
+    let worktree_head = git_stdout_in(wt, &["rev-parse", "HEAD"])?;
+    if branch_head == worktree_head && reviewed_patch_reverses_cleanly(wt, &parent_commit, sha)? {
+        return Ok(true);
+    }
+
+    Ok(content_present)
+}
+
+fn blob_bytes_at(wt: &Path, rev: &str, file: &str) -> Result<Option<Vec<u8>>, String> {
+    let spec = format!("{rev}:{file}");
+    let exists = crate::git_exec::run_git(wt, &["cat-file", "-e", &spec])?;
+    if !exists.status.success() {
+        return Ok(None);
+    }
+
+    let output = crate::git_exec::run_git(wt, &["show", &spec])?;
+    if !output.status.success() {
+        return Err(format!(
+            "Failed to read blob {spec}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    Ok(Some(output.stdout))
+}
+
+fn reviewed_patch_reverses_cleanly(wt: &Path, parent: &str, sha: &str) -> Result<bool, String> {
+    let patch = crate::git_exec::run_git(wt, &["diff", "--binary", parent, sha])?;
+    if !patch.status.success() {
+        return Ok(false);
+    }
+    if patch.stdout.is_empty() {
+        return Ok(true);
+    }
+
+    let output = crate::git_exec::run_git_with_stdin(
+        wt,
+        &["apply", "--check", "--reverse", "-"],
+        &patch.stdout,
+    )?;
+    Ok(output.status.success())
+}
+
+fn bytes_contains(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run_git(path: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(path)
+            .output()
+            .unwrap_or_else(|err| panic!("failed to run git {}: {err}", args.join(" ")));
+        assert!(
+            output.status.success(),
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    fn init_git_repo(path: &Path) {
+        run_git(path, &["init", "-b", "main"]);
+        run_git(path, &["config", "user.email", "brehon@example.invalid"]);
+        run_git(path, &["config", "user.name", "Brehon Test"]);
+        std::fs::write(path.join("README.md"), "seed\n").unwrap();
+        run_git(path, &["add", "README.md"]);
+        run_git(path, &["commit", "-m", "seed"]);
+    }
+
+    #[test]
+    fn ensure_brehon_ignored_migrates_legacy_worktree_aware_ignores() {
+        let temp = tempfile::tempdir().unwrap();
+        init_git_repo(temp.path());
+        let exclude = temp.path().join(".git/info/exclude");
+        std::fs::create_dir_all(exclude.parent().unwrap()).unwrap();
+        std::fs::write(&exclude, "!/.brehon/\n/.brehon/worktrees/**\nuser-cache/\n").unwrap();
+
+        ensure_brehon_ignored_in_repo(temp.path()).unwrap();
+
+        let contents = std::fs::read_to_string(&exclude).unwrap();
+        let lines = contents.lines().map(str::trim).collect::<Vec<_>>();
+        assert!(lines.contains(&".brehon/"));
+        assert!(!lines.contains(&"!/.brehon/"));
+        assert!(!lines.contains(&"/.brehon/worktrees/**"));
+        assert!(lines.contains(&"user-cache/"));
+        for pattern in WORKTREE_AWARE_BREHON_IGNORE_PATTERNS {
+            assert!(lines.contains(pattern), "{pattern} missing: {contents}");
+        }
+    }
+
+    #[test]
+    fn ensure_brehon_ignored_hides_nested_worktree_gitignore_rules() {
+        let temp = tempfile::tempdir().unwrap();
+        init_git_repo(temp.path());
+
+        ensure_brehon_ignored_in_repo(temp.path()).unwrap();
+
+        let worktree_dir = temp
+            .path()
+            .join(".brehon/worktrees/runs/session-a/agy-worker");
+        std::fs::create_dir_all(&worktree_dir).unwrap();
+        std::fs::write(worktree_dir.join(".gitignore"), "!.mcp.json.example\n").unwrap();
+        std::fs::write(worktree_dir.join(".mcp.json.example"), "{}\n").unwrap();
+        std::fs::write(worktree_dir.join("work.txt"), "work\n").unwrap();
+
+        let ignored_dir = run_git(
+            temp.path(),
+            &[
+                "check-ignore",
+                "-v",
+                ".brehon/worktrees/runs/session-a/agy-worker",
+            ],
+        );
+        assert!(ignored_dir.contains(".brehon/"));
+
+        let ignored_file = run_git(
+            temp.path(),
+            &[
+                "check-ignore",
+                "-v",
+                ".brehon/worktrees/runs/session-a/agy-worker/work.txt",
+            ],
+        );
+        assert!(ignored_file.contains(".brehon/"));
+
+        let status = run_git(
+            temp.path(),
+            &["status", "--porcelain", "--untracked-files=all"],
+        );
+        assert!(!status.contains(".brehon"), "{status}");
+    }
+
+    #[test]
+    fn ensure_brehon_ignored_from_linked_worktree_updates_common_exclude() {
+        let temp = tempfile::tempdir().unwrap();
+        init_git_repo(temp.path());
+        let linked = temp.path().join("linked");
+        let linked_arg = linked.to_string_lossy().to_string();
+        run_git(
+            temp.path(),
+            &["worktree", "add", "-b", "linked", &linked_arg],
+        );
+
+        ensure_brehon_ignored_in_repo(&linked).unwrap();
+
+        let contents = std::fs::read_to_string(temp.path().join(".git/info/exclude")).unwrap();
+        for pattern in WORKTREE_AWARE_BREHON_IGNORE_PATTERNS {
+            assert!(contents.lines().any(|line| line.trim() == *pattern));
+        }
+    }
+}

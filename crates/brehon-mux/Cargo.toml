@@ -1,0 +1,48 @@
+[package]
+name = "brehon-mux"
+version = "0.1.0"
+edition = "2024"
+description = "Terminal multiplexer for Brehon factory mode"
+license = "MIT"
+
+[features]
+test-pty-fallback = []
+
+[dependencies]
+ghostty_vt = { path = "../ghostty_vt" }
+brehon-recording = { path = "../brehon-recording" }
+brehon-protocol = { path = "../brehon-protocol" }
+brehon-pty = { path = "../brehon-pty" }
+brehon-ports = { path = "../brehon-ports" }
+brehon-acp = { path = "../brehon-acp" }
+brehon-adapter-sdk = { path = "../brehon-adapter-sdk" }
+brehon-types = { path = "../brehon-types" }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+panesmith = { workspace = true }
+
+tokio = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+strum = { workspace = true }
+dirs = "6"
+
+indexmap = { workspace = true }
+unicode-width = { workspace = true }
+
+[dev-dependencies]
+brehon-daemon = { path = "../brehon-daemon" }
+brehon-policy = { path = "../brehon-policy" }
+brehon-runtime = { path = "../brehon-runtime" }
+brehon-test-harness = { path = "../brehon-test-harness" }
+tokio-test = "0.4"
+tracing-subscriber = { workspace = true }
+tempfile = "3"

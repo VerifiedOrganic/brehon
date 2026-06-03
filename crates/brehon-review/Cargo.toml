@@ -1,0 +1,24 @@
+[package]
+name = "brehon-review"
+version = "0.1.0"
+edition = "2021"
+description = "Multi-agent code review system with reviewer gates"
+license = "MIT"
+
+[dependencies]
+brehon-types = { path = "../brehon-types" }
+brehon-ports = { path = "../brehon-ports" }
+brehon-mux = { path = "../brehon-mux" }
+brehon-test-harness = { path = "../brehon-test-harness" }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+parking_lot = "0.12"
+
+[dev-dependencies]
+futures = "0.3"

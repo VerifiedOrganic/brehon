@@ -1,0 +1,24 @@
+[package]
+name = "brehon-doctor"
+version = "0.1.0"
+edition = "2021"
+description = "Diagnostic and health-check utilities for Brehon"
+license = "MIT"
+
+[dependencies]
+fjall = { workspace = true }
+brehon-types = { path = "../brehon-types" }
+brehon-config = { path = "../brehon-config" }
+anyhow = { workspace = true }
+tantivy = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+
+git2 = "0.20"
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+filetime = "0.2"

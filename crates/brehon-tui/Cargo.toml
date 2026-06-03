@@ -1,0 +1,31 @@
+[package]
+name = "brehon-tui"
+version = "0.1.0"
+edition = "2021"
+description = "Terminal user interface built with Ratatui for Brehon"
+license = "MIT"
+
+[dependencies]
+async-trait = { workspace = true }
+brehon-mux = { path = "../brehon-mux" }
+brehon-ports = { path = "../brehon-ports" }
+brehon-types = { path = "../brehon-types" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+panesmith = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+base64 = "0.22"
+unicode-width = { workspace = true }
+
+[dev-dependencies]
+brehon-config = { path = "../brehon-config" }
+brehon-mux = { path = "../brehon-mux", features = ["test-pty-fallback"] }
+insta = "1"
+portable-pty = { workspace = true }
+tempfile = "3"
