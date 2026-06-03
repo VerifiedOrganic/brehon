@@ -23,12 +23,13 @@ and tuned to a specific way of working. Read accordingly.
 
 ## 1. One process, many components
 
-Brehon runs as a single process: `brehon-cli` (binary name `brehon`). There is
-no daemon, no background service, no orchestration sidecar. Everything the
-system does — task assignment, supervision, review coordination, MCP serving,
-PTY multiplexing, TUI rendering — happens inside one Tokio runtime, with
-components communicating through in-process channels and a shared event store
-on disk.
+Brehon runs as a single OS process: `brehon-cli` (binary name `brehon`). There
+is no detached background daemon and no separate orchestration service — even
+the `brehon-daemon` crate, despite its name, is an *in-process* runtime
+coordination plane, not a spawned sidecar. Everything the system does — task
+assignment, supervision, review coordination, MCP serving, PTY multiplexing,
+TUI rendering — happens inside one Tokio runtime, with components communicating
+through in-process channels and a shared event store on disk.
 
 The process boundary is the unit of crash recovery. If `brehon run` exits,
 the next invocation reconciles state from the event store under
@@ -167,9 +168,19 @@ See [ADR-0006](adr/0006-fjall-tantivy.md) for the choice of backends.
 
 ## 5. Supervisor and the supervision loop
 
-`brehon-supervisor` is intentionally not an AI agent. It is a deterministic
-Rust process that consumes events from `EventStore` and maintains an
-in-memory model of every active worker.
+A naming caveat first, because the word "supervisor" is overloaded and the
+overload trips people (it has tripped people writing documentation for this very
+repo). There are **two** distinct things:
+
+1. The **supervisor agent** — a role you assign to an AI lane in config
+   (`roles.supervisor`). It plans work, assigns tasks, guides workers, and
+   resolves supervisor-owned integration conflicts. It is a full AI and it costs
+   tokens like any other agent. It is *not* what this section is about.
+2. The **supervision loop** — the `brehon-supervisor` crate, described below.
+
+`brehon-supervisor` (the loop) is intentionally not an AI agent. It is a
+deterministic Rust process that consumes events from `EventStore` and maintains
+an in-memory model of every active worker.
 
 Components:
 
@@ -244,7 +255,10 @@ See [ADR-0004](adr/0004-reviewer-panel.md).
 
 ## 7. Recovery
 
-Crash recovery is built around two assumptions:
+Five agents, real money, and live git running unattended for hours: recovery is
+not an afterthought here, it's load-bearing. The good news is it mostly comes
+for free from the event-sourced design. Crash recovery is built around two
+assumptions:
 
 - The event store is the only source of truth.
 - All on-disk derived state (panel rosters, review rounds, worktrees, the
@@ -427,7 +441,8 @@ Configuration is YAML, loaded by `brehon-config`. The schema is in
 The two key concepts:
 
 - **Launchers** — how to spawn an agent CLI. Each launcher specifies
-  the adapter (`Acp` or `NativeHooks`), the command, and arguments.
+  the adapter kind (`Acp`, `NativeAgent`, `PtyHooks`, `Codex`, … — the
+  `AdapterKind` enum in `brehon-types/src/agent.rs`), the command, and arguments.
 - **Lanes** — named bundles of launcher + model + system prompt + reasoning
   effort. Workers, supervisors, and reviewers are assigned to lanes.
 
@@ -499,12 +514,13 @@ Two small but real subsystems sit alongside the supervisor:
 
 ## 14. Adapters
 
-Nine agent adapters live under `crates/brehon-adapter-*/`. All implement
-the `AgentAdapter` trait from `brehon-adapter-sdk`:
+Nine agent adapters live under `crates/brehon-adapter-*/` (plus the
+Brehon-native runtime `brehon-native-agent`). All implement the `AgentAdapter`
+trait from `brehon-adapter-sdk`:
 
 | Adapter | Protocol | Notes |
 | ------- | -------- | ----- |
-| `brehon-adapter-claude` | NativeHooks (PTY) | Claude Code CLI; uses CLI's built-in hook system rather than ACP. |
+| `brehon-adapter-claude` | `PtyHooks` (PTY) | Claude Code CLI; uses CLI's built-in hook system rather than ACP. |
 | `brehon-adapter-codex` | Websocket | Talks to `codex app-server`. |
 | `brehon-adapter-copilot` | ACP (stdio) | GitHub Copilot CLI. |
 | `brehon-adapter-gemini` | ACP (stdio) | Gemini CLI with `--acp`. |
@@ -512,10 +528,12 @@ the `AgentAdapter` trait from `brehon-adapter-sdk`:
 | `brehon-adapter-kimi` | (specific) | Kimi Code CLI. |
 | `brehon-adapter-opencode` | (specific) | OpenCode. |
 | `brehon-adapter-openai` | HTTP | OpenAI-compatible HTTP streaming endpoint. |
+| `brehon-adapter-agy` | (specific) | Google Antigravity 2.0 CLI (`agy`). |
 | `brehon-native-agent` | ACP | Brehon's own ACP runtime for OpenAI-compatible providers. |
 
-All nine compile, all nine have tests, all nine are wired into the
-adapter-selection logic in `brehon-cli/src/commands/run/workers.rs`.
+All nine `brehon-adapter-*` crates compile, have tests, and are wired into the
+adapter-selection logic in `brehon-cli/src/commands/run/workers.rs`, alongside
+the native runtime.
 
 ---
 

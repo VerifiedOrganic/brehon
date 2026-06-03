@@ -9,40 +9,56 @@
 In early Irish law, a **brehon** (*breithem*) was a professional judge who decided
 disputes by panel — weighing arguments, applying precedent, and issuing binding
 verdicts whose weight depended on the standing of each judge on the bench.
-This project does the same for your codebase.
+This project does the same for your codebase. We just gave the idea a token
+budget and a terminal UI.
 
-Workers (AI coding agents — Claude Code, Codex, Gemini CLI, OpenCode, and others)
-implement tasks in isolated git worktrees. When work is ready, it is sent to a
-**panel of reviewer agents** who independently score it against a policy. If the
-panel's collective verdict clears the threshold, the work merges. If not, it goes
-back for another round, with the same panel — bound to the task — preserving
-context across revisions.
+Here's the loop. **Workers** (AI coding agents — Claude Code, Codex, Gemini CLI,
+OpenCode, Kimi, and others) implement tasks in isolated git worktrees. When work
+is ready, it goes to a **panel of reviewer agents** who independently score it
+against a policy. Clear the threshold and it merges onto an epic branch; miss it
+and the task goes back for another round. Presiding over all of it is the
+**supervisor** — which is really two things sharing a name: an AI lead that plans
+and assigns work, and a deterministic Rust supervision loop that watches an
+event store, tracks budgets, and nudges workers that wander off, calling on an
+AI itself only for the genuinely ambiguous judgment calls. The principle: spend
+tokens on judgment, run everything else as free deterministic logic.
 
-A lightweight Rust supervisor watches the whole process by reading an event store.
-Tokens are only spent when human-style judgment is needed; everything else is
-free deterministic logic.
+If you're going to use this, **read the [User Guide](docs/USER_GUIDE.md) first.**
+It's honest about what this costs and how to make it cost less, and it'll save
+you from learning those lessons on a real invoice.
 
 ## Heads up before you dive in
 
-- **This is something I built around my own workflow.** It's the fifth
-  internal rewrite of this idea. I've been running the current version 24/7
-  for weeks, and lived on earlier iterations for months before that — under
-  a different name, since I renamed the project right before open-sourcing it.
-  Long story short: it works for me, and it's been hammered on enough that
-  the obvious bugs are out. But the *shape* of it — the lane model, the
-  panel-judges-panel structure, the assumptions about how a session flows —
-  was tuned to how I work. It might be a perfect fit for you, it might be
-  ridiculous overkill, it might be subtly wrong for your style. Treat this
-  repo as a data point. I'm publishing it because the design choices might
-  be useful to look at, not because I'm claiming it's the way to do this.
-- **It can be expensive.** A panel of N reviewers means every "ready for
-  review" event triggers N independent agent calls, each of which reads the
-  diff and may pull in surrounding context. Multiply by retry rounds, multiply
-  again if your worker lane is also a paid model. A long session with three
-  reviewers and a couple of revision rounds can burn through tokens fast.
-  The `brehon-supervisor` tracks budgets and the config lets you cap rounds
-  and panel size, but the defaults are tuned for *quality of verdict*, not
-  for thrift — turn the dials down before you turn it loose on a real epic.
+- **This works for me. It will, with near-total certainty, have bugs and rough
+  edges for you.** Both of those things are true at once, and I'd rather say so
+  plainly than oversell it. It's the fifth internal rewrite of the idea, and I
+  run it hard: long unattended sessions, *days* on end, against genuinely large
+  software. It plans its own follow-up work, picks the next task, sends it to the
+  panel, and keeps going — including self-referential tasks where Brehon is the
+  thing being worked on, improving itself while I'm asleep. So I'm confident the
+  long-horizon loop holds up; that part is well-tested by simply living in it.
+  What I *can't* promise you is polish. Something built around one person's
+  workflow, run daily by that one person, accumulates sharp corners the author
+  has long since stopped noticing — and the *shape* of it (the lane model, the
+  panel-judges-panel structure, the rhythm of a session) is tuned to how I work,
+  not how you do. It might fit you perfectly, it might be overkill, it might be
+  subtly wrong for your style. Treat this repo as a working data point, not a
+  finished product.
+- **It is built to spend tokens, and it can spend a lot of them.** A panel of N
+  reviewers means every "ready for review" event triggers N independent agent
+  calls; multiply by revision rounds, multiply again if your worker lane is also
+  a paid model, and add an always-on AI supervisor and optional research briefs
+  on top. This is not a bug — buying several independent expert opinions on every
+  change is the entire point, and it's the thing that makes it expensive. **But
+  every part of that is a dial you set:** panel size, review rounds, which models
+  on which lanes, budget caps. The defaults shown in the docs are *one person's*
+  settings, tuned for verdict quality, not thrift. The [User Guide](docs/USER_GUIDE.md)
+  does the real cost arithmetic and lists every knob — turn them down before you
+  point this at a real epic.
+- **It's CLI all the way down.** There's no web app and no hosted dashboard.
+  Brehon drives real agent CLIs as subprocesses and the whole thing runs in your
+  terminal. That's deliberate — it's built for long-horizon work driven from the
+  command line. If that's your habitat, welcome.
 
 ## What's in the box
 
@@ -50,8 +66,8 @@ This is a 36-crate Rust workspace (~230k LOC, 1,100+ tests) implementing:
 
 - A **task orchestrator** with a kanban-style board, dependency DAG, and worker pool
   reconciliation (`brehon-orchestrator`).
-- A **Rust-native supervisor** that consumes an append-only event store, detects
-  stuck workers, tracks token budgets, and escalates when necessary
+- A **Rust-native supervision loop** that consumes an append-only event store,
+  detects stuck workers, tracks token budgets, and escalates when necessary
   (`brehon-supervisor`).
 - A **reviewer-panel coordinator** with score collection, threshold evaluation,
   feedback consolidation, panel affinity, and stale-detection (`brehon-review`).
@@ -63,8 +79,10 @@ This is a 36-crate Rust workspace (~230k LOC, 1,100+ tests) implementing:
   memories/rules/skills via tantivy (`brehon-store-fjall`, `brehon-search-tantivy`).
 - A **worktree-per-worker** git layer with recovery for stale lockfiles and
   mid-operation states (`brehon-git`).
-- Nine **agent adapters** covering Claude Code, Codex, Gemini, GitHub Copilot,
-  Kimi, JetBrains Junie, OpenCode, OpenAI HTTP, and a native ACP client.
+- Nine **agent adapters** (`brehon-adapter-*`) covering Claude Code, Codex,
+  Gemini, GitHub Copilot, Kimi, JetBrains Junie, OpenCode, OpenAI-compatible
+  HTTP, and Google Antigravity — plus a Brehon-native ACP runtime
+  (`brehon-native-agent`).
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for a full walkthrough and the
 [Architecture Decision Records](docs/adr/) for the reasoning behind each major
@@ -78,11 +96,9 @@ choice.
    in-flight state from the previous session.
 2. The orchestrator computes the task DAG and assigns ready tasks to workers
    based on lane configuration.
-3. Each worker gets its own git worktree under the configured external
-   worktree root. By default this is outside the repository under the user's
-   platform data directory, scoped by repo name and hash. No two workers can
-   step on each other, and git-aware tools do not see hidden `.brehon/`
-   workspaces as ignored checkouts.
+3. Each worker gets its own git worktree, by default outside the repository
+   under the platform data directory, scoped by repo name and hash. No two
+   workers can clobber each other's working state.
 4. Workers are spawned as PTY processes inside the mux. The TUI shows their
    live terminals; agents talk to the MCP server for shared context.
 5. When a worker reports a task ready, the verification tool spawns a
@@ -90,21 +106,27 @@ choice.
 6. Each reviewer scores the work 1–10, attaches structured findings
    (blocking / suggestion / nitpick), and submits independently.
 7. The score collector applies the policy: minimum average, minimum individual
-   score, no blocking findings, minimum approval count. If met, the supervisor
-   integrates the work via git cherry-pick to the epic branch.
-8. If not met, the same panel is bound to the task for the next round.
-   The policy caps rounds before escalation to a human supervisor.
+   score, no blocking findings, minimum approval count. If met, the work is
+   integrated via git cherry-pick to the epic branch.
+8. If not met, the same panel roster is bound to the task for the next round,
+   up to a configured cap before escalation to a human.
+
+Note that overlapping changes can still conflict when they're integrated onto the
+epic branch — isolation prevents live collisions, not merge-time ones. Good plan
+design (disjoint write scopes) is what keeps that cheap; the
+[User Guide](docs/USER_GUIDE.md) covers how.
 
 ## Prerequisites
 
 - **Rust** 1.75 or later. Install via [rustup](https://rustup.rs/).
-- **Zig** 0.13 (only required if you are building the vendored ghostty
+- **Zig** 0.15.2+ (only required if you are building the vendored ghostty
   terminal-emulation bindings from source; pre-built artifacts cover most users).
 - **Git** 2.x with worktree support (any modern version).
 - At least one supported agent CLI installed:
   Claude Code, Codex, Gemini CLI, OpenCode, Kimi, JetBrains Junie, or GitHub Copilot CLI.
   You can also point Brehon at any OpenAI-compatible HTTP endpoint via the
-  `brehon-adapter-openai` adapter.
+  `brehon-adapter-openai` adapter. Whichever you choose, make sure the bare CLI
+  can reach its model on its own before you ask Brehon to drive it.
 
 ## Build
 
@@ -128,198 +150,81 @@ install -m 0755 target/release/brehon ~/.local/bin/brehon
 cd /path/to/your/project
 brehon init
 
-# Load a plan document into the task board.
-# (See "Loading a plan" below for what PLAN.md needs to look like
-# and why this is split into two commands.)
+# Verify your CLIs, git, and config are healthy before spending anything
+brehon doctor
+
+# Load a plan document into the task board (see the User Guide for the format
+# and why this is two commands)
 brehon extract-plan PLAN.md --output .brehon/plan.json
 brehon import-plan .brehon/plan.json
 
-# Run the orchestrator with the default configuration
+# Run the orchestrator
 brehon run
 
 # Or invoke the MCP server only (for use from another agent)
 brehon serve
-
-# Inspect runtime state / dashboard
-brehon runtime dashboard
-
-# Diagnose missing agents, malformed config, broken worktrees, etc.
-brehon doctor
 ```
 
-If you don't have a plan document yet and just want to drive Brehon via an
-external agent talking to its MCP server, you can skip the extract/import
-steps — `brehon run` will spin up with an empty board, and tasks can be
-created through the MCP `task` tool.
-
-## Loading a plan
-
-The realistic on-ramp into Brehon is a **plan document** — a structured
-description of the work, broken into phases, epics, and concrete tasks with
-dependencies, sizes, and gate conditions. Without one, the orchestrator has
-nothing to dispatch (other than what an external agent pushes in over MCP),
-so for most users this is the first real step after `brehon init`.
-
-Two commands handle plan ingestion. They share extraction logic and a
-`--mode` flag, but split *what they do with the result*:
-
-- **`brehon extract-plan FILE`** — Parse or LLM-extract a plan document into
-  a normalized JSON form. Prints to stdout by default, or to `--output PATH`.
-  Does **not** touch the task board.
-- **`brehon import-plan FILE`** — Take a plan (either the original source
-  document, or already-extracted JSON) and create the corresponding
-  `initiative → phase-epics → tasks` tree on the task board, including the
-  final hardening epic. Use `--dry-run` to preview what would be imported
-  without writing anything.
-
-### The three extraction modes
-
-| Mode | What it does | When to use |
-| ---- | ------------ | ----------- |
-| `direct` | Parse the markdown directly with Brehon's built-in parser. Deterministic, free, instant. | Your plan already follows the structure below. |
-| `supervisor` | Feed the document to the configured supervisor lane's CLI (claude / codex / gemini / opencode) under a JSON schema, and let it normalize the result into a `PlanDocument`. **This is the expensive path** — at minimum one LLM call, often one per phase or even per task for chunkable documents. | Your plan is free-form, hand-written, or follows a different convention. |
-| `auto` (default) | Try direct first; fall back to supervisor only if direct parsing fails. | You don't know which one applies and want the cheapest viable option. |
-
-The supervisor mode reads the supervisor lane out of `.brehon/config.yaml`
-and requires it to be an ACP-style subprocess launcher (`claude`, `codex`,
-`gemini`, or `opencode`). If the supervisor lane is configured differently,
-the command will refuse rather than silently change behavior.
-
-Timeouts are tunable via env vars: `BREHON_PLAN_EXTRACT_IDLE_TIMEOUT_SECS`
-(how long the extractor may go silent before being killed) and
-`BREHON_PLAN_EXTRACT_MAX_TIMEOUT_SECS` (wall-clock ceiling). The legacy
-single-value `BREHON_PLAN_EXTRACT_TIMEOUT_SECS` is still honored for
-back-compat.
-
-### The recommended pattern: extract once, import many times
-
-```bash
-# One expensive LLM pass to normalize a free-form plan into JSON.
-brehon extract-plan PLAN.md --mode supervisor --output .brehon/plan.json
-
-# Review or hand-edit .brehon/plan.json if you want — it's a checked-in
-# artifact you can keep alongside the source markdown.
-
-# Cheap, deterministic, re-runnable import from the normalized form.
-brehon import-plan .brehon/plan.json
-```
-
-This split is the main reason both commands exist. Extraction over an LLM
-can take minutes and cost real money; you don't want to redo it every time
-you tweak something. The normalized JSON is the cache.
-
-### What the direct parser expects
-
-If you want to skip the LLM and use `--mode direct`, your markdown needs to
-look like this (slightly simplified — see
-`crates/brehon-cli/src/commands/import_plan/tests.rs` for canonical
-examples):
-
-```markdown
-# My Plan Title
-
-**Project:** My Project
-**Stack:** Rust + Tokio
-**Target:** Linux x86_64
-
-## Phase 1: Foundations
-
-### Phase 1.1: Wire up the storage layer
-
-| ID    | Title                    | Dependencies | Size | Gate          | Status |
-| ----- | ------------------------ | ------------ | ---- | ------------- | ------ |
-| T-101 | Define event types       |              | S    | unit tests    | Open   |
-| T-102 | Implement append path    | T-101        | M    | smoke test    | Open   |
-
-### Phase 1 gate: Tests and acceptance
-
-| ID    | Title              | Dependencies | Size | Gate        | Status |
-| ----- | ------------------ | ------------ | ---- | ----------- | ------ |
-| T-1G  | Phase 1 sign-off   | T-101,T-102  | S    | all pass    | Open   |
-```
-
-If your existing plan format is close but not identical, run `extract-plan`
-with `--mode supervisor` once, save the JSON, and import from there.
+Don't have a plan document yet? You don't need one to start. `brehon run` will
+spin up with an empty board, and you can create a single task with
+`brehon task create` or drive Brehon entirely via an external agent over MCP.
+The [User Guide](docs/USER_GUIDE.md) walks a single task end to end as a first
+run — start there.
 
 ## Configuration
 
-Configuration lives at `.brehon/config.yaml`. The default schema (see
-`crates/brehon-config/src/defaults.yaml` for the full version) is built
-around two concepts:
+Configuration lives at `.brehon/config.yaml`. `brehon init` generates a starter
+config shaped by the agent CLIs it finds on your `PATH`. The schema (see
+`crates/brehon-config/src/defaults.yaml` for the full version) is built around
+two concepts:
 
 - **Launchers** — how to spawn a particular agent CLI. Each launcher specifies
-  the adapter (`Acp` or `NativeHooks`), the command, and arguments.
-- **Lanes** — named bundles of launcher + model + system prompt. Workers,
-  supervisors, and reviewers are assigned to lanes, not directly to launchers.
-
-Example excerpt:
+  the adapter kind (`Acp` for ACP-compatible agents, `NativeAgent` for the
+  Brehon-native runtime, `PtyHooks` for Claude's PTY-hook integration, plus
+  `Codex`, `Kimi`, and others — see the `AdapterKind` enum), the command, and
+  arguments.
+- **Lanes** — named bundles of launcher + model + system prompt + reasoning
+  effort. Workers, supervisors, and reviewers are assigned to lanes, not directly
+  to launchers — which is what lets you route cheap work to cheap models and
+  reserve the expensive lane for the scary tasks.
 
 ```yaml
 version: 1
 
 launchers:
   claude:
-    adapter: NativeHooks
+    adapter: Acp
     command: claude
   codex:
     adapter: Acp
     command: codex
     args: ["app-server"]
-  gemini:
-    adapter: Acp
-    command: gemini
-    args: ["--acp"]
 
 lanes:
   claude-supervisor:
     launcher: claude
     model:
       provider: anthropic
-      name: claude-sonnet-4-6
+      name: claude-opus-4-6
   codex-worker:
     launcher: codex
     model:
       provider: openai
-      name: gpt-5.3-codex
+      name: gpt-5.4
   claude-reviewer:
     launcher: claude
     model:
       provider: anthropic
       name: claude-opus-4-6
     system_prompt: |
-      You are a reviewer. Your job is to evaluate submitted work,
-      not to implement it.
+      You are a reviewer. Evaluate submitted work; do not implement it.
 ```
 
-The supervisor, worker pool sizing, reviewer panel composition, and review
-scoring policy are all configured under their respective sections; see the
-defaults file and the schema validator (`brehon-config/src/validate/`) for the
-authoritative form.
-
-Brehon can optionally compress selected model-facing context before it is
-queued to agents. Compression is disabled by default. External Headroom-style
-compression is fail-closed: if the command is missing, times out, returns
-invalid UTF-8, returns empty text, or does not reduce the estimated token count,
-Brehon sends the original context.
-
-```yaml
-context:
-  compression:
-    enabled: true
-    mode: headroom
-    min_tokens: 2000
-    store_raw: true
-    prompt_contexts: [review_handoff, review_research, research_handoff]
-    never_compress: []
-    headroom:
-      command: headroom
-      args: ["compress", "--stdin"]
-      timeout_ms: 10000
-```
-
-`prompt_contexts` is an allow list for prompt surfaces. Existing
-`compact_memories`, `compact_rules`, and `compact_tasks` continue to control
-MCP context-tool output separately.
+Panel composition, worker pool sizing, review scoring policy, routing, research,
+and budget caps all live under their respective sections. **Every one of them is
+yours to tune** — the [User Guide](docs/USER_GUIDE.md)'s "Turning the dials"
+section is a tour of the cost and quality knobs, and the schema validator
+(`brehon-config/src/validate/`) is the authoritative form.
 
 ## CLI Reference
 
@@ -333,13 +238,14 @@ MCP context-tool output separately.
 | `brehon test [--live]`        | Run scenario tests; `--live` exercises real agents.                  |
 | `brehon runtime <subcmd>`     | Inspect runtime state (dashboard, events, panes).                    |
 | `brehon ps` / `brehon kill`   | Process inspection for in-flight runs.                               |
-| `brehon task <subcmd>`        | Direct task-board operations (list, get, transition).                |
+| `brehon task <subcmd>`        | Direct task-board operations (create, list, get, transition).        |
 | `brehon factory <subcmd>`     | Factory-mode worker lifecycle.                                       |
 | `brehon extract-plan FILE`    | Normalize a plan document into JSON (direct parse or LLM-extract).   |
 | `brehon import-plan FILE`     | Import a plan (markdown or normalized JSON) into the task board.     |
 | `brehon process <subcmd>`     | Low-level process control.                                           |
 | `brehon reset`                | Reset runtime state. Guarded against destroying `main`/`master`.     |
-| `brehon clean`                | Clean up stale worktrees and runtime directories.                    |
+| `brehon clean`                | Remove all Brehon artifacts. Guarded against protected branches.     |
+| `brehon maintenance`          | Report or prune stale worktrees and branches.                        |
 | `brehon epic-truth`           | Report the current epic-branch ground truth.                         |
 
 Use `brehon <cmd> --help` for the full flag set of each subcommand.
@@ -361,7 +267,7 @@ using a config like:
 ```
 
 See `.mcp.json.example` in this repo for a copy-pasteable starting point.
-The tools currently exposed include `agent`, `advisor`, `health`, `research`,
+The tools exposed include `agent`, `advisor`, `health`, `research`,
 the `*_memory` family, `*_rule` family, `search_skills`, the `*_task` family,
 `verification`, plus factory, git-cherry-pick, context-efficiency,
 proof-summary, stability, and routing tools.
@@ -377,11 +283,10 @@ crates/
   brehon-supervisor    event-store monitor, stuck detection, budget tracking
   brehon-review        panel, scoring, thresholds, consolidation
   brehon-runtime       in-process event bus
-  brehon-workflow      audited dry-run workflow primitives
   brehon-policy        runtime policy gates
   brehon-detect        pattern-based output anomaly detection
   brehon-protocol      factory client/server wire format
-  brehon-daemon        sidecar daemon process
+  brehon-daemon        in-process runtime coordination plane
   brehon-gatekeeper    epic-level preflight gating
   brehon-host          experimental terminal-host abstraction
   brehon-acp           Agent Communication Protocol (stdio)
@@ -395,7 +300,7 @@ crates/
   brehon-recording     terminal session recording
   brehon-doctor        diagnostics
   brehon-adapter-sdk   shared adapter trait + helpers
-  brehon-adapter-claude    Claude Code adapter (PTY-native hooks)
+  brehon-adapter-claude    Claude Code adapter
   brehon-adapter-codex     Codex adapter (websocket app-server)
   brehon-adapter-copilot   GitHub Copilot CLI adapter (ACP)
   brehon-adapter-gemini    Gemini CLI adapter (ACP)
@@ -403,11 +308,13 @@ crates/
   brehon-adapter-kimi      Kimi Code adapter
   brehon-adapter-openai    OpenAI-compatible HTTP adapter
   brehon-adapter-opencode  OpenCode adapter
+  brehon-adapter-agy       Google Antigravity (agy) adapter
   brehon-native-agent      Brehon-native ACP runtime
   brehon-cli           command-line entry point (binary: brehon)
   brehon-test-harness  shared test fixtures
   ghostty_vt           vendored terminal-emulation bindings
 docs/
+  USER_GUIDE.md        the practical guide — start here
   ARCHITECTURE.md      detailed system walkthrough
   adr/                 architecture decision records
 ```
@@ -422,37 +329,13 @@ cargo fmt --all -- --check                      # formatting check
 cargo doc --workspace --no-deps --open          # rustdoc
 ```
 
-The test suite includes unit tests in each crate plus integration tests under
-`crates/brehon-cli/tests/` (`scenarios_tests`, `chaos_tests`, `crash_tests`,
-`soak_tests`, `stress_tests`, `epic_integration_tests`, `git_tests`,
-`supervised_sidecar`, `review_flow`, and `doctor_integration`).
-
-## Stability gate harnesses
-
-The repo also ships operator-facing validation harnesses under `scripts/` for
-the current hardening phases. They preflight required symbols, fail fast if a
-test filter goes vacuous, and save you from retyping long `cargo test`
-selectors.
-
-```bash
-./scripts/phase0_stability_gate.sh --dry-run
-./scripts/phase1_stability_gate.sh
-./scripts/phase3_stability_gate.sh
-./scripts/phase4_stability_gate.sh
-./scripts/phase5_stability_gate.sh   # full final-hardening pass
-```
-
-Use `--dry-run` on any gate to print the exact checks it will execute. The
-Phase 5 harness composes the earlier stability gates and then runs the crash,
-doctor, lease-recovery, soak, and chaos checks that gate final hardening.
-
-## Contributing
-
-See [CONTRIBUTING.md](CONTRIBUTING.md).
-
-This is pre-1.0 software. Crate boundaries, configuration shapes, and on-disk
-formats may still change. Pin your version.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for how contributions are handled, the
+hexagonal dependency rules, and what's likely to land versus get a long
+discussion first.
 
 ## License
 
 [MIT](LICENSE)
+
+This is pre-1.0 software. Crate boundaries, configuration shapes, and on-disk
+formats may still change. Pin your version.

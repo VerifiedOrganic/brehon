@@ -46,9 +46,10 @@ This project follows the [Rust Code of Conduct](https://www.rust-lang.org/polici
 
 ### Prerequisites
 
-- **Rust 1.70+** (stable toolchain recommended)
+- **Rust 1.75+** (stable toolchain recommended)
 - **git** for version control
-- A basic understanding of async Rust and the tokio runtime
+- A working familiarity with async Rust and the tokio runtime — this codebase is
+  Tokio all the way down, and it will not hide that from you
 
 ### Fork and Clone
 
@@ -173,7 +174,9 @@ pub async fn append_atomic(
 
 ### All New Code Needs Tests
 
-Every new feature, bug fix, or refactoring must include tests:
+This is a project whose entire premise is that work isn't done until a panel of
+reviewers is convinced — so it would be a little awkward if the code itself
+shipped on vibes. Every new feature, bug fix, or refactoring must include tests:
 
 ### Unit Tests
 
@@ -242,20 +245,29 @@ async fn test_task_dispatch() {
 
 ### Hexagonal Architecture (Ports/Adapters)
 
-Brehon follows hexagonal architecture with strict dependency rules:
+Brehon follows hexagonal architecture with strict dependency rules. The whole
+point is that the arrows only ever point one way — *inward*, toward the pure
+core. Adapters know about the core; the core knows nothing about adapters.
 
+```mermaid
+flowchart TB
+    subgraph Composition["Composition root — brehon-cli"]
+        CLI["wires the concrete adapters into the core at startup"]
+    end
+    subgraph Adapters["Adapters — all I/O lives here"]
+        ADP["store-fjall · search-tantivy · acp · git · mcp · tui"]
+    end
+    subgraph Core["Core domain — pure, no I/O"]
+        DOM["types · ports · orchestrator · supervisor · review"]
+    end
+    CLI -->|constructs| Adapters
+    CLI -->|constructs| Core
+    Adapters -->|implement port traits defined in| Core
 ```
-┌─────────────────────────────────────────────────────────┐
-│                    Composition Root                     │
-│                      (brehon-cli)                        │
-├─────────────────────────────────────────────────────────┤
-│                      Adapters                           │
-│  (store-fjall, search-tantivy, acp, git, mcp, tui)     │
-├─────────────────────────────────────────────────────────┤
-│                 Core Domain (Pure)                      │
-│  (types, ports, orchestrator, supervisor, review)      │
-└─────────────────────────────────────────────────────────┘
-```
+
+If you ever find yourself adding a dependency that makes an arrow point the
+other way — core reaching out to an adapter — stop. That's the one rule the
+whole layout exists to protect.
 
 ### Dependency Rules
 
