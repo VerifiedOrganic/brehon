@@ -173,8 +173,10 @@ run — start there.
 
 ## Configuration
 
-Configuration lives at `.brehon/config.yaml`. `brehon init` generates a starter
-config shaped by the agent CLIs it finds on your `PATH`. The schema (see
+Configuration lives at `.brehon/config.yaml`. `brehon init` generates a clean,
+budget-safe starter: a single Claude worker, judged by a single-member Claude
+review panel, coordinated by a Claude supervisor — plus commented `EXTEND` and
+`ROUTING` examples so you can grow the team when you're ready. The schema (see
 `crates/brehon-config/src/defaults.yaml` for the full version) is built around
 two concepts:
 
@@ -195,10 +197,6 @@ launchers:
   claude:
     adapter: Acp
     command: claude
-  codex:
-    adapter: Acp
-    command: codex
-    args: ["app-server"]
 
 lanes:
   claude-supervisor:
@@ -206,11 +204,11 @@ lanes:
     model:
       provider: anthropic
       name: claude-opus-4-6
-  codex-worker:
-    launcher: codex
+  claude-worker:
+    launcher: claude
     model:
-      provider: openai
-      name: gpt-5.4
+      provider: anthropic
+      name: claude-sonnet-4-6
   claude-reviewer:
     launcher: claude
     model:
@@ -219,6 +217,10 @@ lanes:
     system_prompt: |
       You are a reviewer. Evaluate submitted work; do not implement it.
 ```
+
+That's the whole default roster. Bringing in a second model — say a Codex
+worker and a Codex reviewer for a two-vote panel — is a copy-paste out of the
+commented `EXTEND` block `brehon init` writes into the file.
 
 Panel composition, worker pool sizing, review scoring policy, routing, research,
 and budget caps all live under their respective sections. **Every one of them is
