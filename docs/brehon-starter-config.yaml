@@ -1,0 +1,359 @@
+# Simple Brehon starter configuration
+#
+# This file is intended to live at `.brehon/config.yaml` in a target repository.
+# After placing it there, run:
+#   brehon config validate
+#   brehon doctor
+#
+# Required local tools/accounts:
+# - `claude` CLI for the Claude Code harness lanes.
+# - `KIMI_API_KEY` for the Claude-harness Kimi lanes.
+# - `DEEPSEEK_API_KEY` for the Claude-harness DeepSeek supervisor lane.
+# - `OLLAMA_API_KEY` for the Claude-harness Ollama Cloud lanes.
+# - Optional: `codex` CLI if you uncomment the Codex supervisor/reviewer examples.
+
+version: 1
+
+launchers:
+  # Kimi K2.6 through the Claude Code harness. This mirrors the working
+  # OpenPacket pattern: Claude Code speaks to Kimi through an Anthropic-style
+  # endpoint.
+  claude-kimi-k2-6:
+    adapter: Acp
+    command: claude
+    args: []
+    env:
+      ANTHROPIC_BASE_URL: https://api.kimi.com/coding/
+      ANTHROPIC_AUTH_TOKEN: ${KIMI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${KIMI_API_KEY:-}
+      API_TIMEOUT_MS: "3000000"
+      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+      ANTHROPIC_MODEL: kimi-for-coding
+      ANTHROPIC_DEFAULT_OPUS_MODEL: kimi-for-coding
+      ANTHROPIC_DEFAULT_SONNET_MODEL: kimi-for-coding
+      ANTHROPIC_DEFAULT_HAIKU_MODEL: kimi-for-coding
+      CLAUDE_CODE_SUBAGENT_MODEL: kimi-for-coding
+      CLAUDE_CODE_EFFORT_LEVEL: max
+      CLAUDE_CODE_AUTO_COMPACT_WINDOW: "262144"
+      CLAUDE_AUTOCOMPACT_PCT_OVERRIDE: "70"
+
+  # DeepSeek V4 Pro through the Claude Code harness. If your DeepSeek access is
+  # via another Anthropic-compatible gateway, change only ANTHROPIC_BASE_URL and
+  # the API key env var.
+  claude-deepseek-v4-pro:
+    adapter: Acp
+    command: claude
+    args: []
+    env:
+      ANTHROPIC_BASE_URL: https://api.deepseek.com/anthropic
+      ANTHROPIC_AUTH_TOKEN: ${DEEPSEEK_API_KEY:-}
+      ANTHROPIC_API_KEY: ${DEEPSEEK_API_KEY:-}
+      API_TIMEOUT_MS: "3000000"
+      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+      ANTHROPIC_MODEL: deepseek-v4-pro
+      ANTHROPIC_DEFAULT_OPUS_MODEL: deepseek-v4-pro
+      ANTHROPIC_DEFAULT_SONNET_MODEL: deepseek-v4-pro
+      ANTHROPIC_DEFAULT_HAIKU_MODEL: deepseek-v4-flash
+      CLAUDE_CODE_SUBAGENT_MODEL: deepseek-v4-flash
+      CLAUDE_CODE_EFFORT_LEVEL: max
+
+  # Ollama Cloud GLM 5.1 through the Claude Code harness.
+  # Claude Code will call the Anthropic-compatible /v1/messages API under this
+  # base URL. Override OLLAMA_ANTHROPIC_BASE_URL if your endpoint differs.
+  claude-ollama-cloud-5-1:
+    adapter: Acp
+    command: claude
+    args: []
+    env:
+      ANTHROPIC_BASE_URL: ${OLLAMA_ANTHROPIC_BASE_URL:-https://ollama.com}
+      ANTHROPIC_AUTH_TOKEN: ${OLLAMA_API_KEY:-}
+      ANTHROPIC_API_KEY: ${OLLAMA_API_KEY:-}
+      API_TIMEOUT_MS: "3000000"
+      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+      ANTHROPIC_MODEL: glm-5.1
+      ANTHROPIC_DEFAULT_OPUS_MODEL: glm-5.1
+      ANTHROPIC_DEFAULT_SONNET_MODEL: glm-5.1
+      ANTHROPIC_DEFAULT_HAIKU_MODEL: glm-5.1
+      CLAUDE_CODE_SUBAGENT_MODEL: glm-5.1
+      CLAUDE_CODE_EFFORT_LEVEL: high
+
+  # Optional Ollama Cloud DeepSeek V4 Pro through the Claude Code harness.
+  # Uncomment this launcher and the matching supervisor lane below to use it.
+  #
+  # claude-ollama-cloud-deepseek-v4-pro:
+  #   adapter: Acp
+  #   command: claude
+  #   args: []
+  #   env:
+  #     ANTHROPIC_BASE_URL: ${OLLAMA_ANTHROPIC_BASE_URL:-https://ollama.com}
+  #     ANTHROPIC_AUTH_TOKEN: ${OLLAMA_API_KEY:-}
+  #     ANTHROPIC_API_KEY: ${OLLAMA_API_KEY:-}
+  #     API_TIMEOUT_MS: "3000000"
+  #     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+  #     ANTHROPIC_MODEL: deepseek-v4-pro[1m]
+  #     ANTHROPIC_DEFAULT_OPUS_MODEL: deepseek-v4-pro[1m]
+  #     ANTHROPIC_DEFAULT_SONNET_MODEL: deepseek-v4-pro[1m]
+  #     ANTHROPIC_DEFAULT_HAIKU_MODEL: deepseek-v4-flash
+  #     CLAUDE_CODE_SUBAGENT_MODEL: deepseek-v4-flash
+  #     CLAUDE_CODE_EFFORT_LEVEL: max
+
+  # Optional Codex CLI launcher. This is intentionally commented out so the
+  # starter stays Claude-harness-only until someone opts into Codex.
+  #
+  # codex:
+  #   adapter: Acp
+  #   command: codex
+  #   args:
+  #     - app-server
+
+lanes:
+  # Every active lane below uses a Claude Code harness launcher. Commented
+  # Codex examples are optional copy/paste blocks for teams that want Codex too.
+  # The `model.provider` fields identify the upstream model service.
+  claude-deepseek-v4-pro-supervisor:
+    launcher: claude-deepseek-v4-pro
+    model:
+      provider: deepseek
+      name: deepseek-v4-pro
+    reasoning_effort: max
+    system_prompt: |
+      You are the supervisor for a small Brehon run.
+      Keep scope tight, split work into small tasks, and assign ready tasks to
+      workers. Each task should have concrete acceptance criteria and expected
+      verification. Workers implement; reviewers judge. Do not implement normal
+      worker tasks yourself unless the run is blocked on supervisor-owned glue.
+      Ask the human when scope or risk is unclear.
+
+  # Optional supervisor: Ollama Cloud DeepSeek V4 Pro through Claude Code.
+  #
+  # To use it, uncomment the `claude-ollama-cloud-deepseek-v4-pro` launcher
+  # above, uncomment this lane, and change `roles.supervisor.name` from
+  # `claude-deepseek-v4-pro-supervisor` to
+  # `claude-ollama-cloud-deepseek-v4-pro-supervisor`.
+  #
+  # claude-ollama-cloud-deepseek-v4-pro-supervisor:
+  #   launcher: claude-ollama-cloud-deepseek-v4-pro
+  #   model:
+  #     provider: ollama-cloud
+  #     name: deepseek-v4-pro[1m]
+  #   reasoning_effort: max
+  #   system_prompt: |
+  #     You are the supervisor for a small Brehon run.
+  #     Keep scope tight, split work into small tasks, and assign ready tasks to
+  #     workers. Each task should have concrete acceptance criteria and expected
+  #     verification. Workers implement; reviewers judge. Do not implement normal
+  #     worker tasks yourself unless the run is blocked on supervisor-owned glue.
+  #     Ask the human when scope or risk is unclear.
+
+  # Optional supervisor: Codex CLI.
+  #
+  # To use it, uncomment the `codex` launcher above, uncomment this lane, and
+  # change `roles.supervisor.name` from `claude-deepseek-v4-pro-supervisor` to
+  # `codex-supervisor`.
+  #
+  # codex-supervisor:
+  #   launcher: codex
+  #   model:
+  #     provider: openai
+  #     name: gpt-5.4
+  #   reasoning_effort: high
+  #   system_prompt: |
+  #     You are the supervisor for a small Brehon run.
+  #     Keep scope tight, split work into small tasks, and assign ready tasks to
+  #     workers. Each task should have concrete acceptance criteria and expected
+  #     verification. Workers implement; reviewers judge. Do not implement normal
+  #     worker tasks yourself unless the run is blocked on supervisor-owned glue.
+  #     Ask the human when scope or risk is unclear.
+
+  # Optional stronger worker for routing large or risky tasks.
+  #
+  # To use it, uncomment the `claude-ollama-cloud-deepseek-v4-pro` launcher
+  # above, uncomment this lane, add it under `roles.workers`, and uncomment the
+  # routing rules below.
+  #
+  # claude-ollama-cloud-deepseek-v4-pro-worker:
+  #   launcher: claude-ollama-cloud-deepseek-v4-pro
+  #   model:
+  #     provider: ollama-cloud
+  #     name: deepseek-v4-pro[1m]
+  #   reasoning_effort: max
+  #   system_prompt: |
+  #     You are an implementation worker for large or risky tasks.
+  #     Complete only the assigned task, keep the diff narrow, preserve existing
+  #     style and contracts, and update tests or evidence when behavior changes.
+  #     Leave exact verification commands and any residual risk in your handoff.
+  #     Do not edit .brehon runtime files.
+
+  claude-kimi-k2-6-worker:
+    launcher: claude-kimi-k2-6
+    model:
+      provider: kimi-code
+      name: kimi-for-coding
+    reasoning_effort: high
+    system_prompt: |
+      You are an implementation worker using Kimi K2.6 through Claude Code.
+      Complete only the assigned task, keep the diff narrow, preserve existing
+      style and contracts, and update tests or evidence when behavior changes.
+      Leave exact verification commands and any residual risk in your handoff.
+      Do not edit .brehon runtime files.
+
+  claude-kimi-k2-6-reviewer:
+    launcher: claude-kimi-k2-6
+    model:
+      provider: kimi-code
+      name: kimi-for-coding
+    reasoning_effort: high
+    system_prompt: |
+      You are a reviewer. Evaluate the submitted work; do not implement it.
+      Check the diff against the task, correctness, integration, tests, and
+      maintainability. Treat missing tests as a real gap unless the task
+      explicitly waives them. Submit structured findings with severity and
+      concrete file references before reporting idle.
+
+  claude-ollama-cloud-5-1-reviewer:
+    launcher: claude-ollama-cloud-5-1
+    model:
+      provider: ollama-cloud
+      name: glm-5.1
+    reasoning_effort: high
+    system_prompt: |
+      You are a reviewer. Evaluate the submitted work; do not implement it.
+      Focus on independent confirmation: edge cases, regression risk, unclear
+      requirements, and whether the verification evidence actually covers the
+      change. Submit structured findings with severity and concrete file
+      references before reporting idle.
+
+  # Optional reviewer: Codex CLI.
+  #
+  # To add Codex to the review panel, uncomment the `codex` launcher above,
+  # uncomment this lane, then uncomment the matching `codex-reviewer` lines
+  # under `roles.reviewers`, `review.default_reviewers`, and
+  # `review.panels[0].reviewers`. Also raise `review.policy.min_approvals` to 3
+  # if you want all three reviewers to approve.
+  #
+  # codex-reviewer:
+  #   launcher: codex
+  #   model:
+  #     provider: openai
+  #     name: gpt-5.4
+  #   reasoning_effort: high
+  #   system_prompt: |
+  #     You are a reviewer. Evaluate the submitted work; do not implement it.
+  #     Check the diff against the task, correctness, integration, tests, and
+  #     maintainability. Treat missing tests as a real gap unless the task
+  #     explicitly waives them. Submit structured findings with severity and
+  #     concrete file references before reporting idle.
+
+roles:
+  supervisor:
+    name: claude-deepseek-v4-pro-supervisor
+    kind: Supervisor
+    description: Coordinates a small two-worker Brehon run.
+    permissions:
+      - CreateTasks
+      - AssignTasks
+      - SendMessage
+      - Broadcast
+      - ContextReadWrite
+      - ManageAgents
+      - ManageRoles
+  workers:
+    - lane: claude-kimi-k2-6-worker
+      min: 2
+      max: 2
+    # Optional routed worker for large or risky tasks. If you uncomment this,
+    # also raise orchestration.max_active_workers and orchestration.spawn_workers
+    # from 2 to 3 below.
+    # - lane: claude-ollama-cloud-deepseek-v4-pro-worker
+    #   min: 1
+    #   max: 1
+  reviewers:
+    - lane: claude-kimi-k2-6-reviewer
+      min: 1
+      max: 1
+    - lane: claude-ollama-cloud-5-1-reviewer
+      min: 1
+      max: 1
+    # Optional third reviewer:
+    # - lane: codex-reviewer
+    #   min: 1
+    #   max: 1
+
+routing:
+  default_worker_lane: claude-kimi-k2-6-worker
+  # Optional routing once you uncomment a stronger worker lane above.
+  #
+  # escalation_lane: claude-ollama-cloud-deepseek-v4-pro-worker
+  # rules:
+  #   - id: high-risk-or-large
+  #     match:
+  #       text_any:
+  #         - "Imported size estimate: L"
+  #         - security
+  #         - auth
+  #         - migration
+  #         - release
+  #         - performance
+  #         - concurrency
+  #         - data loss
+  #     policy:
+  #       preferred_lane: claude-ollama-cloud-deepseek-v4-pro-worker
+  #       strict: false
+
+review:
+  policy:
+    min_average_score: 7
+    min_individual_score: 6
+    blocking_score: 5
+    min_approvals: 2
+    require_blocking_feedback_resolution: true
+    max_review_rounds: 2
+  timeout_minutes: 30
+  auto_assign: true
+  default_reviewers:
+    - claude-kimi-k2-6-reviewer
+    - claude-ollama-cloud-5-1-reviewer
+    # - codex-reviewer
+  panel_mode: full_council
+  lease_mode: exclusive
+  panels:
+    - id: primary
+      reviewers:
+        - claude-kimi-k2-6-reviewer
+        - claude-ollama-cloud-5-1-reviewer
+        # - codex-reviewer
+  max_diff_tokens: 10000
+  chunk_strategy: ByDirectory
+  stale_detection:
+    enabled: true
+    ignore_files:
+      - Cargo.lock
+      - package-lock.json
+      - .gitignore
+      - .brehon/**
+      - .agents/**
+    strategy: DeltaReview
+
+orchestration:
+  # Raise both values to 3 if you uncomment the optional routed worker above.
+  max_active_workers: 2
+  spawn_workers: 2
+  worker_idle_behavior: Wait
+  allow_mutating_idle_work: false
+
+budget:
+  alert_threshold_percent: 80
+  enforcement: Soft
+
+security:
+  sandbox_profile: OsDefault
+  persist_transcripts: true
+  env_allowlist:
+    - PATH
+    - HOME
+    - USER
+    - SHELL
+    - KIMI_API_KEY
+    - DEEPSEEK_API_KEY
+    - OLLAMA_API_KEY
+    - OLLAMA_ANTHROPIC_BASE_URL
