@@ -81,6 +81,7 @@ pub enum ValidationWarningKind {
     ResearchPolicyConflict,
     ProfilePolicyConflict,
     InvalidWorktreeRoot,
+    LauncherEnvConflict,
 }
 
 impl ValidationWarningKind {
@@ -99,6 +100,7 @@ impl ValidationWarningKind {
                 | ValidationWarningKind::ResearchPolicyConflict
                 | ValidationWarningKind::ProfilePolicyConflict
                 | ValidationWarningKind::InvalidWorktreeRoot
+                | ValidationWarningKind::LauncherEnvConflict
         )
     }
 }
@@ -157,6 +159,7 @@ impl std::fmt::Display for ValidationWarningKind {
             ValidationWarningKind::ResearchPolicyConflict => write!(f, "Research policy conflict"),
             ValidationWarningKind::ProfilePolicyConflict => write!(f, "Profile policy conflict"),
             ValidationWarningKind::InvalidWorktreeRoot => write!(f, "Invalid worktree root"),
+            ValidationWarningKind::LauncherEnvConflict => write!(f, "Launcher env conflict"),
         }
     }
 }
@@ -174,6 +177,7 @@ pub fn validate(config: &BrehonConfig) -> Vec<ValidationWarning> {
     warnings.extend(validate_review_panels(config));
     warnings.extend(validate_prompt_policy(config));
     warnings.extend(validate_launcher_capability_overrides(config));
+    warnings.extend(validate_launcher_env_conflicts(config));
     warnings.extend(validate_runtime_workflows(config));
     warnings.extend(validate_runtime_policy(config));
     warnings.extend(validate_runtime_terminal_host(config));
@@ -992,6 +996,33 @@ fn validate_launcher_capability_overrides(config: &BrehonConfig) -> Vec<Validati
         }
     }
     warnings
+}
+
+fn validate_launcher_env_conflicts(config: &BrehonConfig) -> Vec<ValidationWarning> {
+    let mut warnings = Vec::new();
+    for (name, launcher) in &config.launchers {
+        if builtin_cli_from_launcher(launcher) != Some(SupervisorCli::Claude) {
+            continue;
+        }
+        if launcher_env_is_set(launcher, "ANTHROPIC_AUTH_TOKEN")
+            && launcher_env_is_set(launcher, "ANTHROPIC_API_KEY")
+        {
+            warnings.push(ValidationWarning::new(
+                ValidationWarningKind::LauncherEnvConflict,
+                format!(
+                    "launcher '{name}' invokes Claude Code and sets both ANTHROPIC_AUTH_TOKEN and ANTHROPIC_API_KEY. Claude Code treats these as conflicting auth sources; set exactly one. Use ANTHROPIC_AUTH_TOKEN for Claude-compatible third-party providers, or ANTHROPIC_API_KEY for Anthropic API key auth."
+                ),
+            ));
+        }
+    }
+    warnings
+}
+
+fn launcher_env_is_set(launcher: &brehon_types::AgentConnectionConfig, key: &str) -> bool {
+    launcher
+        .env
+        .get(key)
+        .is_some_and(|value| !value.trim().is_empty())
 }
 
 fn validate_runtime_workflows(config: &BrehonConfig) -> Vec<ValidationWarning> {
@@ -2518,6 +2549,40 @@ rooms:
                     "requests built-in 'claude' with unsupported transport/control_plane overrides",
                 )
         }));
+    }
+
+    #[test]
+    fn claude_launcher_rejects_conflicting_anthropic_credentials() {
+        let mut config = minimal_valid_config();
+        let launcher = config.launchers.get_mut("claude-code").unwrap();
+        launcher.env = HashMap::from([
+            ("ANTHROPIC_AUTH_TOKEN".to_string(), "token".to_string()),
+            ("ANTHROPIC_API_KEY".to_string(), "key".to_string()),
+        ]);
+
+        let warnings = validate(&config);
+
+        assert!(warnings.iter().any(|warning| {
+            warning.kind == ValidationWarningKind::LauncherEnvConflict
+                && warning.is_fatal
+                && warning.message.contains("sets both ANTHROPIC_AUTH_TOKEN")
+        }));
+    }
+
+    #[test]
+    fn non_claude_launcher_allows_anthropic_credential_env_names() {
+        let mut config = minimal_valid_config();
+        let launcher = config.launchers.get_mut("codex").unwrap();
+        launcher.env = HashMap::from([
+            ("ANTHROPIC_AUTH_TOKEN".to_string(), "token".to_string()),
+            ("ANTHROPIC_API_KEY".to_string(), "key".to_string()),
+        ]);
+
+        let warnings = validate(&config);
+
+        assert!(!warnings
+            .iter()
+            .any(|warning| warning.kind == ValidationWarningKind::LauncherEnvConflict));
     }
 
     #[test]

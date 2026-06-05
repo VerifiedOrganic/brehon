@@ -780,6 +780,12 @@ fn test_grok_worker_unsafe_profile_propagates_sandbox_env() {
     .expect("create grok worker pane");
     let config = pane.gateway_spawn_config().expect("gateway config");
     assert_gateway_sandbox_env(config, "unsafe", "true");
+    assert!(
+        config
+            .args
+            .windows(2)
+            .any(|window| window == ["--sandbox", "off"])
+    );
 }
 
 #[test]
@@ -1575,10 +1581,21 @@ fn test_custom_acp_worker_uses_stdio_gateway_protocol() {
 
 #[test]
 fn test_grok_acp_worker_receives_brehon_mcp_server() {
-    let brehon_root = PathBuf::from("/tmp/.brehon");
+    let temp = tempfile::tempdir().expect("temp project");
+    let project_root = temp.path().join("repo");
+    let brehon_root = project_root.join(".brehon");
+    let git_dir = project_root.join(".git");
+    let grok_config_dir = temp.path().join("grok-config");
+    std::fs::create_dir_all(&brehon_root).expect("create brehon root");
+    std::fs::create_dir_all(&git_dir).expect("create git dir");
+
+    let launcher_env = [(
+        "GROK_BREHON_SANDBOX_CONFIG_DIR".to_string(),
+        grok_config_dir.to_string_lossy().to_string(),
+    )];
     let pane = Pane::worker_with_agent_type(
         "worker-1",
-        PathBuf::from("/tmp"),
+        project_root.clone(),
         Some("session-a"),
         Some(&brehon_root),
         "supervisor",
@@ -1590,7 +1607,7 @@ fn test_grok_acp_worker_receives_brehon_mcp_server() {
         None,
         None,
         None,
-        &[],
+        &launcher_env,
         None,
     )
     .expect("create grok worker pane");
@@ -1602,14 +1619,23 @@ fn test_grok_acp_worker_receives_brehon_mcp_server() {
         config
             .args
             .windows(2)
-            .any(|window| window == ["--cwd", "/tmp"])
+            .any(|window| window == ["--cwd", project_root.to_string_lossy().as_ref()])
     );
+    let sandbox_profile = config
+        .args
+        .windows(2)
+        .find_map(|window| (window[0] == "--sandbox").then_some(window[1].as_str()))
+        .expect("grok sandbox profile");
     assert!(
-        config
-            .args
-            .windows(2)
-            .any(|window| window == ["--sandbox", "workspace"])
+        sandbox_profile.starts_with("brehon-repo-"),
+        "unexpected sandbox profile: {sandbox_profile}"
     );
+    let sandbox_config =
+        std::fs::read_to_string(grok_config_dir.join("sandbox.toml")).expect("sandbox config");
+    assert!(sandbox_config.contains(&format!("[profiles.\"{sandbox_profile}\"]")));
+    assert!(sandbox_config.contains("extends = \"workspace\""));
+    assert!(sandbox_config.contains(&brehon_root.to_string_lossy().to_string()));
+    assert!(sandbox_config.contains(&git_dir.to_string_lossy().to_string()));
     let mcp_servers = config
         .env
         .iter()

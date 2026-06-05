@@ -29,6 +29,7 @@ fn pty_runtime() -> &'static tokio::runtime::Runtime {
 }
 
 const SCRUBBED_ENV_KEYS: &[&str] = &[
+    "ANTHROPIC_AUTH_TOKEN",
     "ANTHROPIC_API_KEY",
     "OPENAI_API_KEY",
     "OPENAI_ORG_ID",
