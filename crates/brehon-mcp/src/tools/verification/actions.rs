@@ -105,6 +105,23 @@ fn enqueue_reviewer_reset_with_logging(task_id: &str, review_id: &str, reviewer:
     }
 }
 
+fn enqueue_reviewer_resets_with_logging(
+    task_id: &str,
+    review_id: &str,
+    reviewers: &[String],
+) -> Vec<String> {
+    let mut queued = Vec::new();
+    for reviewer in reviewers {
+        if queued.iter().any(|existing| existing == reviewer) {
+            continue;
+        }
+        if enqueue_reviewer_reset_with_logging(task_id, review_id, reviewer) {
+            queued.push(reviewer.clone());
+        }
+    }
+    queued
+}
+
 fn parse_review_findings_arg(value: Option<&Value>) -> Result<Vec<StoredFinding>, String> {
     let Some(value) = value else {
         return Ok(Vec::new());
@@ -1459,11 +1476,12 @@ impl VerificationTool {
             .iter()
             .all(|r| state.submissions_received.contains(r));
 
-        let mut reviewer_reset_queued = false;
+        let mut reviewer_resets_queued = Vec::new();
         if self.share_after_submit_enabled() && !all_submitted {
-            reviewer_reset_queued =
-                enqueue_reviewer_reset_with_logging(&task_id, &review_id, &reviewer);
+            reviewer_resets_queued =
+                enqueue_reviewer_resets_with_logging(&task_id, &review_id, &[reviewer.clone()]);
         }
+        let reviewer_reset_queued = !reviewer_resets_queued.is_empty();
 
         let submissions = read_round_submissions(&task_id, state.current_round);
         let mut report = self.evaluate_round(&task_id, &review_id, &state, &submissions);
@@ -1487,6 +1505,7 @@ impl VerificationTool {
                 "task_id": task_id,
                 "panel_progress": progress,
                 "reviewer_reset_queued": reviewer_reset_queued,
+                "reviewer_resets_queued": reviewer_resets_queued,
                 "next_action": next_action_review_status(&task_id),
                 "message": if self.share_after_submit_enabled() {
                     format!("Review submitted. Waiting for remaining reviewers ({progress}). Reviewer reuse is gated on a clean session reset.")
@@ -1677,10 +1696,18 @@ impl VerificationTool {
             _ => None,
         };
 
-        if self.share_after_submit_enabled() && all_submitted {
-            reviewer_reset_queued =
-                enqueue_reviewer_reset_with_logging(&task_id, &review_id, &reviewer);
-        }
+        let reviewer_resets_queued = if self.share_after_submit_enabled() {
+            enqueue_reviewer_resets_with_logging(&task_id, &review_id, &[reviewer.clone()])
+        } else {
+            let submitted_reviewers = state
+                .panel
+                .iter()
+                .filter(|panel_reviewer| state.submissions_received.contains(*panel_reviewer))
+                .cloned()
+                .collect::<Vec<_>>();
+            enqueue_reviewer_resets_with_logging(&task_id, &review_id, &submitted_reviewers)
+        };
+        let reviewer_reset_queued = !reviewer_resets_queued.is_empty();
 
         let mut result = serde_json::json!({
             "status": "ok",
@@ -1696,6 +1723,7 @@ impl VerificationTool {
             "notified_supervisors": notified,
             "notified_worker": worker_notified,
             "reviewer_reset_queued": reviewer_reset_queued,
+            "reviewer_resets_queued": reviewer_resets_queued,
             "next_action": next_action_after_review_outcome(&task_id, &report.outcome),
             "message": "Panel complete. Consolidated report delivered to supervisor."
         });
