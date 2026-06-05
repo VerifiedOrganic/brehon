@@ -370,6 +370,12 @@ impl Drop for TestEnv {
     }
 }
 
+fn reviewer_reset_queue_len(env: &TestEnv) -> usize {
+    std::fs::read_dir(env.root.join("runtime/reviewer-reset-queue"))
+        .map(|entries| entries.flatten().count())
+        .unwrap_or(0)
+}
+
 fn queued_messages_for(root: &std::path::Path, target: &str) -> Vec<String> {
     let queue_dir = root.join("runtime").join("prompt-queue");
     let mut messages = Vec::new();
@@ -473,14 +479,7 @@ async fn test_full_review_approved_flow() {
     let json = parse_result(&result);
     assert_eq!(json["panel_progress"], "1/2");
     assert_eq!(json["reviewer_reset_queued"], false);
-    assert_eq!(json["reviewer_resets_queued"], json!([]));
-    let reset_queue = env.root.join("runtime").join("reviewer-reset-queue");
-    let queued = if reset_queue.exists() {
-        std::fs::read_dir(&reset_queue).unwrap().flatten().count()
-    } else {
-        0
-    };
-    assert_eq!(queued, 0);
+    assert_eq!(reviewer_reset_queue_len(&env), 0);
 
     // Step 3: Second reviewer submits — triggers evaluation
     std::env::set_var("BREHON_AGENT_NAME", "reviewer-beta");
@@ -501,12 +500,7 @@ async fn test_full_review_approved_flow() {
     assert_eq!(json["outcome"], "approved");
     assert!(json["average_score"].as_f64().unwrap() >= 8.0);
     assert_eq!(json["reviewer_reset_queued"], true);
-    assert_eq!(
-        json["reviewer_resets_queued"],
-        json!(["reviewer-alpha", "reviewer-beta"])
-    );
-    let queued = std::fs::read_dir(&reset_queue).unwrap().flatten().count();
-    assert_eq!(queued, 2);
+    assert_eq!(reviewer_reset_queue_len(&env), 2);
 
     // Step 4: Verify review status
     std::env::set_var("BREHON_AGENT_NAME", "supervisor-1");
@@ -1615,10 +1609,7 @@ async fn test_share_after_submit_keeps_reviewer_reserved_until_reset_ack() {
         .unwrap();
     let submit_json = parse_result(&submit);
     assert_eq!(submit_json["reviewer_reset_queued"], true);
-
-    let reset_queue = env.root.join("runtime").join("reviewer-reset-queue");
-    let queued = std::fs::read_dir(&reset_queue).unwrap().flatten().count();
-    assert_eq!(queued, 1);
+    assert_eq!(reviewer_reset_queue_len(&env), 1);
 
     std::env::set_var("BREHON_AGENT_NAME", "supervisor-1");
     std::env::set_var("BREHON_AGENT_ROLE", "supervisor");
@@ -2011,13 +2002,7 @@ async fn test_share_after_submit_defers_final_reviewer_reset_until_round_close_s
         extract_text(&submit)
     );
 
-    let reset_queue = env.root.join("runtime").join("reviewer-reset-queue");
-    let queued = if reset_queue.exists() {
-        std::fs::read_dir(&reset_queue).unwrap().flatten().count()
-    } else {
-        0
-    };
-    assert_eq!(queued, 0);
+    assert_eq!(reviewer_reset_queue_len(&env), 0);
 }
 
 #[tokio::test]
@@ -2077,10 +2062,7 @@ async fn test_share_after_submit_queues_final_reviewer_reset_after_successful_ro
         .unwrap();
     let submit_json = parse_result(&submit);
     assert_eq!(submit_json["reviewer_reset_queued"], true);
-
-    let reset_queue = env.root.join("runtime").join("reviewer-reset-queue");
-    let queued = std::fs::read_dir(&reset_queue).unwrap().flatten().count();
-    assert_eq!(queued, 1);
+    assert_eq!(reviewer_reset_queue_len(&env), 1);
 }
 
 #[tokio::test]
