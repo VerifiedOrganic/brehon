@@ -1,6 +1,6 @@
 [package]
 name = "brehon-acp"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Agent Communication Protocol (ACP) implementation for agent lifecycle management"
 license = "MIT"

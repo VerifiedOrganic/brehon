@@ -1,6 +1,6 @@
 [package]
 name = "brehon-protocol"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Protocol types for Brehon Factory client-server communication"
 license = "MIT"
