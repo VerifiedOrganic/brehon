@@ -16,7 +16,7 @@ use tracing::info;
 
 use crate::commands::{
     claude_hook, clean, config, doctor, epic_truth, factory, import_plan, init, maintenance,
-    process, reset, run, runtime, serve, task, test as test_cmd,
+    process, reset, review_audit, run, runtime, serve, task, test as test_cmd,
 };
 
 fn absolutize_project_root(path: &Path) -> Option<PathBuf> {
@@ -262,6 +262,26 @@ enum Commands {
         /// Output report as JSON
         #[arg(long, conflicts_with = "prune")]
         json: bool,
+    },
+
+    /// Audit review artifacts and target-branch evidence from a completed run.
+    #[command(name = "review-audit")]
+    ReviewAudit {
+        /// Project root containing `.brehon/`. Defaults to the current project.
+        #[arg(long)]
+        root: Option<PathBuf>,
+        /// Git target branch/ref that should contain reviewed work.
+        #[arg(long, default_value = "main")]
+        target: String,
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+        /// Exit non-zero when any task is not trusted.
+        #[arg(long)]
+        fail_on_findings: bool,
+        /// Maximum target commits scanned for patch-id equivalence.
+        #[arg(long, default_value_t = 1000)]
+        max_target_commits: usize,
     },
 
     #[command(name = "factory")]
@@ -637,6 +657,28 @@ async fn main() -> ExitCode {
         Some(Commands::Maintenance { prune, force, json }) => {
             let path = project_path.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
             match maintenance::execute(&path, prune, force, json) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("\n  {} {}", ui::red("Error:"), e);
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Some(Commands::ReviewAudit {
+            root,
+            target,
+            json,
+            fail_on_findings,
+            max_target_commits,
+        }) => {
+            let path = root.or(project_path);
+            match review_audit::execute(
+                path.as_deref(),
+                &target,
+                json,
+                fail_on_findings,
+                max_target_commits,
+            ) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("\n  {} {}", ui::red("Error:"), e);

@@ -1,5 +1,6 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 
 use async_trait::async_trait;
 use brehon_acp::{DirectToolBridge, DirectToolBridgeFactory};
@@ -9,6 +10,16 @@ use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
 static TOOL_ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+static DURABLE_BACKING_CACHE: LazyLock<StdMutex<HashMap<DurableBackingKey, Arc<DurableBacking>>>> =
+    LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+type DurableBackingKey = (PathBuf, PathBuf);
+
+struct DurableBacking {
+    store: Arc<brehon_store_fjall::FjallEventStore>,
+    proof_store_available: bool,
+    search_index: Option<Arc<brehon_search_tantivy::TantivySearchIndex>>,
+}
 
 pub(crate) struct BrehonDirectToolBridgeFactory;
 
@@ -68,34 +79,66 @@ fn attach_durable_backing(mut server: McpServer, env: &[(String, String)]) -> Mc
             return server;
         }
     };
-    let db_path = resolve_state_path(&project_root, &config.context.db_path);
-    match brehon_store_fjall::FjallEventStore::new(&db_path) {
-        Ok(store) => {
-            let store = Arc::new(store);
-            let proof_store_available = store.proof_store_available();
+    match durable_backing_for(&project_root, &config) {
+        Ok(backing) => {
             server = server
-                .with_event_store(store.clone())
-                .with_run_store(store.clone());
-            if proof_store_available {
-                server = server.with_proof_store(store);
+                .with_event_store(backing.store.clone())
+                .with_run_store(backing.store.clone());
+            if backing.proof_store_available {
+                server = server.with_proof_store(backing.store.clone());
             } else {
+                let db_path = resolve_state_path(&project_root, &config.context.db_path);
                 tracing::warn!(path = %db_path.display(), "Direct MCP tools running without durable proof projection");
+            }
+            if let Some(search_index) = backing.search_index.clone() {
+                server = server.with_search_index(search_index);
             }
         }
         Err(err) => {
-            tracing::warn!(path = %db_path.display(), error = %err, "Direct MCP tools running without fjall backing");
-        }
-    }
-    let index_path = resolve_state_path(&project_root, &config.context.search_index_path);
-    if index_path.join("index").exists() {
-        match brehon_search_tantivy::TantivySearchIndex::load_existing(&index_path) {
-            Ok(index) => server = server.with_search_index(Arc::new(index)),
-            Err(err) => {
-                tracing::warn!(path = %index_path.display(), error = %err, "Direct MCP tools running without Tantivy search backing");
-            }
+            tracing::warn!(error = %err, "Direct MCP tools running without fjall backing");
         }
     }
     server
+}
+
+fn durable_backing_for(
+    project_root: &Path,
+    config: &brehon_types::BrehonConfig,
+) -> Result<Arc<DurableBacking>, String> {
+    let db_path = resolve_state_path(project_root, &config.context.db_path);
+    let index_path = resolve_state_path(project_root, &config.context.search_index_path);
+    let key = (stable_path_key(&db_path), stable_path_key(&index_path));
+
+    let mut cache = DURABLE_BACKING_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(backing) = cache.get(&key) {
+        return Ok(backing.clone());
+    }
+
+    let store = Arc::new(
+        brehon_store_fjall::FjallEventStore::new(&db_path)
+            .map_err(|err| format!("{}: {err}", db_path.display()))?,
+    );
+    let proof_store_available = store.proof_store_available();
+    let search_index = if index_path.join("index").exists() {
+        match brehon_search_tantivy::TantivySearchIndex::load_existing(&index_path) {
+            Ok(index) => Some(Arc::new(index)),
+            Err(err) => {
+                tracing::warn!(path = %index_path.display(), error = %err, "Direct MCP tools running without Tantivy search backing");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let backing = Arc::new(DurableBacking {
+        store,
+        proof_store_available,
+        search_index,
+    });
+    cache.insert(key, backing.clone());
+    Ok(backing)
 }
 
 fn resolve_state_path(project_root: &Path, configured: &str) -> PathBuf {
@@ -105,6 +148,10 @@ fn resolve_state_path(project_root: &Path, configured: &str) -> PathBuf {
     } else {
         project_root.join(path)
     }
+}
+
+fn stable_path_key(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 fn env_path(env: &[(String, String)], key: &str) -> Option<PathBuf> {

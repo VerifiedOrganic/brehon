@@ -5,6 +5,8 @@ use anyhow::{Context, Result};
 use brehon_ports::GitOperations;
 use brehon_types::{is_terminal_task_status, normalize_task_status, BrehonConfig};
 
+use crate::commands::serve::{BREHON_MCP_BACKING_ENV, MCP_BACKING_RUNTIME_FILES};
+
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
@@ -188,6 +190,10 @@ fn brehon_mcp_server_config(
     insert_env_path(&mut env, "BREHON_PROJECT_ROOT", project_root);
     insert_env_path(&mut env, "BREHON_WORKSPACE_ROOT", workspace_root);
     insert_env_path(&mut env, "BREHON_CLONE_PATH", workspace_root);
+    env.insert(
+        BREHON_MCP_BACKING_ENV.to_string(),
+        serde_json::Value::String(MCP_BACKING_RUNTIME_FILES.to_string()),
+    );
     if let Some(worktrees_root) = worktrees_root {
         insert_env_path(&mut env, "BREHON_WORKTREE_ROOT", worktrees_root);
     }
@@ -2600,16 +2606,43 @@ mod tests {
         brehon_config::parse_defaults().unwrap().security
     }
 
+    fn isolated_git_command(path: &Path) -> std::process::Command {
+        let mut command = std::process::Command::new("git");
+        command.current_dir(path);
+        for key in [
+            "BREHON_ALLOW_PROTECTED_BRANCH_COMMIT",
+            "BREHON_PROTECTED_BRANCH_BYPASS_TOKEN",
+            "BREHON_PROTECTED_BRANCH_BYPASS_DIR",
+            "BREHON_PROTECTED_BRANCHES",
+            "GIT_DIR",
+            "GIT_COMMON_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        ] {
+            command.env_remove(key);
+        }
+        command
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env(
+                "GIT_CONFIG_GLOBAL",
+                if cfg!(windows) { "NUL" } else { "/dev/null" },
+            )
+            .env("GIT_TERMINAL_PROMPT", "0");
+        command
+    }
+
     fn run_git(path: &Path, args: &[&str]) -> String {
-        let output = std::process::Command::new("git")
+        let output = isolated_git_command(path)
             .args(args)
-            .current_dir(path)
             .output()
             .unwrap_or_else(|err| panic!("failed to run git {}: {err}", args.join(" ")));
         assert!(
             output.status.success(),
-            "git {} failed: {}",
+            "git {} failed\nstdout:\n{}\nstderr:\n{}",
             args.join(" "),
+            String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
         String::from_utf8_lossy(&output.stdout).trim().to_string()
@@ -4398,6 +4431,10 @@ mod tests {
             supervisor_mcp["mcpServers"]["brehon"]["env"]["BREHON_WORKSPACE_ROOT"],
             supervisor_path.to_string_lossy().to_string()
         );
+        assert_eq!(
+            supervisor_mcp["mcpServers"]["brehon"]["env"][BREHON_MCP_BACKING_ENV],
+            MCP_BACKING_RUNTIME_FILES
+        );
 
         let reviewer_mcp: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(reviewer_path.join(".mcp.json")).unwrap(),
@@ -4416,6 +4453,10 @@ mod tests {
             reviewer_mcp["mcpServers"]["brehon"]["env"]["BREHON_WORKSPACE_ROOT"],
             reviewer_path.to_string_lossy().to_string()
         );
+        assert_eq!(
+            reviewer_mcp["mcpServers"]["brehon"]["env"][BREHON_MCP_BACKING_ENV],
+            MCP_BACKING_RUNTIME_FILES
+        );
 
         let supervisor_agy: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(supervisor_path.join(".agents/mcp_config.json")).unwrap(),
@@ -4427,6 +4468,10 @@ mod tests {
             supervisor_agy["mcpServers"]["brehon"]["env"]["BREHON_AGENT_NAME"],
             "claude-code"
         );
+        assert_eq!(
+            supervisor_agy["mcpServers"]["brehon"]["env"][BREHON_MCP_BACKING_ENV],
+            MCP_BACKING_RUNTIME_FILES
+        );
 
         let reviewer_agy: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(reviewer_path.join(".agents/mcp_config.json")).unwrap(),
@@ -4437,6 +4482,10 @@ mod tests {
         assert_eq!(
             reviewer_agy["mcpServers"]["brehon"]["env"]["BREHON_AGENT_NAME"],
             "reviewer-a"
+        );
+        assert_eq!(
+            reviewer_agy["mcpServers"]["brehon"]["env"][BREHON_MCP_BACKING_ENV],
+            MCP_BACKING_RUNTIME_FILES
         );
 
         let reviewer_opencode: serde_json::Value = serde_json::from_str(
@@ -4467,6 +4516,10 @@ mod tests {
         assert_eq!(
             reviewer_opencode["mcp"]["brehon"]["environment"]["BREHON_WORKSPACE_ROOT"],
             reviewer_path.to_string_lossy().to_string()
+        );
+        assert_eq!(
+            reviewer_opencode["mcp"]["brehon"]["environment"][BREHON_MCP_BACKING_ENV],
+            MCP_BACKING_RUNTIME_FILES
         );
 
         cleanup_scoped_worktrees(temp.path(), &supervisor_cwds).await;
@@ -4897,12 +4950,8 @@ mod tests {
 
         std::fs::write(temp.path().join("allowed.txt"), "allowed\n").unwrap();
         run_git(temp.path(), &["add", "allowed.txt"]);
-        let output = std::process::Command::new("git")
+        let output = isolated_git_command(temp.path())
             .args(["commit", "-m", "allowed on inactive main"])
-            .current_dir(temp.path())
-            .env_remove("BREHON_ALLOW_PROTECTED_BRANCH_COMMIT")
-            .env_remove("BREHON_PROTECTED_BRANCH_BYPASS_TOKEN")
-            .env_remove("BREHON_PROTECTED_BRANCHES")
             .output()
             .unwrap();
         assert!(
@@ -4922,12 +4971,8 @@ mod tests {
 
         std::fs::write(temp.path().join("blocked.txt"), "blocked\n").unwrap();
         run_git(temp.path(), &["add", "blocked.txt"]);
-        let blocked = std::process::Command::new("git")
+        let blocked = isolated_git_command(temp.path())
             .args(["commit", "-m", "blocked on main"])
-            .current_dir(temp.path())
-            .env_remove("BREHON_ALLOW_PROTECTED_BRANCH_COMMIT")
-            .env_remove("BREHON_PROTECTED_BRANCH_BYPASS_TOKEN")
-            .env_remove("BREHON_PROTECTED_BRANCHES")
             .output()
             .unwrap();
         assert!(
@@ -4943,12 +4988,8 @@ mod tests {
 
         run_git(temp.path(), &["checkout", "-b", "feature/protected-hook"]);
         run_git(temp.path(), &["commit", "-m", "feature branch allowed"]);
-        let blocked_ref_update = std::process::Command::new("git")
+        let blocked_ref_update = isolated_git_command(temp.path())
             .args(["update-ref", "refs/heads/main", "HEAD"])
-            .current_dir(temp.path())
-            .env_remove("BREHON_ALLOW_PROTECTED_BRANCH_COMMIT")
-            .env_remove("BREHON_PROTECTED_BRANCH_BYPASS_TOKEN")
-            .env_remove("BREHON_PROTECTED_BRANCHES")
             .output()
             .unwrap();
         assert!(
@@ -4965,9 +5006,8 @@ mod tests {
         run_git(temp.path(), &["checkout", "main"]);
         std::fs::write(temp.path().join("repair.txt"), "repair\n").unwrap();
         run_git(temp.path(), &["add", "repair.txt"]);
-        let env_only_repair = std::process::Command::new("git")
+        let env_only_repair = isolated_git_command(temp.path())
             .args(["commit", "-m", "deliberate repair"])
-            .current_dir(temp.path())
             .env("BREHON_ALLOW_PROTECTED_BRANCH_COMMIT", "1")
             .env("BREHON_PROTECTED_BRANCH_BYPASS_TOKEN", "missing-lease")
             .env("BREHON_PROTECTED_BRANCH_BYPASS_DIR", temp.path())
@@ -4995,9 +5035,8 @@ mod tests {
             format!("pid={}\n", std::process::id()),
         )
         .unwrap();
-        let leased_repair = std::process::Command::new("git")
+        let leased_repair = isolated_git_command(temp.path())
             .args(["commit", "-m", "deliberate repair"])
-            .current_dir(temp.path())
             .env("BREHON_ALLOW_PROTECTED_BRANCH_COMMIT", "1")
             .env("BREHON_PROTECTED_BRANCH_BYPASS_TOKEN", &bypass_token)
             .output()
@@ -5019,12 +5058,8 @@ mod tests {
 
         std::fs::write(temp.path().join("after-shutdown.txt"), "allowed\n").unwrap();
         run_git(temp.path(), &["add", "after-shutdown.txt"]);
-        let output = std::process::Command::new("git")
+        let output = isolated_git_command(temp.path())
             .args(["commit", "-m", "allowed after shutdown"])
-            .current_dir(temp.path())
-            .env_remove("BREHON_ALLOW_PROTECTED_BRANCH_COMMIT")
-            .env_remove("BREHON_PROTECTED_BRANCH_BYPASS_TOKEN")
-            .env_remove("BREHON_PROTECTED_BRANCHES")
             .output()
             .unwrap();
         assert!(
@@ -5050,12 +5085,8 @@ mod tests {
         std::fs::write(temp.path().join("feature.txt"), "feature\n").unwrap();
         run_git(temp.path(), &["add", "feature.txt"]);
 
-        let output = std::process::Command::new("git")
+        let output = isolated_git_command(temp.path())
             .args(["commit", "-m", "feature"])
-            .current_dir(temp.path())
-            .env_remove("BREHON_ALLOW_PROTECTED_BRANCH_COMMIT")
-            .env_remove("BREHON_PROTECTED_BRANCH_BYPASS_TOKEN")
-            .env_remove("BREHON_PROTECTED_BRANCHES")
             .output()
             .unwrap();
         assert!(!output.status.success());
@@ -5096,9 +5127,8 @@ mod tests {
         run_git(temp.path(), &["checkout", "-b", "feature/cleaned-hook"]);
         std::fs::write(temp.path().join("feature.txt"), "feature\n").unwrap();
         run_git(temp.path(), &["add", "feature.txt"]);
-        let output = std::process::Command::new("git")
+        let output = isolated_git_command(temp.path())
             .args(["commit", "-m", "feature"])
-            .current_dir(temp.path())
             .output()
             .unwrap();
         assert!(!output.status.success());
@@ -5550,6 +5580,10 @@ mod tests {
             config["mcpServers"]["brehon"]["env"]["BREHON_ROOT"],
             temp.path().join(".brehon").to_string_lossy().to_string()
         );
+        assert_eq!(
+            config["mcpServers"]["brehon"]["env"][BREHON_MCP_BACKING_ENV],
+            MCP_BACKING_RUNTIME_FILES
+        );
         assert_eq!(config["mcpServers"]["other"]["command"], "other");
         assert!(config["mcpServers"].get("agora").is_none());
 
@@ -5569,6 +5603,10 @@ mod tests {
         assert_eq!(
             opencode_config["mcp"]["brehon"]["environment"]["BREHON_ROOT"],
             temp.path().join(".brehon").to_string_lossy().to_string()
+        );
+        assert_eq!(
+            opencode_config["mcp"]["brehon"]["environment"][BREHON_MCP_BACKING_ENV],
+            MCP_BACKING_RUNTIME_FILES
         );
     }
 }

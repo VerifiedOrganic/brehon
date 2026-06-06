@@ -815,6 +815,7 @@ dependencies = [
  "brehon-types",
  "chrono",
  "fjall",
+ "libc",
  "serde",
  "serde_json",
  "tempfile",
