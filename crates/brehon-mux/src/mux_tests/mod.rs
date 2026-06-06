@@ -6,6 +6,7 @@ mod activity;
 mod agy_recovery;
 mod basic;
 mod delivery;
+mod delivery_gateway_startup;
 mod factory;
 mod opencode_recovery;
 mod scoping;

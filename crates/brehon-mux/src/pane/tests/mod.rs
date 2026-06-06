@@ -3,6 +3,7 @@ use crate::harness::{AgentAdapter, SupervisorCli};
 mod basic;
 mod context;
 mod gateway;
+mod grok_sandbox;
 mod injection;
 mod supervisor;
 
