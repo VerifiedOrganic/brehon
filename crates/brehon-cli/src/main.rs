@@ -266,23 +266,7 @@ enum Commands {
 
     /// Audit review artifacts and target-branch evidence from a completed run.
     #[command(name = "review-audit")]
-    ReviewAudit {
-        /// Project root containing `.brehon/`. Defaults to the current project.
-        #[arg(long)]
-        root: Option<PathBuf>,
-        /// Git target branch/ref that should contain reviewed work.
-        #[arg(long, default_value = "main")]
-        target: String,
-        /// Emit machine-readable JSON.
-        #[arg(long)]
-        json: bool,
-        /// Exit non-zero when any task is not trusted.
-        #[arg(long)]
-        fail_on_findings: bool,
-        /// Maximum target commits scanned for patch-id equivalence.
-        #[arg(long, default_value_t = 1000)]
-        max_target_commits: usize,
-    },
+    ReviewAudit(review_audit::ReviewAuditArgs),
 
     #[command(name = "factory")]
     Factory {
@@ -664,20 +648,14 @@ async fn main() -> ExitCode {
                 }
             }
         }
-        Some(Commands::ReviewAudit {
-            root,
-            target,
-            json,
-            fail_on_findings,
-            max_target_commits,
-        }) => {
-            let path = root.or(project_path);
+        Some(Commands::ReviewAudit(args)) => {
+            let path = args.root.or(project_path);
             match review_audit::execute(
                 path.as_deref(),
-                &target,
-                json,
-                fail_on_findings,
-                max_target_commits,
+                &args.target,
+                args.json,
+                args.fail_on_findings,
+                args.max_target_commits,
             ) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {

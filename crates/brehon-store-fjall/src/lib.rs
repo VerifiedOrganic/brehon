@@ -42,8 +42,10 @@
 //! - Recovery scan detects orphaned tasks, prepared merges, expired leases
 //! - Database opens cleanly after unclean shutdown
 
+mod error;
 pub mod keys;
 pub mod migrations;
+mod owner_lock;
 pub mod proof_store;
 pub mod queries;
 pub mod queue;
