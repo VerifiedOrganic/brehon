@@ -76,6 +76,11 @@ impl PanePromptQueue {
                 return;
             }
 
+            if queued.generation > pane_generation {
+                self.waiting.push_front(queued);
+                return;
+            }
+
             tracing::info!(
                 pane_id = %pane_id,
                 prompt_id = %queued.prompt_id,

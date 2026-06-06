@@ -250,11 +250,12 @@ impl Mux {
     }
 
     pub(super) fn drop_stale_in_flight_prompt_after_recycle(pane: &mut crate::pane::Pane) {
+        let pane_generation = pane.current_generation();
         let stale = pane
             .prompt_queue
             .in_flight
             .as_ref()
-            .is_some_and(|in_flight| in_flight.generation != pane.current_generation());
+            .is_some_and(|in_flight| in_flight.generation < pane_generation);
         if !stale {
             return;
         }
@@ -264,7 +265,7 @@ impl Mux {
             pane_id = %pane.id,
             prompt_id = %dropped.prompt_id,
             prompt_gen = dropped.generation.0,
-            pane_gen = pane.current_generation().0,
+            pane_gen = pane_generation.0,
             "dropped stale queued prompt after recycle"
         );
     }

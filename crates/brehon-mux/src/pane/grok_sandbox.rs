@@ -106,7 +106,12 @@ fn grok_brehon_profile_name(config: &PtyConfig, cwd: &Path) -> String {
         .map(sanitize_grok_profile_component)
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "project".to_string());
-    let hash = stable_path_hash(&project_root.to_string_lossy());
+    let hash_input = format!(
+        "{}\n{}",
+        project_root.to_string_lossy(),
+        cwd.to_string_lossy()
+    );
+    let hash = stable_path_hash(&hash_input);
     format!("brehon-{label}-{hash:016x}")
 }
 

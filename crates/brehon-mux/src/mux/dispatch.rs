@@ -43,6 +43,17 @@ pub(super) fn is_opencode_model_config_spawn(spawn_config: &GatewaySpawnConfig) 
         || spawn_config.protocol == brehon_acp::GatewayProtocol::OpenCodeServer
 }
 
+fn startup_prompt_target_generation(pane: Option<&crate::pane::Pane>) -> Generation {
+    let Some(pane) = pane else {
+        return Generation::default();
+    };
+    let generation = pane.current_generation();
+    if pane.is_gateway_backed() && pane.gateway_session_id().is_none() {
+        return Generation(generation.0.saturating_add(1));
+    }
+    generation
+}
+
 pub(super) fn opencode_model_candidates(spawn_config: &GatewaySpawnConfig) -> Vec<String> {
     let Some(model) = gateway_env_value(&spawn_config.env, "BREHON_AGENT_MODEL")
         .map(str::trim)
@@ -1134,6 +1145,26 @@ impl Mux {
         inject_after: Instant,
         prompt_id: Option<PromptId>,
     ) -> PromptDeliveryAttempt {
+        let generation = self.current_generation_or_default(pane_id);
+        self.queue_delayed_prompt_for_generation(
+            pane_id,
+            prompt,
+            from,
+            inject_after,
+            prompt_id,
+            generation,
+        )
+    }
+
+    fn queue_delayed_prompt_for_generation(
+        &mut self,
+        pane_id: &str,
+        prompt: String,
+        from: Option<String>,
+        inject_after: Instant,
+        prompt_id: Option<PromptId>,
+        generation: Generation,
+    ) -> PromptDeliveryAttempt {
         let Some(pane) = self.panes.get_mut(pane_id) else {
             return PromptDeliveryAttempt::Rejected {
                 reason: DeathReason::SessionDropped,
@@ -1166,7 +1197,6 @@ impl Mux {
 
         let ahead_of = pane.delayed_prompt_count();
         let prompt_id = prompt_id.unwrap_or_else(Self::new_prompt_id);
-        let generation = pane.current_generation();
         let queued = QueuedPrompt {
             prompt_id: prompt_id.clone(),
             prompt,
@@ -2009,8 +2039,15 @@ impl Mux {
             }
             _ => "PTY injection",
         };
-        let generation = self.pane_generation_for_observability(pane_id);
-        match self.queue_delayed_prompt(pane_id, prompt, None, Instant::now() + delay, None) {
+        let generation = startup_prompt_target_generation(pane);
+        match self.queue_delayed_prompt_for_generation(
+            pane_id,
+            prompt,
+            None,
+            Instant::now() + delay,
+            None,
+            generation,
+        ) {
             PromptDeliveryAttempt::Queued {
                 prompt_id,
                 ahead_of,
