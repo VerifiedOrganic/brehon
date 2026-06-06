@@ -1589,15 +1589,14 @@ fi
     #[cfg(unix)]
     #[test]
     fn merge_container_branch_into_target_uses_protected_branch_bypass_env() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         let root = tempfile::tempdir().unwrap();
         init_repo(root.path());
-
         run_git(root.path(), &["checkout", "-b", "initiative/test"]);
         std::fs::write(root.path().join("initiative.txt"), "initiative\n").unwrap();
         run_git(root.path(), &["add", "initiative.txt"]);
         run_git(root.path(), &["commit", "-m", "initiative work"]);
         run_git(root.path(), &["checkout", "main"]);
-
         install_bypass_required_hook(root.path(), "pre-merge-commit");
         install_bypass_required_hook(root.path(), "commit-msg");
         install_bypass_required_hook(root.path(), "reference-transaction");
@@ -1621,6 +1620,7 @@ fi
     #[cfg(unix)]
     #[test]
     fn squash_merge_container_branch_uses_protected_branch_bypass_env_and_records_source_tip() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         let root = tempfile::tempdir().unwrap();
         init_repo(root.path());
 

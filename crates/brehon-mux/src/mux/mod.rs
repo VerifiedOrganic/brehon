@@ -27,6 +27,7 @@ mod panesmith;
 mod policy;
 mod runtime;
 mod stability;
+mod supervisor_recovery;
 mod types;
 
 pub use command::{MuxRuntimeCommandPort, MuxRuntimeCommandReceiver};

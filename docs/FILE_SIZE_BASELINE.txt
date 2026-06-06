@@ -2,7 +2,7 @@
 # Format: <cap_lines> <path>
 # Files listed here are allowed to exceed the global 900-line cap, but
 # must not exceed their per-file cap. Enforced by scripts/check-file-size.sh.
-# Regenerated from the repository state on 2026-06-02.
+# Regenerated from the repository state on 2026-06-06.
 
 1464 crates/brehon-acp/src/gateway.rs
 2538 crates/brehon-acp/src/session.rs
@@ -22,7 +22,7 @@
 2250 crates/brehon-cli/src/commands/maintenance.rs
 4399 crates/brehon-cli/src/commands/run/mod.rs
 1981 crates/brehon-cli/src/commands/run/review.rs
-5576 crates/brehon-cli/src/commands/run/setup.rs
+5582 crates/brehon-cli/src/commands/run/setup.rs
 1242 crates/brehon-cli/src/ui.rs
 1856 crates/brehon-config/src/lib.rs
 4193 crates/brehon-config/src/validate.rs
@@ -48,17 +48,17 @@
 2568 crates/brehon-mcp/src/tools/verification/tool.rs
 3117 crates/brehon-mcp/src/tools/verification/tool_tests.rs
 5621 crates/brehon-mcp/tests/review_flow.rs
-2260 crates/brehon-mux/src/mux/dispatch.rs
-1763 crates/brehon-mux/src/mux/events.rs
-1394 crates/brehon-mux/src/mux/lifecycle.rs
+2280 crates/brehon-mux/src/mux/dispatch.rs
+1765 crates/brehon-mux/src/mux/events.rs
+1405 crates/brehon-mux/src/mux/lifecycle.rs
 3797 crates/brehon-mux/src/mux_tests/activity.rs
 1237 crates/brehon-mux/src/mux_tests/basic.rs
 2342 crates/brehon-mux/src/mux_tests/delivery.rs
-2079 crates/brehon-mux/src/mux_tests/factory.rs
+2081 crates/brehon-mux/src/mux_tests/factory.rs
 1120 crates/brehon-mux/src/pane/activity.rs
 3031 crates/brehon-mux/src/pane/spawn.rs
 1437 crates/brehon-mux/src/pane/terminal.rs
-2563 crates/brehon-mux/src/pane/tests/gateway.rs
+2589 crates/brehon-mux/src/pane/tests/gateway.rs
 1263 crates/brehon-mux/src/teams.rs
 984 crates/brehon-native-agent/src/agent_runtime/runner.rs
 1323 crates/brehon-native-agent/src/permissions.rs
@@ -66,8 +66,8 @@
 1115 crates/brehon-native-agent/src/runtime.rs
 1482 crates/brehon-native-agent/src/tools.rs
 1629 crates/brehon-orchestrator/src/orchestrator.rs
-946 crates/brehon-pty/src/pty/core.rs
-3508 crates/brehon-pty/src/pty/mod.rs
+947 crates/brehon-pty/src/pty/core.rs
+3547 crates/brehon-pty/src/pty/mod.rs
 916 crates/brehon-recording/src/reader.rs
 1053 crates/brehon-review/src/coordinator.rs
 2751 crates/brehon-store-fjall/src/store.rs

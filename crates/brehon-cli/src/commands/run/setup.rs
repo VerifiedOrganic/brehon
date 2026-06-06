@@ -8,6 +8,8 @@ use brehon_types::{is_terminal_task_status, normalize_task_status, BrehonConfig}
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
+mod adapter_selection;
+
 const BREHON_PROTECTED_BRANCH_GUARD_BEGIN: &str = "# BEGIN BREHON PROTECTED BRANCH GUARD";
 const BREHON_PROTECTED_BRANCH_GUARD_END: &str = "# END BREHON PROTECTED BRANCH GUARD";
 const BREHON_PROTECTED_BRANCH_GUARD_MARKER: &str = "protected-branch-guard-active";
@@ -789,15 +791,8 @@ pub(crate) fn agent_to_adapter(name: &str, config: &BrehonConfig) -> brehon_mux:
     use brehon_types::agent::AdapterKind;
 
     if let Some((cli, has_capability_overrides)) = resolved_builtin_cli(name, config) {
-        let is_supervisor = config.roles.supervisor.name == name;
-        if cli == SupervisorCli::OpenCode && is_supervisor {
-            let mut capabilities = cli.capabilities();
-            if let Some(agent_config) = config.lane_launcher(name) {
-                apply_capability_overrides(&mut capabilities, agent_config);
-            }
-            capabilities.transport = HarnessTransport::InteractivePty;
-            capabilities.preferred_control_plane = HarnessControlPlane::PtyInjection;
-            return AgentAdapter::built_in_with_capabilities(cli, capabilities);
+        if let Some(adapter) = adapter_selection::opencode_supervisor_adapter(name, config, cli) {
+            return adapter;
         }
 
         if !has_capability_overrides {
@@ -3285,57 +3280,6 @@ mod tests {
         assert_eq!(
             adapter.as_builtin(),
             Some(brehon_mux::SupervisorCli::OpenCode)
-        );
-    }
-
-    #[test]
-    fn test_agent_to_adapter_forces_opencode_supervisor_to_pty() {
-        let mut config = brehon_config::parse_defaults().unwrap();
-        config.launchers.insert(
-            "opencode-supervisor".to_string(),
-            brehon_types::AgentConnectionConfig {
-                adapter: brehon_types::agent::AdapterKind::Acp,
-                command: Some("opencode".to_string()),
-                args: vec![],
-                provider: None,
-                transport: None,
-                control_plane: None,
-                base_url: None,
-                api_key_env: None,
-                permission_mode: None,
-                profile: None,
-                max_parallel_tool_calls: None,
-                assistant_message_passthrough_fields: Vec::new(),
-                reasoning_effort_param: None,
-                extra_body: None,
-                env: std::collections::HashMap::new(),
-                headers: std::collections::HashMap::new(),
-            },
-        );
-        config.lanes.insert(
-            "opencode-supervisor".to_string(),
-            brehon_types::LaneConfig {
-                launcher: "opencode-supervisor".to_string(),
-                model: None,
-                reasoning_effort: None,
-                system_prompt: None,
-                profile: None,
-            },
-        );
-        config.roles.supervisor.name = "opencode-supervisor".to_string();
-
-        let adapter = agent_to_adapter("opencode-supervisor", &config);
-        assert_eq!(
-            adapter.as_builtin(),
-            Some(brehon_mux::SupervisorCli::OpenCode)
-        );
-        assert_eq!(
-            adapter.capabilities().transport,
-            brehon_mux::HarnessTransport::InteractivePty
-        );
-        assert_eq!(
-            adapter.capabilities().preferred_control_plane,
-            brehon_mux::HarnessControlPlane::PtyInjection
         );
     }
 

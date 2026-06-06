@@ -220,31 +220,23 @@ pub(crate) fn agent_is_marked_unavailable(agent_name: &str) -> bool {
 }
 
 pub(crate) fn write_agy_health_marker(pane: &crate::pane::Pane, reason: &str, error: &str) {
-    let last_delivery = pane
-        .last_prompt_delivery_attempt
-        .map(|inst| {
-            let elapsed = std::time::Instant::now().saturating_duration_since(inst);
-            chrono::Utc::now()
-                .checked_sub_signed(
-                    chrono::Duration::from_std(elapsed)
-                        .unwrap_or_else(|_| chrono::Duration::zero()),
-                )
-                .map(|t| t.to_rfc3339())
-        })
-        .flatten();
+    let last_delivery = pane.last_prompt_delivery_attempt.and_then(|inst| {
+        let elapsed = std::time::Instant::now().saturating_duration_since(inst);
+        chrono::Utc::now()
+            .checked_sub_signed(
+                chrono::Duration::from_std(elapsed).unwrap_or_else(|_| chrono::Duration::zero()),
+            )
+            .map(|t| t.to_rfc3339())
+    });
 
-    let last_mcp = pane
-        .last_successful_mcp_call
-        .map(|inst| {
-            let elapsed = std::time::Instant::now().saturating_duration_since(inst);
-            chrono::Utc::now()
-                .checked_sub_signed(
-                    chrono::Duration::from_std(elapsed)
-                        .unwrap_or_else(|_| chrono::Duration::zero()),
-                )
-                .map(|t| t.to_rfc3339())
-        })
-        .flatten();
+    let last_mcp = pane.last_successful_mcp_call.and_then(|inst| {
+        let elapsed = std::time::Instant::now().saturating_duration_since(inst);
+        chrono::Utc::now()
+            .checked_sub_signed(
+                chrono::Duration::from_std(elapsed).unwrap_or_else(|_| chrono::Duration::zero()),
+            )
+            .map(|t| t.to_rfc3339())
+    });
 
     let last_output = pane.last_output_at;
     let last_output_str = {
