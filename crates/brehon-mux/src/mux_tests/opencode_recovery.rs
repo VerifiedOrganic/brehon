@@ -201,6 +201,57 @@ fn test_opencode_recovery_blocked_on_approval() {
 }
 
 #[test]
+fn test_opencode_supervisor_drops_stale_queued_prompt_after_recycle() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _env = ScopedEnv::set(&[("BREHON_SKIP_PREFLIGHT", "1")]);
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let mut mux = Mux::new(24, 80);
+    let mut pane = Pane::new_with_backend_cli(
+        "opencode-supervisor",
+        "OpenCode Supervisor",
+        crate::pane::PaneKind::Supervisor,
+        crate::pane::PaneBackend::None,
+        24,
+        80,
+        AgentAdapter::BuiltIn(SupervisorCli::OpenCode),
+    )
+    .unwrap();
+    pane.set_pane_state(PaneState::Ready {
+        since: Instant::now(),
+    });
+    mux.add_pane(pane);
+
+    let inject_after = Instant::now() - Duration::from_millis(1);
+    match mux.queue_delayed_prompt(
+        "opencode-supervisor",
+        "stale prompt".to_string(),
+        None,
+        inject_after,
+        None,
+    ) {
+        PromptDeliveryAttempt::Queued { .. } => {}
+        other => panic!("expected queued stale prompt, got {other:?}"),
+    }
+    assert_eq!(mux.pending_delayed_prompt_count(), 1);
+
+    let generation = rt.block_on(mux.recycle("opencode-supervisor", "test recycle"));
+    assert_eq!(generation, Generation(1));
+
+    mux.tick_pane_state_machine_at(rt.handle(), Instant::now());
+
+    let pane = mux.get("opencode-supervisor").unwrap();
+    assert_eq!(pane.current_generation(), Generation(1));
+    assert_eq!(mux.pending_delayed_prompt_count(), 0);
+    assert!(pane.delayed_prompt_in_flight().is_none());
+    assert!(pane.delayed_prompt_waiting().is_empty());
+}
+
+#[test]
 fn test_opencode_quarantine_after_repeated_crashes_and_health_marker() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let brehon_root = std::env::temp_dir().join(format!(

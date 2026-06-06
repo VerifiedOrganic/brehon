@@ -75,6 +75,15 @@ impl Drop for OpenCodeEventSubscription {
     }
 }
 
+async fn server_process_is_alive(inner: &Arc<OpenCodeServerSessionInner>) -> bool {
+    inner
+        .process
+        .lock()
+        .await
+        .as_ref()
+        .is_some_and(|process| process.is_alive())
+}
+
 #[derive(Debug, Error)]
 pub enum OpenCodeError {
     #[error("failed to spawn opencode server: {0}")]
@@ -795,11 +804,7 @@ async fn run_prompt(
         {
             Ok(result) => result,
             Err(err) if poll_recovery.should_retry(&err) => {
-                let process_alive = {
-                    let guard = inner.process.lock().await;
-                    guard.as_ref().map(|p| p.is_alive()).unwrap_or(true)
-                };
-                if !process_alive {
+                if !server_process_is_alive(&inner).await {
                     return Err(OpenCodeError::Http(format!(
                         "OpenCode server process exited mid-turn; original error: {err}"
                     )));
@@ -832,11 +837,7 @@ async fn run_prompt(
         let session_busy = match fetch_session_busy(&inner, &session_id).await {
             Ok(session_busy) => session_busy,
             Err(err) if poll_recovery.should_retry(&err) => {
-                let process_alive = {
-                    let guard = inner.process.lock().await;
-                    guard.as_ref().map(|p| p.is_alive()).unwrap_or(true)
-                };
-                if !process_alive {
+                if !server_process_is_alive(&inner).await {
                     return Err(OpenCodeError::Http(format!(
                         "OpenCode server process exited mid-turn; original error: {err}"
                     )));
@@ -2927,6 +2928,9 @@ fn parse_host_port(server_url: &str) -> Result<(String, u16), OpenCodeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     #[test]
     fn test_server_url_from_env_wins() {
@@ -3658,5 +3662,102 @@ mod tests {
         };
         let res = session.send_prompt(prompt).await;
         assert!(matches!(res, Err(OpenCodeError::NotRunning)));
+    }
+
+    #[tokio::test]
+    async fn test_run_prompt_aborts_poll_recovery_when_server_process_missing() {
+        let (server_url, server_task) = spawn_poll_failure_server().await;
+        let session_id = SessionId::new(uuid::Uuid::new_v4().to_string());
+        let spec = SessionSpec::new(
+            brehon_types::AgentId::new("opencode-worker"),
+            "worker".to_string(),
+            "/tmp".to_string(),
+        );
+        let inner = Arc::new(OpenCodeServerSessionInner {
+            session_id,
+            spec,
+            process: Mutex::new(None),
+            server_url,
+            client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .expect("client"),
+            auth: None,
+            model: Mutex::new(None),
+            opencode_session_id: Mutex::new(Some("session-1".to_string())),
+            adapter_event_tx: std::sync::Mutex::new(None),
+            active_prompts: Mutex::new(HashMap::new()),
+            prompt_results: Arc::new(Mutex::new(HashMap::new())),
+            tokens_used: AtomicU64::new(0),
+            turn_lock: Mutex::new(()),
+            alive: AtomicBool::new(true),
+            capabilities: AgentCapabilities {
+                content_block_types: vec!["text".to_string()],
+                session_config_options: vec![],
+                permission_support: false,
+                terminal_support: false,
+                tool_call_streaming: brehon_types::ToolCallStreaming::Basic,
+            },
+        });
+
+        let prompt = PromptTurn {
+            prompt_id: brehon_types::PromptId::new("P-1"),
+            content: "hello".to_string(),
+            kind: brehon_types::MessageKind::TaskAssignment,
+            sent_at: chrono::Utc::now(),
+        };
+
+        let err = run_prompt(inner, prompt).await.unwrap_err();
+        assert!(matches!(
+            err,
+            OpenCodeError::Http(message)
+                if message.contains("OpenCode server process exited mid-turn")
+                    && message.contains("session message fetch failed with 500")
+        ));
+        server_task.abort();
+    }
+
+    async fn spawn_poll_failure_server() -> (String, JoinHandle<()>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        let message_calls = Arc::new(AtomicUsize::new(0));
+        let handle = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let message_calls = message_calls.clone();
+                tokio::spawn(async move {
+                    let mut buffer = vec![0u8; 4096];
+                    let Ok(bytes_read) = socket.read(&mut buffer).await else {
+                        return;
+                    };
+                    let request = String::from_utf8_lossy(&buffer[..bytes_read]);
+                    let first_line = request.lines().next().unwrap_or_default();
+                    let (status, body) = if first_line.starts_with("GET /session/session-1/message")
+                    {
+                        let call = message_calls.fetch_add(1, Ordering::SeqCst);
+                        if call == 0 {
+                            ("200 OK", "[]")
+                        } else {
+                            (
+                                "500 Internal Server Error",
+                                r#"{"name":"UnknownError","data":{"message":"Unexpected server error"}}"#,
+                            )
+                        }
+                    } else if first_line.starts_with("POST /session/session-1/prompt_async") {
+                        ("200 OK", "{}")
+                    } else {
+                        ("404 Not Found", "{}")
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+
+        (format!("http://{addr}"), handle)
     }
 }

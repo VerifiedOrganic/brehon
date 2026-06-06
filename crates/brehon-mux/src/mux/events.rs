@@ -1459,7 +1459,7 @@ impl Mux {
                     // helper exits normally or times out internally it clears
                     // the marker. A stale marker therefore means the helper
                     // process itself is wedged.
-                    if !should_recover {
+                    if !should_recover && pane.is_agy() {
                         if let Some(age) = Self::agy_helper_inflight_age(&pane_id)
                             && age >= Self::AGY_HELPER_INFLIGHT_TIMEOUT
                         {
