@@ -45,9 +45,9 @@
 13220 crates/brehon-mcp/src/tools/task_actions/tool_tests.rs
 1037 crates/brehon-mcp/src/tools/tasks.rs
 2861 crates/brehon-mcp/src/tools/verification/actions.rs
-2568 crates/brehon-mcp/src/tools/verification/tool.rs
-3117 crates/brehon-mcp/src/tools/verification/tool_tests.rs
-5621 crates/brehon-mcp/tests/review_flow.rs
+2645 crates/brehon-mcp/src/tools/verification/tool.rs
+3193 crates/brehon-mcp/src/tools/verification/tool_tests.rs
+5625 crates/brehon-mcp/tests/review_flow.rs
 2280 crates/brehon-mux/src/mux/dispatch.rs
 1765 crates/brehon-mux/src/mux/events.rs
 1405 crates/brehon-mux/src/mux/lifecycle.rs

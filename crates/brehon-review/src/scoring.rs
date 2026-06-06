@@ -181,6 +181,9 @@ impl ThresholdEvaluator {
     }
 
     /// Evaluate with a specific number of reviewers (for panel size decisions).
+    ///
+    /// This only returns `Approved` when at least `reviewer_count` submissions
+    /// exist and every counted reviewer approved.
     pub fn evaluate_with_reviewer_count(
         &self,
         collector: &ScoreCollector,
@@ -189,7 +192,11 @@ impl ThresholdEvaluator {
         if collector.count() < reviewer_count {
             return ThresholdResult::NeedMoreReviewers;
         }
-        self.evaluate(collector)
+        let result = self.evaluate(collector);
+        if result == ThresholdResult::Approved && collector.approval_count() < reviewer_count {
+            return ThresholdResult::NeedMoreReviewers;
+        }
+        result
     }
 }
 
@@ -451,6 +458,44 @@ mod tests {
 
         let result = evaluator.evaluate_with_reviewer_count(&collector, 3);
         assert_eq!(result, ThresholdResult::NeedMoreReviewers);
+    }
+
+    #[test]
+    fn threshold_evaluator_requires_all_counted_reviewers_to_approve() {
+        let evaluator = ThresholdEvaluator::new(default_policy());
+        let mut collector = ScoreCollector::new();
+
+        collector.add(
+            "r1".to_string(),
+            ReviewScore::new(8),
+            ReviewVerdict::Approve,
+        );
+        collector.add(
+            "r2".to_string(),
+            ReviewScore::new(8),
+            ReviewVerdict::Approve,
+        );
+        collector.add(
+            "r3".to_string(),
+            ReviewScore::new(8),
+            ReviewVerdict::Approve,
+        );
+
+        assert_eq!(
+            evaluator.evaluate_with_reviewer_count(&collector, 4),
+            ThresholdResult::NeedMoreReviewers
+        );
+
+        collector.add(
+            "r4".to_string(),
+            ReviewScore::new(8),
+            ReviewVerdict::Approve,
+        );
+
+        assert_eq!(
+            evaluator.evaluate_with_reviewer_count(&collector, 4),
+            ThresholdResult::Approved
+        );
     }
 
     #[test]

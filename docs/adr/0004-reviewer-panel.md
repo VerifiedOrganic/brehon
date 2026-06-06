@@ -64,7 +64,9 @@ Concretely, in `crates/brehon-review/`:
   - `min_average` — panel mean must be at least this.
   - `min_individual` — every reviewer must score at least this.
   - `blocking` — no finding with `blocking` severity above this level.
-  - `min_approvals` — at least this many reviewers must verdict `approved`.
+  - `min_approvals` — at least this many reviewers must verdict `approved`;
+    full-council/configured panels still require every seated panel reviewer
+    to approve before consolidation can approve the task.
 - The **`FeedbackConsolidator`** deduplicates findings across reviewers,
   preserves dissent (a finding only one reviewer raised is still surfaced),
   and produces a single consolidated report for the worker.
@@ -78,9 +80,10 @@ Concretely, in `crates/brehon-review/`:
   outliers (a reviewer who always scores 10, a reviewer who always
   blocks).
 
-The default policy values (subject to per-project overrides) are
+The base policy values (subject to per-project overrides) are
 `min_average=7`, `min_individual=6`, `blocking<=5`, `min_approvals=2`,
-`max_rounds=3`.
+`max_rounds=3`. Generated three-reviewer full-council configs set
+`min_approvals=3` so the config mirrors the runtime approval rule.
 
 Round state is persisted under `.brehon/runtime/reviews/<review_id>/`.
 Events emitted for each transition (`ReviewRequested`,
@@ -139,11 +142,12 @@ loses the context of why the prior round was rejected. The same
 reviewers re-reviewing the same work is the closest approximation we
 have to a human reviewer responding to revisions on a PR.
 
-**Consensus-required (unanimous approval).** Considered. Rejected
-because a single bad reviewer (sycophant, outlier, or just confused)
-can block legitimate merges. The `min_approvals` lever lets the operator
-choose; the default `min_approvals=2` with panel size 3 tolerates one
-dissenter.
+**Consensus-required for seated full-council panels.** Accepted for the
+production reviewer council. Brehon waits for every seated reviewer and does
+not approve a full-council/configured-panel task unless each seated reviewer
+approves. The `min_approvals` lever remains useful for smaller or quorum-style
+policies, but a configured council should set it to the panel size so the
+configuration communicates the actual approval rule.
 
 **Quorum-based without scores (just count approvals).** Considered.
 Rejected because scoring catches the "everyone approved but nobody loved

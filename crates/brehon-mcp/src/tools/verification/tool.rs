@@ -16,7 +16,7 @@ use brehon_types::config::{
     ReviewPanelConfig, ReviewPanelMode,
 };
 use brehon_types::{
-    normalize_task_status, Event, EventKind, Priority, ReviewFinding, ReviewScore,
+    normalize_task_status, Event, EventKind, Priority, ReviewFinding, ReviewScore, ReviewVerdict,
     TaskCompletionMode,
 };
 
@@ -62,7 +62,7 @@ use crate::tools::task_actions::{
 #[cfg(test)]
 use super::state::{read_round_request, verdict_str};
 #[cfg(test)]
-use brehon_types::{CommentSeverity, ReviewVerdict};
+use brehon_types::CommentSeverity;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum RejectionReason {
@@ -101,6 +101,68 @@ fn task_status_for_report(state: &ReviewState, report: &ConsolidatedReport) -> &
     } else {
         task_status_for_review_outcome(&report.outcome).unwrap_or("changes_requested")
     }
+}
+
+#[derive(Debug, Default)]
+struct FullPanelApprovalGap {
+    missing: Vec<String>,
+    not_approved: Vec<String>,
+}
+
+impl FullPanelApprovalGap {
+    fn is_empty(&self) -> bool {
+        self.missing.is_empty() && self.not_approved.is_empty()
+    }
+
+    fn reason(&self) -> String {
+        match (self.missing.is_empty(), self.not_approved.is_empty()) {
+            (false, false) => format!(
+                "Full panel approval required; waiting for reviewer(s): {}; reviewer(s) did not approve: {}",
+                self.missing.join(", "),
+                self.not_approved.join(", ")
+            ),
+            (false, true) => format!(
+                "Full panel approval required; waiting for reviewer(s): {}",
+                self.missing.join(", ")
+            ),
+            (true, false) => format!(
+                "Full panel approval required; reviewer(s) did not approve: {}",
+                self.not_approved.join(", ")
+            ),
+            (true, true) => "Full panel approval required".to_string(),
+        }
+    }
+}
+
+fn full_panel_approval_gap(
+    state: &ReviewState,
+    submissions: &[StoredSubmission],
+    ignored_reviewers: &HashSet<String>,
+) -> FullPanelApprovalGap {
+    if state.panel.is_empty() {
+        return FullPanelApprovalGap::default();
+    }
+
+    let submissions_by_reviewer: HashMap<&str, &StoredSubmission> = submissions
+        .iter()
+        .map(|submission| (submission.reviewer.as_str(), submission))
+        .collect();
+    let mut gap = FullPanelApprovalGap::default();
+
+    for reviewer in &state.panel {
+        let Some(submission) = submissions_by_reviewer.get(reviewer.as_str()) else {
+            gap.missing.push(reviewer.clone());
+            continue;
+        };
+
+        if ignored_reviewers.contains(reviewer)
+            || parse_verdict(&submission.verdict) != ReviewVerdict::Approve
+        {
+            gap.not_approved.push(reviewer.clone());
+        }
+    }
+
+    gap
 }
 
 impl Default for VerificationTool {
@@ -2070,6 +2132,7 @@ impl VerificationTool {
         let mut collector = ScoreCollector::new();
         let mut scores_map = serde_json::Map::new();
         let mut ignored_negative_reviews = Vec::new();
+        let mut ignored_reviewers = HashSet::new();
 
         for sub in submissions {
             let score = ReviewScore::new(sub.score);
@@ -2088,6 +2151,7 @@ impl VerificationTool {
                 score_entry["ignored_for_threshold"] = Value::Bool(true);
                 score_entry["ignored_reason"] = Value::String(reason.clone());
                 ignored_negative_reviews.push(format!("{}: {reason}", sub.reviewer));
+                ignored_reviewers.insert(sub.reviewer.clone());
             } else {
                 collector.add(sub.reviewer.clone(), score, verdict);
             }
@@ -2098,18 +2162,31 @@ impl VerificationTool {
         // Step 2: Threshold evaluation using brehon-review
         let evaluator = ThresholdEvaluator::new(self.config.policy.clone());
         let threshold = evaluator.evaluate(&collector);
+        let mut threshold_result = format!("{threshold:?}");
 
         let (outcome, threshold_reason) = match threshold {
             brehon_review::ThresholdResult::Approved => {
-                let reason = if ignored_negative_reviews.is_empty() {
-                    "All thresholds met".to_string()
+                let full_panel_gap =
+                    full_panel_approval_gap(state, submissions, &ignored_reviewers);
+                if !full_panel_gap.is_empty() {
+                    if full_panel_gap.missing.is_empty() {
+                        threshold_result = "ChangesRequested".to_string();
+                        ("changes_requested".to_string(), full_panel_gap.reason())
+                    } else {
+                        threshold_result = "NeedMoreReviewers".to_string();
+                        ("collecting".to_string(), full_panel_gap.reason())
+                    }
                 } else {
-                    format!(
-                        "All thresholds met after ignoring {} unsupported negative review(s) with no blocking findings",
-                        ignored_negative_reviews.len()
-                    )
-                };
-                ("approved".to_string(), reason)
+                    let reason = if ignored_negative_reviews.is_empty() {
+                        "All thresholds met".to_string()
+                    } else {
+                        format!(
+                            "All thresholds met after ignoring {} unsupported negative review(s) with no blocking findings",
+                            ignored_negative_reviews.len()
+                        )
+                    };
+                    ("approved".to_string(), reason)
+                }
             }
             brehon_review::ThresholdResult::ChangesRequested => {
                 let reason = if collector.has_blocking_findings() {
@@ -2210,7 +2287,7 @@ impl VerificationTool {
             average_score: (avg * 10.0).round() / 10.0,
             min_score: min,
             approval_count: collector.approval_count(),
-            threshold_result: format!("{threshold:?}"),
+            threshold_result,
             threshold_reason,
             blocking: consolidated
                 .blocking

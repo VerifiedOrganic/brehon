@@ -889,8 +889,10 @@ own point on the same dials.
   make them three *different* opinions.
 - **Raise the bar.** `min_average_score`, `min_individual_score`, and
   `min_approvals` are how strict "good enough" is. Raise them for code that
-  ships to users; relax them for an internal spike. Just know that a higher bar
-  means more rounds, and more rounds mean — say it with me — more tokens.
+  ships to users; relax them for an internal spike. For full-council panels,
+  keep `min_approvals` equal to the panel size because Brehon requires every
+  seated reviewer to approve. Just know that a higher bar means more rounds,
+  and more rounds mean — say it with me — more tokens.
 
 The through-line: every quality dial and every cost dial are *the same dials*,
 turned in opposite directions. There is no setting that gives you more rigor for

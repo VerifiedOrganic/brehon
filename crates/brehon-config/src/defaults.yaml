@@ -246,7 +246,7 @@ review:
     min_average_score: 7
     min_individual_score: 6
     blocking_score: 5
-    min_approvals: 2
+    min_approvals: 3
     require_blocking_feedback_resolution: true
     max_review_rounds: 3
   timeout_minutes: 30

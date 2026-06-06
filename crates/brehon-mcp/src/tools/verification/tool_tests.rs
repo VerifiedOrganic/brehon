@@ -3115,3 +3115,79 @@ fn test_evaluate_round_escalates_at_total_review_livelock_limit() {
         report.threshold_reason
     );
 }
+
+#[test]
+fn test_evaluate_round_requires_full_panel_approval() {
+    let tool = make_tool();
+    let state = ReviewState {
+        task_id: "T-full-panel".to_string(),
+        status: "collecting".to_string(),
+        current_round: 1,
+        cycle_start_round: 1,
+        review_epoch_start_round: 1,
+        current_review_id: "REV-full-panel".to_string(),
+        max_rounds: 3,
+        panel_id: "primary".to_string(),
+        panel_mode: "configured_panel".to_string(),
+        panel: vec!["r1".to_string(), "r2".to_string(), "r3".to_string()],
+        submissions_received: vec!["r1".to_string(), "r2".to_string()],
+        reviewer_assignments: std::collections::BTreeMap::new(),
+        created_at: String::new(),
+        updated_at: String::new(),
+    };
+    let mut submissions = vec![
+        StoredSubmission {
+            review_id: "REV-full-panel".to_string(),
+            reviewer: "r1".to_string(),
+            round: 1,
+            score: 8,
+            verdict: "approved".to_string(),
+            summary: String::new(),
+            findings: vec![],
+            submitted_at: String::new(),
+        },
+        StoredSubmission {
+            review_id: "REV-full-panel".to_string(),
+            reviewer: "r2".to_string(),
+            round: 1,
+            score: 8,
+            verdict: "approved".to_string(),
+            summary: String::new(),
+            findings: vec![],
+            submitted_at: String::new(),
+        },
+    ];
+
+    let report = tool.evaluate_round("T-full-panel", "REV-full-panel", &state, &submissions);
+
+    assert_eq!(report.outcome, "collecting");
+    assert_eq!(report.threshold_result, "NeedMoreReviewers");
+    assert!(
+        report.threshold_reason.contains("r3"),
+        "{}",
+        report.threshold_reason
+    );
+
+    submissions.push(StoredSubmission {
+        review_id: "REV-full-panel".to_string(),
+        reviewer: "r3".to_string(),
+        round: 1,
+        score: 8,
+        verdict: "approved".to_string(),
+        summary: String::new(),
+        findings: vec![],
+        submitted_at: String::new(),
+    });
+    let mut completed_state = state;
+    completed_state.submissions_received.push("r3".to_string());
+
+    let report = tool.evaluate_round(
+        "T-full-panel",
+        "REV-full-panel",
+        &completed_state,
+        &submissions,
+    );
+
+    assert_eq!(report.outcome, "approved");
+    assert_eq!(report.approval_count, 3);
+}

@@ -223,9 +223,10 @@ lanes:
 
 That's the active roster (shown here Claude-only for brevity). If you also have
 Codex, Gemini, etc. on your `PATH`, `brehon init` writes their launchers and
-lanes too — defined but unused. Bringing one into a two-vote panel is then a
-matter of adding its `*-worker`/`*-reviewer` lane to `roles`/`review` and bumping
-`min_approvals`, not authoring config from scratch.
+lanes too — defined but unused. Bringing one into the review council is then a
+matter of adding its `*-worker`/`*-reviewer` lane to `roles`/`review` and keeping
+`min_approvals` equal to the seated panel size, not authoring config from
+scratch.
 
 Panel composition, worker pool sizing, review scoring policy, routing, research,
 and budget caps all live under their respective sections. **Every one of them is

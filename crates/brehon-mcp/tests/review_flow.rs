@@ -973,7 +973,7 @@ async fn test_submit_review_rejects_unsupported_negative_and_allows_same_reviewe
 }
 
 #[tokio::test]
-async fn test_persisted_unsupported_negative_review_does_not_block_two_valid_approvals() {
+async fn test_persisted_unsupported_negative_review_blocks_full_panel_approval() {
     let _lock = ENV_LOCK.lock().unwrap();
     let env = TestEnv::new();
     env.write_session("reviewer-gamma", "reviewer", Some("opencode"));
@@ -1036,6 +1036,7 @@ async fn test_persisted_unsupported_negative_review_does_not_block_two_valid_app
     state["submissions_received"] = serde_json::json!(["reviewer-gamma"]);
     std::fs::write(&state_path, serde_json::to_string_pretty(&state).unwrap()).unwrap();
 
+    let mut final_submit_json = serde_json::Value::Null;
     for reviewer in ["reviewer-alpha", "reviewer-beta"] {
         std::env::set_var("BREHON_AGENT_NAME", reviewer);
         std::env::set_var("BREHON_AGENT_ROLE", "reviewer");
@@ -1051,14 +1052,19 @@ async fn test_persisted_unsupported_negative_review_does_not_block_two_valid_app
             .await
             .unwrap();
         assert!(submit.is_error.is_none(), "{}", extract_text(&submit));
+        final_submit_json = parse_result(&submit);
     }
+
+    assert_eq!(final_submit_json["outcome"], "changes_requested");
+    assert_eq!(final_submit_json["panel_progress"], "3/3");
 
     let consolidated_path = round_dir.join("consolidated.json");
     let consolidated: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(consolidated_path).unwrap()).unwrap();
-    assert_eq!(consolidated["outcome"], "approved");
+    assert_eq!(consolidated["outcome"], "changes_requested");
     assert_eq!(consolidated["approval_count"], 2);
     assert_eq!(consolidated["min_score"], 8);
+    assert_eq!(consolidated["threshold_result"], "ChangesRequested");
     assert_eq!(
         consolidated["scores"]["reviewer-gamma"]["ignored_for_threshold"],
         true
@@ -1066,7 +1072,7 @@ async fn test_persisted_unsupported_negative_review_does_not_block_two_valid_app
     assert!(consolidated["threshold_reason"]
         .as_str()
         .unwrap()
-        .contains("ignoring 1 unsupported negative review"));
+        .contains("reviewer-gamma"));
     assert!(consolidated["dissent"]
         .as_array()
         .unwrap()

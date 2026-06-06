@@ -14,9 +14,9 @@ use std::{collections::HashSet, sync::LazyLock};
 use brehon_adapter_sdk::harness::{
     builtin_cli_from_launcher_shape, HarnessControlPlane, HarnessTransport, SupervisorCli,
 };
-use brehon_types::config::ContextCompressionMode;
 #[cfg(test)]
 use brehon_types::config::ContextCompressionTarget;
+use brehon_types::config::{ContextCompressionMode, ReviewPanelMode};
 use brehon_types::{
     BrehonConfig, PermissionProfile, ResearchPermissions, RoleKind, RuntimeTerminalHostKind,
     RuntimeTerminalHostPaneOwnership,
@@ -1564,6 +1564,31 @@ fn validate_review_thresholds(config: &BrehonConfig) -> Vec<ValidationWarning> {
         ));
     }
 
+    let configured_panel_size = config
+        .review
+        .panels
+        .iter()
+        .map(|panel| panel.reviewers.len())
+        .max()
+        .filter(|size| *size > 0)
+        .or_else(|| {
+            (config.review.panel_mode == ReviewPanelMode::FullCouncil
+                && !config.review.default_reviewers.is_empty())
+            .then_some(config.review.default_reviewers.len())
+        });
+
+    if let Some(panel_size) = configured_panel_size {
+        if panel_size > policy.min_approvals as usize {
+            warnings.push(ValidationWarning::non_fatal(
+                ValidationWarningKind::ReviewPolicyConflict,
+                format!(
+                    "full-council/configured review panel has {panel_size} reviewer(s) but min_approvals is {}; Brehon requires every seated panel reviewer to approve, so raise min_approvals to {panel_size} to keep the config explicit",
+                    policy.min_approvals
+                ),
+            ));
+        }
+    }
+
     if policy.max_review_rounds < 1 {
         warnings.push(ValidationWarning::new(
             ValidationWarningKind::InvalidReviewThreshold,
@@ -2054,6 +2079,44 @@ mod tests {
             warnings.is_empty(),
             "Expected no warnings, got: {:?}",
             warnings
+        );
+    }
+
+    #[test]
+    fn review_policy_warns_when_full_panel_exceeds_min_approvals() {
+        let mut config = minimal_valid_config();
+        config.lanes.insert(
+            "reviewer-2".to_string(),
+            LaneConfig {
+                launcher: "codex".to_string(),
+                model: None,
+                reasoning_effort: None,
+                system_prompt: None,
+                profile: None,
+            },
+        );
+        config.roles.reviewers.push(ReviewerPoolConfig {
+            lane: "reviewer-2".into(),
+            model: None,
+            reasoning_effort: None,
+            system_prompt: None,
+            min: 1,
+            max: 1,
+        });
+        config.review.policy.min_approvals = 1;
+        config.review.panels[0].reviewers = vec!["codex".into(), "reviewer-2".into()];
+
+        let warnings = validate(&config);
+        let policy_warning = warnings
+            .iter()
+            .find(|warning| warning.kind == ValidationWarningKind::ReviewPolicyConflict)
+            .expect("expected panel/min_approvals mismatch warning");
+        assert!(!policy_warning.is_fatal);
+        assert!(
+            policy_warning.message.contains("2 reviewer(s)")
+                && policy_warning.message.contains("min_approvals is 1"),
+            "{}",
+            policy_warning.message
         );
     }
 

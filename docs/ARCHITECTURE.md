@@ -238,7 +238,9 @@ The flow during a review round:
      with file + line + suggestion.
 5. `ScoreCollector` accumulates submissions. When the panel is complete,
    `ThresholdEvaluator` applies the policy (`min_average`, `min_individual`,
-   max blocking severity, `min_approvals`).
+   max blocking severity, `min_approvals`). Full-council/configured panels
+   additionally require every seated reviewer to approve before the report can
+   consolidate as approved.
 6. If the threshold is met, the supervisor performs the integration
    (cherry-pick to the epic branch via `brehon-git`).
 7. If not, the task transitions to `ChangesRequested`; the same panel is

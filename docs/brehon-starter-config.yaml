@@ -229,7 +229,8 @@ lanes:
   # uncomment this lane, then uncomment the matching `codex-reviewer` lines
   # under `roles.reviewers`, `review.default_reviewers`, and
   # `review.panels[0].reviewers`. Also raise `review.policy.min_approvals` to 3
-  # if you want all three reviewers to approve.
+  # so the config matches the full-council requirement that every seated
+  # reviewer approve.
   #
   # codex-reviewer:
   #   launcher: codex
