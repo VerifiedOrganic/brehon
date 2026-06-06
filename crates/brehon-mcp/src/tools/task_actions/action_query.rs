@@ -35,6 +35,9 @@ use super::paths::{brehon_root_dir, project_root};
 use super::persistence::{read_all_tasks, read_task, write_task};
 use super::structured_spec::control_plane_scope_issue_for_task;
 
+mod ready_closeout;
+mod ready_conflicts;
+
 fn nonempty_json_string(task: &serde_json::Map<String, Value>, key: &str) -> Option<String> {
     task.get(key)
         .and_then(|value| value.as_str())
@@ -673,32 +676,8 @@ fn stalled_changes_requested_entry(
     }))
 }
 
-fn supervisor_integration_conflicts_from_tasks(
-    tasks: &[serde_json::Map<String, Value>],
-) -> Vec<Value> {
-    let mut conflicts: Vec<Value> = tasks
-        .iter()
-        .filter(|task| {
-            let status = task
-                .get("status")
-                .and_then(|value| value.as_str())
-                .unwrap_or("");
-            !is_terminal_task_status(status) && task_has_supervisor_integration_conflict(task)
-        })
-        .cloned()
-        .map(Value::Object)
-        .collect();
-
-    conflicts.sort_by(|a, b| {
-        let a_time = a.get("updated_at").and_then(|v| v.as_str()).unwrap_or("");
-        let b_time = b.get("updated_at").and_then(|v| v.as_str()).unwrap_or("");
-        b_time.cmp(a_time)
-    });
-    conflicts
-}
-
 pub(super) fn read_supervisor_integration_conflicts() -> Vec<Value> {
-    supervisor_integration_conflicts_from_tasks(&read_all_tasks())
+    ready_conflicts::supervisor_integration_conflicts_from_tasks(&read_all_tasks())
 }
 
 pub(super) fn sanitize_task_for_agent(
@@ -1028,7 +1007,10 @@ pub(super) async fn execute_ready(args: &Value) -> Result<ToolResult, McpError> 
         None => None,
     };
     let active_worker_assignment_conflicts = active_worker_assignment_conflicts(&all_tasks);
-    let integration_conflict_tasks = supervisor_integration_conflicts_from_tasks(&all_tasks);
+    let integration_conflict_tasks =
+        ready_conflicts::supervisor_integration_conflicts_from_tasks(&all_tasks);
+    let integrated_closeout_tasks =
+        ready_closeout::integrated_closeout_tasks(&all_tasks, project_config.as_ref());
     let blocked_handoff_tasks: Vec<Value> = all_tasks
         .iter()
         .filter(|t| !task_has_supervisor_integration_conflict(t))
@@ -1143,6 +1125,9 @@ pub(super) async fn execute_ready(args: &Value) -> Result<ToolResult, McpError> 
             if task_has_supervisor_integration_conflict(t) {
                 return false;
             }
+            if ready_closeout::is_integrated_closeout_candidate(t) {
+                return false;
+            }
             if status != "approved" || task_type != "task" || completion_mode != "merge" {
                 return false;
             }
@@ -1185,6 +1170,7 @@ pub(super) async fn execute_ready(args: &Value) -> Result<ToolResult, McpError> 
 
     let count = tasks.len();
     let integration_conflict_count = integration_conflict_tasks.len();
+    let integrated_closeout_count = integrated_closeout_tasks.len();
     let blocked_handoff_count = blocked_handoff_tasks.len();
     let recoverable_blocked_count = recoverable_blocked_tasks.len();
     let review_ready_count = review_ready_tasks.len();
@@ -1202,6 +1188,11 @@ pub(super) async fn execute_ready(args: &Value) -> Result<ToolResult, McpError> 
     if integration_conflict_count > 0 {
         priority_notes.push(format!(
             "{integration_conflict_count} supervisor-owned integration conflict(s) require immediate resolution"
+        ));
+    }
+    if integrated_closeout_count > 0 {
+        priority_notes.push(format!(
+            "{integrated_closeout_count} integrated task closeout(s) require finalize-only supervisor integration"
         ));
     }
     if recoverable_blocked_count > 0 {
@@ -1249,6 +1240,8 @@ pub(super) async fn execute_ready(args: &Value) -> Result<ToolResult, McpError> 
                 "action": "conflicts"
             }
         })
+    } else if let Some(action) = ready_closeout::first_next_action(&integrated_closeout_tasks) {
+        action
     } else if recoverable_blocked_count > 0 {
         serde_json::json!({
             "kind": "repair_frontier",
@@ -1342,6 +1335,8 @@ pub(super) async fn execute_ready(args: &Value) -> Result<ToolResult, McpError> 
         "active_worker_assignment_conflict_count": active_worker_assignment_conflict_count,
         "integration_conflict_tasks": integration_conflict_tasks,
         "integration_conflict_count": integration_conflict_count,
+        "integrated_closeout_tasks": integrated_closeout_tasks,
+        "integrated_closeout_count": integrated_closeout_count,
         "blocked_handoff_tasks": blocked_handoff_tasks,
         "blocked_handoff_count": blocked_handoff_count,
         "recoverable_blocked_tasks": recoverable_blocked_tasks,
@@ -1363,6 +1358,8 @@ pub(super) async fn execute_ready(args: &Value) -> Result<ToolResult, McpError> 
                 priority_notes.join("; "),
                 if integration_conflict_count > 0 {
                     "Resolve supervisor-owned integration conflicts before review, integration, or new assignment work."
+                } else if integrated_closeout_count > 0 {
+                    "Finalize integrated closeout tasks before review, integration, or new assignment work."
                 } else if recoverable_blocked_count > 0 {
                     "Recover blocked handoff tasks before declaring the frontier blocked."
                 } else {

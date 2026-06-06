@@ -1569,12 +1569,11 @@ if [ -z "${BREHON_PROTECTED_BRANCH_BYPASS_TOKEN:-}" ]; then
   echo protected bypass token missing >&2
   exit 1
 fi
-brehon_git_common_dir="$(git rev-parse --git-common-dir 2>/dev/null || true)"
-case "$brehon_git_common_dir" in
-  /*) ;;
-  *) brehon_git_common_dir="$(git rev-parse --show-toplevel)/$brehon_git_common_dir" ;;
-esac
-if [ ! -f "$brehon_git_common_dir/brehon/protected-branch-bypass/$BREHON_PROTECTED_BRANCH_BYPASS_TOKEN" ]; then
+if [ -z "${BREHON_PROTECTED_BRANCH_BYPASS_DIR:-}" ]; then
+  echo protected bypass dir missing >&2
+  exit 1
+fi
+if [ ! -f "$BREHON_PROTECTED_BRANCH_BYPASS_DIR/$BREHON_PROTECTED_BRANCH_BYPASS_TOKEN" ]; then
   echo protected bypass lease missing >&2
   exit 1
 fi

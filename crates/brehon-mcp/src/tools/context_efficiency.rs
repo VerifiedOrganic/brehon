@@ -591,7 +591,7 @@ mod tests {
         let script = temp.path().join("headroom-test");
         fs::write(
             &script,
-            "#!/bin/sh\n/usr/bin/sed 's/repeated verbose context/x/g'\n",
+            "#!/bin/sh\n/bin/cat >/dev/null\nprintf '%s\\n' x\n",
         )
         .unwrap();
         let mut permissions = fs::metadata(&script).unwrap().permissions();
@@ -614,7 +614,7 @@ mod tests {
 
         let outcome =
             compact_model_context(&input, &config, ContextCompressionTarget::ReviewHandoff);
-        assert!(outcome.applied);
+        assert!(outcome.applied, "compression was not applied: {outcome:?}");
         assert!(outcome.compressed_tokens < outcome.original_tokens);
         assert!(!outcome.text.contains("repeated verbose context"));
 
