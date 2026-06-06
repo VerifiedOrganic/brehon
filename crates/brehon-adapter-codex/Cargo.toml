@@ -1,6 +1,6 @@
 [package]
 name = "brehon-adapter-codex"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "Codex (OpenAI CLI) adapter for Brehon — implements AgentAdapter for the Codex app-server websocket protocol"
 license = "MIT"

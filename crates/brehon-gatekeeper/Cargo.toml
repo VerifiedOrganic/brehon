@@ -1,6 +1,6 @@
 [package]
 name = "brehon-gatekeeper"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "Epic-level gating pipeline for Brehon"
 license = "MIT"

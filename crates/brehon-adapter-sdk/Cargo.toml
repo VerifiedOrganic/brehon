@@ -1,6 +1,6 @@
 [package]
 name = "brehon-adapter-sdk"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "SDK for Brehon agent adapters — defines the AgentAdapter trait, shared protocol types, and adapter-level types"
 license = "MIT"
