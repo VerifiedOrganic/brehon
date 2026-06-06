@@ -6,7 +6,7 @@
 
 1464 crates/brehon-acp/src/gateway.rs
 2538 crates/brehon-acp/src/session.rs
-1254 crates/brehon-adapter-agy/src/agy.rs
+959 crates/brehon-adapter-agy/src/agy.rs
 3113 crates/brehon-adapter-codex/src/codex.rs
 1275 crates/brehon-adapter-copilot/src/copilot.rs
 1757 crates/brehon-adapter-gemini/src/gemini.rs
@@ -30,8 +30,8 @@
 1114 crates/brehon-doctor/src/checkers/runtime.rs
 935 crates/brehon-doctor/src/checkers/store_search.rs
 973 crates/brehon-git/src/rebase.rs
-1108 crates/brehon-git/src/recovery.rs
-1356 crates/brehon-git/src/worktree.rs
+1117 crates/brehon-git/src/recovery.rs
+1450 crates/brehon-git/src/worktree.rs
 1797 crates/brehon-host/src/lib.rs
 2528 crates/brehon-mcp/src/tools/agent.rs
 1458 crates/brehon-mcp/src/tools/factory/tool.rs
@@ -67,7 +67,7 @@
 1482 crates/brehon-native-agent/src/tools.rs
 1629 crates/brehon-orchestrator/src/orchestrator.rs
 947 crates/brehon-pty/src/pty/core.rs
-3547 crates/brehon-pty/src/pty/mod.rs
+3554 crates/brehon-pty/src/pty/mod.rs
 916 crates/brehon-recording/src/reader.rs
 1053 crates/brehon-review/src/coordinator.rs
 2751 crates/brehon-store-fjall/src/store.rs
