@@ -219,6 +219,62 @@ pub(crate) fn agent_is_marked_unavailable(agent_name: &str) -> bool {
     value.get("status").and_then(|status| status.as_str()) == Some("unavailable")
 }
 
+pub(crate) fn write_agy_health_marker(pane: &crate::pane::Pane, reason: &str, error: &str) {
+    let last_delivery = pane
+        .last_prompt_delivery_attempt
+        .map(|inst| {
+            let elapsed = std::time::Instant::now().saturating_duration_since(inst);
+            chrono::Utc::now()
+                .checked_sub_signed(
+                    chrono::Duration::from_std(elapsed)
+                        .unwrap_or_else(|_| chrono::Duration::zero()),
+                )
+                .map(|t| t.to_rfc3339())
+        })
+        .flatten();
+
+    let last_mcp = pane
+        .last_successful_mcp_call
+        .map(|inst| {
+            let elapsed = std::time::Instant::now().saturating_duration_since(inst);
+            chrono::Utc::now()
+                .checked_sub_signed(
+                    chrono::Duration::from_std(elapsed)
+                        .unwrap_or_else(|_| chrono::Duration::zero()),
+                )
+                .map(|t| t.to_rfc3339())
+        })
+        .flatten();
+
+    let last_output = pane.last_output_at;
+    let last_output_str = {
+        let elapsed = std::time::Instant::now().saturating_duration_since(last_output);
+        chrono::Utc::now()
+            .checked_sub_signed(
+                chrono::Duration::from_std(elapsed).unwrap_or_else(|_| chrono::Duration::zero()),
+            )
+            .map(|t| t.to_rfc3339())
+    };
+
+    write_agent_health_payload_sync(
+        &pane.id,
+        serde_json::json!({
+            "agent": pane.id,
+            "status": "unavailable",
+            "reason": reason,
+            "error": error,
+            "restart_count": pane.restart_count,
+            "last_restart_reason": pane.last_restart_reason,
+            "last_prompt_delivery_attempt": last_delivery,
+            "last_successful_mcp_call": last_mcp,
+            "last_output_at": last_output_str,
+            "current_generation": pane.current_generation.0,
+            "blocked_dead_unavailable_reason": pane.blocked_dead_unavailable_reason,
+            "updated_at": chrono::Utc::now().to_rfc3339(),
+        }),
+    );
+}
+
 // ── impl Mux stability methods ──────────────────────────────────────────────
 
 impl Mux {

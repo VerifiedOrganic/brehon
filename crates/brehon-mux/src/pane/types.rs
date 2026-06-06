@@ -331,6 +331,20 @@ pub struct Pane {
     pub(crate) task_context: Option<TaskContextSnapshot>,
     /// Review context snapshot for reviewer panes.
     pub(crate) review_context: Option<ReviewContextSnapshot>,
+    /// Last prompt delivery attempt time
+    pub(crate) last_prompt_delivery_attempt: Option<Instant>,
+    /// Last successful MCP helper call time
+    pub(crate) last_successful_mcp_call: Option<Instant>,
+    /// Number of restarts/recycles
+    pub(crate) restart_count: u32,
+    /// Reason for the last restart/recycle
+    pub(crate) last_restart_reason: Option<String>,
+    /// Reason why the pane is blocked, dead, or unavailable
+    pub(crate) blocked_dead_unavailable_reason: Option<String>,
+    /// Last restart time
+    pub(crate) last_restart_at: Option<Instant>,
+    /// Number of consecutive crashes without a successful recovery period
+    pub(crate) consecutive_crashes: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

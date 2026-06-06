@@ -507,6 +507,28 @@ impl McpServer {
                         role = %caller.role,
                         "MCP tool call completed"
                     );
+                    if let Ok(brehon_root) = std::env::var("BREHON_ROOT") {
+                        let agent_file_name = caller
+                            .agent_name
+                            .chars()
+                            .map(|ch| {
+                                if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                                    ch
+                                } else {
+                                    '_'
+                                }
+                            })
+                            .collect::<String>();
+                        let path = std::path::PathBuf::from(brehon_root)
+                            .join("runtime")
+                            .join("last-successful-mcp")
+                            .join(agent_file_name);
+                        if let Some(parent) = path.parent() {
+                            let _ = std::fs::create_dir_all(parent);
+                        }
+                        let now = chrono::Utc::now().to_rfc3339();
+                        let _ = std::fs::write(&path, now);
+                    }
                 }
                 result
             }

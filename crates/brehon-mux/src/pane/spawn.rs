@@ -978,6 +978,13 @@ impl Pane {
             permission_resolution_fallback_until: None,
             task_context: None,
             review_context: None,
+            last_prompt_delivery_attempt: None,
+            last_successful_mcp_call: None,
+            restart_count: 0,
+            last_restart_reason: None,
+            blocked_dead_unavailable_reason: None,
+            last_restart_at: None,
+            consecutive_crashes: 0,
         };
         pane.arm_claude_inbox_nudge_grace_period();
         Ok(pane)
@@ -996,6 +1003,14 @@ impl Pane {
 
     pub(crate) fn set_pty_spawn_config(&mut self, config: PtyConfig) {
         self.pty_spawn_config = Some(config);
+    }
+
+    pub(crate) fn is_agy(&self) -> bool {
+        match &self.cli_type {
+            AgentAdapter::BuiltIn(cli) => *cli == SupervisorCli::Agy,
+            AgentAdapter::BuiltInOverride(cfg) => cfg.cli == SupervisorCli::Agy,
+            AgentAdapter::Custom(_) => false,
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1844,7 +1859,8 @@ impl Pane {
                     worker_cli_str,
                     model,
                     teams,
-                );
+                )
+                .map_err(Error::pty)?;
                 apply_runtime_session_name(&mut config.env, session_name);
                 apply_configured_agent_type(&mut config, configured_agent_type);
                 merge_launcher_env(&mut config.env, launcher_env);
@@ -2602,7 +2618,8 @@ impl Pane {
             }
             SupervisorCli::Agy => {
                 let mut config =
-                    PtyConfig::agy(name, role, cwd, brehon_root, None, None, model, teams);
+                    PtyConfig::agy(name, role, cwd, brehon_root, None, None, model, teams)
+                        .map_err(Error::pty)?;
                 apply_runtime_session_name(&mut config.env, session_name);
                 apply_configured_agent_type(&mut config, configured_agent_type);
                 merge_launcher_env(&mut config.env, launcher_env);
@@ -3107,7 +3124,8 @@ impl Pane {
                     Some(worker_cli_str),
                     model,
                     teams,
-                );
+                )
+                .map_err(Error::pty)?;
                 apply_runtime_session_name(&mut config.env, session_name);
                 apply_configured_agent_type(&mut config, configured_agent_type);
                 merge_launcher_env(&mut config.env, launcher_env);

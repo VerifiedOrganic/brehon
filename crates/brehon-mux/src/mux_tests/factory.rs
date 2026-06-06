@@ -262,6 +262,8 @@ fn test_factory_uses_panesmith_for_all_interactive_pty_roles() {
 
 #[test]
 fn test_factory_uses_panesmith_for_agy_interactive_pty_roles() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _env = ScopedEnv::set(&[("BREHON_SKIP_PREFLIGHT", "1")]);
     let project_root = super::fresh_temp_dir("brehon-mux-panesmith-agy-roles");
     let config = MuxConfig {
         cwd: project_root,

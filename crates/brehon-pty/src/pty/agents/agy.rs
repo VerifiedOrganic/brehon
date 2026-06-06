@@ -18,7 +18,7 @@ impl PtyConfig {
         factory_worker_cli: Option<&str>,
         model: Option<&str>,
         _teams: Option<&TeamsSpawnConfig>,
-    ) -> Self {
+    ) -> Result<Self, String> {
         let params = brehon_adapter_agy::AgySpawnParams {
             name: name.to_string(),
             role: role.to_string(),
@@ -34,14 +34,19 @@ impl PtyConfig {
         };
 
         let config = brehon_adapter_agy::AgySessionConfig::from_params(&params);
+        brehon_adapter_agy::agy::run_preflight_checks(
+            config.cwd.as_deref().unwrap_or(&params.cwd),
+            &config.command,
+            params.brehon_root.as_ref(),
+        )?;
 
-        Self {
+        Ok(Self {
             command: config.command,
             args: config.args,
             cwd: config.cwd,
             env: config.env,
             rows: config.rows,
             cols: config.cols,
-        }
+        })
     }
 }
