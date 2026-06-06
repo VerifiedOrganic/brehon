@@ -22,9 +22,7 @@ use tracing::{debug, warn};
 const PROMPT_RESULT_POLL_MS: u64 = 50;
 const AGY_SESSION_COMPLETE_KEY: &str = "_session_complete";
 const AGY_PROJECT_MCP_CONFIG_PATH: &str = ".agents/mcp_config.json";
-const AGY_BREHON_MCP_CLIENT_PATH: &str = ".antigravitycli/brehon_mcp_client.py";
 const AGY_PREFLIGHT_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
-const AGY_PREFLIGHT_HELPER_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// Error type for Agy adapter operations.
 #[derive(Debug, thiserror::Error)]
@@ -118,7 +116,6 @@ impl AgySessionConfig {
         ));
         let brehon_exe = current_brehon_exe();
         configure_mcp_in_workspace(&params.cwd, &brehon_exe, &env);
-        write_brehon_mcp_client_helper(&params.cwd, &brehon_exe, &env);
 
         let mut args = Vec::new();
         if params.allow_privileged_mode {
@@ -130,32 +127,32 @@ impl AgySessionConfig {
             let startup_prompt = build_worker_startup_prompt(
                 &params.name,
                 params.supervisor_name.as_deref().unwrap_or("supervisor"),
-                "agent",
-                "task",
+                "mcp_brehon_agent",
+                "mcp_brehon_task",
                 project_policy.as_deref(),
             );
             args.push("--prompt-interactive".to_string());
-            args.push(with_agy_mcp_usage_guidance(startup_prompt));
+            args.push(startup_prompt);
         } else if params.role == "supervisor" {
             let project_policy = project_policy_for_role(params.brehon_root.as_ref(), &params.role);
             let startup_prompt = build_supervisor_startup_prompt(
                 &params.name,
-                "agent",
-                "task",
+                "mcp_brehon_agent",
+                "mcp_brehon_task",
                 project_policy.as_deref(),
             );
             args.push("--prompt-interactive".to_string());
-            args.push(with_agy_mcp_usage_guidance(startup_prompt));
+            args.push(startup_prompt);
         } else if params.role == "reviewer" {
             let project_policy = project_policy_for_role(params.brehon_root.as_ref(), &params.role);
             let startup_prompt = build_reviewer_startup_prompt(
                 &params.name,
-                "agent",
-                "verification",
+                "mcp_brehon_agent",
+                "mcp_brehon_verification",
                 project_policy.as_deref(),
             );
             args.push("--prompt-interactive".to_string());
-            args.push(with_agy_mcp_usage_guidance(startup_prompt));
+            args.push(startup_prompt);
         }
 
         Self {
@@ -250,29 +247,6 @@ fn push_process_brehon_env_defaults(env: &mut Vec<(String, String)>) {
     }
 }
 
-fn with_agy_mcp_usage_guidance(startup_prompt: String) -> String {
-    format!(
-        "Antigravity MCP usage for this Brehon session:\n\
-         - Brehon is available through the local helper \
-           `.antigravitycli/brehon_mcp_client.py`.\n\
-         - Antigravity CLI currently rejects guessed native MCP tool-call names such as `task`, \
-           `brehon:task`, `brehon__task`, `mcp_brehon_task`, and `mcp__brehon__task`. Do not \
-           attempt those tool names.\n\
-         - Use shell commands that invoke the helper with `python3`. For example: \
-           `python3 .antigravitycli/brehon_mcp_client.py agent \
-           '{{\"action\":\"message\",\"target\":\"<supervisor>\",\"message\":\"ready\"}}'` or \
-           `python3 .antigravitycli/brehon_mcp_client.py task '{{\"action\":\"mine\"}}'`.\n\
-         - If the helper fails, report that as an infrastructure error to the supervisor instead \
-           of exploring Antigravity internals.\n\
-         - Do not inspect `~/.gemini/antigravity-cli/mcp/` JSON descriptor files or `.mcp.json` \
-           while trying to discover Brehon tools; those descriptors are only Antigravity's MCP cache.\n\n\
-         - Do not inspect `~/.gemini/antigravity-cli/scratch/`, \
-           `~/.gemini/antigravity-cli/worktrees/`, or Antigravity helper scripts such as \
-           `mcp_client.py`; they are CLI internals, not the Brehon control plane.\n\n\
-         {startup_prompt}"
-    )
-}
-
 fn configure_mcp_in_workspace(workspace: &Path, exe: &str, env: &[(String, String)]) {
     if cfg!(test) {
         return;
@@ -289,214 +263,6 @@ fn configure_project_mcp_config(workspace: &Path, exe: &str, env: &[(String, Str
         &path,
         desired_agy_mcp_config_for_workspace(exe, workspace, env),
     );
-}
-
-fn write_brehon_mcp_client_helper(workspace: &Path, exe: &str, env: &[(String, String)]) {
-    if cfg!(test) {
-        return;
-    }
-    let path = workspace.join(AGY_BREHON_MCP_CLIENT_PATH);
-    if let Err(err) = write_brehon_mcp_client_helper_at(&path, workspace, exe, env) {
-        warn!(
-            path = %path.display(),
-            "failed to write Agy Brehon MCP helper: {err}"
-        );
-    }
-}
-
-fn write_brehon_mcp_client_helper_at(
-    path: &Path,
-    workspace: &Path,
-    exe: &str,
-    env: &[(String, String)],
-) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let helper = render_brehon_mcp_client_helper(exe, workspace, env);
-    std::fs::write(path, helper)?;
-    Ok(())
-}
-
-fn render_brehon_mcp_client_helper(
-    exe: &str,
-    workspace: &Path,
-    env: &[(String, String)],
-) -> String {
-    let env_json = serde_json::Value::Object(brehon_mcp_env_map(env));
-    format!(
-        r#"#!/usr/bin/env python3
-import json
-import os
-import subprocess
-import sys
-import select
-import time
-
-BREHON_COMMAND = {command}
-BREHON_ARGS = ["serve"]
-BREHON_CWD = {cwd}
-BREHON_ENV = {env}
-
-INITIALIZE_TIMEOUT = 10.0
-CALL_TIMEOUT = 30.0
-SHUTDOWN_TIMEOUT = 5.0
-
-def usage():
-    print("Usage: brehon_mcp_client.py <tool_name> [arguments_json]", file=sys.stderr)
-    sys.exit(2)
-
-def send(proc, message):
-    proc.stdin.write(json.dumps(message) + "\n")
-    proc.stdin.flush()
-
-def read_available_stderr(proc):
-    try:
-        r, _, _ = select.select([proc.stderr], [], [], 0.5)
-        if not r:
-            return ""
-        return os.read(proc.stderr.fileno(), 4096).decode(errors="replace")
-    except Exception:
-        return ""
-
-def recv(proc, timeout_sec):
-    rlist, _, _ = select.select([proc.stdout], [], [], timeout_sec)
-    if not rlist:
-        proc.poll()
-        stderr = read_available_stderr(proc)
-        raise RuntimeError(f"Timeout waiting for response (timeout={{timeout_sec}}s). Exit code: {{proc.returncode}}. Stderr: {{stderr}}")
-    line = proc.stdout.readline()
-    if not line:
-        stderr = read_available_stderr(proc)
-        raise RuntimeError(f"Brehon MCP server closed stdout before replying. Exit code: {{proc.returncode}}. Stderr: {{stderr}}")
-    try:
-        return json.loads(line)
-    except Exception as err:
-        raise RuntimeError(f"Malformed JSON from server: {{err}}. Line: {{line}}")
-
-def tool_result_is_error(message):
-    result = message.get("result") if isinstance(message, dict) else None
-    return isinstance(result, dict) and result.get("isError") is True
-
-def safe_file_name(value):
-    return "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in value)
-
-def marker_path(kind):
-    root = BREHON_ENV.get("BREHON_ROOT") or os.environ.get("BREHON_ROOT")
-    agent = BREHON_ENV.get("BREHON_AGENT_NAME") or os.environ.get("BREHON_AGENT_NAME")
-    if not root or not agent:
-        return None
-    return os.path.join(root, "runtime", kind, safe_file_name(agent))
-
-def write_inflight_marker(tool_name):
-    path = marker_path("mcp-helper-inflight")
-    if not path:
-        return
-    try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        payload = {{
-            "agent": BREHON_ENV.get("BREHON_AGENT_NAME"),
-            "tool": tool_name,
-            "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        }}
-        with open(path, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle)
-    except Exception:
-        pass
-
-def clear_inflight_marker():
-    path = marker_path("mcp-helper-inflight")
-    if not path:
-        return
-    try:
-        os.remove(path)
-    except FileNotFoundError:
-        pass
-    except Exception:
-        pass
-
-def main():
-    if len(sys.argv) < 2:
-        usage()
-    tool_name = sys.argv[1]
-    raw_args = " ".join(sys.argv[2:]).strip() if len(sys.argv) > 2 else "{{}}"
-    try:
-        arguments = json.loads(raw_args or "{{}}")
-    except Exception as err:
-        print(f"invalid arguments JSON: {{err}}", file=sys.stderr)
-        sys.exit(2)
-
-    child_env = os.environ.copy()
-    child_env.update(BREHON_ENV)
-    write_inflight_marker(tool_name)
-    try:
-        proc = subprocess.Popen(
-            [BREHON_COMMAND] + BREHON_ARGS,
-            cwd=BREHON_CWD,
-            env=child_env,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
-        )
-    except Exception as e:
-        clear_inflight_marker()
-        print(f"Failed to spawn Brehon MCP process: {{e}}", file=sys.stderr)
-        sys.exit(1)
-
-    try:
-        send(proc, {{
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "initialize",
-            "params": {{
-                "protocolVersion": "2024-11-05",
-                "capabilities": {{}},
-                "clientInfo": {{"name": "brehon-agy-helper", "version": "1.0"}},
-            }},
-        }})
-        init_res = recv(proc, INITIALIZE_TIMEOUT)
-        if "error" in init_res:
-            err = init_res["error"]
-            print(f"MCP server initialization failed: {{err.get('message', err)}}", file=sys.stderr)
-            sys.exit(1)
-
-        send(proc, {{"jsonrpc": "2.0", "method": "notifications/initialized"}})
-        send(proc, {{
-            "jsonrpc": "2.0",
-            "id": 2,
-            "method": "tools/call",
-            "params": {{"name": tool_name, "arguments": arguments}},
-        }})
-        result = recv(proc, CALL_TIMEOUT)
-        print(json.dumps(result, indent=2))
-        if "error" in result:
-            err = result["error"]
-            print(f"MCP server error: {{err.get('message', err)}}", file=sys.stderr)
-            sys.exit(1)
-        if tool_result_is_error(result):
-            print("MCP tool call returned error in result", file=sys.stderr)
-            sys.exit(1)
-    except Exception as err:
-        print(f"Error: {{err}}", file=sys.stderr)
-        sys.exit(1)
-    finally:
-        clear_inflight_marker()
-        proc.terminate()
-        try:
-            proc.wait(timeout=SHUTDOWN_TIMEOUT)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-
-if __name__ == "__main__":
-    main()
-"#,
-        command = serde_json::to_string(exe).unwrap_or_else(|_| "\"brehon\"".to_string()),
-        cwd = serde_json::to_string(&workspace.to_string_lossy().to_string())
-            .unwrap_or_else(|_| "\".\"".to_string()),
-        env = serde_json::to_string_pretty(&env_json).unwrap_or_else(|_| "{}".to_string()),
-    )
 }
 
 fn merge_brehon_mcp_server(path: &Path, brehon_server: serde_json::Value) {
@@ -917,39 +683,7 @@ pub fn run_preflight_checks(
         return Err("MCP config does not contain 'brehon' server".to_string());
     }
 
-    // 3. Verify helper file exists
-    let helper_path = workspace.join(AGY_BREHON_MCP_CLIENT_PATH);
-    if !helper_path.exists() {
-        return Err(format!(
-            "MCP helper file '{}' does not exist",
-            helper_path.display()
-        ));
-    }
-
-    // 4. Verify helper can call a cheap Brehon tool successfully
-    let mut helper_check = Command::new("python3");
-    helper_check
-        .arg(&helper_path)
-        .arg("health")
-        .current_dir(workspace);
-    let output = run_command_with_timeout(
-        "python3 Agy Brehon MCP helper health",
-        helper_check,
-        AGY_PREFLIGHT_HELPER_TIMEOUT,
-    )
-    .map_err(|err| format!("Failed to execute python3 helper: {err}"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        return Err(format!(
-            "MCP helper call to 'health' failed with exit code {:?}.\nStdout: {}\nStderr: {}",
-            output.status.code(),
-            stdout.trim(),
-            stderr.trim()
-        ));
-    }
-
-    // 5. Verify trust-folder config was written or failure is surfaced clearly
+    // 3. Verify trust-folder config was written or failure is surfaced clearly
     let home = std::env::var("HOME")
         .map(PathBuf::from)
         .map_err(|_| "HOME environment variable not set".to_string())?;

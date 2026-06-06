@@ -220,7 +220,13 @@ pub(super) fn inspect_worktree(worker_name: &str, merge_target: Option<&str>) ->
     let mut opts = git2::StatusOptions::new();
     opts.include_untracked(true);
     if let Ok(statuses) = repo.statuses(Some(&mut opts)) {
-        dirty_count = statuses.len() as u32;
+        dirty_count = statuses
+            .iter()
+            .filter(|entry| match entry.path() {
+                Some(path) => !brehon_git::is_brehon_local_scaffold_path(path),
+                None => true,
+            })
+            .count() as u32;
     }
 
     let reassignment_safe = dirty_count == 0;

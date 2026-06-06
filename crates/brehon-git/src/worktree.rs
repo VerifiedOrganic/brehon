@@ -7,6 +7,7 @@ use git2::{BranchType, Repository, RepositoryState};
 use tracing::{debug, warn};
 
 use crate::error::GitError;
+use crate::is_brehon_local_scaffold_path;
 use crate::recovery::RecoveryOps;
 
 pub struct CleanupReport {
@@ -868,6 +869,9 @@ fn tracked_dirty_files(repo: &Repository) -> Result<Vec<String>, GitError> {
             | git2::Status::WT_TYPECHANGE
             | git2::Status::CONFLICTED => {
                 if let Some(path) = entry.path() {
+                    if is_brehon_local_scaffold_path(path) {
+                        continue;
+                    }
                     files.push(path.to_string());
                 }
             }
@@ -943,6 +947,24 @@ mod tests {
         let root = temp_dir.path().join(".brehon").join("worktrees");
         std::fs::create_dir_all(&root).expect("failed to create test worktree root");
         root.join(name)
+    }
+
+    fn commit_paths(repo: &Repository, paths: &[&str], message: &str) {
+        let sig = git2::Signature::now("Test", "test@example.com").expect("failed to create sig");
+        let mut index = repo.index().expect("failed to get index");
+        for path in paths {
+            index.add_path(Path::new(path)).expect("failed to add path");
+        }
+        index.write().expect("failed to write index");
+        let oid = index.write_tree().expect("failed to write tree");
+        let tree = repo.find_tree(oid).expect("failed to find tree");
+        let parent = repo
+            .head()
+            .expect("failed to read head")
+            .peel_to_commit()
+            .expect("failed to peel head");
+        repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &[&parent])
+            .expect("failed to commit paths");
     }
 
     #[test]
@@ -1255,6 +1277,78 @@ mod tests {
         assert!(
             matches!(state, WorktreeStateCheck::Dirty { .. }),
             "Dirty worktree should be reported as dirty, got: {:?}",
+            state
+        );
+    }
+
+    #[test]
+    fn worktree_state_check_ignores_brehon_local_scaffold() {
+        let (temp_dir, repo) = setup_test_repo();
+        std::fs::create_dir_all(temp_dir.path().join(".agents"))
+            .expect("failed to create agents dir");
+        std::fs::create_dir_all(temp_dir.path().join(".claude"))
+            .expect("failed to create claude dir");
+        std::fs::write(temp_dir.path().join(".mcp.json"), "{}\n")
+            .expect("failed to write mcp config");
+        std::fs::write(temp_dir.path().join(".agents/mcp_config.json"), "{}\n")
+            .expect("failed to write agy config");
+        std::fs::write(temp_dir.path().join("opencode.json"), "{}\n")
+            .expect("failed to write opencode config");
+        std::fs::write(temp_dir.path().join(".claude/settings.local.json"), "{}\n")
+            .expect("failed to write claude settings");
+        commit_paths(
+            &repo,
+            &[
+                ".mcp.json",
+                ".agents/mcp_config.json",
+                "opencode.json",
+                ".claude/settings.local.json",
+            ],
+            "track local scaffold",
+        );
+
+        let ops = WorktreeOps::new(&repo);
+        let branch_name = format!("test-{}", uuid::Uuid::new_v4());
+        let worktree_path = test_worktree_path(&temp_dir, "scaffold-only-worktree");
+        ops.create_worktree(&branch_name, &worktree_path)
+            .expect("create should succeed");
+
+        std::fs::write(worktree_path.join(".mcp.json"), "{\"brehon\":true}\n")
+            .expect("failed to rewrite mcp config");
+        std::fs::write(
+            worktree_path.join(".agents/mcp_config.json"),
+            "{\"brehon\":true}\n",
+        )
+        .expect("failed to rewrite agy config");
+        std::fs::write(worktree_path.join("opencode.json"), "{\"brehon\":true}\n")
+            .expect("failed to rewrite opencode config");
+        std::fs::write(
+            worktree_path.join(".claude/settings.local.json"),
+            "{\"permissions\":{}}\n",
+        )
+        .expect("failed to rewrite claude settings");
+        std::fs::create_dir_all(worktree_path.join(".antigravitycli"))
+            .expect("failed to create agy local dir");
+        std::fs::write(worktree_path.join(".antigravitycli/cache.json"), "{}\n")
+            .expect("failed to write agy local state");
+
+        let state = ops
+            .worktree_state_check(&worktree_path)
+            .expect("state check should succeed");
+        assert_eq!(
+            state,
+            WorktreeStateCheck::Clean,
+            "Brehon local scaffold should not dirty worktree"
+        );
+
+        std::fs::write(worktree_path.join("new_file.txt"), "real work\n")
+            .expect("failed to write real work");
+        let state = ops
+            .worktree_state_check(&worktree_path)
+            .expect("state check should succeed");
+        assert!(
+            matches!(state, WorktreeStateCheck::Dirty { .. }),
+            "Real work should still dirty worktree, got: {:?}",
             state
         );
     }

@@ -2399,10 +2399,17 @@ key = "oauth/kimi-code"
             config.args.first().map(String::as_str),
             Some("--dangerously-skip-permissions")
         );
-        assert_eq!(
-            config.args.get(1).map(String::as_str),
-            Some("--prompt-interactive")
-        );
+        let prompt_index = config
+            .args
+            .iter()
+            .position(|arg| arg == "--prompt-interactive")
+            .expect("prompt-interactive flag");
+        let prompt = config
+            .args
+            .get(prompt_index + 1)
+            .expect("startup prompt follows prompt-interactive");
+        assert!(prompt.contains("mcp_brehon_task"));
+        assert!(!prompt.contains("python3"));
     }
 
     #[test]

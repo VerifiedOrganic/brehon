@@ -227,7 +227,9 @@ pub(super) fn non_brehon_status_entries(status: &str) -> Vec<&str> {
         .lines()
         .filter(|line| {
             let path = line.get(3..).unwrap_or("").trim();
-            !path.is_empty() && !path.starts_with(".brehon/")
+            !path.is_empty()
+                && !path.starts_with(".brehon/")
+                && !brehon_git::is_brehon_local_scaffold_path(path)
         })
         .collect()
 }

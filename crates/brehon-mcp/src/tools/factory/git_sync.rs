@@ -356,7 +356,14 @@ pub(super) fn sync_worker_worktree_to_assignment_seed(
             e
         )
     })?;
-    if !statuses.is_empty() {
+    let dirty_entries = statuses
+        .iter()
+        .filter(|entry| match entry.path() {
+            Some(path) => !brehon_git::is_brehon_local_scaffold_path(path),
+            None => true,
+        })
+        .count();
+    if dirty_entries > 0 {
         return Err(format!(
             "Cannot assign task to worker '{}': worktree '{}' is dirty before syncing {} '{}'. Clean or archive it first.",
             worker_name,

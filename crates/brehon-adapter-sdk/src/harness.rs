@@ -392,7 +392,7 @@ impl SupervisorCli {
                 supports_teams: false,
                 one_shot: false,
                 uses_ink_prompt: true,
-                prompt_injection_strategy: PromptInjectionStrategy::InkEcho,
+                prompt_injection_strategy: PromptInjectionStrategy::ImmediateSubmit,
                 tool_prefix: Cow::Borrowed("mcp_brehon_"),
                 transport: HarnessTransport::InteractivePty,
                 preferred_control_plane: HarnessControlPlane::PtyInjection,

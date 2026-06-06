@@ -25,6 +25,7 @@ mod diff;
 mod error;
 mod gitignore;
 mod integration;
+mod local_scaffold;
 mod merge;
 mod ops;
 mod rebase;
@@ -39,6 +40,7 @@ pub use gitignore::{
     WORKTREE_AWARE_BREHON_IGNORE_PATTERNS,
 };
 pub use integration::IntegrationOps;
+pub use local_scaffold::{is_brehon_local_scaffold_path, BREHON_LOCAL_SCAFFOLD_PATHS};
 pub use merge::MergeOps;
 pub use ops::Git2Operations;
 pub use rebase::RebaseOps;

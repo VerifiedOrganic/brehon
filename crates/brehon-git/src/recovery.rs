@@ -7,6 +7,7 @@ use git2::Repository;
 use tracing::{debug, info, warn};
 
 use crate::error::GitError;
+use crate::is_brehon_local_scaffold_path;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum LockfileKind {
@@ -174,6 +175,11 @@ impl<'a> RecoveryOps<'a> {
         let statuses = self.repo.statuses(Some(&mut options))?;
 
         for entry in statuses.iter() {
+            if let Some(path) = entry.path() {
+                if is_brehon_local_scaffold_path(path) {
+                    continue;
+                }
+            }
             match entry.status() {
                 git2::Status::INDEX_NEW
                 | git2::Status::INDEX_MODIFIED
@@ -217,6 +223,9 @@ impl<'a> RecoveryOps<'a> {
                 | git2::Status::WT_TYPECHANGE
                 | git2::Status::CONFLICTED => {
                     if let Some(path) = entry.path() {
+                        if is_brehon_local_scaffold_path(path) {
+                            continue;
+                        }
                         files.push(path.to_string());
                     }
                 }
