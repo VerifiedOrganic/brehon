@@ -1018,7 +1018,7 @@ impl Mux {
                 Ok(Some(outcome)) => {
                     if outcome.is_success() {
                         if let Some(pane) = self.panes.get_mut(pane_id)
-                            && pane.is_agy()
+                            && pane.is_agy_or_opencode_supervisor()
                         {
                             pane.last_prompt_delivery_attempt = Some(Instant::now());
                         }
@@ -1085,7 +1085,7 @@ impl Mux {
             }
             let pane_id = pane_id.to_string();
             if let Some(pane) = self.panes.get_mut(&pane_id)
-                && pane.is_agy()
+                && pane.is_agy_or_opencode_supervisor()
             {
                 pane.last_prompt_delivery_attempt = Some(Instant::now());
             }
@@ -1295,7 +1295,7 @@ impl Mux {
         {
             super::panesmith::ensure_panesmith_mux_outcome("prompt transaction", &outcome)?;
             if let Some(pane) = self.panes.get_mut(pane_id)
-                && pane.is_agy()
+                && pane.is_agy_or_opencode_supervisor()
             {
                 pane.last_prompt_delivery_attempt = Some(Instant::now());
             }
@@ -1316,7 +1316,7 @@ impl Mux {
 
         self.inject_unchecked(pane_id, prompt).await?;
         if let Some(pane) = self.panes.get_mut(pane_id)
-            && pane.is_agy()
+            && pane.is_agy_or_opencode_supervisor()
         {
             pane.last_prompt_delivery_attempt = Some(Instant::now());
         }

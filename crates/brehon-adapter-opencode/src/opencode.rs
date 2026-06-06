@@ -795,6 +795,15 @@ async fn run_prompt(
         {
             Ok(result) => result,
             Err(err) if poll_recovery.should_retry(&err) => {
+                let process_alive = {
+                    let guard = inner.process.lock().await;
+                    guard.as_ref().map(|p| p.is_alive()).unwrap_or(true)
+                };
+                if !process_alive {
+                    return Err(OpenCodeError::Http(format!(
+                        "OpenCode server process exited mid-turn; original error: {err}"
+                    )));
+                }
                 sleep(Duration::from_millis(TURN_POLL_RECOVERY_BACKOFF_MS)).await;
                 continue;
             }
@@ -823,6 +832,15 @@ async fn run_prompt(
         let session_busy = match fetch_session_busy(&inner, &session_id).await {
             Ok(session_busy) => session_busy,
             Err(err) if poll_recovery.should_retry(&err) => {
+                let process_alive = {
+                    let guard = inner.process.lock().await;
+                    guard.as_ref().map(|p| p.is_alive()).unwrap_or(true)
+                };
+                if !process_alive {
+                    return Err(OpenCodeError::Http(format!(
+                        "OpenCode server process exited mid-turn; original error: {err}"
+                    )));
+                }
                 sleep(Duration::from_millis(TURN_POLL_RECOVERY_BACKOFF_MS)).await;
                 continue;
             }
@@ -3575,5 +3593,70 @@ mod tests {
             &events[0],
             AdapterEvent::Output { text, .. } if text == " now"
         ));
+    }
+
+    #[tokio::test]
+    async fn test_kill_aborts_active_prompts_and_fences_new_prompts() {
+        let session_id = SessionId::new(uuid::Uuid::new_v4().to_string());
+        let spec = SessionSpec::new(
+            brehon_types::AgentId::new("opencode-worker"),
+            "worker".to_string(),
+            "/tmp".to_string(),
+        );
+        let inner = Arc::new(OpenCodeServerSessionInner {
+            session_id,
+            spec,
+            process: Mutex::new(None),
+            server_url: "http://127.0.0.1:0".to_string(),
+            client: reqwest::Client::new(),
+            auth: None,
+            model: Mutex::new(None),
+            opencode_session_id: Mutex::new(Some("session-1".to_string())),
+            adapter_event_tx: std::sync::Mutex::new(None),
+            active_prompts: Mutex::new(HashMap::new()),
+            prompt_results: Arc::new(Mutex::new(HashMap::new())),
+            tokens_used: AtomicU64::new(0),
+            turn_lock: Mutex::new(()),
+            alive: AtomicBool::new(true),
+            capabilities: AgentCapabilities {
+                content_block_types: vec!["text".to_string()],
+                session_config_options: vec![],
+                permission_support: false,
+                terminal_support: false,
+                tool_call_streaming: brehon_types::ToolCallStreaming::Basic,
+            },
+        });
+        let session = OpenCodeServerSession {
+            inner: inner.clone(),
+            created_at: chrono::Utc::now(),
+        };
+
+        // Add a mock active prompt task
+        let task_handle = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+        inner
+            .active_prompts
+            .lock()
+            .await
+            .insert("prompt-1".to_string(), task_handle);
+
+        assert!(inner.alive.load(Ordering::SeqCst));
+        assert_eq!(inner.active_prompts.lock().await.len(), 1);
+
+        session.kill().await.unwrap();
+
+        assert!(!inner.alive.load(Ordering::SeqCst));
+        assert_eq!(inner.active_prompts.lock().await.len(), 0);
+
+        // Try to send a prompt, should fail with NotRunning
+        let prompt = PromptTurn {
+            prompt_id: brehon_types::PromptId::new("P-2"),
+            content: "hello".to_string(),
+            kind: brehon_types::MessageKind::TaskAssignment,
+            sent_at: chrono::Utc::now(),
+        };
+        let res = session.send_prompt(prompt).await;
+        assert!(matches!(res, Err(OpenCodeError::NotRunning)));
     }
 }

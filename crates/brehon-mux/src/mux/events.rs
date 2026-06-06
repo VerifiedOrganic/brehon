@@ -1392,7 +1392,7 @@ impl Mux {
         for pane_id in pane_ids {
             // 1. Reset Agy crash counter after a stable post-restart window.
             if let Some(pane) = self.panes.get_mut(&pane_id) {
-                if pane.is_agy()
+                if pane.is_agy_or_opencode_supervisor()
                     && !pane.exited
                     && !matches!(pane.pane_state(), Some(PaneState::Dead { .. }))
                     && let Some(last_restart) = pane.last_restart_at
@@ -1405,7 +1405,7 @@ impl Mux {
 
             // 2. Read Agy MCP timestamp file to update observability state.
             if let Some(pane) = self.panes.get_mut(&pane_id) {
-                if pane.is_agy()
+                if pane.is_agy_or_opencode_supervisor()
                     && let Some(last_mcp) =
                         Self::read_successful_mcp_timestamp_as_instant(&pane_id, now)
                 {
@@ -1419,7 +1419,7 @@ impl Mux {
             let mut error_msg = String::new();
 
             if let Some(pane) = self.panes.get(&pane_id) {
-                if pane.is_agy() {
+                if pane.is_agy_or_opencode_supervisor() {
                     // Check if process has exited
                     let is_dead = matches!(
                         pane.pane_state(),

@@ -789,6 +789,17 @@ pub(crate) fn agent_to_adapter(name: &str, config: &BrehonConfig) -> brehon_mux:
     use brehon_types::agent::AdapterKind;
 
     if let Some((cli, has_capability_overrides)) = resolved_builtin_cli(name, config) {
+        let is_supervisor = config.roles.supervisor.name == name;
+        if cli == SupervisorCli::OpenCode && is_supervisor {
+            let mut capabilities = cli.capabilities();
+            if let Some(agent_config) = config.lane_launcher(name) {
+                apply_capability_overrides(&mut capabilities, agent_config);
+            }
+            capabilities.transport = HarnessTransport::InteractivePty;
+            capabilities.preferred_control_plane = HarnessControlPlane::PtyInjection;
+            return AgentAdapter::built_in_with_capabilities(cli, capabilities);
+        }
+
         if !has_capability_overrides {
             return AgentAdapter::BuiltIn(cli);
         }

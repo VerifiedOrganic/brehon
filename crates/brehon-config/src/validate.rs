@@ -1091,6 +1091,26 @@ fn validate_supervisor_terminal_contract(config: &BrehonConfig) -> Vec<Validatio
         return warnings;
     };
 
+    // If it's Opencode, check if it explicitly requests ACP control plane/transport
+    if let Some(cli) = builtin_cli_from_launcher(launcher) {
+        if cli == SupervisorCli::OpenCode {
+            let cp_override = launcher_control_plane_override(launcher).ok().flatten();
+            let tp_override = launcher_transport_override(launcher).ok().flatten();
+            if cp_override == Some(HarnessControlPlane::Acp)
+                || tp_override == Some(HarnessTransport::AppServer)
+            {
+                warnings.push(ValidationWarning::new(
+                    ValidationWarningKind::SupervisorTerminalContract,
+                    format!(
+                        "Supervisor lane '{}' uses launcher '{}' which explicitly configures OpenCode to use ACP control plane/transport (transport={:?}, control_plane={:?}), but supervisors must be PTY-backed.",
+                        supervisor_lane, launcher_name, tp_override, cp_override
+                    ),
+                ));
+                return warnings;
+            }
+        }
+    }
+
     if supervisor_launcher_supports_pty(launcher) {
         return warnings;
     }
@@ -2443,6 +2463,53 @@ rooms:
         assert!(!warnings
             .iter()
             .any(|warning| warning.kind == ValidationWarningKind::SupervisorTerminalContract));
+    }
+
+    #[test]
+    fn supervisor_terminal_contract_rejects_opencode_acp_launcher() {
+        let mut config = minimal_valid_config();
+        config.launchers.insert(
+            "opencode-acp-supervisor".into(),
+            AgentConnectionConfig {
+                adapter: AdapterKind::Acp,
+                command: Some("opencode".into()),
+                args: vec![],
+                provider: None,
+                transport: Some(HarnessTransport::AppServer.to_string()),
+                control_plane: Some(HarnessControlPlane::Acp.to_string()),
+                base_url: None,
+                api_key_env: None,
+                permission_mode: None,
+                profile: None,
+                max_parallel_tool_calls: None,
+                assistant_message_passthrough_fields: Vec::new(),
+                reasoning_effort_param: None,
+                extra_body: None,
+                env: HashMap::new(),
+                headers: HashMap::new(),
+            },
+        );
+        config.lanes.insert(
+            "opencode-supervisor".into(),
+            LaneConfig {
+                launcher: "opencode-acp-supervisor".into(),
+                model: None,
+                reasoning_effort: None,
+                system_prompt: None,
+                profile: None,
+            },
+        );
+        config.roles.supervisor.name = "opencode-supervisor".into();
+
+        let warnings = validate(&config);
+
+        assert!(warnings.iter().any(|warning| {
+            warning.kind == ValidationWarningKind::SupervisorTerminalContract
+                && warning.is_fatal
+                && warning
+                    .message
+                    .contains("explicitly configures OpenCode to use ACP")
+        }));
     }
 
     #[test]

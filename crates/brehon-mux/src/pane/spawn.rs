@@ -1013,6 +1013,20 @@ impl Pane {
         }
     }
 
+    pub(crate) fn is_opencode_supervisor(&self) -> bool {
+        let is_sup = matches!(self.kind, crate::pane::PaneKind::Supervisor);
+        let is_opencode = match &self.cli_type {
+            AgentAdapter::BuiltIn(cli) => *cli == SupervisorCli::OpenCode,
+            AgentAdapter::BuiltInOverride(cfg) => cfg.cli == SupervisorCli::OpenCode,
+            AgentAdapter::Custom(_) => false,
+        };
+        is_sup && is_opencode
+    }
+
+    pub(crate) fn is_agy_or_opencode_supervisor(&self) -> bool {
+        self.is_agy() || self.is_opencode_supervisor()
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn pty_pane_from_config(
         name: &str,

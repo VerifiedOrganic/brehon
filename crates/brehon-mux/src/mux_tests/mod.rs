@@ -7,6 +7,7 @@ mod agy_recovery;
 mod basic;
 mod delivery;
 mod factory;
+mod opencode_recovery;
 mod scoping;
 mod suppression;
 
