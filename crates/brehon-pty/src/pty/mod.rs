@@ -158,6 +158,41 @@ mod tests {
         }
     }
 
+    fn set_env_for_test(key: &'static str, value: &str) -> impl Drop {
+        struct Guard {
+            _lock: std::sync::MutexGuard<'static, ()>,
+            key: &'static str,
+            previous: Option<String>,
+        }
+
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                if let Some(previous) = self.previous.take() {
+                    unsafe {
+                        std::env::set_var(self.key, previous);
+                    }
+                } else {
+                    unsafe {
+                        std::env::remove_var(self.key);
+                    }
+                }
+            }
+        }
+
+        static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+        let mutex = LOCK.get_or_init(|| StdMutex::new(()));
+        let lock = mutex.lock().expect("env lock poisoned");
+        let previous = std::env::var(key).ok();
+        unsafe {
+            std::env::set_var(key, value);
+        }
+        Guard {
+            _lock: lock,
+            key,
+            previous,
+        }
+    }
+
     #[derive(Clone, Debug)]
     enum TryWaitResult {
         Running,
@@ -2341,6 +2376,7 @@ key = "oauth/kimi-code"
 
     #[test]
     fn test_pty_config_agy_runs_unattended_under_safe_profile() {
+        let _preflight = set_env_for_test("BREHON_SKIP_PREFLIGHT", "1");
         let config = PtyConfig::agy(
             "agy-worker",
             "worker",
@@ -2350,7 +2386,8 @@ key = "oauth/kimi-code"
             None,
             None,
             None,
-        );
+        )
+        .expect("agy config");
 
         assert_eq!(config.command, "agy");
         assert!(
@@ -2370,6 +2407,7 @@ key = "oauth/kimi-code"
 
     #[test]
     fn test_pty_config_agy_unsafe_profile_enables_dangerous_skip_permissions() {
+        let _preflight = set_env_for_test("BREHON_SKIP_PREFLIGHT", "1");
         let workdir = fresh_temp_dir("brehon-agy-unsafe");
         write_unsafe_sandbox_profile(&workdir);
         let brehon_root = workdir.join(".brehon");
@@ -2382,7 +2420,8 @@ key = "oauth/kimi-code"
             None,
             None,
             None,
-        );
+        )
+        .expect("agy config");
 
         assert!(
             config

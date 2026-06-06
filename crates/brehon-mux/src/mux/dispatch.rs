@@ -1017,6 +1017,11 @@ impl Mux {
             match rt.block_on(self.send_panesmith_prompt_transaction(pane_id, &prompt)) {
                 Ok(Some(outcome)) => {
                     if outcome.is_success() {
+                        if let Some(pane) = self.panes.get_mut(pane_id)
+                            && pane.is_agy_or_opencode_supervisor()
+                        {
+                            pane.last_prompt_delivery_attempt = Some(Instant::now());
+                        }
                         return;
                     }
                     let error = super::panesmith::ensure_panesmith_mux_outcome(
@@ -1079,6 +1084,11 @@ impl Mux {
                 return;
             }
             let pane_id = pane_id.to_string();
+            if let Some(pane) = self.panes.get_mut(&pane_id)
+                && pane.is_agy_or_opencode_supervisor()
+            {
+                pane.last_prompt_delivery_attempt = Some(Instant::now());
+            }
             rt.spawn(async move {
                 if let Err(err) = injector.inject_prompt(&prompt).await {
                     tracing::warn!(pane = %pane_id, error = %err, "Non-blocking PTY prompt injection failed");
@@ -1284,6 +1294,11 @@ impl Mux {
             .await?
         {
             super::panesmith::ensure_panesmith_mux_outcome("prompt transaction", &outcome)?;
+            if let Some(pane) = self.panes.get_mut(pane_id)
+                && pane.is_agy_or_opencode_supervisor()
+            {
+                pane.last_prompt_delivery_attempt = Some(Instant::now());
+            }
             return Ok(PromptDeliveryAttempt::Delivered {
                 prompt_id,
                 generation,
@@ -1300,6 +1315,11 @@ impl Mux {
         }
 
         self.inject_unchecked(pane_id, prompt).await?;
+        if let Some(pane) = self.panes.get_mut(pane_id)
+            && pane.is_agy_or_opencode_supervisor()
+        {
+            pane.last_prompt_delivery_attempt = Some(Instant::now());
+        }
         Ok(PromptDeliveryAttempt::Delivered {
             prompt_id,
             generation,

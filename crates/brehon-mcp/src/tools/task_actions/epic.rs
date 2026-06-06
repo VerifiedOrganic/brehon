@@ -1569,12 +1569,11 @@ if [ -z "${BREHON_PROTECTED_BRANCH_BYPASS_TOKEN:-}" ]; then
   echo protected bypass token missing >&2
   exit 1
 fi
-brehon_git_common_dir="$(git rev-parse --git-common-dir 2>/dev/null || true)"
-case "$brehon_git_common_dir" in
-  /*) ;;
-  *) brehon_git_common_dir="$(git rev-parse --show-toplevel)/$brehon_git_common_dir" ;;
-esac
-if [ ! -f "$brehon_git_common_dir/brehon/protected-branch-bypass/$BREHON_PROTECTED_BRANCH_BYPASS_TOKEN" ]; then
+if [ -z "${BREHON_PROTECTED_BRANCH_BYPASS_DIR:-}" ]; then
+  echo protected bypass dir missing >&2
+  exit 1
+fi
+if [ ! -f "$BREHON_PROTECTED_BRANCH_BYPASS_DIR/$BREHON_PROTECTED_BRANCH_BYPASS_TOKEN" ]; then
   echo protected bypass lease missing >&2
   exit 1
 fi
@@ -1589,15 +1588,14 @@ fi
     #[cfg(unix)]
     #[test]
     fn merge_container_branch_into_target_uses_protected_branch_bypass_env() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         let root = tempfile::tempdir().unwrap();
         init_repo(root.path());
-
         run_git(root.path(), &["checkout", "-b", "initiative/test"]);
         std::fs::write(root.path().join("initiative.txt"), "initiative\n").unwrap();
         run_git(root.path(), &["add", "initiative.txt"]);
         run_git(root.path(), &["commit", "-m", "initiative work"]);
         run_git(root.path(), &["checkout", "main"]);
-
         install_bypass_required_hook(root.path(), "pre-merge-commit");
         install_bypass_required_hook(root.path(), "commit-msg");
         install_bypass_required_hook(root.path(), "reference-transaction");
@@ -1621,6 +1619,7 @@ fi
     #[cfg(unix)]
     #[test]
     fn squash_merge_container_branch_uses_protected_branch_bypass_env_and_records_source_tip() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         let root = tempfile::tempdir().unwrap();
         init_repo(root.path());
 

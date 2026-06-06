@@ -7,7 +7,6 @@
 //! the normal `cherry_picking → resolved` path detected by authoritative git
 //! probes (CHERRY_PICK_HEAD, unmerged files, ancestry, patch-equivalence).
 
-use std::collections::HashSet;
 use std::path::Path;
 
 use serde_json::Value;
@@ -17,9 +16,15 @@ use brehon_types::{normalize_task_status, TaskCompletionMode};
 use crate::error::McpError;
 use crate::server::ToolResult;
 use crate::tools::verification::{
-    commits_refer_to_same_oid, delete_review_state, release_panel_lease_for_task, reviewed_commits,
+    commits_refer_to_same_oid, delete_review_state, release_panel_lease_for_task,
 };
 use crate::tools::{error_result, text_result};
+
+mod integration_closeout;
+
+use integration_closeout::{
+    integration_commit_metadata, reviewed_commits_with_cherry_pick_trailers,
+};
 
 use super::integration_proof::{IntegrationProofRecorder, IntegrationSuccessProof};
 
@@ -249,10 +254,6 @@ pub(super) async fn execute(
         }
     };
 
-    if persisted_state.phase == IntegrationPhase::Aborted && !force {
-        return Ok(error_result("explicitly aborted; use force=true to retry"));
-    }
-
     let _repo_lock = match acquire_repo_lock().await {
         Ok(lock) => lock,
         Err(err) => {
@@ -264,17 +265,14 @@ pub(super) async fn execute(
 
     // --- Review metadata ---
     let review_request = read_current_review_request(id);
-    let reviewed_commit = review_request
-        .as_ref()
-        .map(|request| request.commit.trim().to_string())
-        .unwrap_or_default();
-    let resolved_empty_commit_set = review_request
-        .as_ref()
-        .is_some_and(|request| request.resolved_empty_commit_set);
-    let reviewed_commit_set = review_request
-        .as_ref()
-        .map(reviewed_commits)
-        .unwrap_or_default();
+    let allow_latest_commit_fallback = current_integration_status == "integrated"
+        || persisted_state.phase == IntegrationPhase::Aborted;
+    let (reviewed_commit, reviewed_commit_set, resolved_empty_commit_set, from_review_request) =
+        integration_commit_metadata(
+            &task_data,
+            review_request.as_ref(),
+            allow_latest_commit_fallback,
+        );
 
     if reviewed_commit.is_empty() || (reviewed_commit_set.is_empty() && !resolved_empty_commit_set)
     {
@@ -289,7 +287,7 @@ pub(super) async fn execute(
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        if !commits_refer_to_same_oid(latest_commit, &reviewed_commit) {
+        if from_review_request && !commits_refer_to_same_oid(latest_commit, &reviewed_commit) {
             let mut stale_task = task_data.clone();
             let detected_at = chrono::Utc::now().to_rfc3339();
             stale_task.insert("status".into(), Value::String("review_ready".to_string()));
@@ -510,6 +508,9 @@ pub(super) async fn execute(
             }
 
             Action::Finalize => {
+                if prior_phase == IntegrationPhase::Aborted {
+                    already_integrated = true;
+                }
                 state.phase = transition.new_phase;
                 state.last_transition_at = chrono::Utc::now().to_rfc3339();
                 return finalize_integration(
@@ -636,21 +637,15 @@ fn run_git_probes(
     // whole-set conditions already hold.
     let mut is_ancestor = true;
     let mut is_patch_equivalent = true;
-    let mut has_reviewed_cherry_pick_trailers =
-        !state.reviewed_commits.is_empty() && !state.cherry_pick_base_head.is_empty();
+    let mut has_reviewed_cherry_pick_trailers = !state.reviewed_commits.is_empty();
     let mut reviewed_commits_applied = true;
     let mut tree_matches_after_all = true;
-    let reviewed_commits_with_trailers =
-        if state.reviewed_commits.is_empty() || state.cherry_pick_base_head.is_empty() {
-            HashSet::new()
-        } else {
-            reviewed_commits_with_cherry_pick_trailers_since(
-                worktree,
-                &state.cherry_pick_base_head,
-                &state.reviewed_commits,
-            )
-            .unwrap_or_default()
-        };
+    let reviewed_commits_with_trailers = reviewed_commits_with_cherry_pick_trailers(
+        worktree,
+        branch,
+        &state.cherry_pick_base_head,
+        &state.reviewed_commits,
+    );
 
     for commit in &state.reviewed_commits {
         let commit_is_ancestor =
@@ -679,40 +674,6 @@ fn run_git_probes(
         reviewed_commits_applied,
         tree_matches_after: tree_matches_after_all,
     })
-}
-
-fn reviewed_commits_with_cherry_pick_trailers_since(
-    worktree: &Path,
-    base_head: &str,
-    reviewed_commits: &[String],
-) -> Result<HashSet<String>, String> {
-    let range = format!("{base_head}..HEAD");
-    let output = crate::git_exec::run_git(worktree, &["log", "--format=%H%x1e%B%x1f", &range])?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(if stderr.is_empty() {
-            format!(
-                "git log --format=%B%x1e {range} exited with status {}",
-                output.status
-            )
-        } else {
-            stderr
-        });
-    }
-
-    let history = String::from_utf8_lossy(&output.stdout);
-    let commit_bodies: Vec<&str> = history
-        .split('\u{1f}')
-        .filter_map(|entry| entry.split_once('\u{1e}').map(|(_, body)| body))
-        .collect();
-    let mut matches = HashSet::new();
-    for reviewed_commit in reviewed_commits {
-        let needle = format!("(cherry picked from commit {reviewed_commit})");
-        if commit_bodies.iter().any(|body| body.contains(&needle)) {
-            matches.insert(reviewed_commit.clone());
-        }
-    }
-    Ok(matches)
 }
 
 fn reset_state_for_force_retry(
@@ -909,6 +870,7 @@ async fn finalize_integration(
     final_state.phase = IntegrationPhase::Complete;
     final_state.last_transition_at = now.clone();
     final_state.conflicting_files.clear();
+    final_state.resolution = None;
     write_integration_state(task, &final_state);
 
     if !write_task(id, task) {
@@ -1257,13 +1219,15 @@ fn integrate_state_reject_response(
                 "description": "No further integrate action is available until the completed merge is reverted."
             }),
         )
-    } else if reason == "explicitly aborted; use force=true to retry" {
+    } else if reason
+        == "explicitly aborted and reviewed commit set is not present on merge target; use force=true to retry"
+    {
         (
             "integration_aborted",
-            "The supervisor explicitly aborted this integration attempt.",
+            "The supervisor explicitly aborted this integration attempt, and the reviewed commit set is not already present on the merge target.",
             serde_json::json!({
                 "kind": "force_retry",
-                "description": "Use force=true to start a new integration attempt from the aborted state."
+                "description": "Use force=true only if the supervisor intends to start a new integration attempt from the aborted state."
             }),
             serde_json::json!({
                 "kind": "none",

@@ -21,7 +21,6 @@ impl Mux {
     const TERMINAL_PROMPT_PREFILTER_TAIL_BYTES: usize =
         Self::TERMINAL_PROMPT_PREFILTER_TAIL_CHARS * 4;
     const TERMINAL_PROMPT_VIEWPORT_SCAN_LINES: usize = 6;
-
     pub(crate) fn clear_active_gateway_operations(&mut self, pane_id: &str) {
         self.active_gateway_operations.remove(pane_id);
     }
@@ -1333,6 +1332,8 @@ impl Mux {
     fn tick_pane_state_machine_impl(&mut self, rt: &tokio::runtime::Handle, now: Instant) {
         let pane_ids: Vec<String> = self.panes.keys().cloned().collect();
         for pane_id in pane_ids {
+            self.tick_agy_or_opencode_supervisor_recovery(rt, &pane_id, now);
+
             let state_change = if let Some(pane) = self.panes.get_mut(&pane_id) {
                 let previous = pane.pane_state().map(Self::runtime_pane_state_for_state);
                 if pane.tick_state_machine(now) {
@@ -1371,6 +1372,7 @@ impl Mux {
         now: Instant,
     ) -> Option<QueuedPrompt> {
         let pane = self.panes.get_mut(pane_id)?;
+        Self::drop_stale_in_flight_prompt_after_recycle(pane);
         if let Some(queued) = pane.take_ready_delayed_prompt(now) {
             return Some(queued);
         }

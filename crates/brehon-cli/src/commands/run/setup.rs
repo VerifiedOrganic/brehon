@@ -8,6 +8,8 @@ use brehon_types::{is_terminal_task_status, normalize_task_status, BrehonConfig}
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
+mod adapter_selection;
+
 const BREHON_PROTECTED_BRANCH_GUARD_BEGIN: &str = "# BEGIN BREHON PROTECTED BRANCH GUARD";
 const BREHON_PROTECTED_BRANCH_GUARD_END: &str = "# END BREHON PROTECTED BRANCH GUARD";
 const BREHON_PROTECTED_BRANCH_GUARD_MARKER: &str = "protected-branch-guard-active";
@@ -789,6 +791,10 @@ pub(crate) fn agent_to_adapter(name: &str, config: &BrehonConfig) -> brehon_mux:
     use brehon_types::agent::AdapterKind;
 
     if let Some((cli, has_capability_overrides)) = resolved_builtin_cli(name, config) {
+        if let Some(adapter) = adapter_selection::opencode_supervisor_adapter(name, config, cli) {
+            return adapter;
+        }
+
         if !has_capability_overrides {
             return AgentAdapter::BuiltIn(cli);
         }
@@ -2057,7 +2063,7 @@ if [ "$brehon_protected_branch_bypass_valid" != "1" ] && [ "$brehon_protected_br
     done < "$brehon_ref_txn_input"
 fi
 unset brehon_old_ref brehon_new_ref brehon_ref_name brehon_ref_branch brehon_protected_branches brehon_protected_branch
-unset brehon_protected_branch_bypass_valid brehon_bypass_token brehon_bypass_path brehon_bypass_pid
+unset brehon_protected_branch_bypass_valid brehon_bypass_token brehon_bypass_dir brehon_bypass_path brehon_bypass_pid
 unset brehon_protected_branch_guard_active brehon_git_common_dir brehon_git_root brehon_guard_marker brehon_guard_pid brehon_guard_line
 exec < "$brehon_ref_txn_input"
 {BREHON_PROTECTED_BRANCH_GUARD_END}"#
@@ -2088,7 +2094,7 @@ if [ "$brehon_protected_branch_bypass_valid" != "1" ] && [ "$brehon_protected_br
     fi
 fi
 unset brehon_current_branch brehon_protected_branches brehon_protected_branch
-unset brehon_protected_branch_bypass_valid brehon_bypass_token brehon_bypass_path brehon_bypass_pid
+unset brehon_protected_branch_bypass_valid brehon_bypass_token brehon_bypass_dir brehon_bypass_path brehon_bypass_pid
 unset brehon_protected_branch_guard_active brehon_git_common_dir brehon_git_root brehon_guard_marker brehon_guard_pid brehon_guard_line
 {BREHON_PROTECTED_BRANCH_GUARD_END}"#
     )
@@ -2096,47 +2102,42 @@ unset brehon_protected_branch_guard_active brehon_git_common_dir brehon_git_root
 
 fn protected_branch_guard_active_shell() -> &'static str {
     r#"brehon_protected_branch_guard_active=0
-brehon_git_common_dir="$(git rev-parse --git-common-dir 2>/dev/null || true)"
-if [ -n "$brehon_git_common_dir" ]; then
-    case "$brehon_git_common_dir" in
-        /*) ;;
-        *)
-            brehon_git_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-            brehon_git_common_dir="$brehon_git_root/$brehon_git_common_dir"
-            ;;
-    esac
-    brehon_guard_marker="$brehon_git_common_dir/brehon/protected-branch-guard-active"
-    if [ -f "$brehon_guard_marker" ]; then
-        brehon_guard_pid=""
-        while IFS= read -r brehon_guard_line; do
-            case "$brehon_guard_line" in
-                pid=*)
-                    brehon_guard_pid="${brehon_guard_line#pid=}"
-                    break
-                    ;;
-            esac
-        done < "$brehon_guard_marker" || true
-        case "$brehon_guard_pid" in
-            ""|*[!0-9]*) ;;
-            *)
-                if kill -0 "$brehon_guard_pid" 2>/dev/null; then
-                    brehon_protected_branch_guard_active=1
-                fi
-                ;;
+brehon_bypass_token="${BREHON_PROTECTED_BRANCH_BYPASS_TOKEN:-}"
+brehon_bypass_dir="${BREHON_PROTECTED_BRANCH_BYPASS_DIR:-}"
+case "$brehon_bypass_token" in *[!A-Za-z0-9_.-]*|"") brehon_bypass_token="" ;; esac
+if [ "${BREHON_ALLOW_PROTECTED_BRANCH_COMMIT:-}" = "1" ] && [ -n "$brehon_bypass_token" ] && [ -n "$brehon_bypass_dir" ] && [ -f "$brehon_bypass_dir/$brehon_bypass_token" ]; then
+    brehon_bypass_dir="${brehon_bypass_dir%/}"
+    brehon_git_common_dir="${brehon_bypass_dir%/brehon/protected-branch-bypass}"
+else
+    brehon_git_common_dir="$(git rev-parse --git-common-dir 2>/dev/null || true)"
+    case "$brehon_git_common_dir" in ""|/*) ;; *) brehon_git_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"; brehon_git_common_dir="$brehon_git_root/$brehon_git_common_dir" ;; esac
+fi
+brehon_guard_marker="$brehon_git_common_dir/brehon/protected-branch-guard-active"
+if [ -n "$brehon_git_common_dir" ] && [ -f "$brehon_guard_marker" ]; then
+    brehon_guard_pid=""
+    while IFS= read -r brehon_guard_line; do
+        case "$brehon_guard_line" in
+            pid=*) brehon_guard_pid="${brehon_guard_line#pid=}"; break ;;
         esac
-    fi
+    done < "$brehon_guard_marker" || true
+    case "$brehon_guard_pid" in
+        ""|*[!0-9]*) ;;
+        *) kill -0 "$brehon_guard_pid" 2>/dev/null && brehon_protected_branch_guard_active=1 ;;
+    esac
 fi"#
 }
 
 fn protected_branch_bypass_shell() -> String {
     format!(
         r#"brehon_protected_branch_bypass_valid=0
-if [ "${{BREHON_ALLOW_PROTECTED_BRANCH_COMMIT:-}}" = "1" ] && [ -n "${{BREHON_PROTECTED_BRANCH_BYPASS_TOKEN:-}}" ] && [ -n "$brehon_git_common_dir" ]; then
+if [ "${{BREHON_ALLOW_PROTECTED_BRANCH_COMMIT:-}}" = "1" ] && [ -n "${{BREHON_PROTECTED_BRANCH_BYPASS_TOKEN:-}}" ]; then
     brehon_bypass_token="$BREHON_PROTECTED_BRANCH_BYPASS_TOKEN"
     case "$brehon_bypass_token" in
         *[!A-Za-z0-9_.-]*|"") ;;
         *)
-            brehon_bypass_path="$brehon_git_common_dir/brehon/{BREHON_PROTECTED_BRANCH_BYPASS_DIR}/$brehon_bypass_token"
+            brehon_bypass_dir="${{BREHON_PROTECTED_BRANCH_BYPASS_DIR:-}}"
+            [ -n "$brehon_bypass_dir" ] || brehon_bypass_dir="${{brehon_git_common_dir:+$brehon_git_common_dir/brehon/{BREHON_PROTECTED_BRANCH_BYPASS_DIR}}}"
+            brehon_bypass_path="${{brehon_bypass_dir:+$brehon_bypass_dir/$brehon_bypass_token}}"
             if [ -f "$brehon_bypass_path" ]; then
                 brehon_bypass_pid=""
                 while IFS= read -r brehon_guard_line; do
@@ -2149,11 +2150,7 @@ if [ "${{BREHON_ALLOW_PROTECTED_BRANCH_COMMIT:-}}" = "1" ] && [ -n "${{BREHON_PR
                 done < "$brehon_bypass_path" || true
                 case "$brehon_bypass_pid" in
                     ""|*[!0-9]*) ;;
-                    *)
-                        if kill -0 "$brehon_bypass_pid" 2>/dev/null; then
-                            brehon_protected_branch_bypass_valid=1
-                        fi
-                        ;;
+                    *) kill -0 "$brehon_bypass_pid" 2>/dev/null && brehon_protected_branch_bypass_valid=1 ;;
                 esac
             fi
             ;;
@@ -4972,7 +4969,8 @@ mod tests {
             .args(["commit", "-m", "deliberate repair"])
             .current_dir(temp.path())
             .env("BREHON_ALLOW_PROTECTED_BRANCH_COMMIT", "1")
-            .env_remove("BREHON_PROTECTED_BRANCH_BYPASS_TOKEN")
+            .env("BREHON_PROTECTED_BRANCH_BYPASS_TOKEN", "missing-lease")
+            .env("BREHON_PROTECTED_BRANCH_BYPASS_DIR", temp.path())
             .output()
             .unwrap();
         assert!(
@@ -4982,7 +4980,7 @@ mod tests {
         );
         let env_only_stderr = String::from_utf8_lossy(&env_only_repair.stderr);
         assert!(
-            env_only_stderr.contains("Brehon lease token"),
+            env_only_stderr.contains("Brehon protected branch guard"),
             "stderr: {env_only_stderr}"
         );
 

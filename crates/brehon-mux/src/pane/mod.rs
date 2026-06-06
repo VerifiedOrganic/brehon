@@ -6,6 +6,7 @@
 //! - Metadata (agent name, role, etc.)
 
 pub mod activity;
+mod grok_sandbox;
 mod host_launch;
 pub(crate) mod panesmith_shim;
 mod pty_io;

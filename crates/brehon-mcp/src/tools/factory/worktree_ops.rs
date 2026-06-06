@@ -139,10 +139,8 @@ pub(super) fn remove_worktree_with_git2(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::TEST_ENV_LOCK;
     use std::ffi::OsString;
-    use std::sync::Mutex;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     struct ScopedEnv {
         saved: Vec<(&'static str, Option<OsString>)>,
@@ -177,7 +175,7 @@ mod tests {
 
     #[test]
     fn candidate_worker_worktree_paths_honors_external_worktree_root() {
-        let _lock = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         let brehon = tempfile::tempdir().unwrap();
         let external = tempfile::tempdir().unwrap();
         let worker = external.path().join("runs/run-1/worker-1");

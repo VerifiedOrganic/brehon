@@ -1125,10 +1125,10 @@ impl Mux {
             }
         }
 
-        let Some((kind, last_output_at)) = self
+        let Some((kind, last_output_at, exited)) = self
             .panes
             .get(pane_id)
-            .map(|pane| (pane.kind().clone(), pane.last_output_at()))
+            .map(|pane| (pane.kind().clone(), pane.last_output_at(), pane.exited))
         else {
             tracing::warn!(
                 pane = %pane_id,
@@ -1140,6 +1140,7 @@ impl Mux {
 
         if let Some(marker) = self.recycle_markers.get(pane_id).copied()
             && last_output_at <= marker.at
+            && !exited
         {
             tracing::debug!(
                 pane = %pane_id,
@@ -1158,6 +1159,16 @@ impl Mux {
             pane.set_pending_inbox_nudge(false);
             pane.set_pane_state(PaneState::Ready { since: recycled_at });
             pane.set_last_output_at(recycled_at);
+            pane.restart_count = pane.restart_count.saturating_add(1);
+            pane.last_restart_reason = Some(reason.to_string());
+            pane.last_restart_at = Some(recycled_at);
+            if Self::agy_recovery_reason_counts_as_crash(reason) {
+                pane.consecutive_crashes = pane.consecutive_crashes.saturating_add(1);
+            } else {
+                pane.consecutive_crashes = 0;
+            }
+            pane.exited = false;
+            pane.exit_code = None;
             next_generation
         } else {
             tracing::warn!(

@@ -70,6 +70,12 @@ pub(crate) fn run_git_allow_protected_branch_commit(
 ) -> Result<Output, String> {
     let lease = create_protected_branch_bypass_lease(cwd)?;
     let token = lease.token.as_str();
+    let bypass_dir = lease.path.parent().and_then(Path::to_str).ok_or_else(|| {
+        format!(
+            "Failed to expose protected-branch bypass dir for {}",
+            lease.path.display()
+        )
+    })?;
     run_command_hardened_with_env(
         "git",
         cwd,
@@ -79,6 +85,7 @@ pub(crate) fn run_git_allow_protected_branch_commit(
         &[
             ("BREHON_ALLOW_PROTECTED_BRANCH_COMMIT", "1"),
             ("BREHON_PROTECTED_BRANCH_BYPASS_TOKEN", token),
+            ("BREHON_PROTECTED_BRANCH_BYPASS_DIR", bypass_dir),
         ],
     )
 }

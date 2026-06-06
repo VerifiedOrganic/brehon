@@ -240,7 +240,7 @@ fn test_codex_family_uses_ink_echo_injection() {
     assert!(uses_ink_echo_injection(&builtin(SupervisorCli::Codex)));
     assert!(uses_ink_echo_injection(&builtin(SupervisorCli::OpenCode)));
     assert!(uses_ink_echo_injection(&builtin(SupervisorCli::Junie)));
-    assert!(!uses_ink_echo_injection(&builtin(SupervisorCli::Agy)));
+    assert!(uses_ink_echo_injection(&builtin(SupervisorCli::Agy)));
     assert!(!uses_ink_echo_injection(&builtin(SupervisorCli::Kimi)));
     assert!(!uses_ink_echo_injection(&builtin(SupervisorCli::Copilot)));
 }
@@ -270,6 +270,7 @@ fn test_injection_modes_are_mutually_exclusive() {
         SupervisorCli::Codex,
         SupervisorCli::OpenCode,
         SupervisorCli::Junie,
+        SupervisorCli::Agy,
     ] {
         let adapter = builtin(cli);
         assert!(
@@ -295,11 +296,6 @@ fn test_injection_modes_are_mutually_exclusive() {
     assert!(!uses_ink_echo_injection(&kimi));
     assert!(!uses_delayed_submit_injection(&kimi));
     assert!(!uses_pre_submit_interrupt_reset(&kimi));
-
-    let agy = builtin(SupervisorCli::Agy);
-    assert!(!uses_ink_echo_injection(&agy));
-    assert!(!uses_delayed_submit_injection(&agy));
-    assert!(!uses_pre_submit_interrupt_reset(&agy));
 
     // Claude uses none of the special injection modes
     let claude = builtin(SupervisorCli::Claude);

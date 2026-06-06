@@ -18,6 +18,15 @@ fn explicit_env_key_is_not_scrubbed() {
     assert!(should_scrub_env_key(&explicit_env_keys, "OPENAI_API_KEY"));
 }
 
+#[test]
+fn inherited_anthropic_auth_token_is_scrubbed() {
+    let explicit_env_keys = HashSet::new();
+    assert!(should_scrub_env_key(
+        &explicit_env_keys,
+        "ANTHROPIC_AUTH_TOKEN"
+    ));
+}
+
 /// Bytes outside a sync block pass straight through.
 #[test]
 fn sync_filter_passes_through_non_sync_bytes() {

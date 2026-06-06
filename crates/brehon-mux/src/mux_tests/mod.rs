@@ -3,9 +3,11 @@ use std::path::PathBuf;
 pub(crate) use brehon_test_harness::{ScopedEnv, TEST_ENV_LOCK};
 
 mod activity;
+mod agy_recovery;
 mod basic;
 mod delivery;
 mod factory;
+mod opencode_recovery;
 mod scoping;
 mod suppression;
 

@@ -211,7 +211,7 @@ pub(super) fn next_state(
         }
         IntegrationPhase::Resolved => resolved_transitions(probes, intent),
         IntegrationPhase::Complete => complete_transitions(intent),
-        IntegrationPhase::Aborted => aborted_transitions(intent),
+        IntegrationPhase::Aborted => aborted_transitions(probes, intent),
     }
 }
 
@@ -390,7 +390,7 @@ fn complete_transitions(intent: OperatorIntent) -> Transition {
     }
 }
 
-fn aborted_transitions(intent: OperatorIntent) -> Transition {
+fn aborted_transitions(probes: &GitProbeResult, intent: OperatorIntent) -> Transition {
     match intent {
         OperatorIntent::ForceIntegrate => Transition {
             new_phase: IntegrationPhase::Null,
@@ -398,9 +398,23 @@ fn aborted_transitions(intent: OperatorIntent) -> Transition {
                 "force=true discarding previously aborted integration state".to_string(),
             ),
         },
+        OperatorIntent::Integrate
+            if probes.is_ancestor
+                || probes.is_patch_equivalent
+                || probes.has_reviewed_cherry_pick_trailers
+                || probes.reviewed_commits_applied =>
+        {
+            Transition {
+                new_phase: IntegrationPhase::Complete,
+                action: Action::Finalize,
+            }
+        }
         _ => Transition {
             new_phase: IntegrationPhase::Aborted,
-            action: Action::Reject("explicitly aborted; use force=true to retry".to_string()),
+            action: Action::Reject(
+                "explicitly aborted and reviewed commit set is not present on merge target; use force=true to retry"
+                    .to_string(),
+            ),
         },
     }
 }
@@ -735,6 +749,23 @@ mod tests {
         );
         assert_eq!(got.new_phase, IntegrationPhase::Aborted);
         assert!(matches!(got.action, Action::Reject(_)));
+    }
+
+    #[test]
+    fn transition_aborted_finalizes_when_reviewed_commits_are_applied() {
+        let got = next_state(
+            IntegrationPhase::Aborted,
+            "approved",
+            &GitProbeResult {
+                is_patch_equivalent: true,
+                reviewed_commits_applied: true,
+                ..probes()
+            },
+            &["abc123".into()],
+            OperatorIntent::Integrate,
+        );
+        assert_eq!(got.new_phase, IntegrationPhase::Complete);
+        assert_eq!(got.action, Action::Finalize);
     }
 
     #[test]

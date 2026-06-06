@@ -301,12 +301,12 @@ mod tests {
             &shell_path,
             br#"#!/bin/sh
 if [ "$1" = "-lc" ]; then
-  sleep 5
+  printf 'login-shell'
   exit 42
 fi
 if [ "$1" = "-c" ]; then
-  shift
-  exec /bin/sh -c "$1"
+  printf 'argv:%s\ncmd:%s\n' "$1" "$2"
+  exit 0
 fi
 exit 43
 "#,
@@ -329,7 +329,8 @@ exit 43
         .unwrap();
 
         assert!(output.contains("exit_code: 0"));
-        assert!(output.contains("non-login"));
+        assert!(output.contains("argv:-c"));
+        assert!(output.contains("cmd:printf non-login"));
     }
 
     fn git(cwd: &Path, args: &[&str]) {

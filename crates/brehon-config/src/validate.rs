@@ -81,6 +81,7 @@ pub enum ValidationWarningKind {
     ResearchPolicyConflict,
     ProfilePolicyConflict,
     InvalidWorktreeRoot,
+    LauncherEnvConflict,
 }
 
 impl ValidationWarningKind {
@@ -99,6 +100,7 @@ impl ValidationWarningKind {
                 | ValidationWarningKind::ResearchPolicyConflict
                 | ValidationWarningKind::ProfilePolicyConflict
                 | ValidationWarningKind::InvalidWorktreeRoot
+                | ValidationWarningKind::LauncherEnvConflict
         )
     }
 }
@@ -157,6 +159,7 @@ impl std::fmt::Display for ValidationWarningKind {
             ValidationWarningKind::ResearchPolicyConflict => write!(f, "Research policy conflict"),
             ValidationWarningKind::ProfilePolicyConflict => write!(f, "Profile policy conflict"),
             ValidationWarningKind::InvalidWorktreeRoot => write!(f, "Invalid worktree root"),
+            ValidationWarningKind::LauncherEnvConflict => write!(f, "Launcher env conflict"),
         }
     }
 }
@@ -174,6 +177,7 @@ pub fn validate(config: &BrehonConfig) -> Vec<ValidationWarning> {
     warnings.extend(validate_review_panels(config));
     warnings.extend(validate_prompt_policy(config));
     warnings.extend(validate_launcher_capability_overrides(config));
+    warnings.extend(validate_launcher_env_conflicts(config));
     warnings.extend(validate_runtime_workflows(config));
     warnings.extend(validate_runtime_policy(config));
     warnings.extend(validate_runtime_terminal_host(config));
@@ -994,6 +998,33 @@ fn validate_launcher_capability_overrides(config: &BrehonConfig) -> Vec<Validati
     warnings
 }
 
+fn validate_launcher_env_conflicts(config: &BrehonConfig) -> Vec<ValidationWarning> {
+    let mut warnings = Vec::new();
+    for (name, launcher) in &config.launchers {
+        if builtin_cli_from_launcher(launcher) != Some(SupervisorCli::Claude) {
+            continue;
+        }
+        if launcher_env_is_set(launcher, "ANTHROPIC_AUTH_TOKEN")
+            && launcher_env_is_set(launcher, "ANTHROPIC_API_KEY")
+        {
+            warnings.push(ValidationWarning::new(
+                ValidationWarningKind::LauncherEnvConflict,
+                format!(
+                    "launcher '{name}' invokes Claude Code and sets both ANTHROPIC_AUTH_TOKEN and ANTHROPIC_API_KEY. Claude Code treats these as conflicting auth sources; set exactly one. Use ANTHROPIC_AUTH_TOKEN for Claude-compatible third-party providers, or ANTHROPIC_API_KEY for Anthropic API key auth."
+                ),
+            ));
+        }
+    }
+    warnings
+}
+
+fn launcher_env_is_set(launcher: &brehon_types::AgentConnectionConfig, key: &str) -> bool {
+    launcher
+        .env
+        .get(key)
+        .is_some_and(|value| !value.trim().is_empty())
+}
+
 fn validate_runtime_workflows(config: &BrehonConfig) -> Vec<ValidationWarning> {
     let mut warnings = Vec::new();
     let mut seen = HashSet::new();
@@ -1059,6 +1090,32 @@ fn validate_supervisor_terminal_contract(config: &BrehonConfig) -> Vec<Validatio
     let Some(launcher) = config.launchers.get(launcher_name) else {
         return warnings;
     };
+
+    // OpenCode supervisors are PTY-only. Its built-in worker/reviewer
+    // capability defaults to AppServer/ACP, so validate the effective pair,
+    // not just explicit overrides.
+    if let Some(cli) = builtin_cli_from_launcher(launcher) {
+        if cli == SupervisorCli::OpenCode {
+            let effective = launcher_effective_capabilities(launcher);
+            let cp_override = launcher_control_plane_override(launcher).ok().flatten();
+            let tp_override = launcher_transport_override(launcher).ok().flatten();
+            if effective
+                != Some((
+                    HarnessTransport::InteractivePty,
+                    HarnessControlPlane::PtyInjection,
+                ))
+            {
+                warnings.push(ValidationWarning::new(
+                    ValidationWarningKind::SupervisorTerminalContract,
+                    format!(
+                        "Supervisor lane '{}' uses launcher '{}' which resolves OpenCode to non-PTY supervisor transport/control plane (effective={:?}, transport_override={:?}, control_plane_override={:?}), but OpenCode supervisors must be PTY-backed.",
+                        supervisor_lane, launcher_name, effective, tp_override, cp_override
+                    ),
+                ));
+                return warnings;
+            }
+        }
+    }
 
     if supervisor_launcher_supports_pty(launcher) {
         return warnings;
@@ -1739,6 +1796,9 @@ fn validate_retention(config: &BrehonConfig) -> Vec<ValidationWarning> {
 
 #[cfg(test)]
 mod tests {
+    #[path = "validate_supervisor_terminal_contract_tests.rs"]
+    mod supervisor_terminal_contract_tests;
+
     use super::*;
     use brehon_types::{
         AdapterKind, AgentConnectionConfig, AgentsMdMode, AutonomyLevel, BudgetConfig,
@@ -2282,182 +2342,6 @@ rooms:
     }
 
     #[test]
-    fn supervisor_terminal_contract_rejects_gateway_only_acp_launcher() {
-        let mut config = minimal_valid_config();
-        config.launchers.insert(
-            "goose".into(),
-            AgentConnectionConfig {
-                adapter: AdapterKind::Acp,
-                command: Some("goose".into()),
-                args: vec!["acp".into()],
-                provider: None,
-                transport: None,
-                control_plane: None,
-                base_url: None,
-                api_key_env: None,
-                permission_mode: None,
-                profile: None,
-                max_parallel_tool_calls: None,
-                assistant_message_passthrough_fields: Vec::new(),
-                reasoning_effort_param: None,
-                extra_body: None,
-                env: HashMap::new(),
-                headers: HashMap::new(),
-            },
-        );
-        config.lanes.insert(
-            "goose-supervisor".into(),
-            LaneConfig {
-                launcher: "goose".into(),
-                model: None,
-                reasoning_effort: None,
-                system_prompt: None,
-                profile: None,
-            },
-        );
-        config.roles.supervisor.name = "goose-supervisor".into();
-
-        let warnings = validate(&config);
-
-        assert!(warnings.iter().any(|warning| {
-            warning.kind == ValidationWarningKind::SupervisorTerminalContract
-                && warning.is_fatal
-                && warning.message.contains("Gateway-only ACP/API launchers")
-        }));
-    }
-
-    #[test]
-    fn supervisor_terminal_contract_rejects_openai_launcher() {
-        let mut config = minimal_valid_config();
-        config.launchers.insert(
-            "openai".into(),
-            AgentConnectionConfig {
-                adapter: AdapterKind::OpenAiCompatible,
-                command: None,
-                args: Vec::new(),
-                provider: None,
-                transport: None,
-                control_plane: None,
-                base_url: Some("https://api.openai.example/v1".into()),
-                api_key_env: Some("OPENAI_API_KEY".into()),
-                permission_mode: None,
-                profile: None,
-                max_parallel_tool_calls: None,
-                assistant_message_passthrough_fields: Vec::new(),
-                reasoning_effort_param: None,
-                extra_body: None,
-                env: HashMap::new(),
-                headers: HashMap::new(),
-            },
-        );
-        config.lanes.insert(
-            "api-supervisor".into(),
-            LaneConfig {
-                launcher: "openai".into(),
-                model: None,
-                reasoning_effort: None,
-                system_prompt: None,
-                profile: None,
-            },
-        );
-        config.roles.supervisor.name = "api-supervisor".into();
-
-        let warnings = validate(&config);
-
-        assert!(warnings.iter().any(|warning| {
-            warning.kind == ValidationWarningKind::SupervisorTerminalContract
-                && warning.is_fatal
-                && warning.message.contains("interactive PTY-backed")
-        }));
-    }
-
-    #[test]
-    fn supervisor_terminal_contract_accepts_custom_pty_launcher() {
-        let mut config = minimal_valid_config();
-        config.launchers.insert(
-            "goose-pty".into(),
-            AgentConnectionConfig {
-                adapter: AdapterKind::PtyHooks,
-                command: Some("goose".into()),
-                args: vec!["--interactive".into()],
-                provider: None,
-                transport: None,
-                control_plane: None,
-                base_url: None,
-                api_key_env: None,
-                permission_mode: None,
-                profile: None,
-                max_parallel_tool_calls: None,
-                assistant_message_passthrough_fields: Vec::new(),
-                reasoning_effort_param: None,
-                extra_body: None,
-                env: HashMap::new(),
-                headers: HashMap::new(),
-            },
-        );
-        config.lanes.insert(
-            "goose-supervisor".into(),
-            LaneConfig {
-                launcher: "goose-pty".into(),
-                model: None,
-                reasoning_effort: None,
-                system_prompt: None,
-                profile: None,
-            },
-        );
-        config.roles.supervisor.name = "goose-supervisor".into();
-
-        let warnings = validate(&config);
-
-        assert!(!warnings
-            .iter()
-            .any(|warning| warning.kind == ValidationWarningKind::SupervisorTerminalContract));
-    }
-
-    #[test]
-    fn supervisor_terminal_contract_accepts_acp_sidecar_launcher() {
-        let mut config = minimal_valid_config();
-        config.launchers.insert(
-            "native-supervisor".into(),
-            AgentConnectionConfig {
-                adapter: AdapterKind::Acp,
-                command: Some("brehon-native-agent".into()),
-                args: vec!["--supervised".into()],
-                provider: None,
-                transport: Some("interactive_pty".into()),
-                control_plane: Some("acp_sidecar".into()),
-                base_url: None,
-                api_key_env: None,
-                permission_mode: None,
-                profile: None,
-                max_parallel_tool_calls: None,
-                assistant_message_passthrough_fields: Vec::new(),
-                reasoning_effort_param: None,
-                extra_body: None,
-                env: HashMap::new(),
-                headers: HashMap::new(),
-            },
-        );
-        config.lanes.insert(
-            "native-supervisor".into(),
-            LaneConfig {
-                launcher: "native-supervisor".into(),
-                model: None,
-                reasoning_effort: None,
-                system_prompt: None,
-                profile: None,
-            },
-        );
-        config.roles.supervisor.name = "native-supervisor".into();
-
-        let warnings = validate(&config);
-
-        assert!(!warnings
-            .iter()
-            .any(|warning| warning.kind == ValidationWarningKind::SupervisorTerminalContract));
-    }
-
-    #[test]
     fn launcher_capability_validation_rejects_unknown_control_plane() {
         let mut config = minimal_valid_config();
         config.launchers.get_mut("codex").unwrap().control_plane = Some("wat".into());
@@ -2518,6 +2402,40 @@ rooms:
                     "requests built-in 'claude' with unsupported transport/control_plane overrides",
                 )
         }));
+    }
+
+    #[test]
+    fn claude_launcher_rejects_conflicting_anthropic_credentials() {
+        let mut config = minimal_valid_config();
+        let launcher = config.launchers.get_mut("claude-code").unwrap();
+        launcher.env = HashMap::from([
+            ("ANTHROPIC_AUTH_TOKEN".to_string(), "token".to_string()),
+            ("ANTHROPIC_API_KEY".to_string(), "key".to_string()),
+        ]);
+
+        let warnings = validate(&config);
+
+        assert!(warnings.iter().any(|warning| {
+            warning.kind == ValidationWarningKind::LauncherEnvConflict
+                && warning.is_fatal
+                && warning.message.contains("sets both ANTHROPIC_AUTH_TOKEN")
+        }));
+    }
+
+    #[test]
+    fn non_claude_launcher_allows_anthropic_credential_env_names() {
+        let mut config = minimal_valid_config();
+        let launcher = config.launchers.get_mut("codex").unwrap();
+        launcher.env = HashMap::from([
+            ("ANTHROPIC_AUTH_TOKEN".to_string(), "token".to_string()),
+            ("ANTHROPIC_API_KEY".to_string(), "key".to_string()),
+        ]);
+
+        let warnings = validate(&config);
+
+        assert!(!warnings
+            .iter()
+            .any(|warning| warning.kind == ValidationWarningKind::LauncherEnvConflict));
     }
 
     #[test]

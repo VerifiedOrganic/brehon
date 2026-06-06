@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use brehon_adapter_sdk::process::ProcessError;
@@ -22,6 +23,8 @@ const PROMPT_RESULT_POLL_MS: u64 = 50;
 const AGY_SESSION_COMPLETE_KEY: &str = "_session_complete";
 const AGY_PROJECT_MCP_CONFIG_PATH: &str = ".agents/mcp_config.json";
 const AGY_BREHON_MCP_CLIENT_PATH: &str = ".antigravitycli/brehon_mcp_client.py";
+const AGY_PREFLIGHT_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+const AGY_PREFLIGHT_HELPER_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// Error type for Agy adapter operations.
 #[derive(Debug, thiserror::Error)]
@@ -327,11 +330,17 @@ import json
 import os
 import subprocess
 import sys
+import select
+import time
 
 BREHON_COMMAND = {command}
 BREHON_ARGS = ["serve"]
 BREHON_CWD = {cwd}
 BREHON_ENV = {env}
+
+INITIALIZE_TIMEOUT = 10.0
+CALL_TIMEOUT = 30.0
+SHUTDOWN_TIMEOUT = 5.0
 
 def usage():
     print("Usage: brehon_mcp_client.py <tool_name> [arguments_json]", file=sys.stderr)
@@ -341,16 +350,70 @@ def send(proc, message):
     proc.stdin.write(json.dumps(message) + "\n")
     proc.stdin.flush()
 
-def recv(proc):
+def read_available_stderr(proc):
+    try:
+        r, _, _ = select.select([proc.stderr], [], [], 0.5)
+        if not r:
+            return ""
+        return os.read(proc.stderr.fileno(), 4096).decode(errors="replace")
+    except Exception:
+        return ""
+
+def recv(proc, timeout_sec):
+    rlist, _, _ = select.select([proc.stdout], [], [], timeout_sec)
+    if not rlist:
+        proc.poll()
+        stderr = read_available_stderr(proc)
+        raise RuntimeError(f"Timeout waiting for response (timeout={{timeout_sec}}s). Exit code: {{proc.returncode}}. Stderr: {{stderr}}")
     line = proc.stdout.readline()
     if not line:
-        stderr = proc.stderr.read()
-        raise RuntimeError("Brehon MCP server closed stdout before replying: " + stderr)
-    return json.loads(line)
+        stderr = read_available_stderr(proc)
+        raise RuntimeError(f"Brehon MCP server closed stdout before replying. Exit code: {{proc.returncode}}. Stderr: {{stderr}}")
+    try:
+        return json.loads(line)
+    except Exception as err:
+        raise RuntimeError(f"Malformed JSON from server: {{err}}. Line: {{line}}")
 
 def tool_result_is_error(message):
     result = message.get("result") if isinstance(message, dict) else None
     return isinstance(result, dict) and result.get("isError") is True
+
+def safe_file_name(value):
+    return "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in value)
+
+def marker_path(kind):
+    root = BREHON_ENV.get("BREHON_ROOT") or os.environ.get("BREHON_ROOT")
+    agent = BREHON_ENV.get("BREHON_AGENT_NAME") or os.environ.get("BREHON_AGENT_NAME")
+    if not root or not agent:
+        return None
+    return os.path.join(root, "runtime", kind, safe_file_name(agent))
+
+def write_inflight_marker(tool_name):
+    path = marker_path("mcp-helper-inflight")
+    if not path:
+        return
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        payload = {{
+            "agent": BREHON_ENV.get("BREHON_AGENT_NAME"),
+            "tool": tool_name,
+            "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }}
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+    except Exception:
+        pass
+
+def clear_inflight_marker():
+    path = marker_path("mcp-helper-inflight")
+    if not path:
+        return
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
 
 def main():
     if len(sys.argv) < 2:
@@ -365,16 +428,23 @@ def main():
 
     child_env = os.environ.copy()
     child_env.update(BREHON_ENV)
-    proc = subprocess.Popen(
-        [BREHON_COMMAND] + BREHON_ARGS,
-        cwd=BREHON_CWD,
-        env=child_env,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        bufsize=1,
-    )
+    write_inflight_marker(tool_name)
+    try:
+        proc = subprocess.Popen(
+            [BREHON_COMMAND] + BREHON_ARGS,
+            cwd=BREHON_CWD,
+            env=child_env,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+    except Exception as e:
+        clear_inflight_marker()
+        print(f"Failed to spawn Brehon MCP process: {{e}}", file=sys.stderr)
+        sys.exit(1)
+
     try:
         send(proc, {{
             "jsonrpc": "2.0",
@@ -386,7 +456,12 @@ def main():
                 "clientInfo": {{"name": "brehon-agy-helper", "version": "1.0"}},
             }},
         }})
-        recv(proc)
+        init_res = recv(proc, INITIALIZE_TIMEOUT)
+        if "error" in init_res:
+            err = init_res["error"]
+            print(f"MCP server initialization failed: {{err.get('message', err)}}", file=sys.stderr)
+            sys.exit(1)
+
         send(proc, {{"jsonrpc": "2.0", "method": "notifications/initialized"}})
         send(proc, {{
             "jsonrpc": "2.0",
@@ -394,14 +469,23 @@ def main():
             "method": "tools/call",
             "params": {{"name": tool_name, "arguments": arguments}},
         }})
-        result = recv(proc)
+        result = recv(proc, CALL_TIMEOUT)
         print(json.dumps(result, indent=2))
-        if "error" in result or tool_result_is_error(result):
+        if "error" in result:
+            err = result["error"]
+            print(f"MCP server error: {{err.get('message', err)}}", file=sys.stderr)
             sys.exit(1)
+        if tool_result_is_error(result):
+            print("MCP tool call returned error in result", file=sys.stderr)
+            sys.exit(1)
+    except Exception as err:
+        print(f"Error: {{err}}", file=sys.stderr)
+        sys.exit(1)
     finally:
+        clear_inflight_marker()
         proc.terminate()
         try:
-            proc.wait(timeout=2)
+            proc.wait(timeout=SHUTDOWN_TIMEOUT)
         except subprocess.TimeoutExpired:
             proc.kill()
 
@@ -791,9 +875,190 @@ fn agy_error_to_adapter_error(err: AgyError) -> AdapterError {
     }
 }
 
+/// Run preflight checks before considering Agy ready.
+pub fn run_preflight_checks(
+    workspace: &Path,
+    command: &str,
+    brehon_root: Option<&PathBuf>,
+) -> Result<(), String> {
+    if (cfg!(test) && std::env::var("BREHON_FORCE_PREFLIGHT").is_err())
+        || std::env::var("BREHON_SKIP_PREFLIGHT").is_ok()
+    {
+        return Ok(());
+    }
+
+    // 1. Verify agy command is resolvable
+    let mut command_check = Command::new(command);
+    command_check.arg("--help");
+    run_command_with_timeout(
+        &format!("{command} --help"),
+        command_check,
+        AGY_PREFLIGHT_COMMAND_TIMEOUT,
+    )
+    .map_err(|err| format!("Command '{command}' is not resolvable: {err}"))?;
+
+    // 2. Verify workspace `.agents/mcp_config.json` contains Brehon server
+    let mcp_config_path = workspace.join(AGY_PROJECT_MCP_CONFIG_PATH);
+    if !mcp_config_path.exists() {
+        return Err(format!(
+            "MCP config file '{}' does not exist",
+            mcp_config_path.display()
+        ));
+    }
+    let mcp_config_file = std::fs::File::open(&mcp_config_path)
+        .map_err(|e| format!("Failed to open MCP config file: {}", e))?;
+    let mcp_config: serde_json::Value = serde_json::from_reader(mcp_config_file)
+        .map_err(|e| format!("Failed to parse MCP config JSON: {}", e))?;
+    if mcp_config
+        .get("mcpServers")
+        .and_then(|s| s.get("brehon"))
+        .is_none()
+    {
+        return Err("MCP config does not contain 'brehon' server".to_string());
+    }
+
+    // 3. Verify helper file exists
+    let helper_path = workspace.join(AGY_BREHON_MCP_CLIENT_PATH);
+    if !helper_path.exists() {
+        return Err(format!(
+            "MCP helper file '{}' does not exist",
+            helper_path.display()
+        ));
+    }
+
+    // 4. Verify helper can call a cheap Brehon tool successfully
+    let mut helper_check = Command::new("python3");
+    helper_check
+        .arg(&helper_path)
+        .arg("health")
+        .current_dir(workspace);
+    let output = run_command_with_timeout(
+        "python3 Agy Brehon MCP helper health",
+        helper_check,
+        AGY_PREFLIGHT_HELPER_TIMEOUT,
+    )
+    .map_err(|err| format!("Failed to execute python3 helper: {err}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        return Err(format!(
+            "MCP helper call to 'health' failed with exit code {:?}.\nStdout: {}\nStderr: {}",
+            output.status.code(),
+            stdout.trim(),
+            stderr.trim()
+        ));
+    }
+
+    // 5. Verify trust-folder config was written or failure is surfaced clearly
+    let home = std::env::var("HOME")
+        .map(PathBuf::from)
+        .map_err(|_| "HOME environment variable not set".to_string())?;
+    let paths_to_check = trusted_workspace_paths(workspace, brehon_root);
+    if paths_to_check.is_empty() {
+        return Err("No workspace paths to trust".to_string());
+    }
+    let trusted_folders_files = [
+        home.join(".gemini/trustedFolders.json"),
+        home.join(".gemini/config/trustedFolders.json"),
+        home.join(".gemini/antigravity-cli/trustedFolders.json"),
+    ];
+    let settings_file = home.join(".gemini/antigravity-cli/settings.json");
+
+    for p in &paths_to_check {
+        let p_str = p.to_string_lossy().to_string();
+        let mut found = false;
+        for config_path in &trusted_folders_files {
+            if config_path.exists() {
+                if let Ok(file) = std::fs::File::open(config_path) {
+                    if let Ok(value) = serde_json::from_reader::<_, serde_json::Value>(file) {
+                        if value.get(&p_str).is_some() {
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if !found && settings_file.exists() {
+            if let Ok(file) = std::fs::File::open(&settings_file) {
+                if let Ok(value) = serde_json::from_reader::<_, serde_json::Value>(file) {
+                    if let Some(arr) = value.get("trustedWorkspaces").and_then(|v| v.as_array()) {
+                        if arr.iter().any(|item| item.as_str() == Some(&p_str)) {
+                            found = true;
+                        }
+                    }
+                }
+            }
+        }
+        if !found {
+            return Err(format!(
+                "Path '{}' is not present in global trust folder configurations. Preflight trust check failed.",
+                p_str
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn run_command_with_timeout(
+    label: &str,
+    mut command: Command,
+    timeout: Duration,
+) -> Result<Output, String> {
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| err.to_string())?;
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_status)) => {
+                return child.wait_with_output().map_err(|err| err.to_string());
+            }
+            Ok(None) => {}
+            Err(err) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(err.to_string());
+            }
+        }
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let output = child.wait_with_output().ok();
+            let stderr = output
+                .as_ref()
+                .map(|output| String::from_utf8_lossy(&output.stderr).trim().to_string())
+                .filter(|text| !text.is_empty())
+                .unwrap_or_default();
+            let detail = if stderr.is_empty() {
+                String::new()
+            } else {
+                format!(" stderr: {stderr}")
+            };
+            return Err(format!(
+                "{label} timed out after {}s.{detail}",
+                timeout.as_secs()
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
 #[async_trait]
 impl AgentAdapter for AgyAdapter {
     async fn spawn(&self, spec: SessionSpec) -> AdapterResult<SessionId> {
+        let worktree = Path::new(&spec.worktree_path);
+        let brehon_root = std::env::var("BREHON_ROOT").ok().map(PathBuf::from);
+        if let Err(err) = run_preflight_checks(worktree, &self.config.command, brehon_root.as_ref())
+        {
+            return Err(AdapterError::spawn_failed(format!(
+                "Agy preflight checks failed: {}",
+                err
+            )));
+        }
+
         let session = AgySession::spawn(spec, &self.config)
             .await
             .map_err(agy_error_to_adapter_error)?;
@@ -957,298 +1222,4 @@ impl AgentAdapter for AgyAdapter {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn agy_session_config_from_params_worker() {
-        let params = AgySpawnParams {
-            name: "agy-worker".to_string(),
-            role: "worker".to_string(),
-            cwd: PathBuf::from("/tmp"),
-            brehon_root: None,
-            supervisor_name: Some("supervisor".to_string()),
-            factory_worker_cli: None,
-            model: None,
-            allow_privileged_mode: false,
-        };
-        let config = AgySessionConfig::from_params(&params);
-        assert_eq!(config.command, "agy");
-        assert_eq!(config.args[0], "--prompt-interactive");
-        assert!(config.args[1].contains("Brehon worker startup"));
-        assert!(config.args[1].contains("Antigravity MCP usage for this Brehon session"));
-        assert!(config.args[1].contains(".antigravitycli/brehon_mcp_client.py"));
-        assert!(config.args[1].contains("python3 .antigravitycli/brehon_mcp_client.py task"));
-        assert!(config.args[1].contains("mcp__brehon__task"));
-        assert!(config.args[1].contains("Do not inspect `~/.gemini/antigravity-cli/mcp/`"));
-        assert!(config.args[1].contains("Do not inspect `~/.gemini/antigravity-cli/scratch/`"));
-        assert!(config.args[1].contains("report that as an infrastructure error"));
-        assert!(config.args[1].contains("You are worker 'agy-worker'"));
-        assert!(config.args[1].contains("target=supervisor"));
-        assert!(config
-            .env
-            .iter()
-            .any(|(k, v)| k == "BREHON_AGENT_NAME" && v == "agy-worker"));
-        assert!(config
-            .env
-            .iter()
-            .any(|(k, v)| k == "BREHON_AGENT_ROLE" && v == "worker"));
-        assert!(!config
-            .args
-            .contains(&"--dangerously-skip-permissions".to_string()));
-    }
-
-    #[test]
-    fn agy_session_config_unsafe_profile_enables_skip_permissions() {
-        let params = AgySpawnParams {
-            name: "agy-worker".to_string(),
-            role: "worker".to_string(),
-            cwd: PathBuf::from("/tmp"),
-            brehon_root: None,
-            supervisor_name: Some("supervisor".to_string()),
-            factory_worker_cli: None,
-            model: None,
-            allow_privileged_mode: true,
-        };
-        let config = AgySessionConfig::from_params(&params);
-        assert_eq!(config.args[0], "--dangerously-skip-permissions");
-    }
-
-    #[test]
-    fn agy_mcp_config_merges_brehon_server_in_workspace_agents_config() {
-        let test_root =
-            std::env::temp_dir().join(format!("brehon-agy-mcp-test-{}", uuid::Uuid::new_v4()));
-        let workspace = test_root.join("workspace");
-        let config_path = workspace.join(AGY_PROJECT_MCP_CONFIG_PATH);
-        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &config_path,
-            r#"{"mcpServers":{"agora":{"command":"agora","args":["serve"]},"other":{"command":"other","args":["serve"]},"brehon":{"command":"/old/brehon","args":["serve"],"cwd":"/old/worktree","env":{"BREHON_SESSION_NAME":"brehon-session","BREHON_WORKTREE_ROOT":"/external/worktrees","BREHON_SUPERVISOR_NAME":"claude-supervisor"}}}}"#,
-        )
-        .unwrap();
-
-        let env = vec![
-            ("BREHON_AGENT_NAME".to_string(), "agy-worker".to_string()),
-            ("BREHON_AGENT_ROLE".to_string(), "worker".to_string()),
-            (
-                "BREHON_ROOT".to_string(),
-                workspace.join(".brehon").to_string_lossy().to_string(),
-            ),
-            ("PATH".to_string(), "/usr/bin".to_string()),
-        ];
-        configure_project_mcp_config(&workspace, "/tmp/brehon", &env);
-
-        let config: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(config_path).unwrap()).unwrap();
-        assert_eq!(
-            config["mcpServers"]["brehon"]["command"],
-            serde_json::json!("/tmp/brehon")
-        );
-        assert_eq!(
-            config["mcpServers"]["brehon"]["args"],
-            serde_json::json!(["serve"])
-        );
-        assert_eq!(
-            config["mcpServers"]["brehon"]["cwd"],
-            serde_json::Value::String(workspace.to_string_lossy().to_string())
-        );
-        assert_eq!(
-            config["mcpServers"]["brehon"]["env"]["BREHON_AGENT_NAME"],
-            "agy-worker"
-        );
-        assert_eq!(
-            config["mcpServers"]["brehon"]["env"]["BREHON_AGENT_ROLE"],
-            "worker"
-        );
-        assert_eq!(
-            config["mcpServers"]["brehon"]["env"]["BREHON_ROOT"],
-            workspace.join(".brehon").to_string_lossy().to_string()
-        );
-        assert_eq!(
-            config["mcpServers"]["brehon"]["env"]["BREHON_SESSION_NAME"],
-            "brehon-session"
-        );
-        assert_eq!(
-            config["mcpServers"]["brehon"]["env"]["BREHON_WORKTREE_ROOT"],
-            "/external/worktrees"
-        );
-        assert_eq!(
-            config["mcpServers"]["brehon"]["env"]["BREHON_SUPERVISOR_NAME"],
-            "claude-supervisor"
-        );
-        assert_eq!(config["mcpServers"]["other"]["command"], "other");
-        assert!(config["mcpServers"].get("agora").is_none());
-        assert!(!workspace.join(".mcp.json").exists());
-
-        let _ = std::fs::remove_dir_all(test_root);
-    }
-
-    #[test]
-    fn agy_mcp_helper_embeds_workspace_and_brehon_env() {
-        let test_root =
-            std::env::temp_dir().join(format!("brehon-agy-helper-test-{}", uuid::Uuid::new_v4()));
-        let workspace = test_root.join("workspace");
-        let helper_path = workspace.join(AGY_BREHON_MCP_CLIENT_PATH);
-        let env = vec![
-            ("BREHON_AGENT_NAME".to_string(), "agy-worker".to_string()),
-            (
-                "BREHON_WORKTREE_ROOT".to_string(),
-                "/external/worktrees".to_string(),
-            ),
-            ("PATH".to_string(), "/usr/bin".to_string()),
-        ];
-
-        write_brehon_mcp_client_helper_at(&helper_path, &workspace, "/tmp/brehon", &env).unwrap();
-        let helper = std::fs::read_to_string(&helper_path).unwrap();
-
-        assert!(helper.contains("BREHON_COMMAND = \"/tmp/brehon\""));
-        assert!(helper.contains(&format!("BREHON_CWD = \"{}\"", workspace.to_string_lossy())));
-        assert!(helper.contains("\"BREHON_AGENT_NAME\": \"agy-worker\""));
-        assert!(helper.contains("\"BREHON_WORKTREE_ROOT\": \"/external/worktrees\""));
-        assert!(helper.contains("\"method\": \"tools/call\""));
-        assert!(helper.contains("\"name\": tool_name"));
-        assert!(helper.contains("def tool_result_is_error(message):"));
-        assert!(helper.contains("result.get(\"isError\") is True"));
-        assert!(!helper.contains("\"PATH\""));
-
-        let _ = std::fs::remove_dir_all(test_root);
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn agy_mcp_helper_exits_nonzero_on_tool_result_error() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let test_root = std::env::temp_dir().join(format!(
-            "brehon-agy-helper-error-test-{}",
-            uuid::Uuid::new_v4()
-        ));
-        let workspace = test_root.join("workspace");
-        let helper_path = workspace.join(AGY_BREHON_MCP_CLIENT_PATH);
-        let fake_brehon = test_root.join("fake-brehon.py");
-        std::fs::create_dir_all(&workspace).unwrap();
-        std::fs::write(
-            &fake_brehon,
-            r#"#!/usr/bin/env python3
-import json
-import sys
-
-for line in sys.stdin:
-    message = json.loads(line)
-    method = message.get("method")
-    if method == "initialize":
-        print(json.dumps({
-            "jsonrpc": "2.0",
-            "id": message.get("id"),
-            "result": {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {},
-                "serverInfo": {"name": "fake-brehon", "version": "test"}
-            }
-        }), flush=True)
-    elif method == "tools/call":
-        print(json.dumps({
-            "jsonrpc": "2.0",
-            "id": message.get("id"),
-            "result": {
-                "content": [{"type": "text", "text": "tool failed"}],
-                "isError": True
-            }
-        }), flush=True)
-        break
-"#,
-        )
-        .unwrap();
-        let mut permissions = std::fs::metadata(&fake_brehon).unwrap().permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&fake_brehon, permissions).unwrap();
-
-        write_brehon_mcp_client_helper_at(
-            &helper_path,
-            &workspace,
-            fake_brehon.to_str().unwrap(),
-            &[],
-        )
-        .unwrap();
-
-        let output = std::process::Command::new("python3")
-            .arg(&helper_path)
-            .arg("task")
-            .arg(r#"{"action":"complete","id":"T-x"}"#)
-            .output()
-            .expect("run generated agy helper");
-
-        assert!(
-            !output.status.success(),
-            "helper must fail when MCP tool result has isError=true; stdout={}",
-            String::from_utf8_lossy(&output.stdout)
-        );
-        assert!(
-            String::from_utf8_lossy(&output.stdout).contains("\"isError\": true"),
-            "helper should still print the MCP response for the agent to inspect"
-        );
-
-        let _ = std::fs::remove_dir_all(test_root);
-    }
-
-    #[test]
-    fn agy_trust_updates_legacy_and_cli_settings() {
-        let test_root =
-            std::env::temp_dir().join(format!("brehon-agy-trust-test-{}", uuid::Uuid::new_v4()));
-        let home = test_root.join("home");
-        let project = test_root.join("project");
-        let worktree = project.join(".brehon/worktrees/runs/test/worker-1");
-        std::fs::create_dir_all(&worktree).unwrap();
-        let settings_path = home.join(".gemini/antigravity-cli/settings.json");
-        std::fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &settings_path,
-            r#"{"colorScheme":"dark","trustedWorkspaces":["/already/trusted"]}"#,
-        )
-        .unwrap();
-
-        let paths = trusted_workspace_paths(&worktree, Some(&project.join(".brehon")));
-        trust_folders_in_home(&home, &paths);
-        let worktree_key = paths[0].to_string_lossy();
-        let project_key = paths[1].to_string_lossy();
-
-        let trusted: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(home.join(".gemini/trustedFolders.json")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(
-            trusted
-                .get(worktree_key.as_ref())
-                .and_then(serde_json::Value::as_str),
-            Some("TRUST_FOLDER")
-        );
-        assert_eq!(
-            trusted
-                .get(project_key.as_ref())
-                .and_then(serde_json::Value::as_str),
-            Some("TRUST_FOLDER")
-        );
-
-        let settings: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(settings_path).unwrap()).unwrap();
-        let workspaces = settings["trustedWorkspaces"].as_array().unwrap();
-        assert!(workspaces
-            .iter()
-            .any(|value| value.as_str() == Some(worktree_key.as_ref())));
-        assert!(workspaces
-            .iter()
-            .any(|value| value.as_str() == Some(project_key.as_ref())));
-
-        let _ = std::fs::remove_dir_all(test_root);
-    }
-
-    #[test]
-    fn agy_adapter_kind_is_agy() {
-        let adapter = AgyAdapter::new(AgyConfig {
-            command: "agy".to_string(),
-            args: vec![],
-            env: vec![],
-        });
-        assert_eq!(adapter.kind(), brehon_types::AdapterKind::Agy);
-    }
-}
+mod agy_tests;

@@ -1,20 +1,3 @@
-use super::*;
-use crate::server::ContentBlock;
-use crate::tools::test_support::{
-    write_pane_assignment_context_fixture, write_prompt_delivery_fixture,
-};
-use crate::tools::{ScopedEnv, TEST_ENV_LOCK};
-use brehon_types::TaskCompletionMode;
-use proptest::prelude::*;
-use proptest::test_runner::{Config as ProptestConfig, TestCaseError, TestRunner};
-use std::io::{self, Write};
-use std::path::Path;
-use std::process::Command;
-use std::sync::{Arc, Mutex};
-use tempfile::TempDir;
-use tracing_subscriber::fmt::MakeWriter;
-
-// Items from sibling submodules needed by tests
 use super::super::epic::{
     apply_supervisor_integration_conflict, check_epic_completion,
     clear_task_supervisor_integration_conflict, default_conflict_owner,
@@ -29,10 +12,26 @@ use super::super::git_ops::{
 };
 use super::super::lifecycle::{is_container_task, validate_status_transition};
 use super::super::paths::{project_root, workspace_root};
+use super::*;
+use crate::server::ContentBlock;
 use crate::tools::task_actions::update_task_status_atomic;
+use crate::tools::test_support::{
+    write_pane_assignment_context_fixture, write_prompt_delivery_fixture,
+};
 use crate::tools::verification::reviewed_commits;
+use crate::tools::{ScopedEnv, TEST_ENV_LOCK};
+use brehon_types::TaskCompletionMode;
+use proptest::prelude::*;
+use proptest::test_runner::{Config as ProptestConfig, TestCaseError, TestRunner};
+use std::io::{self, Write};
+use std::path::Path;
 use std::path::PathBuf;
-
+use std::process::Command;
+use std::sync::{Arc, Mutex};
+use tempfile::TempDir;
+use tracing_subscriber::fmt::MakeWriter;
+#[path = "tool_tests/integrated_closeout.rs"]
+mod integrated_closeout;
 #[derive(Clone, Default)]
 struct SharedLogBuffer(Arc<Mutex<Vec<u8>>>);
 

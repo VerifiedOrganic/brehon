@@ -3,6 +3,7 @@
 use crate::error::{Error, Result};
 use crate::harness::{AgentAdapter, SupervisorCli};
 use crate::mux::AgentPaneMaterialization;
+use crate::pane::grok_sandbox::apply_grok_acp_hardening;
 use crate::pane::types::{GatewaySpawnConfig, Pane, PaneBackend, PaneKind};
 use crate::pty::{Pty, PtyConfig, TeamsSpawnConfig};
 use brehon_acp::GatewayProtocol;
@@ -258,7 +259,7 @@ pub(crate) fn config_env_value(env: &[(String, String)], key: &str) -> Option<St
         .find_map(|(env_key, value)| (env_key == key).then(|| value.clone()))
 }
 
-fn set_config_env_value(env: &mut Vec<(String, String)>, key: &str, value: &str) {
+pub(super) fn set_config_env_value(env: &mut Vec<(String, String)>, key: &str, value: &str) {
     if let Some((_, existing)) = env.iter_mut().find(|(env_key, _)| env_key == key) {
         *existing = value.to_string();
     } else {
@@ -434,12 +435,6 @@ fn apply_runtime_model_metadata(
     }
 }
 
-fn current_brehon_exe() -> String {
-    std::env::current_exe()
-        .map(|path| path.to_string_lossy().to_string())
-        .unwrap_or_else(|_| "brehon".to_string())
-}
-
 fn command_basename(command: &str) -> &str {
     std::path::Path::new(command)
         .file_name()
@@ -452,12 +447,6 @@ fn is_native_agent_command(command: &str) -> bool {
     name == "native-agent" || name.ends_with("-native-agent")
 }
 
-fn is_grok_agent_stdio(command: &str, args: &[String]) -> bool {
-    command_basename(command) == "grok"
-        && args.iter().any(|arg| arg == "agent")
-        && args.iter().any(|arg| arg == "stdio")
-}
-
 fn args_contain_option(args: &[String], option: &str) -> bool {
     args.iter().any(|arg| {
         arg == option
@@ -465,48 +454,6 @@ fn args_contain_option(args: &[String], option: &str) -> bool {
                 .strip_prefix(option)
                 .is_some_and(|rest| rest.starts_with('='))
     })
-}
-
-fn apply_grok_acp_hardening(config: &mut PtyConfig, command: &str) {
-    if !is_grok_agent_stdio(command, &config.args) {
-        return;
-    }
-
-    let mut prefix_args = Vec::new();
-    if !args_contain_option(&config.args, "--sandbox")
-        && config_env_value(&config.env, "GROK_SANDBOX").is_none()
-    {
-        prefix_args.push("--sandbox".to_string());
-        prefix_args.push("workspace".to_string());
-    }
-    if !args_contain_option(&config.args, "--cwd")
-        && let Some(cwd) = config.cwd.as_ref()
-    {
-        prefix_args.push("--cwd".to_string());
-        prefix_args.push(cwd.to_string_lossy().to_string());
-    }
-    if !prefix_args.is_empty() {
-        config.args.splice(0..0, prefix_args);
-    }
-
-    let server_env = config
-        .env
-        .iter()
-        .filter(|(key, _)| key.starts_with("BREHON_"))
-        .map(|(name, value)| serde_json::json!({ "name": name, "value": value }))
-        .collect::<Vec<_>>();
-    let mcp_servers = serde_json::json!([{
-        "name": "brehon",
-        "type": "stdio",
-        "command": current_brehon_exe(),
-        "args": ["serve"],
-        "env": server_env,
-    }]);
-    set_config_env_value(
-        &mut config.env,
-        "BREHON_ACP_MCP_SERVERS_JSON",
-        &mcp_servers.to_string(),
-    );
 }
 
 fn apply_runtime_session_name(env: &mut Vec<(String, String)>, session_name: Option<&str>) {
@@ -685,6 +632,13 @@ impl Pane {
             permission_resolution_fallback_until: None,
             task_context: None,
             review_context: None,
+            last_prompt_delivery_attempt: None,
+            last_successful_mcp_call: None,
+            restart_count: 0,
+            last_restart_reason: None,
+            blocked_dead_unavailable_reason: None,
+            last_restart_at: None,
+            consecutive_crashes: 0,
         };
         pane.arm_claude_inbox_nudge_grace_period();
         Ok(pane)
@@ -703,6 +657,28 @@ impl Pane {
 
     pub(crate) fn set_pty_spawn_config(&mut self, config: PtyConfig) {
         self.pty_spawn_config = Some(config);
+    }
+
+    pub(crate) fn is_agy(&self) -> bool {
+        match &self.cli_type {
+            AgentAdapter::BuiltIn(cli) => *cli == SupervisorCli::Agy,
+            AgentAdapter::BuiltInOverride(cfg) => cfg.cli == SupervisorCli::Agy,
+            AgentAdapter::Custom(_) => false,
+        }
+    }
+
+    pub(crate) fn is_opencode_supervisor(&self) -> bool {
+        let is_sup = matches!(self.kind, crate::pane::PaneKind::Supervisor);
+        let is_opencode = match &self.cli_type {
+            AgentAdapter::BuiltIn(cli) => *cli == SupervisorCli::OpenCode,
+            AgentAdapter::BuiltInOverride(cfg) => cfg.cli == SupervisorCli::OpenCode,
+            AgentAdapter::Custom(_) => false,
+        };
+        is_sup && is_opencode
+    }
+
+    pub(crate) fn is_agy_or_opencode_supervisor(&self) -> bool {
+        self.is_agy() || self.is_opencode_supervisor()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1144,7 +1120,7 @@ impl Pane {
                     apply_configured_agent_type(&mut config, configured_agent_type);
                     merge_launcher_env(&mut config.env, launcher_env);
                     apply_runtime_model_metadata(&mut config.env, model, reasoning_effort);
-                    apply_grok_acp_hardening(&mut config, command);
+                    apply_grok_acp_hardening(&mut config, command)?;
                     return Self::gateway_pane_from_config(
                         name,
                         PaneKind::Worker,
@@ -1551,7 +1527,8 @@ impl Pane {
                     worker_cli_str,
                     model,
                     teams,
-                );
+                )
+                .map_err(Error::pty)?;
                 apply_runtime_session_name(&mut config.env, session_name);
                 apply_configured_agent_type(&mut config, configured_agent_type);
                 merge_launcher_env(&mut config.env, launcher_env);
@@ -1919,7 +1896,7 @@ impl Pane {
                     apply_configured_agent_type(&mut config, configured_agent_type);
                     merge_launcher_env(&mut config.env, launcher_env);
                     apply_runtime_model_metadata(&mut config.env, model, reasoning_effort);
-                    apply_grok_acp_hardening(&mut config, command);
+                    apply_grok_acp_hardening(&mut config, command)?;
                     return Self::gateway_pane_from_config(
                         name,
                         pane_kind.clone(),
@@ -2309,7 +2286,8 @@ impl Pane {
             }
             SupervisorCli::Agy => {
                 let mut config =
-                    PtyConfig::agy(name, role, cwd, brehon_root, None, None, model, teams);
+                    PtyConfig::agy(name, role, cwd, brehon_root, None, None, model, teams)
+                        .map_err(Error::pty)?;
                 apply_runtime_session_name(&mut config.env, session_name);
                 apply_configured_agent_type(&mut config, configured_agent_type);
                 merge_launcher_env(&mut config.env, launcher_env);
@@ -2814,7 +2792,8 @@ impl Pane {
                     Some(worker_cli_str),
                     model,
                     teams,
-                );
+                )
+                .map_err(Error::pty)?;
                 apply_runtime_session_name(&mut config.env, session_name);
                 apply_configured_agent_type(&mut config, configured_agent_type);
                 merge_launcher_env(&mut config.env, launcher_env);
