@@ -77,15 +77,19 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
+            artifact: linux-x86_64-gnu
             runner: ubuntu-latest
             archive: tar.gz
           - target: aarch64-unknown-linux-gnu
+            artifact: linux-aarch64-gnu
             runner: ubuntu-24.04-arm
             archive: tar.gz
           - target: x86_64-apple-darwin
+            artifact: macos-x86_64
             runner: macos-26-intel
             archive: tar.gz
           - target: aarch64-apple-darwin
+            artifact: macos-aarch64
             runner: macos-14
             archive: tar.gz
           # Windows is currently unsupported (Zig build + PTY stack not validated
@@ -130,7 +134,8 @@ jobs:
           set -euo pipefail
           VERSION="${{ needs.prepare.outputs.version }}"
           TARGET="${{ matrix.target }}"
-          NAME="brehon-${VERSION}-${TARGET}"
+          ARTIFACT="${{ matrix.artifact }}"
+          NAME="brehon-${VERSION}-${ARTIFACT}"
           STAGE="dist/${NAME}"
           mkdir -p "${STAGE}"
 
