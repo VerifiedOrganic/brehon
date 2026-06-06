@@ -24,12 +24,13 @@ use brehon_types::TaskCompletionMode;
 use proptest::prelude::*;
 use proptest::test_runner::{Config as ProptestConfig, TestCaseError, TestRunner};
 use std::io::{self, Write};
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
 use tracing_subscriber::fmt::MakeWriter;
+#[path = "tool_tests/git_patch_id.rs"]
+mod git_patch_id_tests;
 #[path = "tool_tests/integrated_closeout.rs"]
 mod integrated_closeout;
 #[derive(Clone, Default)]

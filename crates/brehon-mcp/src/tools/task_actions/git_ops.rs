@@ -601,7 +601,8 @@ pub(super) fn cherry_pick_sha_in(wt: &Path) -> Option<String> {
 
 /// Compute the stable patch-id for a commit in a worktree.
 pub(super) fn git_patch_id(wt: &Path, sha: &str) -> Result<Option<String>, String> {
-    let diff_output = crate::git_exec::run_git(wt, &["diff-tree", "-p", sha])?;
+    let diff_output =
+        crate::git_exec::run_git(wt, &["diff-tree", "--root", "--no-commit-id", "-p", sha])?;
     if !diff_output.status.success() {
         return Err(format!(
             "git diff-tree failed: {}",
