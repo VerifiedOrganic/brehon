@@ -15,6 +15,11 @@ use crate::runtime::CancellationToken;
 
 const OUTPUT_CHANNEL_CAPACITY: usize = 128;
 const GRACEFUL_TERM_MS: Duration = Duration::from_millis(250);
+const TEXT_FILE_BUSY_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_millis(10),
+    Duration::from_millis(25),
+    Duration::from_millis(50),
+];
 
 #[derive(Debug)]
 enum ShellEvent {
@@ -49,21 +54,45 @@ fn spawn_shell_command(
     command: String,
     tool_env: &Option<Vec<(String, String)>>,
 ) -> Result<Child, String> {
-    let mut cmd = Command::new(shell);
-    cmd.arg("-c");
-    cmd.arg(command);
-    cmd.current_dir(worktree_root);
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
-    if let Some(tool_env) = tool_env {
-        cmd.env_clear();
-        for (key, value) in tool_env {
-            cmd.env(key, value);
+    let mut busy_retries = 0;
+    loop {
+        let mut cmd = Command::new(&shell);
+        cmd.arg("-c");
+        cmd.arg(&command);
+        cmd.current_dir(worktree_root);
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+        if let Some(tool_env) = tool_env {
+            cmd.env_clear();
+            for (key, value) in tool_env {
+                cmd.env(key, value);
+            }
+        }
+        apply_noninteractive_tool_env(&mut cmd);
+
+        match cmd.spawn() {
+            Ok(child) => return Ok(child),
+            Err(err)
+                if is_text_file_busy(&err) && busy_retries < TEXT_FILE_BUSY_RETRY_DELAYS.len() =>
+            {
+                std::thread::sleep(TEXT_FILE_BUSY_RETRY_DELAYS[busy_retries]);
+                busy_retries += 1;
+            }
+            Err(err) => return Err(format!("failed to spawn shell command: {err}")),
         }
     }
-    apply_noninteractive_tool_env(&mut cmd);
-    cmd.spawn()
-        .map_err(|err| format!("failed to spawn shell command: {err}"))
+}
+
+fn is_text_file_busy(err: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        err.raw_os_error() == Some(26)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = err;
+        false
+    }
 }
 
 fn spawn_output_readers(
