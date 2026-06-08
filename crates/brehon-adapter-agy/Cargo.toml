@@ -1,6 +1,6 @@
 [package]
 name = "brehon-adapter-agy"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 description = "Antigravity 2.0 CLI (agy) adapter for Brehon"
 license = "MIT"
