@@ -9,23 +9,20 @@ pub fn Struct(
         .zig => Zig,
         .c => c: {
             const info = @typeInfo(Zig).@"struct";
-            var fields: [info.fields.len]std.builtin.Type.StructField = undefined;
+            var names: [info.fields.len][:0]const u8 = undefined;
+            var types: [info.fields.len]type = undefined;
+            var attrs: [info.fields.len]std.builtin.Type.StructField.Attributes = undefined;
             for (info.fields, 0..) |field, i| {
-                fields[i] = .{
-                    .name = field.name,
-                    .type = field.type,
+                names[i] = field.name;
+                types[i] = field.type;
+                attrs[i] = .{
                     .default_value_ptr = field.default_value_ptr,
-                    .is_comptime = field.is_comptime,
-                    .alignment = field.alignment,
+                    .@"comptime" = field.is_comptime,
+                    .@"align" = field.alignment,
                 };
             }
 
-            break :c @Type(.{ .@"struct" = .{
-                .layout = .@"extern",
-                .fields = &fields,
-                .decls = &.{},
-                .is_tuple = info.is_tuple,
-            } });
+            break :c @Struct(.@"extern", null, &names, &types, &attrs);
         },
     };
 }

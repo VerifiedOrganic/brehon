@@ -8,6 +8,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const assert = @import("../quirks.zig").inlineAssert;
 const Allocator = std.mem.Allocator;
+const compat = @import("../compat.zig");
 const objc = @import("objc");
 const apprt = @import("../apprt.zig");
 const font = @import("../font/main.zig");
@@ -369,7 +370,7 @@ pub const Platform = union(PlatformTag) {
 
     /// Initialize a Platform a tag and configuration from the C ABI.
     pub fn init(tag_int: c_int, c_platform: C) !Platform {
-        const tag = try std.meta.intToEnum(PlatformTag, tag_int);
+        const tag = try compat.intToEnum(PlatformTag, tag_int);
         return switch (tag) {
             .macos => if (MacOS != void) macos: {
                 const config = c_platform.macos;
@@ -1494,7 +1495,7 @@ pub const CAPI = struct {
 
     /// Update the color scheme of the app.
     export fn ghostty_app_set_color_scheme(v: *App, scheme_raw: c_int) void {
-        const scheme = std.meta.intToEnum(apprt.ColorScheme, scheme_raw) catch {
+        const scheme = compat.intToEnum(apprt.ColorScheme, scheme_raw) catch {
             log.warn(
                 "invalid color scheme to ghostty_surface_set_color_scheme value={}",
                 .{scheme_raw},
@@ -1687,7 +1688,7 @@ pub const CAPI = struct {
 
     /// Update the color scheme of the surface.
     export fn ghostty_surface_set_color_scheme(surface: *Surface, scheme_raw: c_int) void {
-        const scheme = std.meta.intToEnum(apprt.ColorScheme, scheme_raw) catch {
+        const scheme = compat.intToEnum(apprt.ColorScheme, scheme_raw) catch {
             log.warn(
                 "invalid color scheme to ghostty_surface_set_color_scheme value={}",
                 .{scheme_raw},
@@ -1848,7 +1849,7 @@ pub const CAPI = struct {
         stage_raw: u32,
         pressure: f64,
     ) void {
-        const stage = std.meta.intToEnum(
+        const stage = compat.intToEnum(
             input.MousePressureStage,
             stage_raw,
         ) catch {

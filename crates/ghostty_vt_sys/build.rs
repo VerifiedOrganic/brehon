@@ -32,13 +32,13 @@ fn main() {
     // Find Zig compiler
     let zig = find_zig(workspace_root).expect(
         "Compatible Zig compiler not found.\n\
-         ghostty_vt_sys currently requires Zig >= 0.15.2 and < 0.16.0.\n\
+         ghostty_vt_sys currently requires Zig >= 0.16.0 and < 0.17.0.\n\
          Set ZIG to a compatible binary or place one at .context/zig/zig.",
     );
     let zig_version = zig_version(&zig).unwrap_or_else(|| {
         panic!(
             "Failed to determine Zig version for {}.\n\
-             ghostty_vt_sys currently requires Zig >= 0.15.2 and < 0.16.0.",
+             ghostty_vt_sys currently requires Zig >= 0.16.0 and < 0.17.0.",
             zig.display()
         )
     });
@@ -86,7 +86,8 @@ fn main() {
     // Link the static library
     let lib_dir = zig_out.join("lib");
 
-    // Zig 0.15.2 produces misaligned mach-o archives on macOS, which ld rejects:
+    // Some Zig-produced mach-o archives on macOS have had member alignment
+    // issues that ld rejects:
     //   "64-bit mach-o member 'libghostty_vt_zcu.o' not 8-byte aligned"
     // Re-pack with the system ar to restore correct alignment.
     #[cfg(target_os = "macos")]
@@ -100,7 +101,7 @@ fn main() {
 }
 
 /// Re-pack a static archive with the system `ar` to ensure 8-byte alignment
-/// of mach-o objects. This works around a Zig 0.15.2 bug on macOS.
+/// of mach-o objects.
 #[cfg(target_os = "macos")]
 fn fix_archive_alignment(archive_path: &Path) {
     if !archive_path.exists() {
@@ -417,13 +418,13 @@ fn zig_candidates(workspace_root: &Path) -> Vec<PathBuf> {
 
 fn homebrew_zig_candidates() -> Vec<PathBuf> {
     let mut candidates = vec![
-        PathBuf::from("/opt/homebrew/opt/zig@0.15/bin/zig"),
-        PathBuf::from("/usr/local/opt/zig@0.15/bin/zig"),
+        PathBuf::from("/opt/homebrew/opt/zig@0.16/bin/zig"),
+        PathBuf::from("/usr/local/opt/zig@0.16/bin/zig"),
     ];
 
     for cellar in [
-        "/opt/homebrew/Cellar/zig@0.15",
-        "/usr/local/Cellar/zig@0.15",
+        "/opt/homebrew/Cellar/zig@0.16",
+        "/usr/local/Cellar/zig@0.16",
     ] {
         let Ok(entries) = fs::read_dir(cellar) else {
             continue;
@@ -460,12 +461,12 @@ fn parse_zig_version(version: &str) -> Option<ZigVersion> {
 fn is_supported_zig_version(version: ZigVersion) -> bool {
     let min = ZigVersion {
         major: 0,
-        minor: 15,
-        patch: 2,
+        minor: 16,
+        patch: 0,
     };
     let max = ZigVersion {
         major: 0,
-        minor: 16,
+        minor: 17,
         patch: 0,
     };
 
@@ -479,7 +480,7 @@ fn assert_supported_zig_version(zig: &Path, version: ZigVersion) {
 
     panic!(
         "Unsupported Zig version {}.{}.{} at {}.\n\
-         ghostty_vt_sys currently requires Zig >= 0.15.2 and < 0.16.0.\n\
+         ghostty_vt_sys currently requires Zig >= 0.16.0 and < 0.17.0.\n\
          Set ZIG to a compatible binary or install one at .context/zig/zig.",
         version.major,
         version.minor,

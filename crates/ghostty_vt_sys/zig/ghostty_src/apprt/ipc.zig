@@ -113,7 +113,9 @@ pub const Action = union(enum) {
     /// Sync with: ghostty_ipc_action_u
     pub const CValue = cvalue: {
         const key_fields = @typeInfo(Key).@"enum".fields;
-        var union_fields: [key_fields.len]std.builtin.Type.UnionField = undefined;
+        var names: [key_fields.len][:0]const u8 = undefined;
+        var types: [key_fields.len]type = undefined;
+        var attrs: [key_fields.len]std.builtin.Type.UnionField.Attributes = undefined;
         for (key_fields, 0..) |field, i| {
             const action = @unionInit(Action, field.name, undefined);
             const Type = t: {
@@ -123,19 +125,12 @@ pub const Action = union(enum) {
                 break :t Type;
             };
 
-            union_fields[i] = .{
-                .name = field.name,
-                .type = Type,
-                .alignment = @alignOf(Type),
-            };
+            names[i] = field.name;
+            types[i] = Type;
+            attrs[i] = .{ .@"align" = @alignOf(Type) };
         }
 
-        break :cvalue @Type(.{ .@"union" = .{
-            .layout = .@"extern",
-            .tag_type = null,
-            .fields = &union_fields,
-            .decls = &.{},
-        } });
+        break :cvalue @Union(.@"extern", null, &names, &types, &attrs);
     };
 
     /// Sync with: ghostty_ipc_action_s

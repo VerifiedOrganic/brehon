@@ -148,13 +148,14 @@ pub fn Common(
                     var params: [fn_info.params.len]std.builtin.Type.Fn.Param = undefined;
                     @memcpy(&params, fn_info.params);
                     params[0].type = *ClassInstance(T);
-                    return @Type(.{ .@"fn" = .{
-                        .calling_convention = fn_info.calling_convention,
-                        .is_generic = fn_info.is_generic,
-                        .is_var_args = fn_info.is_var_args,
-                        .return_type = fn_info.return_type,
-                        .params = &params,
-                    } });
+                    var param_types: [params.len]?type = undefined;
+                    for (params, 0..) |param, i| param_types[i] = param.type;
+                    return @Fn(
+                        fn_info.calling_convention,
+                        .{ .varargs = fn_info.is_var_args },
+                        fn_info.return_type.?,
+                        &param_types,
+                    );
                 }
             };
         }

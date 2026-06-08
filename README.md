@@ -119,7 +119,7 @@ design (disjoint write scopes) is what keeps that cheap; the
 ## Prerequisites
 
 - **Rust** 1.75 or later. Install via [rustup](https://rustup.rs/).
-- **Zig** 0.15.2+ (only required if you are building the vendored ghostty
+- **Zig** 0.16.0+ (only required if you are building the vendored ghostty
   terminal-emulation bindings from source; pre-built artifacts cover most users).
 - **Git** 2.x with worktree support (any modern version).
 - At least one supported agent CLI installed:

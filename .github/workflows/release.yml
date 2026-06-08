@@ -22,7 +22,7 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
   RUST_BACKTRACE: 1
-  ZIG_VERSION: "0.15.2"
+  ZIG_VERSION: "0.16.0"
   BIN_PRIMARY: brehon
   BIN_AGENT: brehon-native-agent
 

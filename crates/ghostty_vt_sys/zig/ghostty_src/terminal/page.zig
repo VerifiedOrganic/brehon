@@ -1969,10 +1969,10 @@ pub const Cell = packed struct(u64) {
         /// The codepoint that this cell contains. If `grapheme` is false,
         /// then this is the only codepoint in the cell. If `grapheme` is
         /// true, then this is the first codepoint in the grapheme cluster.
-        codepoint: u21,
+        codepoint: u24,
 
         /// The content is an empty cell with a background color.
-        color_palette: u8,
+        color_palette: u24,
         color_rgb: RGB,
     } = .{ .codepoint = 0 },
 
@@ -2070,7 +2070,7 @@ pub const Cell = packed struct(u64) {
         return switch (self.content_tag) {
             .codepoint,
             .codepoint_grapheme,
-            => self.content.codepoint,
+            => @intCast(self.content.codepoint),
 
             .bg_color_palette,
             .bg_color_rgb,

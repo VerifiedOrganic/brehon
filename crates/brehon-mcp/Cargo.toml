@@ -1,6 +1,6 @@
 [package]
 name = "brehon-mcp"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 description = "Model Context Protocol (MCP) server exposing tools for agent coordination"
 license = "MIT"

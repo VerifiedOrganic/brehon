@@ -1,6 +1,6 @@
 [package]
 name = "brehon-tui"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 description = "Terminal user interface built with Ratatui for Brehon"
 license = "MIT"

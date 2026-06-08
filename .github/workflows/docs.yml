@@ -17,7 +17,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  ZIG_VERSION: "0.15.2"
+  ZIG_VERSION: "0.16.0"
 
 jobs:
   rustdoc:

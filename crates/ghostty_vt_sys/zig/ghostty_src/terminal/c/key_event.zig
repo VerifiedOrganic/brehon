@@ -1,5 +1,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const compat = @import("../../compat.zig");
 const lib_alloc = @import("../../lib/allocator.zig");
 const CAllocator = lib_alloc.Allocator;
 const key = @import("../../input/key.zig");
@@ -38,7 +39,7 @@ pub fn free(event_: Event) callconv(.c) void {
 
 pub fn set_action(event_: Event, action: key.Action) callconv(.c) void {
     if (comptime std.debug.runtime_safety) {
-        _ = std.meta.intToEnum(key.Action, @intFromEnum(action)) catch {
+        _ = compat.intToEnum(key.Action, @intFromEnum(action)) catch {
             log.warn("set_action invalid action value={d}", .{@intFromEnum(action)});
             return;
         };
@@ -55,7 +56,7 @@ pub fn get_action(event_: Event) callconv(.c) key.Action {
 
 pub fn set_key(event_: Event, k: key.Key) callconv(.c) void {
     if (comptime std.debug.runtime_safety) {
-        _ = std.meta.intToEnum(key.Key, @intFromEnum(k)) catch {
+        _ = compat.intToEnum(key.Key, @intFromEnum(k)) catch {
             log.warn("set_key invalid key value={d}", .{@intFromEnum(k)});
             return;
         };

@@ -1,6 +1,6 @@
 [package]
 name = "brehon-adapter-copilot"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 description = "GitHub Copilot CLI adapter for Brehon — implements AgentAdapter for the Copilot ACP stdio protocol"
 license = "MIT"

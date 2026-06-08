@@ -1,6 +1,6 @@
 [package]
 name = "splash-demo"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 publish = false
 description = "Local visual sanity-check for the brehon startup splash (dev tool only)"

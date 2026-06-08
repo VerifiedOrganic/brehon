@@ -9,7 +9,7 @@ pub const std_options: std.Options = .{
     .logFn = struct {
         fn f(
             comptime _: std.log.Level,
-            comptime _: @Type(.enum_literal),
+            comptime _: @EnumLiteral(),
             comptime _: []const u8,
             _: anytype,
         ) void {}

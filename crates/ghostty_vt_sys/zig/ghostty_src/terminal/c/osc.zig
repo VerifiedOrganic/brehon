@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("../../compat.zig");
 const lib_alloc = @import("../../lib/allocator.zig");
 const CAllocator = lib_alloc.Allocator;
 const osc = @import("../osc.zig");
@@ -69,7 +70,7 @@ pub fn commandData(
     out: ?*anyopaque,
 ) callconv(.c) bool {
     if (comptime std.debug.runtime_safety) {
-        _ = std.meta.intToEnum(CommandData, @intFromEnum(data)) catch {
+        _ = compat.intToEnum(CommandData, @intFromEnum(data)) catch {
             log.warn("commandData invalid data value={d}", .{@intFromEnum(data)});
             return false;
         };

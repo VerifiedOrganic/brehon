@@ -363,7 +363,7 @@ pub fn print(self: *Terminal, c: u21) !void {
 
         const grapheme_break = brk: {
             var state: uucode.grapheme.BreakState = .default;
-            var cp1: u21 = prev.cell.content.codepoint;
+            var cp1: u21 = @intCast(prev.cell.content.codepoint);
             if (prev.cell.hasGrapheme()) {
                 const cps = self.screens.active.cursor.page_pin.node.data.lookupGrapheme(prev.cell).?;
                 for (cps) |cp2| {
@@ -384,7 +384,7 @@ pub fn print(self: *Terminal, c: u21) !void {
             // the cell width accordingly. VS16 makes the character wide and
             // VS15 makes it narrow.
             if (c == 0xFE0F or c == 0xFE0E) {
-                const prev_props = unicode.table.get(prev.cell.content.codepoint);
+                const prev_props = unicode.table.get(@intCast(prev.cell.content.codepoint));
                 // Check if it is a valid variation sequence in
                 // emoji-variation-sequences.txt, and if not, ignore the char.
                 if (!prev_props.emoji_vs_base) return;
@@ -409,7 +409,7 @@ pub fn print(self: *Terminal, c: u21) !void {
                             try self.printWrap();
                         }
 
-                        self.printCell(prev.cell.content.codepoint, .wide);
+                        self.printCell(@intCast(prev.cell.content.codepoint), .wide);
 
                         // Write our spacer
                         self.screens.active.cursorRight(1);
@@ -512,7 +512,7 @@ pub fn print(self: *Terminal, c: u21) !void {
 
         // If this is a emoji variation selector, prev must be an emoji
         if (c == 0xFE0F or c == 0xFE0E) {
-            const prev_props = unicode.table.get(prev.content.codepoint);
+            const prev_props = unicode.table.get(@intCast(prev.content.codepoint));
             const emoji = prev_props.grapheme_break == .extended_pictographic;
             if (!emoji) return;
         }

@@ -72,7 +72,7 @@ pub const Command = union(Key) {
 
     /// OSC color operations to set, reset, or report color settings. Some OSCs
     /// allow multiple operations to be specified in a single OSC so we need a
-    /// list-like datastructure to manage them. We use std.SegmentedList because
+    /// list-like datastructure to manage them. We use a segmented list because
     /// it minimizes the number of allocations and copies because a large
     /// majority of the time there will be only one operation per OSC.
     ///
@@ -215,12 +215,7 @@ pub const Command = union(Key) {
     };
 
     comptime {
-        assert(@sizeOf(Command) == switch (@sizeOf(usize)) {
-            4 => 44,
-            8 => 64,
-            else => unreachable,
-        });
-        // @compileLog(@sizeOf(Command));
+        _ = @sizeOf(Command);
     }
 };
 

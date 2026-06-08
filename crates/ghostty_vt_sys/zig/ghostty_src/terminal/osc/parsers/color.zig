@@ -6,6 +6,8 @@ const SpecialColor = @import("../../color.zig").Special;
 const RGB = @import("../../color.zig").RGB;
 const Parser = @import("../../osc.zig").Parser;
 const Command = @import("../../osc.zig").Command;
+const SegmentedList = @import("../../../datastruct/segmented_list.zig").SegmentedList;
+const compat = @import("../../../compat.zig");
 
 const log = std.log.scoped(.osc_color);
 
@@ -182,7 +184,7 @@ fn parseGetSetAnsiColor(
         // Parse the color.
         const target: Target = switch (op) {
             // OSC5 maps directly to the Special enum.
-            .osc_5 => .{ .special = std.meta.intToEnum(
+            .osc_5 => .{ .special = compat.intToEnum(
                 SpecialColor,
                 std.math.cast(u3, color) orelse return result,
             ) catch return result },
@@ -191,7 +193,7 @@ fn parseGetSetAnsiColor(
             // by the palette count.
             .osc_4 => if (std.math.cast(u8, color)) |idx| .{
                 .palette = idx,
-            } else .{ .special = std.meta.intToEnum(
+            } else .{ .special = compat.intToEnum(
                 SpecialColor,
                 std.math.cast(u3, color - 256) orelse return result,
             ) catch return result },
@@ -255,7 +257,7 @@ fn parseResetAnsiColor(
         // Parse the color.
         const target: Target = switch (op) {
             // OSC105 maps directly to the Special enum.
-            .osc_105 => .{ .special = std.meta.intToEnum(
+            .osc_105 => .{ .special = compat.intToEnum(
                 SpecialColor,
                 std.math.cast(u3, color) orelse continue,
             ) catch continue },
@@ -264,7 +266,7 @@ fn parseResetAnsiColor(
             // by the palette count.
             .osc_104 => if (std.math.cast(u8, color)) |idx| .{
                 .palette = idx,
-            } else .{ .special = std.meta.intToEnum(
+            } else .{ .special = compat.intToEnum(
                 SpecialColor,
                 std.math.cast(u3, color - 256) orelse continue,
             ) catch continue },
@@ -329,7 +331,7 @@ fn parseResetDynamicColor(
 /// The exact prealloc value is chosen arbitrarily assuming most
 /// color ops have very few. If we can get empirical data on more
 /// typical values we can switch to that.
-pub const List = std.SegmentedList(
+pub const List = SegmentedList(
     Request,
     2,
 );
@@ -450,7 +452,7 @@ test "OSC 4:" {
 
     // Test every special color
     for (0..@typeInfo(SpecialColor).@"enum".fields.len) |i| {
-        const special = try std.meta.intToEnum(SpecialColor, i);
+        const special = try compat.intToEnum(SpecialColor, i);
 
         // Simple color set
         // printf '\e]4;256;red\\'
@@ -482,7 +484,7 @@ test "OSC 5:" {
 
     // Test every special color
     for (0..@typeInfo(SpecialColor).@"enum".fields.len) |i| {
-        const special = try std.meta.intToEnum(SpecialColor, i);
+        const special = try compat.intToEnum(SpecialColor, i);
 
         // Simple color set
         // printf '\e]4;256;red\\'
@@ -592,7 +594,7 @@ test "OSC 104:" {
 
     // Test every special color
     for (0..@typeInfo(SpecialColor).@"enum".fields.len) |i| {
-        const special = try std.meta.intToEnum(SpecialColor, i);
+        const special = try compat.intToEnum(SpecialColor, i);
 
         // Simple color set
         // printf '\e]104;256\\'

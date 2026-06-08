@@ -87,4 +87,5 @@
 923 crates/brehon-tui/src/run/task_detail.rs
 1007 crates/brehon-tui/src/run/types.rs
 2965 crates/brehon-types/src/config.rs
+1108 crates/ghostty_vt_sys/zig/zig-pkg/uucode-0.2.0-zig-0.16-2826a37/resources/wcwidth/unicode_width.rs
 1038 vendor/panesmith/crates/panesmith/src/lib.rs

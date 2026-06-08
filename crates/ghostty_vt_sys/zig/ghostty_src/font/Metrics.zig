@@ -585,23 +585,26 @@ pub const Modifier = union(enum) {
 /// Key is an enum of all the available metrics keys.
 pub const Key = key: {
     const field_infos = std.meta.fields(Metrics);
-    var enumFields: [field_infos.len]std.builtin.Type.EnumField = undefined;
+    var names: [field_infos.len][:0]const u8 = undefined;
+    var raw_values: [field_infos.len]usize = undefined;
     var count: usize = 0;
-    for (field_infos, 0..) |field, i| {
+    for (field_infos) |field| {
         if (field.type != u32 and field.type != i32 and field.type != f64) continue;
-        enumFields[i] = .{ .name = field.name, .value = i };
+        names[count] = field.name;
+        raw_values[count] = count;
         count += 1;
     }
 
-    var decls = [_]std.builtin.Type.Declaration{};
-    break :key @Type(.{
-        .@"enum" = .{
-            .tag_type = std.math.IntFittingRange(0, count - 1),
-            .fields = enumFields[0..count],
-            .decls = &decls,
-            .is_exhaustive = true,
-        },
-    });
+    const Tag = std.math.IntFittingRange(0, count - 1);
+    var values: [count]Tag = undefined;
+    for (raw_values[0..count], 0..) |value, i| values[i] = @intCast(value);
+
+    break :key @Enum(
+        Tag,
+        .exhaustive,
+        names[0..count],
+        &values,
+    );
 };
 
 // NOTE: This is purposely not pub because we want to force outside callers

@@ -1395,29 +1395,40 @@ pub const Action = union(enum) {
 
         // Find all fields that are app-scoped
         var i: usize = 0;
-        var union_fields: [all_fields.len]std.builtin.Type.UnionField = undefined;
-        var enum_fields: [all_fields.len]std.builtin.Type.EnumField = undefined;
+        var names: [all_fields.len][:0]const u8 = undefined;
+        var types: [all_fields.len]type = undefined;
+        var attrs: [all_fields.len]std.builtin.Type.UnionField.Attributes = undefined;
+        var enum_names: [all_fields.len][:0]const u8 = undefined;
+        var raw_enum_values: [all_fields.len]usize = undefined;
         for (all_fields) |field| {
             const action = @unionInit(Action, field.name, undefined);
             if (action.scope() == s) {
-                union_fields[i] = field;
-                enum_fields[i] = .{ .name = field.name, .value = i };
+                names[i] = field.name;
+                types[i] = field.type;
+                attrs[i] = .{ .@"align" = field.alignment };
+                enum_names[i] = field.name;
+                raw_enum_values[i] = i;
                 i += 1;
             }
         }
 
+        const Tag = std.math.IntFittingRange(0, i);
+        var enum_values: [i]Tag = undefined;
+        for (raw_enum_values[0..i], 0..) |value, value_i| enum_values[value_i] = @intCast(value);
+
         // Build our union
-        return @Type(.{ .@"union" = .{
-            .layout = .auto,
-            .tag_type = @Type(.{ .@"enum" = .{
-                .tag_type = std.math.IntFittingRange(0, i),
-                .fields = enum_fields[0..i],
-                .decls = &.{},
-                .is_exhaustive = true,
-            } }),
-            .fields = union_fields[0..i],
-            .decls = &.{},
-        } });
+        return @Union(
+            .auto,
+            @Enum(
+                Tag,
+                .exhaustive,
+                enum_names[0..i],
+                &enum_values,
+            ),
+            names[0..i],
+            types[0..i],
+            attrs[0..i],
+        );
     }
 
     /// Returns the scoped version of this action. If the action is not

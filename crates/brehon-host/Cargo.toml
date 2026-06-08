@@ -1,6 +1,6 @@
 [package]
 name = "brehon-host"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2024"
 description = "Terminal host adapter experiments for Brehon"
 license = "MIT"

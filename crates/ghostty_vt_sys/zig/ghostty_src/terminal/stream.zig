@@ -14,6 +14,7 @@ const csi = @import("csi.zig");
 const kitty = @import("kitty.zig");
 const modes = @import("modes.zig");
 const osc = @import("osc.zig");
+const compat = @import("../compat.zig");
 const sgr = @import("sgr.zig");
 const UTF8Decoder = @import("UTF8Decoder.zig");
 const MouseShape = @import("mouse_shape.zig").MouseShape;
@@ -1011,7 +1012,7 @@ pub fn Stream(comptime Handler: type) type {
 
                     const mode_: ?csi.EraseDisplay = switch (input.params.len) {
                         0 => .below,
-                        1 => std.meta.intToEnum(csi.EraseDisplay, input.params[0]) catch null,
+                        1 => compat.intToEnum(csi.EraseDisplay, input.params[0]) catch null,
                         else => null,
                     };
 

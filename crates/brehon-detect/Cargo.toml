@@ -1,6 +1,6 @@
 [package]
 name = "brehon-detect"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2024"
 description = "Advisory semantic detection over Brehon runtime events"
 license = "MIT"

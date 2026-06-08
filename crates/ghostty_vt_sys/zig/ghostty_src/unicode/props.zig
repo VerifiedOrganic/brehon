@@ -14,7 +14,7 @@ pub const Properties = packed struct {
     width: u2 = 0,
 
     /// Grapheme break property.
-    grapheme_break: uucode.x.types.GraphemeBreakNoControl = .other,
+    grapheme_break: uucode.types.GraphemeBreakNoControl = .other,
 
     /// Emoji VS compatibility
     emoji_vs_base: bool = false,

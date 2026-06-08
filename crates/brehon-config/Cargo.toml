@@ -1,6 +1,6 @@
 [package]
 name = "brehon-config"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 description = "Configuration loading and validation for Brehon"
 license = "MIT"

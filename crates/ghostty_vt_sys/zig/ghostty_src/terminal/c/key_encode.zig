@@ -1,5 +1,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const compat = @import("../../compat.zig");
 const lib_alloc = @import("../../lib/allocator.zig");
 const CAllocator = lib_alloc.Allocator;
 const key_encode = @import("../../input/key_encode.zig");
@@ -72,7 +73,7 @@ pub fn setopt(
     value: ?*const anyopaque,
 ) callconv(.c) void {
     if (comptime std.debug.runtime_safety) {
-        _ = std.meta.intToEnum(Option, @intFromEnum(option)) catch {
+        _ = compat.intToEnum(Option, @intFromEnum(option)) catch {
             log.warn("setopt invalid option value={d}", .{@intFromEnum(option)});
             return;
         };
@@ -105,7 +106,7 @@ fn setoptTyped(
         },
         .macos_option_as_alt => {
             if (comptime std.debug.runtime_safety) {
-                _ = std.meta.intToEnum(OptionAsAlt, @intFromEnum(value.*)) catch {
+                _ = compat.intToEnum(OptionAsAlt, @intFromEnum(value.*)) catch {
                     log.warn("setopt invalid OptionAsAlt value={d}", .{@intFromEnum(value.*)});
                     return;
                 };

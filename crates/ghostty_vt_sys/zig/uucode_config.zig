@@ -1,96 +1,121 @@
 const std = @import("std");
-const assert = std.debug.assert;
 const config = @import("config.zig");
-const config_x = @import("config.x.zig");
-const d = config.default;
-const wcwidth = config_x.wcwidth;
-const grapheme_break_no_control = config_x.grapheme_break_no_control;
 
 const Allocator = std.mem.Allocator;
 
-fn computeWidth(
-    alloc: std.mem.Allocator,
-    cp: u21,
-    data: anytype,
-    backing: anytype,
-    tracking: anytype,
-) Allocator.Error!void {
-    _ = alloc;
-    _ = cp;
-    _ = backing;
-    _ = tracking;
+pub const fields = &config.mergeFields(config.fields, &.{
+    .{ .name = "width", .type = u2 },
+    .{ .name = "is_symbol", .type = bool },
+});
 
-    if (data.wcwidth_zero_in_grapheme) {
-        data.width = 0;
-    } else {
-        data.width = @min(2, data.wcwidth_standalone);
-    }
-}
-
-const width = config.Extension{
-    .inputs = &.{
-        "wcwidth_standalone",
-        "wcwidth_zero_in_grapheme",
+pub const build_components = &config.mergeComponents(config.build_components, &.{
+    .{
+        .Impl = Width,
+        .inputs = &.{
+            "wcwidth_standalone",
+            "wcwidth_zero_in_grapheme",
+            "is_emoji_modifier",
+            "grapheme_break_no_control",
+        },
+        .fields = &.{"width"},
     },
-    .compute = &computeWidth,
-    .fields = &.{
-        .{ .name = "width", .type = u2 },
+    .{
+        .Impl = IsSymbol,
+        .inputs = &.{ "block", "general_category" },
+        .fields = &.{"is_symbol"},
     },
-};
+});
 
-fn computeIsSymbol(
-    alloc: Allocator,
-    cp: u21,
-    data: anytype,
-    backing: anytype,
-    tracking: anytype,
-) Allocator.Error!void {
-    _ = alloc;
-    _ = cp;
-    _ = backing;
-    _ = tracking;
-    const block = data.block;
-    data.is_symbol = data.general_category == .other_private_use or
-        block == .arrows or
-        block == .dingbats or
-        block == .emoticons or
-        block == .miscellaneous_symbols or
-        block == .enclosed_alphanumerics or
-        block == .enclosed_alphanumeric_supplement or
-        block == .miscellaneous_symbols_and_pictographs or
-        block == .transport_and_map_symbols;
-}
+pub const get_components = config.get_components;
 
-const is_symbol = config.Extension{
-    .inputs = &.{ "block", "general_category" },
-    .compute = &computeIsSymbol,
-    .fields = &.{
-        .{ .name = "is_symbol", .type = bool },
-    },
-};
-
-pub const tables = [_]config.Table{
+pub const tables: []const config.Table = &.{
     .{
         .name = "runtime",
-        .extensions = &.{},
         .fields = &.{
-            d.field("is_emoji_presentation"),
-            d.field("case_folding_full"),
+            "is_emoji_presentation",
+            "case_folding_full",
         },
     },
     .{
         .name = "buildtime",
-        .extensions = &.{
-            wcwidth,
-            grapheme_break_no_control,
-            width,
-            is_symbol,
-        },
         .fields = &.{
-            width.field("width"),
-            grapheme_break_no_control.field("grapheme_break_no_control"),
-            is_symbol.field("is_symbol"),
-            d.field("is_emoji_vs_base"),
+            "width",
+            "wcwidth_zero_in_grapheme",
+            "grapheme_break_no_control",
+            "is_symbol",
+            "is_emoji_vs_base",
         },
     },
+};
+
+const Width = struct {
+    pub fn build(
+        comptime InputRow: type,
+        comptime Row: type,
+        allocator: Allocator,
+        io: std.Io,
+        inputs: config.MultiSlice(InputRow),
+        rows: *config.MultiSlice(Row),
+        backing: anytype,
+        tracking: anytype,
+    ) !void {
+        _ = allocator;
+        _ = io;
+        _ = backing;
+        _ = tracking;
+
+        rows.len = config.num_code_points;
+        const items = rows.items(.width);
+        const standalone_items = inputs.items(.wcwidth_standalone);
+        const zero_in_grapheme_items = inputs.items(.wcwidth_zero_in_grapheme);
+        const emoji_modifier_items = inputs.items(.is_emoji_modifier);
+        const grapheme_items = inputs.items(.grapheme_break_no_control);
+
+        for (0..config.num_code_points) |i| {
+            if (zero_in_grapheme_items[i] and
+                !emoji_modifier_items[i] and
+                grapheme_items[i] != .prepend)
+            {
+                items[i] = 0;
+            } else {
+                items[i] = @min(2, standalone_items[i]);
+            }
+        }
+    }
+};
+
+const IsSymbol = struct {
+    pub fn build(
+        comptime InputRow: type,
+        comptime Row: type,
+        allocator: Allocator,
+        io: std.Io,
+        inputs: config.MultiSlice(InputRow),
+        rows: *config.MultiSlice(Row),
+        backing: anytype,
+        tracking: anytype,
+    ) !void {
+        _ = allocator;
+        _ = io;
+        _ = backing;
+        _ = tracking;
+
+        rows.len = config.num_code_points;
+        const items = rows.items(.is_symbol);
+        const block_items = inputs.items(.block);
+        const category_items = inputs.items(.general_category);
+
+        for (0..config.num_code_points) |i| {
+            const block = block_items[i];
+            items[i] = category_items[i] == .other_private_use or
+                block == .arrows or
+                block == .dingbats or
+                block == .emoticons or
+                block == .miscellaneous_symbols or
+                block == .enclosed_alphanumerics or
+                block == .enclosed_alphanumeric_supplement or
+                block == .miscellaneous_symbols_and_pictographs or
+                block == .transport_and_map_symbols;
+        }
+    }
 };
