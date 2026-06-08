@@ -671,9 +671,32 @@ pub(super) fn is_patch_equivalent_in_window_in(
 /// message trailer or a path-only diff is not sufficient proof that the branch
 /// contains the reviewed content.
 pub(super) fn tree_matches_after(wt: &Path, sha: &str, branch: &str) -> Result<bool, String> {
+    Ok(tree_matches_after_with_limit(wt, sha, branch, None)?.unwrap_or(false))
+}
+
+/// Bounded variant of [`tree_matches_after`].
+///
+/// Returns `Ok(None)` when the reviewed commit touches more than
+/// `max_changed_files`, so callers can use this as a guarded fallback in
+/// retry-state probes without scanning huge cache-cleanup commits.
+pub(super) fn tree_matches_after_limited(
+    wt: &Path,
+    sha: &str,
+    branch: &str,
+    max_changed_files: usize,
+) -> Result<Option<bool>, String> {
+    tree_matches_after_with_limit(wt, sha, branch, Some(max_changed_files))
+}
+
+fn tree_matches_after_with_limit(
+    wt: &Path,
+    sha: &str,
+    branch: &str,
+    max_changed_files: Option<usize>,
+) -> Result<Option<bool>, String> {
     // Fast path: if sha is already an ancestor, its changes are present.
     if git_commit_is_ancestor_in(wt, sha, branch).unwrap_or(false) {
-        return Ok(true);
+        return Ok(Some(true));
     }
 
     // Compute the diff from sha's parent → sha (the changes we expect).
@@ -681,7 +704,7 @@ pub(super) fn tree_matches_after(wt: &Path, sha: &str, branch: &str) -> Result<b
         Ok(commit) => commit,
         Err(_) => {
             // Root commit or unreachable; fall back to ancestry check only.
-            return Ok(false);
+            return Ok(Some(false));
         }
     };
 
@@ -698,7 +721,7 @@ pub(super) fn tree_matches_after(wt: &Path, sha: &str, branch: &str) -> Result<b
     )?;
 
     if !diff_expected.status.success() {
-        return Ok(false);
+        return Ok(Some(false));
     }
 
     let expected_files: Vec<String> = String::from_utf8_lossy(&diff_expected.stdout)
@@ -710,7 +733,13 @@ pub(super) fn tree_matches_after(wt: &Path, sha: &str, branch: &str) -> Result<b
 
     if expected_files.is_empty() {
         // Empty commit; by definition it matches.
-        return Ok(true);
+        return Ok(Some(true));
+    }
+
+    if let Some(limit) = max_changed_files {
+        if expected_files.len() > limit {
+            return Ok(None);
+        }
     }
 
     let mut exact_match = true;
@@ -729,16 +758,16 @@ pub(super) fn tree_matches_after(wt: &Path, sha: &str, branch: &str) -> Result<b
     }
 
     if exact_match {
-        return Ok(true);
+        return Ok(Some(true));
     }
 
     let branch_head = git_stdout_in(wt, &["rev-parse", branch])?;
     let worktree_head = git_stdout_in(wt, &["rev-parse", "HEAD"])?;
     if branch_head == worktree_head && reviewed_patch_reverses_cleanly(wt, &parent_commit, sha)? {
-        return Ok(true);
+        return Ok(Some(true));
     }
 
-    Ok(content_present)
+    Ok(Some(content_present))
 }
 
 fn blob_bytes_at(wt: &Path, rev: &str, file: &str) -> Result<Option<Vec<u8>>, String> {

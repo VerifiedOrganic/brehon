@@ -14,9 +14,9 @@
 //!    buffer (the classic 64 KiB deadlock that bites `.output()`-style
 //!    callers on commands with large output, e.g. `git diff --binary`).
 //! 3. **Wall-clock timeout.** If the subprocess runs longer than
-//!    [`DEFAULT_GIT_TIMEOUT`], it's killed, reaped, and the helper
-//!    returns a timeout error. The MCP tool surfaces that to the
-//!    supervisor instead of wedging the tool handler forever.
+//!    [`DEFAULT_GIT_TIMEOUT`], its process group is killed, the direct
+//!    child is reaped, and pipe drains are bounded. The MCP tool surfaces
+//!    that to the supervisor instead of wedging the tool handler forever.
 //!
 //! # Why this exists
 //!
@@ -36,10 +36,13 @@
 //! thin adapter over that core.
 
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -50,6 +53,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 /// take longer (e.g. full-repo initial cherry-pick sequence) can supply
 /// a larger timeout via [`run_git_with_timeout`].
 pub(crate) const DEFAULT_GIT_TIMEOUT: Duration = Duration::from_secs(60);
+const PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+const PIPE_DRAIN_AFTER_KILL_TIMEOUT: Duration = Duration::from_millis(200);
 const PROTECTED_BRANCH_BYPASS_DIR: &str = "protected-branch-bypass";
 
 static PROTECTED_BRANCH_BYPASS_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -228,9 +233,23 @@ fn run_command_hardened_with_env(
         cmd.stdin(Stdio::null());
     }
 
+    // Put the subprocess in its own process group so timeout cleanup can
+    // terminate git's helper children too. Otherwise a descendant can keep
+    // stdout/stderr pipe fds open after the direct child is killed.
+    #[cfg(unix)]
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setpgid(0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
     let mut child = cmd
         .spawn()
         .map_err(|err| format!("Failed to spawn {program} {args_joined}: {err}"))?;
+    let child_pid = child.id();
 
     // Feed stdin immediately and close it so the child sees EOF. Must
     // happen BEFORE we park on wait, or git would block reading.
@@ -248,22 +267,14 @@ fn run_command_hardened_with_env(
     // output the overhead is trivial (two thread spawns); for commands
     // with large output (`git diff --binary`, `git log --all`) it's
     // the difference between working and deadlocking.
-    let stdout_pipe = child.stdout.take();
-    let stderr_pipe = child.stderr.take();
-    let stdout_handle = stdout_pipe.map(|mut pipe| {
-        thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = std::io::copy(&mut pipe, &mut buf);
-            buf
-        })
-    });
-    let stderr_handle = stderr_pipe.map(|mut pipe| {
-        thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = std::io::copy(&mut pipe, &mut buf);
-            buf
-        })
-    });
+    let stdout_drain = child
+        .stdout
+        .take()
+        .map(|pipe| PipeDrain::spawn("stdout", pipe));
+    let stderr_drain = child
+        .stderr
+        .take()
+        .map(|pipe| PipeDrain::spawn("stderr", pipe));
 
     let started_at = Instant::now();
     let poll_interval = Duration::from_millis(25);
@@ -272,20 +283,24 @@ fn run_command_hardened_with_env(
             Ok(Some(status)) => break status,
             Ok(None) => {
                 if started_at.elapsed() >= timeout {
-                    let _ = child.kill();
+                    kill_process_tree(&mut child, child_pid);
                     let _ = child.wait();
 
-                    if let Some(handle) = stdout_handle {
-                        let _ = handle.join();
-                    }
-                    if let Some(handle) = stderr_handle {
-                        let _ = handle.join();
-                    }
+                    let stdout_bytes = stdout_drain
+                        .map(PipeDrain::collect_after_kill)
+                        .unwrap_or_default()
+                        .len();
+                    let stderr_bytes = stderr_drain
+                        .map(PipeDrain::collect_after_kill)
+                        .unwrap_or_default()
+                        .len();
 
                     tracing::warn!(
                         program = %program,
                         args = %args_joined,
                         timeout_secs = timeout.as_secs(),
+                        stdout_bytes,
+                        stderr_bytes,
                         "MCP subprocess timed out; killed"
                     );
                     return Err(format!(
@@ -301,12 +316,15 @@ fn run_command_hardened_with_env(
         }
     };
 
-    // Process exited. Join reader threads to collect buffered output.
-    let stdout = stdout_handle
-        .map(|h| h.join().unwrap_or_default())
+    // Process exited. Collect buffered output, but never wait forever: a
+    // leaked child process can inherit pipe writers and keep them open.
+    let stdout = stdout_drain
+        .map(|drain| drain.collect(program, &args_joined))
+        .transpose()?
         .unwrap_or_default();
-    let stderr = stderr_handle
-        .map(|h| h.join().unwrap_or_default())
+    let stderr = stderr_drain
+        .map(|drain| drain.collect(program, &args_joined))
+        .transpose()?
         .unwrap_or_default();
 
     tracing::debug!(
@@ -323,6 +341,75 @@ fn run_command_hardened_with_env(
         stdout,
         stderr,
     })
+}
+
+struct PipeDrain {
+    stream_name: &'static str,
+    rx: Receiver<Vec<u8>>,
+}
+
+impl PipeDrain {
+    fn spawn<R>(stream_name: &'static str, mut pipe: R) -> Self
+    where
+        R: Read + Send + 'static,
+    {
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = std::io::copy(&mut pipe, &mut buf);
+            let _ = tx.send(buf);
+        });
+        Self { stream_name, rx }
+    }
+
+    fn collect(self, program: &str, args_joined: &str) -> Result<Vec<u8>, String> {
+        match self.rx.recv_timeout(PIPE_DRAIN_TIMEOUT) {
+            Ok(buf) => Ok(buf),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Ok(Vec::new()),
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(format!(
+                "{program} {args_joined} exited but {} pipe did not close within {}ms; possible child process inherited stdio",
+                self.stream_name,
+                PIPE_DRAIN_TIMEOUT.as_millis()
+            )),
+        }
+    }
+
+    fn collect_after_kill(self) -> Vec<u8> {
+        self.rx
+            .recv_timeout(PIPE_DRAIN_AFTER_KILL_TIMEOUT)
+            .unwrap_or_default()
+    }
+}
+
+#[cfg(unix)]
+fn signal_process_tree(pid: u32, signal: libc::c_int) {
+    let pid = pid as libc::pid_t;
+    // Prefer the process group created in pre_exec, but also signal the direct
+    // child in case group setup failed or the child moved groups.
+    let group_result = unsafe { libc::kill(-pid, signal) };
+    let group_error = (group_result != 0).then(|| std::io::Error::last_os_error().to_string());
+    let child_result = unsafe { libc::kill(pid, signal) };
+    let child_error = (child_result != 0).then(|| std::io::Error::last_os_error().to_string());
+    if group_result != 0 && child_result != 0 {
+        tracing::warn!(
+            pid,
+            signal,
+            ?group_error,
+            ?child_error,
+            "Failed to signal MCP subprocess"
+        );
+    }
+}
+
+#[cfg(unix)]
+fn kill_process_tree(child: &mut std::process::Child, pid: u32) {
+    signal_process_tree(pid, libc::SIGKILL);
+    let _ = child.kill();
+}
+
+#[cfg(not(unix))]
+fn kill_process_tree(child: &mut std::process::Child, _pid: u32) {
+    let _ = child.kill();
 }
 
 /// Apply the non-interactive env overrides to a git subprocess.
@@ -438,6 +525,56 @@ mod tests {
     }
 
     #[test]
+    fn timeout_does_not_hang_when_descendant_holds_pipe_open() {
+        let dir = tmp_cwd();
+        let started_at = Instant::now();
+        let err = run_command_hardened(
+            "sh",
+            dir.path(),
+            &["-c", "sleep 30 & echo $! > leaked-pipe.pid; sleep 30"],
+            None,
+            TEST_TIMEOUT_SHORT,
+        )
+        .expect_err("expected timeout");
+        let elapsed = started_at.elapsed();
+        cleanup_test_pid(dir.path().join("leaked-pipe.pid"));
+
+        assert!(
+            err.contains("timed out"),
+            "error should name the timeout path: {err}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "timeout path waited on leaked pipe for {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn exited_process_with_leaked_pipe_returns_error_instead_of_hanging() {
+        let dir = tmp_cwd();
+        let started_at = Instant::now();
+        let err = run_command_hardened(
+            "sh",
+            dir.path(),
+            &["-c", "sleep 30 & echo $! > leaked-pipe.pid"],
+            None,
+            TEST_TIMEOUT_LONG,
+        )
+        .expect_err("expected leaked pipe error");
+        let elapsed = started_at.elapsed();
+        cleanup_test_pid(dir.path().join("leaked-pipe.pid"));
+
+        assert!(
+            err.contains("pipe did not close"),
+            "error should identify the leaked pipe: {err}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "pipe drain waited indefinitely for {elapsed:?}"
+        );
+    }
+
+    #[test]
     fn stdin_is_piped_and_closed_so_reader_sees_eof() {
         let dir = tmp_cwd();
         let out = run_command_hardened(
@@ -451,6 +588,22 @@ mod tests {
         assert!(out.status.success());
         assert_eq!(out.stdout, b"piped-input\n");
     }
+
+    #[cfg(unix)]
+    fn cleanup_test_pid(path: PathBuf) {
+        let Ok(pid_raw) = fs::read_to_string(path) else {
+            return;
+        };
+        let Ok(pid) = pid_raw.trim().parse::<libc::pid_t>() else {
+            return;
+        };
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn cleanup_test_pid(_path: PathBuf) {}
 
     #[test]
     fn git_wrapper_sets_non_interactive_env() {

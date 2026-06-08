@@ -108,6 +108,7 @@ pub struct GitProbeResult {
     pub cherry_pick_in_progress: bool,
     pub cherry_pick_sha: Option<String>,
     pub unmerged_files: Vec<String>,
+    pub cherry_pick_branch_advanced: bool,
     pub is_ancestor: bool,
     pub is_patch_equivalent: bool,
     pub has_reviewed_cherry_pick_trailers: bool,
@@ -230,7 +231,11 @@ fn null_transitions(
             )),
         };
     }
-    if probes.is_ancestor || probes.is_patch_equivalent {
+    if probes.is_ancestor
+        || probes.is_patch_equivalent
+        || probes.has_reviewed_cherry_pick_trailers
+        || probes.reviewed_commits_applied
+    {
         Transition {
             new_phase: IntegrationPhase::Resolved,
             action: Action::Verify,
@@ -309,6 +314,11 @@ fn cherry_picking_integrate_transitions(
             new_phase: IntegrationPhase::Resolved,
             action: Action::Verify,
         }
+    } else if probes.cherry_pick_branch_advanced && probes.unmerged_files.is_empty() {
+        Transition {
+            new_phase: IntegrationPhase::CherryPicking,
+            action: Action::StartCherryPick,
+        }
     } else {
         Transition {
             new_phase: IntegrationPhase::CherryPicking,
@@ -339,6 +349,7 @@ fn cherry_picking_force_reset_reason(
         || probes.is_patch_equivalent
         || probes.has_reviewed_cherry_pick_trailers
         || probes.reviewed_commits_applied
+        || probes.cherry_pick_branch_advanced
     {
         None
     } else {
@@ -490,6 +501,38 @@ mod tests {
     }
 
     #[test]
+    fn transition_null_approved_verify_when_reviewed_commits_applied() {
+        let got = next_state(
+            IntegrationPhase::Null,
+            "approved",
+            &GitProbeResult {
+                reviewed_commits_applied: true,
+                ..probes()
+            },
+            &["abc123".into()],
+            OperatorIntent::Integrate,
+        );
+        assert_eq!(got.new_phase, IntegrationPhase::Resolved);
+        assert_eq!(got.action, Action::Verify);
+    }
+
+    #[test]
+    fn transition_null_approved_verify_when_cherry_pick_trailers_exist() {
+        let got = next_state(
+            IntegrationPhase::Null,
+            "approved",
+            &GitProbeResult {
+                has_reviewed_cherry_pick_trailers: true,
+                ..probes()
+            },
+            &["abc123".into()],
+            OperatorIntent::Integrate,
+        );
+        assert_eq!(got.new_phase, IntegrationPhase::Resolved);
+        assert_eq!(got.action, Action::Verify);
+    }
+
+    #[test]
     fn transition_null_non_approved_rejects() {
         for status in ["pending", "assigned", "in_progress", "changes_requested"] {
             let got = next_state(
@@ -624,6 +667,26 @@ mod tests {
         );
         assert_eq!(got.new_phase, IntegrationPhase::Resolved);
         assert_eq!(got.action, Action::Verify);
+    }
+
+    #[test]
+    fn transition_cherry_picking_continues_when_branch_advanced_partially() {
+        let got = next_state(
+            IntegrationPhase::CherryPicking,
+            "approved",
+            &GitProbeResult {
+                cherry_pick_in_progress: false,
+                cherry_pick_branch_advanced: true,
+                is_patch_equivalent: false,
+                has_reviewed_cherry_pick_trailers: false,
+                reviewed_commits_applied: false,
+                ..probes()
+            },
+            &["abc123".into(), "def456".into()],
+            OperatorIntent::Integrate,
+        );
+        assert_eq!(got.new_phase, IntegrationPhase::CherryPicking);
+        assert_eq!(got.action, Action::StartCherryPick);
     }
 
     #[test]
