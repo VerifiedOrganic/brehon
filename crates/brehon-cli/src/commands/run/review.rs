@@ -222,9 +222,7 @@ fn write_runtime_panel_seats(
             updated_at: now.to_string(),
         };
         let path = panel_seats_dir.join(runtime_panel_seat_filename(&panel.panel_id));
-        let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, serde_json::to_string_pretty(&seat)?)?;
-        std::fs::rename(&tmp, path)?;
+        brehon_types::write_json_atomic(&path, &seat)?;
     }
 
     Ok(())
@@ -307,7 +305,7 @@ pub(crate) fn reconcile_task_gate_from_review_state(
 
     if changed {
         value["updated_at"] = serde_json::json!(now);
-        std::fs::write(&path, serde_json::to_string_pretty(&value)?)?;
+        brehon_types::write_json_atomic(&path, &value)?;
     }
 
     Ok(())
@@ -377,7 +375,7 @@ pub(crate) fn recover_orphaned_review_gate_task(path: &Path, now: &str) -> Resul
     }
 
     value["updated_at"] = serde_json::json!(now);
-    std::fs::write(path, serde_json::to_string_pretty(&value)?)?;
+    brehon_types::write_json_atomic(path, &value)?;
     Ok(())
 }
 
@@ -726,7 +724,7 @@ pub(crate) fn reconcile_review_runtime_for_run(
                 if state.status == "collecting" {
                     state.status = "released".to_string();
                     state.updated_at = now.clone();
-                    std::fs::write(&state_path, serde_json::to_string_pretty(&state)?)?;
+                    brehon_types::write_json_atomic(&state_path, &state)?;
                     reconcile_task_gate_from_review_state(
                         brehon_root,
                         &state.task_id,
@@ -818,14 +816,14 @@ pub(crate) fn reconcile_review_runtime_for_run(
 
             if write_lease {
                 let path = review_panels_dir.join(runtime_panel_lease_filename(&state.task_id));
-                std::fs::write(&path, serde_json::to_string_pretty(&desired_lease)?)?;
+                brehon_types::write_json_atomic(&path, &desired_lease)?;
                 lease_paths_by_task.insert(state.task_id.clone(), path);
                 leases_by_task.insert(state.task_id.clone(), desired_lease);
             }
 
             if state_changed {
                 state.updated_at = now.clone();
-                std::fs::write(&state_path, serde_json::to_string_pretty(&state)?)?;
+                brehon_types::write_json_atomic(&state_path, &state)?;
             }
 
             if state.status == "collecting" {
@@ -846,7 +844,7 @@ pub(crate) fn reconcile_review_runtime_for_run(
                         }
                         request.reviewer_prompts = remapped_prompts;
 
-                        std::fs::write(&request_path, serde_json::to_string_pretty(&request)?)?;
+                        brehon_types::write_json_atomic(&request_path, &request)?;
 
                         for reviewer in desired_panel_names
                             .iter()

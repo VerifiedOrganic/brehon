@@ -1318,7 +1318,7 @@ pub(crate) fn reconcile_orphaned_worker_assignments_for_run(
             chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         );
 
-        std::fs::write(&path, serde_json::to_string_pretty(&task)?)?;
+        brehon_types::write_json_atomic(&path, &task)?;
         repaired.push(format!(
             "Recovered orphaned task {task_id} from {normalized_status}: previous assignee {assignee} was no longer live. Returned to {next_status}."
         ));
@@ -2408,7 +2408,7 @@ pub(crate) async fn reconcile_initiative_hierarchy_for_run(
         }
 
         if changed {
-            std::fs::write(&path, serde_json::to_string_pretty(&task)?)?;
+            brehon_types::write_json_atomic(&path, &task)?;
             repaired.push(format!(
                 "Backfilled initiative {} onto branch '{}' ({})",
                 task_id,

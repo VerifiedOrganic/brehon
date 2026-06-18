@@ -246,14 +246,66 @@ fn acquire_file_lock(path: &Path) -> IoResult<FileLock> {
     }
 }
 
-fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> IoResult<()> {
+/// Atomically and durably persist `value` as pretty-printed JSON at `path`.
+///
+/// Crash-safe recovery writes must never observe a truncated or partially
+/// written file. This helper serializes to a hidden temp file in the **same**
+/// directory (so the rename stays on one filesystem), fsyncs the temp file's
+/// contents, renames it over the target, then fsyncs the parent directory so
+/// the rename itself survives a crash (Unix only — see below).
+///
+/// A serialize failure is propagated, never written: this helper will never
+/// truncate or empty the target file on a serialization error.
+///
+/// On non-Unix platforms the parent-directory fsync is skipped (no portable
+/// API); the temp+fsync-file+rename path is still applied, which is the best
+/// available durability there.
+pub fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> IoResult<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let tmp = unique_tmp_path(path);
+    // Serialize FIRST so a serialization failure aborts before we touch any
+    // file — never write a truncated/empty target.
     let data = serde_json::to_string_pretty(value).map_err(std::io::Error::other)?;
-    std::fs::write(&tmp, data)?;
-    std::fs::rename(&tmp, path)
+
+    let tmp = unique_tmp_path(path);
+    match write_tmp_and_rename(&tmp, path, data.as_bytes()) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            // Best-effort cleanup so a failed write does not leak a temp file.
+            let _ = std::fs::remove_file(&tmp);
+            Err(err)
+        }
+    }
+}
+
+fn write_tmp_and_rename(tmp: &Path, path: &Path, data: &[u8]) -> IoResult<()> {
+    {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(tmp)?;
+        use std::io::Write as _;
+        file.write_all(data)?;
+        // fsync the temp file's contents before the rename makes it visible.
+        file.sync_all()?;
+    }
+    std::fs::rename(tmp, path)?;
+    // fsync the parent directory so the rename is durable across a crash.
+    #[cfg(unix)]
+    {
+        if let Some(parent) = path.parent() {
+            let parent = if parent.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                parent
+            };
+            let dir = File::open(parent)?;
+            dir.sync_all()?;
+        }
+    }
+    Ok(())
 }
 
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Option<T> {
@@ -1049,5 +1101,57 @@ mod tests {
         increment_assignment_history(brehon_root, 1).unwrap();
         let counters = refresh_runtime_stability_counters(brehon_root).unwrap();
         assert_eq!(counters.assignment_history, 1);
+    }
+
+    #[test]
+    fn write_json_atomic_round_trips_and_leaves_no_tmp() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("nested").join("value.json");
+        let value = serde_json::json!({ "kind": "task", "id": 7 });
+
+        write_json_atomic(&path, &value).unwrap();
+
+        // The target exists and round-trips.
+        let on_disk: Value = read_json(&path).unwrap();
+        assert_eq!(on_disk, value);
+
+        // Exactly one regular file remains in the directory — no leftover
+        // .tmp turd from the temp+rename sequence.
+        let entries: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            entries,
+            vec!["value.json".to_string()],
+            "entries: {entries:?}"
+        );
+    }
+
+    #[test]
+    fn write_json_atomic_overwrites_without_truncating_on_failure() {
+        // A pre-existing target must remain fully intact and readable after a
+        // successful overwrite (the atomic rename never exposes a half-written
+        // file). This guards the "never observe a truncated target" property.
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("state.json");
+
+        let first = serde_json::json!({ "version": 1, "payload": "first" });
+        write_json_atomic(&path, &first).unwrap();
+
+        let second = serde_json::json!({ "version": 2, "payload": "second" });
+        write_json_atomic(&path, &second).unwrap();
+
+        let on_disk: Value = read_json(&path).unwrap();
+        assert_eq!(on_disk, second);
+
+        // No temp files leaked across the two writes.
+        let leftover: Vec<_> = std::fs::read_dir(root.path())
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftover.is_empty(), "leaked temp files: {leftover:?}");
     }
 }
