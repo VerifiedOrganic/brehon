@@ -375,6 +375,16 @@ context:
       args: ["compress", "--stdin"]
       timeout_ms: 10000
 
+notifications:
+  enabled: false
+  providers:
+    telegram:
+      enabled: false
+      bot_token_env: BREHON_TELEGRAM_BOT_TOKEN
+      chat_id_env: BREHON_TELEGRAM_CHAT_ID
+      send_timeout_secs: 5
+  subscriptions: []
+
 tui:
   default_layout: Balanced
   terminal_mode: Auto

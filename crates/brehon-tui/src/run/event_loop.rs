@@ -3018,6 +3018,10 @@ pub(super) fn detect_and_handle_supervisor_resets(
         let summary = format!(
             "reset supervisor {pane_id} after detected {reason}; reloading coordination context"
         );
+        super::notifications::notify_from_ctx(
+            ctx,
+            super::notifications::crash_detected_event(&pane_id, reason),
+        );
         let reset_reason = format!("supervisor runtime failure: {reason}");
         let command = RuntimeCommand {
             command_id: format!("supervisor-reset-{}", uuid::Uuid::new_v4()),

@@ -434,6 +434,7 @@ dependencies = [
  "brehon-host",
  "brehon-mcp",
  "brehon-mux",
+ "brehon-notify",
  "brehon-orchestrator",
  "brehon-policy",
  "brehon-ports",
@@ -571,6 +572,7 @@ dependencies = [
  "brehon-config",
  "brehon-git",
  "brehon-mux",
+ "brehon-notify",
  "brehon-ports",
  "brehon-review",
  "brehon-store-fjall",
@@ -658,6 +660,18 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "brehon-notify"
+version = "0.1.4"
+dependencies = [
+ "brehon-types",
+ "reqwest",
+ "serde",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -883,6 +897,7 @@ dependencies = [
  "base64",
  "brehon-config",
  "brehon-mux",
+ "brehon-notify",
  "brehon-ports",
  "brehon-types",
  "chrono",

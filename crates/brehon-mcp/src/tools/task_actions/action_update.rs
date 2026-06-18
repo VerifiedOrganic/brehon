@@ -629,6 +629,7 @@ pub(super) async fn execute_complete(
                 }
                 copy_proof_result(&mut result, &Value::Null, &checkpoint_json);
                 copy_checkpoint_warning(&mut result, &checkpoint_json);
+                super::notifications::publish_task_completed(id, &task, "review_ready");
                 result["worktree_cleanup"] =
                     cleanup_current_worktree_allowlisted_artifacts("after_worker_handoff");
                 return Ok(text_result(
@@ -696,6 +697,11 @@ pub(super) async fn execute_complete(
     }
     result["worktree_cleanup"] =
         cleanup_current_worktree_allowlisted_artifacts("after_worker_handoff");
+    if matches!(final_status, "review_ready" | "in_review") {
+        if let Some(task) = read_task(id) {
+            super::notifications::publish_task_completed(id, &task, final_status);
+        }
+    }
 
     Ok(text_result(
         serde_json::to_string_pretty(&result)
@@ -1360,6 +1366,14 @@ pub(super) async fn execute_update(
     {
         if let Err(err) = resolve_promoted_followups_for_terminal_task(id, &task).await {
             return Ok(error_result(err));
+        }
+    }
+    if let Some(ref new_status) = new_status_value {
+        if new_status == "blocked" {
+            super::notifications::publish_task_blocked(id, &task);
+        }
+        if is_terminal_task_status(new_status) {
+            super::notifications::publish_task_closed(id, &task, new_status);
         }
     }
 

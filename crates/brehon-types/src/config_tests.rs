@@ -106,6 +106,7 @@ fn test_config() -> BrehonConfig {
             worktree_cleanup: WorktreeCleanupConfig::default(),
         },
         runtime: RuntimeConfig::default(),
+        notifications: ExternalNotificationsConfig::default(),
         budget: BudgetConfig {
             max_total_cost: None,
             max_cost_per_task: None,

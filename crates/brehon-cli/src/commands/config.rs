@@ -108,6 +108,17 @@ pub fn list(project_path: Option<&Path>, config_override: Option<&Path>) -> Resu
     info!("    max_total_cost: {:?}", config.budget.max_total_cost);
     info!("    enforcement: {:?}", config.budget.enforcement);
 
+    info!("  notifications:");
+    info!("    enabled: {}", config.notifications.enabled);
+    info!(
+        "    telegram_enabled: {}",
+        config.notifications.providers.telegram.enabled
+    );
+    info!(
+        "    subscriptions: {}",
+        config.notifications.subscriptions.len()
+    );
+
     info!("  tui:");
     info!("    default_layout: {:?}", config.tui.default_layout);
     info!("    terminal_mode: {:?}", config.tui.terminal_mode);
@@ -268,6 +279,19 @@ pub fn describe(
             );
         }
 
+        "notifications" => {
+            let telegram = &config.notifications.providers.telegram;
+            info!("notifications:");
+            info!("  enabled: {}", config.notifications.enabled);
+            info!("  providers:");
+            info!("    telegram:");
+            info!("      enabled: {}", telegram.enabled);
+            info!("      bot_token_env: {}", telegram.bot_token_env);
+            info!("      chat_id_env: {}", telegram.chat_id_env);
+            info!("      send_timeout_secs: {}", telegram.send_timeout_secs);
+            info!("  subscriptions: {:?}", config.notifications.subscriptions);
+        }
+
         "tui" => {
             info!("tui:");
             info!("  default_layout: {:?}", config.tui.default_layout);
@@ -334,7 +358,7 @@ pub fn describe(
             );
         }
         _ => {
-            anyhow::bail!("Unknown config key: {}. Valid keys: version, launchers, lanes, roles, review, supervisor, orchestration, runtime, budget, tui, context, security, profiles", key);
+            anyhow::bail!("Unknown config key: {}. Valid keys: version, launchers, lanes, roles, review, supervisor, orchestration, runtime, budget, notifications, tui, context, security, profiles", key);
         }
     }
 

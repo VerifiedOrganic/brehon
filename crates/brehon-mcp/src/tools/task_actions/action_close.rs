@@ -531,6 +531,7 @@ pub(super) async fn execute(args: &Value) -> Result<ToolResult, McpError> {
                             )
                         });
                     }
+                    super::notifications::publish_task_closed(id, &task, terminal_status);
                     return Ok(text_result(
                         serde_json::to_string_pretty(&result)
                             .map_err(|e| McpError::Serialization(e.to_string()))?,
@@ -838,6 +839,7 @@ pub(super) async fn execute(args: &Value) -> Result<ToolResult, McpError> {
         }
     }
 
+    super::notifications::publish_task_closed(id, &task, terminal_status);
     Ok(text_result(
         serde_json::to_string_pretty(&result)
             .map_err(|e| McpError::Serialization(e.to_string()))?,

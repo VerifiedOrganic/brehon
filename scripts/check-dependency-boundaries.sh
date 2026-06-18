@@ -54,6 +54,7 @@ allowed_dependencies() {
     brehon-detect) echo "brehon-types brehon-ports" ;;
     brehon-policy) echo "brehon-types brehon-ports" ;;
     brehon-runtime) echo "brehon-types brehon-ports" ;;
+    brehon-notify) echo "brehon-types" ;;
     brehon-workflow) echo "brehon-types brehon-ports" ;;
     brehon-host) echo "brehon-types brehon-ports" ;;
     brehon-supervisor) echo "brehon-types brehon-ports" ;;
@@ -63,8 +64,8 @@ allowed_dependencies() {
     brehon-pty) echo "brehon-adapter-agy brehon-adapter-claude brehon-adapter-copilot brehon-adapter-junie brehon-adapter-kimi brehon-adapter-sdk brehon-config brehon-types" ;;
     brehon-mux) echo "brehon-recording brehon-protocol brehon-pty brehon-ports brehon-acp brehon-adapter-sdk brehon-types" ;;
     brehon-review) echo "brehon-types brehon-ports brehon-mux brehon-test-harness" ;;
-    brehon-mcp) echo "brehon-config brehon-mux brehon-types brehon-ports brehon-review brehon-git" ;;
-    brehon-tui) echo "brehon-mux brehon-ports brehon-types" ;;
+    brehon-mcp) echo "brehon-config brehon-notify brehon-mux brehon-types brehon-ports brehon-review brehon-git" ;;
+    brehon-tui) echo "brehon-notify brehon-mux brehon-ports brehon-types" ;;
     brehon-native-agent) echo "brehon-adapter-sdk brehon-mcp brehon-types" ;;
     brehon-orchestrator) echo "brehon-types brehon-ports brehon-test-harness" ;;
     brehon-gatekeeper) echo "brehon-git" ;;

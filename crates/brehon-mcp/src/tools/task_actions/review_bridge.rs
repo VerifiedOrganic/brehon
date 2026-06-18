@@ -255,6 +255,10 @@ pub async fn update_task_status_atomic(task_id: &str, new_status: &str) -> Resul
     if !write_task(task_id, &task) {
         return Err(format!("Failed to write task {task_id}"));
     }
+    super::notifications::publish_review_outcome(task_id, &task, normalized);
+    if normalized == "blocked" {
+        super::notifications::publish_task_blocked(task_id, &task);
+    }
 
     Ok(())
 }

@@ -314,14 +314,23 @@ pub(super) async fn execute(
             );
             if !write_task(id, &stale_task) {
                 return Ok(error_result(format!(
-                    "Cannot integrate task {id}: approved review commit {reviewed_commit} is stale because latest_commit is {latest_commit}, and Brehon failed to demote the task back to review_ready."
-                )));
+                        "Cannot integrate task {id}: approved review commit {reviewed_commit} is stale because latest_commit is {latest_commit}, and Brehon failed to demote the task back to review_ready."
+                    )));
             }
-            return integrate_error_response(
+            super::notifications::publish_integration_failed(
                 id,
-                IntegrationPhase::Null,
-                &current_status,
-                task_data.get("merge_target").and_then(|value| value.as_str()),
+                &stale_task,
+                task_data
+                    .get("merge_target")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or(""),
+                "stale_review_approval",
+            );
+            return integrate_error_response(
+                    id,
+                    IntegrationPhase::Null,
+                    &current_status,
+                    task_data.get("merge_target").and_then(|value| value.as_str()),
                 &[],
                 "",
                 &reviewed_commit_set,
@@ -387,6 +396,7 @@ pub(super) async fn execute(
 
     // --- State machine ---
     let mut state = read_integration_state(&task_data);
+    let integration_was_new = state.started_at.is_empty();
 
     // Ensure state is initialised with current metadata.
     state.epic_branch = merge_target.clone();
@@ -405,6 +415,12 @@ pub(super) async fn execute(
     if resolved_empty_commit_set && current_normalized == Some("approved") {
         state.phase = IntegrationPhase::Complete;
     } else if resolved_empty_commit_set {
+        super::notifications::publish_integration_failed(
+            id,
+            &task_data,
+            &merge_target,
+            "integration_requires_approved_status",
+        );
         return integrate_error_response(
             id,
             state.phase,
@@ -428,6 +444,9 @@ pub(super) async fn execute(
                 "description": "Integrate will keep rejecting until the task reaches approved status."
             }),
         );
+    }
+    if integration_was_new {
+        super::notifications::publish_integration_started(id, &task_data, &merge_target);
     }
 
     let mut task = task_data.clone();
@@ -506,8 +525,15 @@ pub(super) async fn execute(
                     {
                         return Ok(error_result(tool_result));
                     }
+                    super::notifications::publish_integration_failed(
+                        id,
+                        &task,
+                        &merge_target,
+                        reason,
+                    );
                     return conflict_response(id, &state, reason, &merge_target);
                 }
+                super::notifications::publish_integration_failed(id, &task, &merge_target, reason);
                 return integrate_state_reject_response(
                     id,
                     &state,
@@ -591,9 +617,21 @@ pub(super) async fn execute(
                         {
                             return Ok(error_result(tool_result));
                         }
+                        super::notifications::publish_integration_failed(
+                            id,
+                            &task,
+                            &merge_target,
+                            &details,
+                        );
                         return conflict_response(id, &state, &details, &merge_target);
                     }
                     Err(CherryPickError::Other(msg)) => {
+                        super::notifications::publish_integration_failed(
+                            id,
+                            &task,
+                            &merge_target,
+                            &msg,
+                        );
                         return Ok(error_result(msg));
                     }
                 }
@@ -623,9 +661,21 @@ pub(super) async fn execute(
                                 {
                                     return Ok(error_result(tool_result));
                                 }
+                                super::notifications::publish_integration_failed(
+                                    id,
+                                    &task,
+                                    &merge_target,
+                                    &details,
+                                );
                                 return conflict_response(id, &state, &details, &merge_target);
                             }
                             Err(CherryPickError::Other(msg)) => {
+                                super::notifications::publish_integration_failed(
+                                    id,
+                                    &task,
+                                    &merge_target,
+                                    &msg,
+                                );
                                 return Ok(error_result(msg));
                             }
                         }
@@ -639,6 +689,12 @@ pub(super) async fn execute(
                         {
                             return Ok(error_result(tool_result));
                         }
+                        super::notifications::publish_integration_failed(
+                            id,
+                            &task,
+                            &merge_target,
+                            &err,
+                        );
                         return conflict_response(id, &state, &err, &merge_target);
                     }
                 }
@@ -1123,6 +1179,8 @@ async fn finalize_integration(
             "after_task_integrated",
             integration_worktree,
         );
+    super::notifications::publish_integration_completed(id, task, merge_target, &integrated_commit);
+    super::notifications::publish_task_closed(id, task, "closed");
 
     Ok(text_result(
         serde_json::to_string_pretty(&result)

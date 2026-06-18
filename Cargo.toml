@@ -17,6 +17,7 @@ members = [
     "crates/brehon-protocol",
     "crates/brehon-recording",
     "crates/brehon-runtime",
+    "crates/brehon-notify",
     "crates/brehon-doctor",
     # Adapters
     "crates/brehon-adapter-sdk",

@@ -83,6 +83,7 @@ pub enum ValidationWarningKind {
     InvalidWorktreeRoot,
     LauncherEnvConflict,
     BudgetPolicyConflict,
+    NotificationPolicyConflict,
 }
 
 impl ValidationWarningKind {
@@ -102,6 +103,7 @@ impl ValidationWarningKind {
                 | ValidationWarningKind::ProfilePolicyConflict
                 | ValidationWarningKind::InvalidWorktreeRoot
                 | ValidationWarningKind::LauncherEnvConflict
+                | ValidationWarningKind::NotificationPolicyConflict
         )
     }
 }
@@ -162,6 +164,9 @@ impl std::fmt::Display for ValidationWarningKind {
             ValidationWarningKind::InvalidWorktreeRoot => write!(f, "Invalid worktree root"),
             ValidationWarningKind::LauncherEnvConflict => write!(f, "Launcher env conflict"),
             ValidationWarningKind::BudgetPolicyConflict => write!(f, "Budget policy conflict"),
+            ValidationWarningKind::NotificationPolicyConflict => {
+                write!(f, "Notification policy conflict")
+            }
         }
     }
 }
@@ -176,6 +181,7 @@ pub fn validate(config: &BrehonConfig) -> Vec<ValidationWarning> {
     warnings.extend(validate_advisors(config));
     warnings.extend(validate_research(config));
     warnings.extend(validate_budget(config));
+    warnings.extend(validate_notifications(config));
     warnings.extend(validate_review_thresholds(config));
     warnings.extend(validate_review_panels(config));
     warnings.extend(validate_prompt_policy(config));
@@ -437,6 +443,96 @@ fn validate_budget(config: &BrehonConfig) -> Vec<ValidationWarning> {
     }
 
     warnings
+}
+
+fn validate_notifications(config: &BrehonConfig) -> Vec<ValidationWarning> {
+    let mut warnings = Vec::new();
+    let notifications = &config.notifications;
+    if !notifications.enabled {
+        return warnings;
+    }
+
+    if notifications.subscriptions.is_empty() {
+        warnings.push(ValidationWarning::non_fatal(
+            ValidationWarningKind::NotificationPolicyConflict,
+            "notifications.enabled=true but subscriptions is empty; no external notifications will be delivered",
+        ));
+    }
+
+    for subscription in &notifications.subscriptions {
+        if subscription.events.is_empty() {
+            warnings.push(ValidationWarning::new(
+                ValidationWarningKind::NotificationPolicyConflict,
+                format!(
+                    "notifications subscription for provider {:?} has no events",
+                    subscription.provider
+                ),
+            ));
+        }
+
+        match subscription.provider {
+            brehon_types::NotificationProviderKind::Telegram => {
+                if !notifications.providers.telegram.enabled {
+                    warnings.push(ValidationWarning::new(
+                        ValidationWarningKind::NotificationPolicyConflict,
+                        "notifications subscribes Telegram events but providers.telegram.enabled=false",
+                    ));
+                }
+            }
+        }
+    }
+
+    let telegram = &notifications.providers.telegram;
+    if telegram.enabled {
+        validate_notification_env_name(
+            "notifications.providers.telegram.bot_token_env",
+            &telegram.bot_token_env,
+            &mut warnings,
+        );
+        validate_notification_env_name(
+            "notifications.providers.telegram.chat_id_env",
+            &telegram.chat_id_env,
+            &mut warnings,
+        );
+        if telegram.send_timeout_secs == 0 {
+            warnings.push(ValidationWarning::new(
+                ValidationWarningKind::NotificationPolicyConflict,
+                "notifications.providers.telegram.send_timeout_secs must be greater than 0",
+            ));
+        }
+    }
+
+    warnings
+}
+
+fn validate_notification_env_name(
+    field: &str,
+    env_name: &str,
+    warnings: &mut Vec<ValidationWarning>,
+) {
+    let trimmed = env_name.trim();
+    if trimmed.is_empty() {
+        warnings.push(ValidationWarning::new(
+            ValidationWarningKind::NotificationPolicyConflict,
+            format!("{field} must name an environment variable"),
+        ));
+        return;
+    }
+    match std::env::var(trimmed) {
+        Ok(value) if !value.trim().is_empty() => {}
+        Ok(_) | Err(std::env::VarError::NotPresent) => {
+            warnings.push(ValidationWarning::non_fatal(
+                ValidationWarningKind::NotificationPolicyConflict,
+                format!("{field} points to unset/empty environment variable {trimmed}; provider delivery will be skipped until it is set"),
+            ));
+        }
+        Err(std::env::VarError::NotUnicode(_)) => {
+            warnings.push(ValidationWarning::new(
+                ValidationWarningKind::NotificationPolicyConflict,
+                format!("{field} points to non-unicode environment variable {trimmed}"),
+            ));
+        }
+    }
 }
 
 fn validate_research(config: &BrehonConfig) -> Vec<ValidationWarning> {
@@ -2063,6 +2159,7 @@ mod tests {
                 worktree_cleanup: brehon_types::WorktreeCleanupConfig::default(),
             },
             runtime: RuntimeConfig::default(),
+            notifications: brehon_types::ExternalNotificationsConfig::default(),
             budget: BudgetConfig {
                 max_total_cost: None,
                 max_cost_per_task: None,
@@ -2195,6 +2292,72 @@ mod tests {
             warning.message.contains("never fire"),
             "{}",
             warning.message
+        );
+    }
+
+    #[test]
+    fn notifications_enabled_without_subscriptions_warns_non_fatal() {
+        let mut config = minimal_valid_config();
+        config.notifications.enabled = true;
+
+        let warning = validate(&config)
+            .into_iter()
+            .find(|w| w.kind == ValidationWarningKind::NotificationPolicyConflict)
+            .expect("enabled notification config with no subscriptions should warn");
+        assert!(!warning.is_fatal, "no subscriptions is a warning");
+        assert!(
+            warning.message.contains("subscriptions is empty"),
+            "{}",
+            warning.message
+        );
+    }
+
+    #[test]
+    fn notifications_reject_subscribed_disabled_provider() {
+        let mut config = minimal_valid_config();
+        config.notifications.enabled = true;
+        config.notifications.subscriptions = vec![brehon_types::NotificationSubscriptionConfig {
+            provider: brehon_types::NotificationProviderKind::Telegram,
+            events: vec![brehon_types::NotificationEventKind::TaskCompleted],
+        }];
+
+        let warning = validate(&config)
+            .into_iter()
+            .find(|w| w.kind == ValidationWarningKind::NotificationPolicyConflict)
+            .expect("subscribed disabled provider should warn");
+        assert!(warning.is_fatal, "disabled subscribed provider is invalid");
+        assert!(
+            warning.message.contains("providers.telegram.enabled=false"),
+            "{}",
+            warning.message
+        );
+    }
+
+    #[test]
+    fn notifications_warn_non_fatal_when_telegram_env_is_unset() {
+        let mut config = minimal_valid_config();
+        config.notifications.enabled = true;
+        config.notifications.providers.telegram.enabled = true;
+        config.notifications.providers.telegram.bot_token_env =
+            "BREHON_TEST_TELEGRAM_TOKEN_NOT_SET".into();
+        config.notifications.providers.telegram.chat_id_env =
+            "BREHON_TEST_TELEGRAM_CHAT_NOT_SET".into();
+        config.notifications.subscriptions = vec![brehon_types::NotificationSubscriptionConfig {
+            provider: brehon_types::NotificationProviderKind::Telegram,
+            events: vec![brehon_types::NotificationEventKind::TaskCompleted],
+        }];
+
+        let warnings = validate(&config);
+        let notification_warnings = warnings
+            .iter()
+            .filter(|w| w.kind == ValidationWarningKind::NotificationPolicyConflict)
+            .collect::<Vec<_>>();
+        assert_eq!(notification_warnings.len(), 2, "{warnings:?}");
+        assert!(
+            notification_warnings
+                .iter()
+                .all(|warning| !warning.is_fatal),
+            "{notification_warnings:?}"
         );
     }
 

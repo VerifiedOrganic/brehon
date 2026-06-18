@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, HashMap};
 use strum::{EnumIter, IntoEnumIterator, IntoStaticStr};
 
 use crate::agent::AdapterKind;
+use crate::notification::ExternalNotificationsConfig;
 use crate::review::ReviewPolicy;
 use crate::role::{ModelConfig, RoleDefinition, RoleKind};
 
@@ -45,6 +46,12 @@ pub struct BrehonConfig {
     /// Runtime side-channel configuration.
     #[serde(default)]
     pub runtime: RuntimeConfig,
+    /// External operator notification configuration.
+    #[serde(
+        default,
+        skip_serializing_if = "ExternalNotificationsConfig::is_default"
+    )]
+    pub notifications: ExternalNotificationsConfig,
     /// Budget configuration.
     pub budget: BudgetConfig,
     /// TUI configuration.
@@ -2729,6 +2736,7 @@ mod tests {
                 worktree_cleanup: WorktreeCleanupConfig::default(),
             },
             runtime: RuntimeConfig::default(),
+            notifications: ExternalNotificationsConfig::default(),
             budget: BudgetConfig {
                 max_total_cost: None,
                 max_cost_per_task: None,

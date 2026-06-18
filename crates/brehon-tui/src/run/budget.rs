@@ -318,6 +318,10 @@ pub(super) fn budget_tick(ctx: &mut EventLoopCtx) {
             if ctx.last_budget_warn.as_deref() != Some(reason.as_str()) {
                 tracing::warn!(reason = %reason, "budget soft warning");
                 push_dashboard_event(&ctx.dashboard_data, format!("budget warning: {reason}"));
+                super::notifications::notify_from_ctx(
+                    ctx,
+                    super::notifications::budget_warning_event(&reason),
+                );
                 ctx.last_budget_warn = Some(reason);
             }
         }
@@ -331,6 +335,10 @@ pub(super) fn budget_tick(ctx: &mut EventLoopCtx) {
                 push_dashboard_event(
                     &ctx.dashboard_data,
                     format!("budget exceeded: {reason} — draining and stopping"),
+                );
+                super::notifications::notify_from_ctx(
+                    ctx,
+                    super::notifications::budget_kill_switch_event(&reason),
                 );
                 emit_budget_breach(ctx, &reason, &cfg);
 

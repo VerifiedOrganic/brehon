@@ -10,10 +10,11 @@ use std::collections::HashMap;
 
 use brehon_types::{
     AdvisorConfig, AgentConnectionConfig, BrehonConfig, BudgetConfig, ContextConfig,
-    EscalationConfig, LaneConfig, NotificationConfig, NudgeConfig, OrchestrationConfig,
-    PermissionsConfig, PromptFragmentConfig, PromptPolicyConfig, ResearchConfig, RetentionConfig,
-    ReviewConfig, ReviewerPoolConfig, RolesConfig, RuntimeConfig, SecurityConfig,
-    StaleDetectionConfig, StuckDetectionConfig, SupervisorConfig, TuiConfig, WorkerPoolConfig,
+    EscalationConfig, ExternalNotificationsConfig, LaneConfig, NotificationConfig, NudgeConfig,
+    OrchestrationConfig, PermissionsConfig, PromptFragmentConfig, PromptPolicyConfig,
+    ResearchConfig, RetentionConfig, ReviewConfig, ReviewerPoolConfig, RolesConfig, RuntimeConfig,
+    SecurityConfig, StaleDetectionConfig, StuckDetectionConfig, SupervisorConfig, TuiConfig,
+    WorkerPoolConfig,
 };
 
 /// Merge two configs, with `overlay` taking precedence over `base`.
@@ -36,6 +37,7 @@ pub fn merge_configs(base: BrehonConfig, overlay: BrehonConfig) -> BrehonConfig 
         supervisor: merge_supervisor(base.supervisor, overlay.supervisor),
         orchestration: merge_orchestration(base.orchestration, overlay.orchestration),
         runtime: merge_runtime(base.runtime, overlay.runtime),
+        notifications: merge_external_notifications(base.notifications, overlay.notifications),
         budget: merge_budget(base.budget, overlay.budget),
         tui: merge_tui(base.tui, overlay.tui),
         escalation: merge_escalation(base.escalation, overlay.escalation),
@@ -252,6 +254,24 @@ fn merge_runtime_terminal_host(
     }
 }
 
+fn merge_external_notifications(
+    base: ExternalNotificationsConfig,
+    overlay: ExternalNotificationsConfig,
+) -> ExternalNotificationsConfig {
+    if overlay.is_default() {
+        return base;
+    }
+    ExternalNotificationsConfig {
+        enabled: overlay.enabled,
+        providers: overlay.providers,
+        subscriptions: if overlay.subscriptions.is_empty() {
+            base.subscriptions
+        } else {
+            overlay.subscriptions
+        },
+    }
+}
+
 fn merge_budget(base: BudgetConfig, overlay: BudgetConfig) -> BudgetConfig {
     BudgetConfig {
         max_total_cost: overlay.max_total_cost.or(base.max_total_cost),
@@ -465,6 +485,7 @@ mod tests {
                 worktree_cleanup: brehon_types::WorktreeCleanupConfig::default(),
             },
             runtime: RuntimeConfig::default(),
+            notifications: ExternalNotificationsConfig::default(),
             budget: BudgetConfig {
                 max_total_cost: None,
                 max_cost_per_task: None,

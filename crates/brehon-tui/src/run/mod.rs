@@ -48,6 +48,7 @@ mod input;
 mod key_handling;
 mod keybind_overlay;
 mod layout;
+mod notifications;
 mod prompt_delivery;
 mod proof_detail;
 mod recovery;
@@ -401,6 +402,18 @@ pub fn run_tui_with_panels_and_runtime_commands(
     let last_session_poll = std::time::Instant::now();
     let session_poll_interval = Duration::from_secs(5);
     let runtime_session_name = mux.session_name().map(str::to_string);
+    notifications::notify_from_parts(
+        &rt,
+        &dashboard_data,
+        &project_config_loader,
+        notifications::run_started_event(
+            runtime_session_name.as_deref(),
+            worker_ids.len(),
+            all_reviewer_ids.len(),
+            advisor_ids.len(),
+            research_ids.len(),
+        ),
+    );
     let last_shared_root_issue: Option<String> = None;
     let pending_dashboard_refresh: Option<tokio::task::JoinHandle<DashboardRefreshSnapshot>> = None;
     let pending_queued_gateway_prompt_deliveries: Vec<AsyncQueuedGatewayPromptDeliveryTask> =
@@ -512,6 +525,15 @@ pub fn run_tui_with_panels_and_runtime_commands(
     event_loop::run(&mut ctx)?;
 
     rt.block_on(ctx.mux.shutdown_all());
+    notifications::notify_now_from_parts(
+        &rt,
+        &ctx.dashboard_data,
+        &ctx.project_config_loader,
+        notifications::run_shutdown_event(
+            ctx.runtime_session_name.as_deref(),
+            ctx.started_at.elapsed().as_secs(),
+        ),
+    );
     shutdown.store(true, Ordering::SeqCst);
     restore_terminal_session();
     terminal_guard.disarm();

@@ -18,6 +18,7 @@ brehon-search-tantivy = { path = "../brehon-search-tantivy" }
 brehon-acp = { path = "../brehon-acp" }
 brehon-pty = { path = "../brehon-pty" }
 brehon-mux = { path = "../brehon-mux" }
+brehon-notify = { path = "../brehon-notify" }
 brehon-git = { path = "../brehon-git" }
 brehon-mcp = { path = "../brehon-mcp" }
 brehon-tui = { path = "../brehon-tui" }
