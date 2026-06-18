@@ -42,7 +42,7 @@
 1381 crates/brehon-mcp/src/tools/task_actions/action_query.rs
 1480 crates/brehon-mcp/src/tools/task_actions/action_update.rs
 2341 crates/brehon-mcp/src/tools/task_actions/epic.rs
-13220 crates/brehon-mcp/src/tools/task_actions/tool_tests.rs
+13287 crates/brehon-mcp/src/tools/task_actions/tool_tests.rs
 1037 crates/brehon-mcp/src/tools/tasks.rs
 2861 crates/brehon-mcp/src/tools/verification/actions.rs
 2645 crates/brehon-mcp/src/tools/verification/tool.rs
