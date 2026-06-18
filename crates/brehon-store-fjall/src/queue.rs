@@ -3,7 +3,7 @@
 //! Handles atomic claims with durable lease semantics for the review queue.
 
 use chrono::Utc;
-use fjall::PartitionHandle;
+use fjall::{Keyspace, PartitionHandle, PersistMode};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock, Weak};
@@ -132,6 +132,7 @@ fn shared_claim_lock(claim_lock_scope: &str) -> Arc<Mutex<()>> {
 }
 
 pub struct QueueManager {
+    keyspace: Keyspace,
     pub queue: PartitionHandle,
     // Phase 0 tradeoff: serialize claim/ack/renew/cleanup for one store path inside
     // this process. That keeps single-winner claims intact even if the same store is
@@ -143,10 +144,15 @@ pub struct QueueManager {
 }
 
 impl QueueManager {
-    pub fn new(queue: PartitionHandle, claim_lock_scope: impl Into<String>) -> Self {
+    pub fn new(
+        keyspace: Keyspace,
+        queue: PartitionHandle,
+        claim_lock_scope: impl Into<String>,
+    ) -> Self {
         let claim_lock_scope = claim_lock_scope.into();
 
         Self {
+            keyspace,
             queue,
             claim_lock_scope: claim_lock_scope.clone(),
             claim_lock: shared_claim_lock(&claim_lock_scope),
@@ -160,6 +166,10 @@ impl QueueManager {
 
     pub fn active_lease_elapsed_ms(&self) -> u64 {
         self.lease_clock.elapsed_ms()
+    }
+
+    fn sync_batch(&self) -> fjall::Batch {
+        self.keyspace.batch().durability(Some(PersistMode::SyncAll))
     }
 
     pub fn claim_next(
@@ -208,9 +218,14 @@ impl QueueManager {
             let lease_key = lease_key(claim_id.as_str());
             let claim_bytes = serde_json::to_vec(&claim)?;
 
-            self.queue.insert(&lease_key, &claim_bytes)?;
-            self.queue
-                .insert(claimed_key.as_bytes(), claim_id.as_str().as_bytes())?;
+            let mut batch = self.sync_batch();
+            batch.insert(&self.queue, &lease_key, &claim_bytes);
+            batch.insert(
+                &self.queue,
+                claimed_key.as_bytes(),
+                claim_id.as_str().as_bytes(),
+            );
+            batch.commit()?;
 
             return Ok(Some(claim));
         }
@@ -237,7 +252,9 @@ impl QueueManager {
                 claim_id = %claim_id,
                 "Removing stale claimed marker with missing lease"
             );
-            self.queue.remove(claimed_key)?;
+            let mut batch = self.sync_batch();
+            batch.remove(&self.queue, claimed_key);
+            batch.commit()?;
             return Ok(false);
         };
 
@@ -250,15 +267,19 @@ impl QueueManager {
                     error = %err,
                     "Removing stale claimed marker with malformed lease payload"
                 );
-                self.queue.remove(&lease_key)?;
-                self.queue.remove(claimed_key)?;
+                let mut batch = self.sync_batch();
+                batch.remove(&self.queue, &lease_key);
+                batch.remove(&self.queue, claimed_key);
+                batch.commit()?;
                 return Ok(false);
             }
         };
 
         if self.claim_is_expired(&claim) {
-            self.queue.remove(&lease_key)?;
-            self.queue.remove(claimed_key)?;
+            let mut batch = self.sync_batch();
+            batch.remove(&self.queue, &lease_key);
+            batch.remove(&self.queue, claimed_key);
+            batch.commit()?;
             return Ok(false);
         }
 
@@ -272,7 +293,9 @@ impl QueueManager {
                 item = %item_id,
                 "Removing inconsistent claimed marker while preserving lease payload"
             );
-            self.queue.remove(claimed_key)?;
+            let mut batch = self.sync_batch();
+            batch.remove(&self.queue, claimed_key);
+            batch.commit()?;
             return Ok(false);
         }
 
@@ -292,18 +315,18 @@ impl QueueManager {
 
         if self.claim_is_expired(&claim) {
             let claimed_key = format!("claimed:{}:{}", claim.queue, claim.item_id);
-            self.queue.remove(&lease_key)?;
-            self.queue.remove(claimed_key.as_bytes())?;
+            let mut batch = self.sync_batch();
+            batch.remove(&self.queue, &lease_key);
+            batch.remove(&self.queue, claimed_key.as_bytes());
+            batch.commit()?;
             return Err(StoreError::ClaimExpired(claim_id.to_string()));
         }
 
         let claimed_key = format!("claimed:{}:{}", claim.queue, claim.item_id);
         let queue_prefix = queue_prefix(&claim.queue);
 
-        self.queue.remove(&lease_key)?;
-        self.queue.remove(claimed_key.as_bytes())?;
-
         let iter = self.queue.iter();
+        let mut queued_item_key = None;
         for result in iter {
             let (key, value) = result.map_err(|e| StoreError::Storage(e.to_string()))?;
 
@@ -312,10 +335,18 @@ impl QueueManager {
             }
 
             if String::from_utf8_lossy(&value) == claim.item_id {
-                self.queue.remove(key)?;
+                queued_item_key = Some(key.to_vec());
                 break;
             }
         }
+
+        let mut batch = self.sync_batch();
+        batch.remove(&self.queue, &lease_key);
+        batch.remove(&self.queue, claimed_key.as_bytes());
+        if let Some(key) = queued_item_key {
+            batch.remove(&self.queue, key);
+        }
+        batch.commit()?;
 
         Ok(())
     }
@@ -333,8 +364,10 @@ impl QueueManager {
 
         if self.claim_is_expired(&claim) {
             let claimed_key = format!("claimed:{}:{}", claim.queue, claim.item_id);
-            self.queue.remove(&lease_key)?;
-            self.queue.remove(claimed_key.as_bytes())?;
+            let mut batch = self.sync_batch();
+            batch.remove(&self.queue, &lease_key);
+            batch.remove(&self.queue, claimed_key.as_bytes());
+            batch.commit()?;
             return Err(StoreError::ClaimExpired(claim_id.to_string()));
         }
 
@@ -344,7 +377,9 @@ impl QueueManager {
         claim.monotonic_deadline_ms = Some(self.lease_clock.deadline_ms_from_now(lease_for));
 
         let new_bytes = serde_json::to_vec(&claim)?;
-        self.queue.insert(&lease_key, &new_bytes)?;
+        let mut batch = self.sync_batch();
+        batch.insert(&self.queue, &lease_key, &new_bytes);
+        batch.commit()?;
 
         Ok(())
     }
@@ -357,7 +392,9 @@ impl QueueManager {
         sequence: u64,
     ) -> Result<(), StoreError> {
         let key = queue_key(queue_name, sequence);
-        self.queue.insert(&key, item_id.as_bytes())?;
+        let mut batch = self.sync_batch();
+        batch.insert(&self.queue, &key, item_id.as_bytes());
+        batch.commit()?;
         Ok(())
     }
 
@@ -411,11 +448,15 @@ impl QueueManager {
         let expired = self.list_expired_claims()?;
         let count = expired.len();
 
-        for claim in &expired {
-            let lease_key = lease_key(claim.claim_id.as_str());
-            let claimed_key = format!("claimed:{}:{}", claim.queue, claim.item_id);
-            self.queue.remove(&lease_key)?;
-            self.queue.remove(claimed_key.as_bytes())?;
+        if !expired.is_empty() {
+            let mut batch = self.sync_batch();
+            for claim in &expired {
+                let lease_key = lease_key(claim.claim_id.as_str());
+                let claimed_key = format!("claimed:{}:{}", claim.queue, claim.item_id);
+                batch.remove(&self.queue, &lease_key);
+                batch.remove(&self.queue, claimed_key.as_bytes());
+            }
+            batch.commit()?;
         }
 
         Ok(count)
@@ -534,7 +575,11 @@ mod tests {
         let queue = keyspace
             .open_partition("queue", PartitionCreateOptions::default())
             .unwrap();
-        let manager = QueueManager::new(queue, dir.path().to_string_lossy().into_owned());
+        let manager = QueueManager::new(
+            keyspace.clone(),
+            queue,
+            dir.path().to_string_lossy().into_owned(),
+        );
 
         manager.enqueue_item("review:high", "R001", 1).unwrap();
 
@@ -562,7 +607,11 @@ mod tests {
         let queue = keyspace
             .open_partition("queue", PartitionCreateOptions::default())
             .unwrap();
-        let manager = QueueManager::new(queue, dir.path().to_string_lossy().into_owned());
+        let manager = QueueManager::new(
+            keyspace.clone(),
+            queue,
+            dir.path().to_string_lossy().into_owned(),
+        );
 
         manager.enqueue_item("review:high", "R001", 1).unwrap();
         manager.enqueue_item("review:high", "R002", 2).unwrap();
@@ -599,7 +648,11 @@ mod tests {
         let queue = keyspace
             .open_partition("queue", PartitionCreateOptions::default())
             .unwrap();
-        let manager = QueueManager::new(queue, dir.path().to_string_lossy().into_owned());
+        let manager = QueueManager::new(
+            keyspace.clone(),
+            queue,
+            dir.path().to_string_lossy().into_owned(),
+        );
 
         manager.enqueue_item("review:high", "R001", 1).unwrap();
 
@@ -641,7 +694,7 @@ mod tests {
             .unwrap();
         let scope = dir.path().to_string_lossy().into_owned();
 
-        let first_manager = QueueManager::new(queue.clone(), scope.clone());
+        let first_manager = QueueManager::new(keyspace.clone(), queue.clone(), scope.clone());
         first_manager
             .enqueue_item("review:high", "R001", 1)
             .unwrap();
@@ -651,7 +704,7 @@ mod tests {
             .expect("initial claim should succeed");
         drop(first_manager);
 
-        let second_manager = QueueManager::new(queue, scope);
+        let second_manager = QueueManager::new(keyspace.clone(), queue, scope);
         let reclaimed = second_manager
             .claim_next("review:high", "consumer-b", Duration::from_secs(60))
             .unwrap()
@@ -670,8 +723,12 @@ mod tests {
         enqueue_item(&queue, "review:high", "R001", 1).unwrap();
 
         let scope = dir.path().to_string_lossy().into_owned();
-        let manager_a = Arc::new(QueueManager::new(queue.clone(), scope.clone()));
-        let manager_b = Arc::new(QueueManager::new(queue, scope));
+        let manager_a = Arc::new(QueueManager::new(
+            keyspace.clone(),
+            queue.clone(),
+            scope.clone(),
+        ));
+        let manager_b = Arc::new(QueueManager::new(keyspace.clone(), queue, scope));
 
         let contenders = 16usize;
         let barrier = Arc::new(AsyncBarrier::new(contenders));
@@ -723,8 +780,8 @@ mod tests {
         let scope = format!("claim-lock-scope-{}", Uuid::new_v4());
 
         {
-            let manager_a = QueueManager::new(queue.clone(), scope.clone());
-            let manager_b = QueueManager::new(queue, scope.clone());
+            let manager_a = QueueManager::new(keyspace.clone(), queue.clone(), scope.clone());
+            let manager_b = QueueManager::new(keyspace.clone(), queue, scope.clone());
 
             assert!(claim_lock_registry_contains_scope(&scope));
 
@@ -749,7 +806,7 @@ mod tests {
             .unwrap();
 
         let scope = format!("claim-lock-scope-race-{}", Uuid::new_v4());
-        let dropping_manager = QueueManager::new(queue.clone(), scope.clone());
+        let dropping_manager = QueueManager::new(keyspace.clone(), queue.clone(), scope.clone());
         let drop_started = Arc::new(StdBarrier::new(2));
         let replacement_created = Arc::new(StdBarrier::new(2));
         install_claim_lock_drop_hook(
@@ -767,7 +824,7 @@ mod tests {
         let drop_thread = std::thread::spawn(move || drop(dropping_manager));
 
         drop_started.wait();
-        let replacement_manager = QueueManager::new(queue.clone(), scope.clone());
+        let replacement_manager = QueueManager::new(keyspace.clone(), queue.clone(), scope.clone());
         replacement_created.wait();
         drop_thread.join().unwrap();
 
@@ -776,7 +833,7 @@ mod tests {
             "replacement manager should keep the scope registered during a concurrent drop"
         );
 
-        let future_manager = QueueManager::new(queue, scope);
+        let future_manager = QueueManager::new(keyspace.clone(), queue, scope);
         assert!(
             Arc::ptr_eq(&replacement_manager.claim_lock, &future_manager.claim_lock),
             "same-scope managers created after a drop race must keep sharing one lock"

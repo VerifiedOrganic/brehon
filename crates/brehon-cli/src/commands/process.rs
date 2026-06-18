@@ -262,9 +262,65 @@ fn send_signal(signal: &str, pids: &[u32]) -> Result<()> {
     Ok(())
 }
 
+fn send_signal_best_effort(signal: &str, pids: &[u32]) -> Result<()> {
+    for pid in pids {
+        let output = Command::new("kill")
+            .arg(signal)
+            .arg(pid.to_string())
+            .output()
+            .context("failed to execute kill")?;
+        if output.status.success() {
+            continue;
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if kill_error_is_process_missing(&stderr) {
+            continue;
+        }
+
+        tracing::warn!(
+            signal,
+            pid,
+            stderr = %stderr,
+            "failed to signal matched Brehon process; will verify liveness before failing"
+        );
+    }
+    Ok(())
+}
+
 fn kill_error_is_process_missing(stderr: &str) -> bool {
     let stderr = stderr.to_ascii_lowercase();
     stderr.contains("no such process") || stderr.contains("not found")
+}
+
+fn pid_is_live(pid: u32) -> Result<bool> {
+    let output = Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .output()
+        .context("failed to execute kill -0")?;
+    if output.status.success() {
+        return Ok(true);
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if kill_error_is_process_missing(&stderr) {
+        return Ok(false);
+    }
+
+    // EPERM or another non-ESRCH failure means the pid still exists from this
+    // sweep's perspective, even if we cannot signal it.
+    Ok(true)
+}
+
+fn retain_live_pids(pids: Vec<u32>) -> Result<Vec<u32>> {
+    let mut live = Vec::new();
+    for pid in pids {
+        if pid_is_live(pid)? {
+            live.push(pid);
+        }
+    }
+    Ok(live)
 }
 
 pub(crate) fn terminate_session_processes(
@@ -288,7 +344,7 @@ pub(crate) fn terminate_session_processes(
         return Ok(Vec::new());
     }
 
-    send_signal("-TERM", &target_pids)?;
+    send_signal_best_effort("-TERM", &target_pids)?;
     thread::sleep(Duration::from_millis(750));
 
     let mut remaining: Vec<u32> = list_processes(project_path, false)?
@@ -299,7 +355,7 @@ pub(crate) fn terminate_session_processes(
         .collect();
 
     if !remaining.is_empty() && force {
-        send_signal("-KILL", &remaining)?;
+        send_signal_best_effort("-KILL", &remaining)?;
         thread::sleep(Duration::from_millis(250));
         remaining = list_processes(project_path, false)?
             .into_iter()
@@ -309,7 +365,7 @@ pub(crate) fn terminate_session_processes(
             .collect();
     }
 
-    Ok(remaining)
+    retain_live_pids(remaining)
 }
 
 fn collect_termination_targets(processes: &[BrehonProcess], excluded_pids: &[u32]) -> Vec<u32> {
@@ -338,20 +394,20 @@ pub(crate) fn terminate_project_processes(
         return Ok(Vec::new());
     }
 
-    send_signal("-TERM", &target_pids)?;
+    send_signal_best_effort("-TERM", &target_pids)?;
     thread::sleep(Duration::from_millis(750));
 
     let mut remaining =
         collect_termination_targets(&list_processes(project_path, false)?, excluded_pids);
 
     if !remaining.is_empty() && force {
-        send_signal("-KILL", &remaining)?;
+        send_signal_best_effort("-KILL", &remaining)?;
         thread::sleep(Duration::from_millis(250));
         remaining =
             collect_termination_targets(&list_processes(project_path, false)?, excluded_pids);
     }
 
-    Ok(remaining)
+    retain_live_pids(remaining)
 }
 
 pub fn execute_kill(project_path: Option<&Path>, args: &KillArgs) -> Result<()> {
@@ -605,5 +661,28 @@ mod tests {
         let _ = child.wait();
 
         send_signal("-TERM", &[pid]).unwrap();
+    }
+
+    #[test]
+    fn retain_live_pids_drops_already_exited_processes() {
+        let mut child = Command::new("sleep").arg("60").spawn().unwrap();
+        let pid = child.id();
+
+        send_signal("-TERM", &[pid]).unwrap();
+        let _ = child.wait();
+
+        assert!(retain_live_pids(vec![pid]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn retain_live_pids_keeps_running_processes() {
+        let mut child = Command::new("sleep").arg("60").spawn().unwrap();
+        let pid = child.id();
+
+        let live = retain_live_pids(vec![pid]).unwrap();
+        assert_eq!(live, vec![pid]);
+
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }

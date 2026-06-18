@@ -235,7 +235,7 @@ fn budget_enforcement_off_warning(budget: &brehon_types::BudgetConfig) -> Option
         brehon_types::BudgetEnforcement::Soft => Some(
             "BUDGET KILL-SWITCH OFF: enforcement is Soft — spend is warned but never \
              stopped. Set enforcement: Hard with a cap (max_tokens_per_agent or \
-             max_wall_clock_minutes) to arm it. Omission means unlimited."
+             max_total_cost or max_wall_clock_minutes) to arm it. Omission means unlimited."
                 .to_string(),
         ),
         // `has_enforceable_ceiling` deliberately excludes `max_cost_per_task` (a
@@ -1416,8 +1416,12 @@ pub async fn execute(
             ));
         }
         Err(err) => {
-            return Err(anyhow::anyhow!(
-                "failed to reap stale Brehon processes before startup: {err}"
+            tracing::warn!(
+                error = %err,
+                "failed to reap stale Brehon processes before startup; continuing"
+            );
+            splash.record(format!(
+                "⚠ Failed to reap stale Brehon processes before startup; continuing: {err}"
             ));
         }
     }
@@ -4384,12 +4388,12 @@ mod tests {
         assert_eq!(summary["status"]["running"], false);
     }
 
-    static EXECUTE_DOTBREHON_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn execute_normalizes_dotbrehon_cwd_for_all_project_root_helpers() {
-        let _guard = EXECUTE_DOTBREHON_TEST_LOCK.lock().unwrap();
+        let _guard = crate::commands::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
 
         // Save original env vars so we can restore them after the test.
         let original_root = std::env::var("BREHON_ROOT").ok();

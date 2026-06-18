@@ -1,7 +1,7 @@
 //! File-based locking for task and repository operations.
 
 use std::fs::OpenOptions;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -15,7 +15,7 @@ pub(super) const TASK_LOCK_RETRY: Duration = Duration::from_millis(10);
 #[cfg(not(test))]
 pub(super) const TASK_LOCK_STALE_AFTER: Duration = Duration::from_secs(30);
 #[cfg(test)]
-pub(super) const TASK_LOCK_STALE_AFTER: Duration = Duration::from_millis(150);
+pub(super) const TASK_LOCK_STALE_AFTER: Duration = Duration::from_secs(1);
 
 // A live holder touches its lock every 10s (1/3 of the 30s stale window, 3x
 // headroom even on coarse-mtime filesystems) so `clear_stale_lock` never sees a
@@ -23,7 +23,7 @@ pub(super) const TASK_LOCK_STALE_AFTER: Duration = Duration::from_millis(150);
 #[cfg(not(test))]
 pub(super) const TASK_LOCK_HEARTBEAT: Duration = Duration::from_secs(10);
 #[cfg(test)]
-pub(super) const TASK_LOCK_HEARTBEAT: Duration = Duration::from_millis(50);
+pub(super) const TASK_LOCK_HEARTBEAT: Duration = Duration::from_millis(100);
 
 pub(crate) struct TaskLock {
     path: PathBuf,
@@ -62,16 +62,20 @@ fn clear_stale_lock(path: &std::path::Path) {
     }
 }
 
-/// Advance the mtime of an existing lock file without changing its contents.
+/// Advance the mtime of an existing lock file.
 ///
 /// Opens the file for writing (never `create_new`, so a removed lock is not
-/// resurrected) and truncates it to length 0 — `set_len` bumps the mtime on
-/// every target filesystem with no extra crate, and the file stays empty as it
-/// is today. The `io::Result` lets the heartbeat detect a removed file.
+/// resurrected) and writes a small marker so the mtime advances even on
+/// filesystems that treat a no-op truncate as metadata-neutral. The
+/// `io::Result` lets the heartbeat detect a removed file.
 fn touch_lock(path: &std::path::Path) -> std::io::Result<()> {
-    let f = OpenOptions::new().write(true).open(path)?;
-    f.set_len(0)?;
-    let _ = f.sync_all();
+    const HEARTBEAT_MARKER: &[u8] = b"heartbeat\n";
+
+    let mut f = OpenOptions::new().write(true).open(path)?;
+    f.seek(SeekFrom::Start(0))?;
+    f.write_all(HEARTBEAT_MARKER)?;
+    f.set_len(HEARTBEAT_MARKER.len() as u64)?;
+    f.sync_all()?;
     Ok(())
 }
 
@@ -89,10 +93,14 @@ fn spawn_heartbeat(path: PathBuf, stop: Arc<AtomicBool>) -> tokio::task::JoinHan
             if stop.load(Ordering::Relaxed) {
                 break;
             }
-            if let Err(err) = touch_lock(&path) {
-                if err.kind() == ErrorKind::NotFound {
+            let touch_path = path.clone();
+            match tokio::task::spawn_blocking(move || touch_lock(&touch_path)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) if err.kind() == ErrorKind::NotFound => {
                     break;
                 }
+                Ok(Err(_)) => {}
+                Err(_) => break,
             }
         }
     })

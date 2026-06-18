@@ -144,39 +144,27 @@ impl FjallEventStore {
         let seq = Self::load_seq(&meta, &events)?;
 
         // Fail closed: a binary must refuse a store written by a newer schema
-        // rather than silently misread it (Fix D2). Read the on-disk version
-        // directly so an absent key (fresh store) is distinguishable from a
-        // present-but-zero value, and stamp the current version exactly once on
-        // a fresh store. No destructive migrations run here.
-        match meta.get(KEY_META_SCHEMA_VERSION)? {
-            Some(bytes) => {
-                let arr: [u8; 8] = bytes
-                    .as_ref()
-                    .try_into()
-                    .map_err(|_| StoreError::Storage("Invalid schema version format".into()))?;
-                let on_disk_version = u64::from_le_bytes(arr);
-                if on_disk_version > crate::migrations::CURRENT_SCHEMA_VERSION {
-                    return Err(StoreError::VersionMismatch {
-                        expected: crate::migrations::CURRENT_SCHEMA_VERSION,
-                        actual: on_disk_version,
-                    });
-                }
-                // Equal or older-but-valid stores open unchanged; a future wave
-                // that bumps CURRENT_SCHEMA_VERSION adds the real migration path.
-            }
-            None => {
-                let version_bytes = crate::migrations::CURRENT_SCHEMA_VERSION.to_le_bytes();
-                meta.insert(KEY_META_SCHEMA_VERSION, version_bytes)?;
-                debug!(
-                    "Stamped fresh store schema version {}",
-                    crate::migrations::CURRENT_SCHEMA_VERSION
-                );
-            }
+        // rather than silently misread it. The migration runner owns the on-disk
+        // version encoding; when it stamps a fresh/unversioned store, persist the
+        // stamp immediately so a crash after open does not leave the store
+        // ambiguously unversioned.
+        let migration_report =
+            crate::migrations::MigrationRunner::new(meta.clone()).run_migrations()?;
+        if migration_report.migrations_applied() {
+            keyspace.persist(PersistMode::SyncAll)?;
+            debug!(
+                "Stamped fresh store schema version {}",
+                crate::migrations::CURRENT_SCHEMA_VERSION
+            );
         }
 
         let view_manager = ViewManager::new(keyspace.clone(), views.clone());
         let query_executor = QueryExecutor::new(events.clone(), meta.clone());
-        let queue_manager = QueueManager::new(queue.clone(), Self::queue_lock_scope(path));
+        let queue_manager = QueueManager::new(
+            keyspace.clone(),
+            queue.clone(),
+            Self::queue_lock_scope(path),
+        );
         let run_store = RunStoreManager::new(keyspace.clone(), runs);
         let views_watermark = Self::load_views_watermark(&meta)?;
         let events_watermark = Self::load_high_water_mark(&events)?;
@@ -1122,7 +1110,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("db");
         let store = FjallEventStore::new(&db_path).unwrap();
-        store.close().unwrap();
+        drop(store);
 
         // Reopen the meta partition directly and confirm the stamp uses the same
         // little-endian encoding the version guard reads on open.

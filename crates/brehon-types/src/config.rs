@@ -1635,21 +1635,19 @@ impl BudgetConfig {
             return None;
         }
         if let Some(max_tokens) = self.max_tokens_per_agent {
-            if max_tokens > 0 && tokens >= max_tokens {
+            if tokens >= max_tokens {
                 return Some(format!(
                     "token limit reached: {tokens} >= max_tokens_per_agent={max_tokens} (run total)"
                 ));
             }
         }
         if let Some(max_cost) = self.max_total_cost {
-            if max_cost > 0.0 {
-                let observed_cost = tokens as f64 * APPROX_COST_PER_TOKEN_USD;
-                if observed_cost >= max_cost {
-                    return Some(format!(
-                        "estimated cost limit reached: ~${observed_cost:.2} >= \
-                         max_total_cost={max_cost:.2} (approximate, from {tokens} tokens)"
-                    ));
-                }
+            let observed_cost = tokens as f64 * APPROX_COST_PER_TOKEN_USD;
+            if observed_cost >= max_cost {
+                return Some(format!(
+                    "estimated cost limit reached: ~${observed_cost:.2} >= \
+                     max_total_cost={max_cost:.2} (approximate, from {tokens} tokens)"
+                ));
             }
         }
         None
@@ -1726,6 +1724,17 @@ mod budget_ceiling_tests {
     fn hard_spend_breach_is_none_under_soft() {
         let cfg = budget(None, None, Some(1), None, BudgetEnforcement::Soft);
         assert!(cfg.hard_spend_breach(u64::MAX).is_none());
+    }
+
+    #[test]
+    fn zero_token_and_cost_caps_are_explicit_ceilings() {
+        let token_cfg = budget(None, None, Some(0), None, BudgetEnforcement::Hard);
+        assert!(token_cfg.has_enforceable_ceiling());
+        assert!(token_cfg.hard_spend_breach(0).is_some());
+
+        let cost_cfg = budget(Some(0.0), None, None, None, BudgetEnforcement::Hard);
+        assert!(cost_cfg.has_enforceable_ceiling());
+        assert!(cost_cfg.hard_spend_breach(0).is_some());
     }
 }
 

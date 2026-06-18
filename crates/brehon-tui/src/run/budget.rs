@@ -128,7 +128,7 @@ pub(crate) fn evaluate_budget(
     // Wall-clock ceiling (saturating; minutes -> seconds).
     if let Some(max_minutes) = cfg.max_wall_clock_minutes {
         let limit_secs = max_minutes.saturating_mul(60);
-        if limit_secs > 0 && elapsed.as_secs() >= limit_secs {
+        if elapsed.as_secs() >= limit_secs {
             let reason = format!(
                 "wall-clock limit reached: elapsed {}m >= max_wall_clock_minutes={}m",
                 elapsed.as_secs() / 60,
@@ -145,45 +145,41 @@ pub(crate) fn evaluate_budget(
     // Token cap (run-total). Only meaningful when spend is readable.
     if spend.readable {
         if let Some(max_tokens) = cfg.max_tokens_per_agent {
-            if max_tokens > 0 {
-                if spend.tokens >= max_tokens {
-                    let reason = format!(
-                        "token limit reached: {} >= max_tokens_per_agent={} (run total)",
-                        spend.tokens, max_tokens
-                    );
-                    return if hard {
-                        BudgetVerdict::Refuse(reason)
-                    } else {
-                        BudgetVerdict::Warn(reason)
-                    };
-                }
-                if let Some(warn) = threshold_warning(
-                    spend.tokens,
-                    max_tokens,
-                    effective_alert_threshold(cfg),
-                    "tokens",
-                ) {
-                    return BudgetVerdict::Warn(warn);
-                }
+            if spend.tokens >= max_tokens {
+                let reason = format!(
+                    "token limit reached: {} >= max_tokens_per_agent={} (run total)",
+                    spend.tokens, max_tokens
+                );
+                return if hard {
+                    BudgetVerdict::Refuse(reason)
+                } else {
+                    BudgetVerdict::Warn(reason)
+                };
+            }
+            if let Some(warn) = threshold_warning(
+                spend.tokens,
+                max_tokens,
+                effective_alert_threshold(cfg),
+                "tokens",
+            ) {
+                return BudgetVerdict::Warn(warn);
             }
         }
 
         // Approximate cost cap derived from the token rollup at a flat rate.
         if let Some(max_cost) = cfg.max_total_cost {
-            if max_cost > 0.0 {
-                let observed_cost = spend.tokens as f64 * brehon_types::APPROX_COST_PER_TOKEN_USD;
-                if observed_cost >= max_cost {
-                    let reason = format!(
-                        "estimated cost limit reached: ~${:.2} >= max_total_cost={:.2} \
-                         (approximate, from {} tokens)",
-                        observed_cost, max_cost, spend.tokens
-                    );
-                    return if hard {
-                        BudgetVerdict::Refuse(reason)
-                    } else {
-                        BudgetVerdict::Warn(reason)
-                    };
-                }
+            let observed_cost = spend.tokens as f64 * brehon_types::APPROX_COST_PER_TOKEN_USD;
+            if observed_cost >= max_cost {
+                let reason = format!(
+                    "estimated cost limit reached: ~${:.2} >= max_total_cost={:.2} \
+                     (approximate, from {} tokens)",
+                    observed_cost, max_cost, spend.tokens
+                );
+                return if hard {
+                    BudgetVerdict::Refuse(reason)
+                } else {
+                    BudgetVerdict::Warn(reason)
+                };
             }
         }
     }
@@ -567,5 +563,33 @@ mod tests {
             BudgetVerdict::Refuse(reason) => assert!(reason.contains("cost limit"), "{reason}"),
             other => panic!("expected cost Refuse, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn zero_caps_are_explicit_immediate_ceilings() {
+        assert!(matches!(
+            evaluate_budget(
+                &readable(0),
+                Duration::ZERO,
+                &cfg(Some(0), None, None, BudgetEnforcement::Hard, 80)
+            ),
+            BudgetVerdict::Refuse(_)
+        ));
+        assert!(matches!(
+            evaluate_budget(
+                &readable(0),
+                Duration::ZERO,
+                &cfg(None, Some(0.0), None, BudgetEnforcement::Hard, 80)
+            ),
+            BudgetVerdict::Refuse(_)
+        ));
+        assert!(matches!(
+            evaluate_budget(
+                &readable(0),
+                Duration::ZERO,
+                &cfg(None, None, Some(0), BudgetEnforcement::Hard, 80)
+            ),
+            BudgetVerdict::Refuse(_)
+        ));
     }
 }
