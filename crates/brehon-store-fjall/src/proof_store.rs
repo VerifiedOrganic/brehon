@@ -441,13 +441,41 @@ impl ProofStoreManager {
     }
 }
 
+/// Map the outcome of a `spawn_blocking` proof-store operation into a
+/// `ProofStoreResult`. The synchronous fjall fsync (`PersistMode::SyncAll`) runs
+/// on the blocking pool so it never parks a Tokio worker; a panic inside the
+/// closure (e.g. a poisoned `mutation_lock`) surfaces here as a `JoinError`,
+/// which we fail closed into a `ProofStoreError::Storage` rather than propagating
+/// the panic. This relies on the `panic = "unwind"` profile setting documented in
+/// the workspace `Cargo.toml`.
+fn map_proof_store_blocking<T>(
+    joined: Result<ProofStoreResult<T>, tokio::task::JoinError>,
+) -> ProofStoreResult<T> {
+    match joined {
+        Ok(inner) => inner,
+        Err(join_err) => Err(ProofStoreError::Storage(format!(
+            "proof store storage task panicked: {join_err}"
+        ))),
+    }
+}
+
 #[async_trait]
 impl ProofStore for FjallEventStore {
     async fn rebuild_proof_projection(&self) -> ProofStoreResult<usize> {
-        let Some(proof_store) = self.proof_store() else {
+        // Bail cheaply before scheduling blocking work when no projection exists.
+        if !self.proof_store_available() {
             return Err(proof_projection_unavailable());
-        };
-        proof_store.rebuild_from_events(self.events_partition())
+        }
+        let store = self.clone();
+        map_proof_store_blocking(
+            tokio::task::spawn_blocking(move || {
+                let Some(proof_store) = store.proof_store() else {
+                    return Err(proof_projection_unavailable());
+                };
+                proof_store.rebuild_from_events(store.events_partition())
+            })
+            .await,
+        )
     }
 
     async fn apply_proof_event(
@@ -455,37 +483,77 @@ impl ProofStore for FjallEventStore {
         event: &Event,
         event_id: EventId,
     ) -> ProofStoreResult<Option<ProofBundle>> {
-        let Some(proof_store) = self.proof_store() else {
+        if !self.proof_store_available() {
             return Err(proof_projection_unavailable());
-        };
-        proof_store.apply_event(event, event_id)
+        }
+        let store = self.clone();
+        let event = event.clone();
+        map_proof_store_blocking(
+            tokio::task::spawn_blocking(move || {
+                let Some(proof_store) = store.proof_store() else {
+                    return Err(proof_projection_unavailable());
+                };
+                proof_store.apply_event(&event, event_id)
+            })
+            .await,
+        )
     }
 
     async fn proof_bundle(
         &self,
         proof_bundle_id: &ProofBundleId,
     ) -> ProofStoreResult<Option<ProofBundle>> {
-        let Some(proof_store) = self.proof_store() else {
+        if !self.proof_store_available() {
             return Err(proof_projection_unavailable());
-        };
-        proof_store.get_bundle(proof_bundle_id)
+        }
+        let store = self.clone();
+        let proof_bundle_id = proof_bundle_id.clone();
+        map_proof_store_blocking(
+            tokio::task::spawn_blocking(move || {
+                let Some(proof_store) = store.proof_store() else {
+                    return Err(proof_projection_unavailable());
+                };
+                proof_store.get_bundle(&proof_bundle_id)
+            })
+            .await,
+        )
     }
 
     async fn proof_bundle_for_task(
         &self,
         task_id: &TaskId,
     ) -> ProofStoreResult<Option<ProofBundle>> {
-        let Some(proof_store) = self.proof_store() else {
+        if !self.proof_store_available() {
             return Err(proof_projection_unavailable());
-        };
-        proof_store.get_bundle_for_task(task_id)
+        }
+        let store = self.clone();
+        let task_id = task_id.clone();
+        map_proof_store_blocking(
+            tokio::task::spawn_blocking(move || {
+                let Some(proof_store) = store.proof_store() else {
+                    return Err(proof_projection_unavailable());
+                };
+                proof_store.get_bundle_for_task(&task_id)
+            })
+            .await,
+        )
     }
 
     async fn proof_bundle_for_run(&self, run_id: &RunId) -> ProofStoreResult<Option<ProofBundle>> {
-        let Some(proof_store) = self.proof_store() else {
+        if !self.proof_store_available() {
             return Err(proof_projection_unavailable());
-        };
-        proof_store.get_bundle_for_run(run_id)
+        }
+        let store = self.clone();
+        let run_id = run_id.clone();
+        map_proof_store_blocking(
+            tokio::task::spawn_blocking(move || {
+                let Some(proof_store) = store.proof_store() else {
+                    return Err(proof_projection_unavailable());
+                };
+                proof_store.get_bundle_for_run(&run_id)
+            })
+            .await,
+        )
     }
 }
 

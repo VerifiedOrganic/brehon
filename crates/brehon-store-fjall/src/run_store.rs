@@ -569,14 +569,38 @@ impl RunStoreManager {
     }
 }
 
+/// Map the outcome of a `spawn_blocking` run-store mutation into a
+/// `RunStoreResult`. The synchronous fjall fsync (`PersistMode::SyncAll`) runs on
+/// the blocking pool so it never parks a Tokio worker; a panic inside the closure
+/// (e.g. a poisoned `mutation_lock`) surfaces here as a `JoinError`, which we fail
+/// closed into a `RunStoreError::Storage` rather than propagating the panic. This
+/// relies on the `panic = "unwind"` profile setting documented in the workspace
+/// `Cargo.toml`.
+fn map_run_store_blocking<T>(
+    joined: Result<RunStoreResult<T>, tokio::task::JoinError>,
+) -> RunStoreResult<T> {
+    match joined {
+        Ok(inner) => inner,
+        Err(join_err) => Err(RunStoreError::Storage(format!(
+            "run store storage task panicked: {join_err}"
+        ))),
+    }
+}
+
 #[async_trait]
 impl RunStore for FjallEventStore {
     async fn create_run(&self, record: RunRecord) -> RunStoreResult<RunRecord> {
-        self.run_store().create_run(record)
+        let store = self.clone();
+        map_run_store_blocking(
+            tokio::task::spawn_blocking(move || store.run_store().create_run(record)).await,
+        )
     }
 
     async fn claim_run(&self, request: ClaimRequest) -> RunStoreResult<RunRecord> {
-        self.run_store().claim_run(request)
+        let store = self.clone();
+        map_run_store_blocking(
+            tokio::task::spawn_blocking(move || store.run_store().claim_run(request)).await,
+        )
     }
 
     async fn renew_claim(
@@ -584,49 +608,87 @@ impl RunStore for FjallEventStore {
         run_id: &RunId,
         generation: ClaimGeneration,
     ) -> RunStoreResult<RunRecord> {
-        self.run_store().renew_claim(run_id, generation)
+        let store = self.clone();
+        let run_id = run_id.clone();
+        map_run_store_blocking(
+            tokio::task::spawn_blocking(move || store.run_store().renew_claim(&run_id, generation))
+                .await,
+        )
     }
 
     async fn release_claim(&self, release: ClaimRelease) -> RunStoreResult<RunRecord> {
-        self.run_store().release_claim(release)
+        let store = self.clone();
+        map_run_store_blocking(
+            tokio::task::spawn_blocking(move || store.run_store().release_claim(release)).await,
+        )
     }
 
     async fn complete_run(&self, completion: RunCompletion) -> RunStoreResult<RunRecord> {
-        self.run_store().complete_run(completion)
+        let store = self.clone();
+        map_run_store_blocking(
+            tokio::task::spawn_blocking(move || store.run_store().complete_run(completion)).await,
+        )
     }
 
     async fn record_continuation(
         &self,
         continuation: RunContinuation,
     ) -> RunStoreResult<RunRecord> {
-        self.run_store().record_continuation(continuation)
+        let store = self.clone();
+        map_run_store_blocking(
+            tokio::task::spawn_blocking(move || {
+                store.run_store().record_continuation(continuation)
+            })
+            .await,
+        )
     }
 
     async fn fail_run(&self, failure: RunFailure) -> RunStoreResult<RunRecord> {
-        self.run_store().fail_run(failure)
+        let store = self.clone();
+        map_run_store_blocking(
+            tokio::task::spawn_blocking(move || store.run_store().fail_run(failure)).await,
+        )
     }
 
     async fn queue_retry(&self, retry: RunRetry) -> RunStoreResult<RunRecord> {
-        self.run_store().queue_retry(retry)
+        let store = self.clone();
+        map_run_store_blocking(
+            tokio::task::spawn_blocking(move || store.run_store().queue_retry(retry)).await,
+        )
     }
 
     async fn start_retry_attempt(
         &self,
         request: RetryAttemptRequest,
     ) -> RunStoreResult<RetryAttemptStarted> {
-        self.run_store().start_retry_attempt(request)
+        let store = self.clone();
+        map_run_store_blocking(
+            tokio::task::spawn_blocking(move || store.run_store().start_retry_attempt(request))
+                .await,
+        )
     }
 
     async fn get_run(&self, run_id: &RunId) -> RunStoreResult<Option<RunRecord>> {
-        self.run_store().get_run(run_id)
+        let store = self.clone();
+        let run_id = run_id.clone();
+        map_run_store_blocking(
+            tokio::task::spawn_blocking(move || store.run_store().get_run(&run_id)).await,
+        )
     }
 
     async fn active_runs(&self) -> RunStoreResult<Vec<RunRecord>> {
-        self.run_store().active_runs()
+        let store = self.clone();
+        map_run_store_blocking(
+            tokio::task::spawn_blocking(move || store.run_store().active_runs()).await,
+        )
     }
 
     async fn runs_for_task(&self, task_id: &TaskId) -> RunStoreResult<Vec<RunRecord>> {
-        self.run_store().runs_for_task(task_id)
+        let store = self.clone();
+        let task_id = task_id.clone();
+        map_run_store_blocking(
+            tokio::task::spawn_blocking(move || store.run_store().runs_for_task(&task_id)).await,
+        )
     }
 }
 
