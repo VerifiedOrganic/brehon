@@ -295,7 +295,7 @@ pub(super) fn budget_tick(ctx: &mut EventLoopCtx) {
     }
     ctx.last_budget_check = Instant::now();
 
-    let brehon_root = ctx.dashboard_data.lock().unwrap().brehon_root.clone();
+    let brehon_root = ctx.dashboard_data.lock().brehon_root.clone();
     let Some(cfg) = load_budget_config(ctx, brehon_root.as_deref()) else {
         // No loadable policy => no configured cap to enforce here. Clear any
         // stale cached refusal so dispatch is not wedged on a vanished config.

@@ -31,6 +31,7 @@ brehon-orchestrator = { path = "../brehon-orchestrator" }
 brehon-review = { path = "../brehon-review" }
 brehon-test-harness = { path = "../brehon-test-harness" }
 tokio = { workspace = true }
+parking_lot = "0.12"
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

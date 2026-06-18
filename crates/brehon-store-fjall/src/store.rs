@@ -5,9 +5,10 @@
 
 use async_trait::async_trait;
 use fjall::{Config, Keyspace, PartitionCreateOptions, PartitionHandle, PersistMode};
+use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, info};
 
@@ -36,7 +37,7 @@ const PROOFS_PARTITION: &str = "proofs";
 ///
 /// The synchronous fjall fsync (`PersistMode::SyncAll` + `batch.commit()`) is
 /// run on the blocking thread pool so it never parks a Tokio worker. A panic
-/// inside that closure (e.g. a poisoned `append_lock`) surfaces here as a
+/// inside that closure (e.g. an unexpected fjall failure) surfaces here as a
 /// `JoinError`; we fail closed by turning it into a `PortError::Storage` rather
 /// than letting the panic propagate to the caller. This relies on the
 /// `panic = "unwind"` profile setting (documented in the workspace `Cargo.toml`):
@@ -142,10 +143,35 @@ impl FjallEventStore {
 
         let seq = Self::load_seq(&meta, &events)?;
 
-        if seq == 0 {
-            let version_bytes = SCHEMA_VERSION.to_le_bytes();
-            meta.insert(KEY_META_SCHEMA_VERSION, version_bytes)?;
-            debug!("Initialized schema version {}", SCHEMA_VERSION);
+        // Fail closed: a binary must refuse a store written by a newer schema
+        // rather than silently misread it (Fix D2). Read the on-disk version
+        // directly so an absent key (fresh store) is distinguishable from a
+        // present-but-zero value, and stamp the current version exactly once on
+        // a fresh store. No destructive migrations run here.
+        match meta.get(KEY_META_SCHEMA_VERSION)? {
+            Some(bytes) => {
+                let arr: [u8; 8] = bytes
+                    .as_ref()
+                    .try_into()
+                    .map_err(|_| StoreError::Storage("Invalid schema version format".into()))?;
+                let on_disk_version = u64::from_le_bytes(arr);
+                if on_disk_version > crate::migrations::CURRENT_SCHEMA_VERSION {
+                    return Err(StoreError::VersionMismatch {
+                        expected: crate::migrations::CURRENT_SCHEMA_VERSION,
+                        actual: on_disk_version,
+                    });
+                }
+                // Equal or older-but-valid stores open unchanged; a future wave
+                // that bumps CURRENT_SCHEMA_VERSION adds the real migration path.
+            }
+            None => {
+                let version_bytes = crate::migrations::CURRENT_SCHEMA_VERSION.to_le_bytes();
+                meta.insert(KEY_META_SCHEMA_VERSION, version_bytes)?;
+                debug!(
+                    "Stamped fresh store schema version {}",
+                    crate::migrations::CURRENT_SCHEMA_VERSION
+                );
+            }
         }
 
         let view_manager = ViewManager::new(keyspace.clone(), views.clone());
@@ -553,8 +579,8 @@ impl FjallEventStore {
         }
     }
 
-    fn append_lock(&self) -> std::sync::MutexGuard<'_, ()> {
-        self.inner.append_lock.lock().expect("append lock poisoned")
+    fn append_lock(&self) -> parking_lot::MutexGuard<'_, ()> {
+        self.inner.append_lock.lock()
     }
 
     fn make_index_keys(&self, event: &Event, seq: u64) -> Vec<Vec<u8>> {
@@ -1089,6 +1115,64 @@ mod tests {
         let events = store.stream(None, 10).await.unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].0.kind, event.kind);
+    }
+
+    #[test]
+    fn fresh_store_stamps_current_schema_version() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("db");
+        let store = FjallEventStore::new(&db_path).unwrap();
+        store.close().unwrap();
+
+        // Reopen the meta partition directly and confirm the stamp uses the same
+        // little-endian encoding the version guard reads on open.
+        let keyspace = Config::new(&db_path).open().unwrap();
+        let meta = keyspace
+            .open_partition(META_PARTITION, PartitionCreateOptions::default())
+            .unwrap();
+        let stamped = meta
+            .get(KEY_META_SCHEMA_VERSION)
+            .unwrap()
+            .expect("fresh store must stamp the schema version");
+        let arr: [u8; 8] = stamped.as_ref().try_into().unwrap();
+        assert_eq!(
+            u64::from_le_bytes(arr),
+            crate::migrations::CURRENT_SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn refuses_to_open_store_written_by_newer_schema() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("db");
+
+        // Create the store, then stamp a future schema version into the meta
+        // partition out of band to simulate a newer binary having written it.
+        let store = FjallEventStore::new(&db_path).unwrap();
+        store.close().unwrap();
+
+        let future_version = crate::migrations::CURRENT_SCHEMA_VERSION + 1;
+        {
+            let keyspace = Config::new(&db_path).open().unwrap();
+            let meta = keyspace
+                .open_partition(META_PARTITION, PartitionCreateOptions::default())
+                .unwrap();
+            meta.insert(KEY_META_SCHEMA_VERSION, future_version.to_le_bytes())
+                .unwrap();
+            keyspace.persist(PersistMode::SyncAll).unwrap();
+        }
+
+        // A downgraded binary must fail closed rather than misread the store.
+        match FjallEventStore::new(&db_path) {
+            Ok(_) => panic!("opening a newer-schema store must fail closed"),
+            Err(err) => assert!(
+                matches!(
+                    err,
+                    StoreError::VersionMismatch { actual, .. } if actual == future_version
+                ),
+                "unexpected error opening newer-schema store: {err:?}"
+            ),
+        }
     }
 
     #[tokio::test]

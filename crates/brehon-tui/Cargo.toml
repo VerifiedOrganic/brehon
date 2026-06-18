@@ -14,6 +14,7 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
+parking_lot = "0.12"
 panesmith = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

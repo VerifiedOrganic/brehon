@@ -4,8 +4,9 @@
 
 use chrono::Utc;
 use fjall::PartitionHandle;
+use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
@@ -70,7 +71,7 @@ impl LeaseClock {
 
 fn shared_lease_clock(claim_lock_scope: &str) -> Arc<LeaseClock> {
     let registry = lease_clock_registry();
-    let mut registry = registry.lock().expect("lease clock registry poisoned");
+    let mut registry = registry.lock();
     prune_lease_clock_registry(&mut registry);
 
     if let Some(clock) = registry.get(claim_lock_scope).and_then(Weak::upgrade) {
@@ -103,9 +104,7 @@ fn claim_lock_drop_hook() -> &'static Mutex<Option<ClaimLockDropHook>> {
 #[cfg(test)]
 fn run_claim_lock_drop_hook(scope: &str) {
     let hook = {
-        let mut hook = claim_lock_drop_hook()
-            .lock()
-            .expect("claim lock drop hook poisoned");
+        let mut hook = claim_lock_drop_hook().lock();
 
         match hook.as_ref() {
             Some(installed) if installed.scope == scope => hook.take().map(|hook| hook.hook),
@@ -120,7 +119,7 @@ fn run_claim_lock_drop_hook(scope: &str) {
 
 fn shared_claim_lock(claim_lock_scope: &str) -> Arc<Mutex<()>> {
     let registry = claim_lock_registry();
-    let mut registry = registry.lock().expect("claim lock registry poisoned");
+    let mut registry = registry.lock();
     prune_claim_lock_registry(&mut registry);
 
     if let Some(lock) = registry.get(claim_lock_scope).and_then(Weak::upgrade) {
@@ -169,7 +168,7 @@ impl QueueManager {
         consumer: &str,
         lease_for: Duration,
     ) -> Result<Option<QueueClaim>, StoreError> {
-        let _guard = self.claim_lock.lock().expect("claim lock poisoned");
+        let _guard = self.claim_lock.lock();
         let queue_prefix = queue_prefix(queue_name);
         let expires_at = Utc::now() + chrono_duration_from_std(lease_for);
         let lease_duration_ms = duration_ms_saturating(lease_for);
@@ -281,7 +280,7 @@ impl QueueManager {
     }
 
     pub fn ack_claim(&self, claim_id: &ClaimId) -> Result<(), StoreError> {
-        let _guard = self.claim_lock.lock().expect("claim lock poisoned");
+        let _guard = self.claim_lock.lock();
         let lease_key = lease_key(claim_id.as_str());
 
         let claim_bytes = self
@@ -322,7 +321,7 @@ impl QueueManager {
     }
 
     pub fn renew_claim(&self, claim_id: &ClaimId, lease_for: Duration) -> Result<(), StoreError> {
-        let _guard = self.claim_lock.lock().expect("claim lock poisoned");
+        let _guard = self.claim_lock.lock();
         let lease_key = lease_key(claim_id.as_str());
 
         let claim_bytes = self
@@ -408,7 +407,7 @@ impl QueueManager {
     }
 
     pub fn cleanup_expired_claims(&self) -> Result<usize, StoreError> {
-        let _guard = self.claim_lock.lock().expect("claim lock poisoned");
+        let _guard = self.claim_lock.lock();
         let expired = self.list_expired_claims()?;
         let count = expired.len();
 
@@ -429,7 +428,7 @@ impl Drop for QueueManager {
         run_claim_lock_drop_hook(&self.claim_lock_scope);
 
         let registry = claim_lock_registry();
-        let mut registry = registry.lock().expect("claim lock registry poisoned");
+        let mut registry = registry.lock();
 
         let should_remove = registry
             .get(&self.claim_lock_scope)
@@ -444,9 +443,7 @@ impl Drop for QueueManager {
         prune_claim_lock_registry(&mut registry);
 
         let lease_registry = lease_clock_registry();
-        let mut lease_registry = lease_registry
-            .lock()
-            .expect("lease clock registry poisoned");
+        let mut lease_registry = lease_registry.lock();
 
         let should_remove_clock = lease_registry
             .get(&self.claim_lock_scope)
@@ -484,16 +481,11 @@ mod tests {
     use tokio::sync::Barrier as AsyncBarrier;
 
     fn install_claim_lock_drop_hook(scope: String, hook: ClaimLockDropHookFn) {
-        *claim_lock_drop_hook()
-            .lock()
-            .expect("claim lock drop hook poisoned") = Some(ClaimLockDropHook { scope, hook });
+        *claim_lock_drop_hook().lock() = Some(ClaimLockDropHook { scope, hook });
     }
 
     fn claim_lock_registry_contains_scope(scope: &str) -> bool {
-        claim_lock_registry()
-            .lock()
-            .expect("claim lock registry poisoned")
-            .contains_key(scope)
+        claim_lock_registry().lock().contains_key(scope)
     }
 
     #[test]

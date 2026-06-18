@@ -313,12 +313,11 @@ fn set_pending(pane: &Pane, needle: &str, deadline: Instant) {
         .ink_submit_generation
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         + 1;
-    let mut pending = pane.pending_ink_submit.lock().unwrap();
-    *pending = Some((needle.to_string(), deadline, generation));
+    *pane.pending_ink_submit.lock() = Some((needle.to_string(), deadline, generation));
 }
 
 fn is_pending(pane: &Pane) -> bool {
-    pane.pending_ink_submit.lock().unwrap().is_some()
+    pane.pending_ink_submit.lock().is_some()
 }
 
 #[test]

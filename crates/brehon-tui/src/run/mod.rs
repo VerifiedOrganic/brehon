@@ -146,7 +146,7 @@ pub fn no_project_config_loader() -> research::ProjectConfigLoader {
 }
 
 pub fn run_tui(shutdown: Arc<AtomicBool>, mux: Mux, rt: tokio::runtime::Handle) -> io::Result<()> {
-    let dashboard = Arc::new(std::sync::Mutex::new(DashboardData::default()));
+    let dashboard = Arc::new(parking_lot::Mutex::new(DashboardData::default()));
     run_tui_with_panels(
         shutdown,
         mux,
@@ -179,7 +179,7 @@ pub fn run_tui_with_panels(
     mux: Mux,
     rt: tokio::runtime::Handle,
     reviewer_panels: &[ReviewerPanel],
-    dashboard_data: Arc<std::sync::Mutex<DashboardData>>,
+    dashboard_data: Arc<parking_lot::Mutex<DashboardData>>,
     orchestration: OrchestrationConfig,
 ) -> io::Result<()> {
     run_tui_with_panels_and_runtime_commands(
@@ -207,7 +207,7 @@ pub fn run_dashboard_tui(
     rt: tokio::runtime::Handle,
     brehon_root: std::path::PathBuf,
 ) -> io::Result<()> {
-    let dashboard = Arc::new(std::sync::Mutex::new(DashboardData {
+    let dashboard = Arc::new(parking_lot::Mutex::new(DashboardData {
         brehon_root: Some(brehon_root),
         ..Default::default()
     }));
@@ -246,7 +246,7 @@ pub fn run_tui_with_panels_and_runtime_commands(
     mux: Mux,
     rt: tokio::runtime::Handle,
     reviewer_panels: &[ReviewerPanel],
-    dashboard_data: Arc<std::sync::Mutex<DashboardData>>,
+    dashboard_data: Arc<parking_lot::Mutex<DashboardData>>,
     orchestration: OrchestrationConfig,
     runtime_command_rx: Option<brehon_mux::MuxRuntimeCommandReceiver>,
     runtime_event_rx: Option<std::sync::mpsc::Receiver<brehon_types::RuntimeEvent>>,

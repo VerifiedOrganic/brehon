@@ -611,7 +611,7 @@ impl Pane {
             pending_messages: VecDeque::new(),
             notify_socket_path: None,
             agent_session_id: None,
-            pending_ink_submit: Arc::new(std::sync::Mutex::new(None)),
+            pending_ink_submit: Arc::new(parking_lot::Mutex::new(None)),
             ink_submit_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             synthetic_prev_was_cr: false,
             terminal_prompt_prefilter_tail: String::new(),

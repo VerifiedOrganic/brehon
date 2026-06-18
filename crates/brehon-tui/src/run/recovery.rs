@@ -64,10 +64,10 @@ pub(crate) struct DeadLetterEntry {
 }
 
 pub(crate) fn push_dashboard_event(
-    dashboard_data: &Arc<std::sync::Mutex<DashboardData>>,
+    dashboard_data: &Arc<parking_lot::Mutex<DashboardData>>,
     description: impl Into<String>,
 ) {
-    let mut dashboard = dashboard_data.lock().unwrap();
+    let mut dashboard = dashboard_data.lock();
     dashboard.events.push(EventInfo {
         timestamp: chrono::Local::now().format("%M:%S").to_string(),
         description: description.into(),

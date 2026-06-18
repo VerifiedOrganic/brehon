@@ -2,8 +2,9 @@
 
 use async_trait::async_trait;
 use fjall::{Keyspace, PartitionHandle, PersistMode};
+use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use brehon_ports::{ProofStore, ProofStoreError, ProofStoreResult};
 use brehon_types::{
@@ -379,10 +380,7 @@ impl ProofStoreManager {
         event: &Event,
         _event_id: EventId,
     ) -> ProofStoreResult<Option<ProofBundle>> {
-        let _guard = self
-            .mutation_lock
-            .lock()
-            .expect("proof store lock poisoned");
+        let _guard = self.mutation_lock.lock();
         let Some(proof_bundle_id) = Self::proof_bundle_id(event) else {
             return Ok(None);
         };
@@ -396,10 +394,7 @@ impl ProofStoreManager {
 
     /// Rebuild the persisted proof projection from the event partition.
     pub fn rebuild_from_events(&self, events: &PartitionHandle) -> ProofStoreResult<usize> {
-        let _guard = self
-            .mutation_lock
-            .lock()
-            .expect("proof store lock poisoned");
+        let _guard = self.mutation_lock.lock();
         let mut bundles: HashMap<ProofBundleId, ProofBundle> = HashMap::new();
         let mut applied = 0usize;
 
@@ -444,7 +439,7 @@ impl ProofStoreManager {
 /// Map the outcome of a `spawn_blocking` proof-store operation into a
 /// `ProofStoreResult`. The synchronous fjall fsync (`PersistMode::SyncAll`) runs
 /// on the blocking pool so it never parks a Tokio worker; a panic inside the
-/// closure (e.g. a poisoned `mutation_lock`) surfaces here as a `JoinError`,
+/// closure (e.g. an unexpected fjall failure) surfaces here as a `JoinError`,
 /// which we fail closed into a `ProofStoreError::Storage` rather than propagating
 /// the panic. This relies on the `panic = "unwind"` profile setting documented in
 /// the workspace `Cargo.toml`.

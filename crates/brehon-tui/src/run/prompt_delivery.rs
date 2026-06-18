@@ -246,7 +246,6 @@ pub(super) fn enqueue_terminal_host_startup_prompt(
     let brehon_root = ctx
         .dashboard_data
         .lock()
-        .unwrap()
         .brehon_root
         .clone()
         .ok_or_else(|| "brehon root unavailable for terminal-host startup prompt".to_string())?;
@@ -1632,7 +1631,7 @@ mod tests {
             false,
         )
         .unwrap();
-        ctx.dashboard_data.lock().unwrap().brehon_root = Some(brehon_root.clone());
+        ctx.dashboard_data.lock().brehon_root = Some(brehon_root.clone());
 
         assert!(!queue_queued_prompt_delivery_via_daemon(
             &mut ctx,

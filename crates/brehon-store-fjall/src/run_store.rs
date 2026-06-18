@@ -3,7 +3,8 @@
 use async_trait::async_trait;
 use chrono::{Duration as ChronoDuration, Utc};
 use fjall::{Keyspace, PartitionHandle, PersistMode};
-use std::sync::{Arc, Mutex};
+use parking_lot::Mutex;
+use std::sync::Arc;
 
 use brehon_ports::{
     ClaimRelease, ClaimRequest, RetryAttemptRequest, RetryAttemptStarted, RunCompletion,
@@ -204,7 +205,7 @@ impl RunStoreManager {
 
     /// Create a run record.
     pub fn create_run(&self, mut record: RunRecord) -> RunStoreResult<RunRecord> {
-        let _guard = self.mutation_lock.lock().expect("run store lock poisoned");
+        let _guard = self.mutation_lock.lock();
 
         if self.get_run_locked(&record.run_id)?.is_some() {
             return Err(RunStoreError::InvalidStatusTransition {
@@ -231,7 +232,7 @@ impl RunStoreManager {
 
     /// Claim a run record.
     pub fn claim_run(&self, request: ClaimRequest) -> RunStoreResult<RunRecord> {
-        let _guard = self.mutation_lock.lock().expect("run store lock poisoned");
+        let _guard = self.mutation_lock.lock();
         let mut record = self.load_required(&request.run_id)?;
 
         if record.status == RunStatus::RetryQueued && !record.retry_is_due_at(request.claimed_at) {
@@ -279,7 +280,7 @@ impl RunStoreManager {
         run_id: &RunId,
         generation: ClaimGeneration,
     ) -> RunStoreResult<RunRecord> {
-        let _guard = self.mutation_lock.lock().expect("run store lock poisoned");
+        let _guard = self.mutation_lock.lock();
         let mut record = self.load_required(run_id)?;
 
         Self::ensure_generation(&record, generation)?;
@@ -303,7 +304,7 @@ impl RunStoreManager {
 
     /// Release a current claim.
     pub fn release_claim(&self, release: ClaimRelease) -> RunStoreResult<RunRecord> {
-        let _guard = self.mutation_lock.lock().expect("run store lock poisoned");
+        let _guard = self.mutation_lock.lock();
         let mut record = self.load_required(&release.run_id)?;
 
         Self::ensure_generation(&record, release.generation)?;
@@ -329,7 +330,7 @@ impl RunStoreManager {
 
     /// Complete a current run.
     pub fn complete_run(&self, completion: RunCompletion) -> RunStoreResult<RunRecord> {
-        let _guard = self.mutation_lock.lock().expect("run store lock poisoned");
+        let _guard = self.mutation_lock.lock();
         let mut record = self.load_required(&completion.run_id)?;
 
         Self::ensure_generation(&record, completion.generation)?;
@@ -355,7 +356,7 @@ impl RunStoreManager {
 
     /// Fail a current run.
     pub fn fail_run(&self, failure: RunFailure) -> RunStoreResult<RunRecord> {
-        let _guard = self.mutation_lock.lock().expect("run store lock poisoned");
+        let _guard = self.mutation_lock.lock();
         let mut record = self.load_required(&failure.run_id)?;
 
         Self::ensure_generation(&record, failure.generation)?;
@@ -381,7 +382,7 @@ impl RunStoreManager {
 
     /// Record a continuation prompt on a current run.
     pub fn record_continuation(&self, continuation: RunContinuation) -> RunStoreResult<RunRecord> {
-        let _guard = self.mutation_lock.lock().expect("run store lock poisoned");
+        let _guard = self.mutation_lock.lock();
         let mut record = self.load_required(&continuation.run_id)?;
 
         Self::ensure_generation(&record, continuation.generation)?;
@@ -413,7 +414,7 @@ impl RunStoreManager {
 
     /// Queue a current run for retry.
     pub fn queue_retry(&self, retry: RunRetry) -> RunStoreResult<RunRecord> {
-        let _guard = self.mutation_lock.lock().expect("run store lock poisoned");
+        let _guard = self.mutation_lock.lock();
         let mut record = self.load_required(&retry.run_id)?;
 
         Self::ensure_generation(&record, retry.generation)?;
@@ -445,7 +446,7 @@ impl RunStoreManager {
         &self,
         request: RetryAttemptRequest,
     ) -> RunStoreResult<RetryAttemptStarted> {
-        let _guard = self.mutation_lock.lock().expect("run store lock poisoned");
+        let _guard = self.mutation_lock.lock();
         let mut queued = self.load_required(&request.queued_run_id)?;
 
         Self::ensure_generation(&queued, request.generation)?;
@@ -522,13 +523,13 @@ impl RunStoreManager {
 
     /// Get a run by id.
     pub fn get_run(&self, run_id: &RunId) -> RunStoreResult<Option<RunRecord>> {
-        let _guard = self.mutation_lock.lock().expect("run store lock poisoned");
+        let _guard = self.mutation_lock.lock();
         self.get_run_locked(run_id)
     }
 
     /// Return all non-terminal runs.
     pub fn active_runs(&self) -> RunStoreResult<Vec<RunRecord>> {
-        let _guard = self.mutation_lock.lock().expect("run store lock poisoned");
+        let _guard = self.mutation_lock.lock();
         let mut records = Vec::new();
 
         for item in self.runs.prefix(b"index:run:active-role:") {
@@ -550,7 +551,7 @@ impl RunStoreManager {
 
     /// Return all runs for a task.
     pub fn runs_for_task(&self, task_id: &TaskId) -> RunStoreResult<Vec<RunRecord>> {
-        let _guard = self.mutation_lock.lock().expect("run store lock poisoned");
+        let _guard = self.mutation_lock.lock();
         let mut records = Vec::new();
 
         for item in self.runs.prefix(&run_task_index_prefix(task_id.as_str())) {
@@ -572,7 +573,7 @@ impl RunStoreManager {
 /// Map the outcome of a `spawn_blocking` run-store mutation into a
 /// `RunStoreResult`. The synchronous fjall fsync (`PersistMode::SyncAll`) runs on
 /// the blocking pool so it never parks a Tokio worker; a panic inside the closure
-/// (e.g. a poisoned `mutation_lock`) surfaces here as a `JoinError`, which we fail
+/// (e.g. an unexpected fjall failure) surfaces here as a `JoinError`, which we fail
 /// closed into a `RunStoreError::Storage` rather than propagating the panic. This
 /// relies on the `panic = "unwind"` profile setting documented in the workspace
 /// `Cargo.toml`.

@@ -84,10 +84,10 @@ pub(crate) fn resolve_worker_pool_counts(
 }
 
 pub(crate) fn push_runtime_dashboard_event(
-    dashboard_data: &Arc<std::sync::Mutex<brehon_tui::DashboardData>>,
+    dashboard_data: &Arc<parking_lot::Mutex<brehon_tui::DashboardData>>,
     description: impl Into<String>,
 ) {
-    let mut dashboard = dashboard_data.lock().unwrap();
+    let mut dashboard = dashboard_data.lock();
     dashboard.events.push(brehon_tui::EventInfo {
         timestamp: chrono::Local::now().format("%H:%M").to_string(),
         description: description.into(),

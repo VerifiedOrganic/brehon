@@ -1,3 +1,4 @@
+use parking_lot::Mutex;
 use std::collections::HashMap;
 #[cfg(unix)]
 use std::fs::File;
@@ -6,7 +7,7 @@ use std::io::ErrorKind;
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock, Mutex, Weak};
+use std::sync::{Arc, LazyLock, Weak};
 
 use crate::store::StoreError;
 
@@ -47,9 +48,7 @@ impl StoreOwnerLock {
         std::fs::create_dir_all(db_path)?;
         let lock_path = owner_lock_path(db_path);
         let key = stable_owner_lock_key(&lock_path);
-        let mut locks = STORE_OWNER_LOCKS
-            .lock()
-            .map_err(|_| StoreError::Storage("Fjall owner lock registry is poisoned".into()))?;
+        let mut locks = STORE_OWNER_LOCKS.lock();
         if let Some(existing) = locks.get(&key).and_then(Weak::upgrade) {
             return Ok(Self { _inner: existing });
         }

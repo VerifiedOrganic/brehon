@@ -2815,7 +2815,7 @@ pub async fn execute(
     crate::signals::setup_signal_handlers(shutdown_flag.clone())?;
 
     // Dashboard data shared between TUI and optional background refresh
-    let dashboard_data = Arc::new(std::sync::Mutex::new(brehon_tui::DashboardData {
+    let dashboard_data = Arc::new(parking_lot::Mutex::new(brehon_tui::DashboardData {
         brehon_root: Some(cwd.join(".brehon")),
         ..Default::default()
     }));
