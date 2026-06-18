@@ -223,6 +223,36 @@ fn runtime_terminal_host_preview_enabled_from_parts(
     config_preview_pane.unwrap_or(false) || experimental_terminal_host_enabled_from_value(env_value)
 }
 
+/// Build the loud startup warning when the budget kill-switch is effectively
+/// off, or `None` when at least one Hard cap is armed.
+///
+/// "Effectively off" = Soft enforcement (never stops), or Hard with no numeric
+/// cap and no wall-clock ceiling configured (the kill-switch can never fire).
+/// Caps default to null/unlimited on purpose; this warning is how the operator
+/// learns that omission means unlimited rather than being surprise-killed.
+fn budget_enforcement_off_warning(budget: &brehon_types::BudgetConfig) -> Option<String> {
+    match budget.enforcement {
+        brehon_types::BudgetEnforcement::Soft => Some(
+            "BUDGET KILL-SWITCH OFF: enforcement is Soft — spend is warned but never \
+             stopped. Set enforcement: Hard with a cap (max_tokens_per_agent or \
+             max_wall_clock_minutes) to arm it. Omission means unlimited."
+                .to_string(),
+        ),
+        // `has_enforceable_ceiling` deliberately excludes `max_cost_per_task` (a
+        // per-task cap the run-total kill-switch does not yet enforce), so a Hard
+        // config whose only cap is `max_cost_per_task` correctly warns here
+        // instead of leaving the operator silently unprotected.
+        brehon_types::BudgetEnforcement::Hard if !budget.has_enforceable_ceiling() => Some(
+            "BUDGET KILL-SWITCH OFF: enforcement is Hard but no enforceable cap is set \
+             (max_tokens_per_agent / max_total_cost / max_wall_clock_minutes are all \
+             null) — the kill-switch can never fire. max_cost_per_task is a per-task cap \
+             that is not yet enforced by the run-total kill-switch. Omission means unlimited."
+                .to_string(),
+        ),
+        brehon_types::BudgetEnforcement::Hard => None,
+    }
+}
+
 fn eager_gateway_bootstrap_enabled(config: &brehon_types::RuntimeTerminalHostConfig) -> bool {
     eager_gateway_bootstrap_enabled_from_parts(
         config,
@@ -1347,6 +1377,13 @@ pub async fn execute(
 
     let config = load_config_with_override(Some(&cwd), config_override)?;
     ensure_runtime_terminal_host_supported(&config)?;
+    if let Some(message) = budget_enforcement_off_warning(&config.budget) {
+        // Loud, unmissable: this run can spend without bound. Caps default to
+        // unlimited by design (so the owner's multi-day runs are not surprise
+        // killed), but the operator must never be silently unprotected.
+        tracing::warn!("{message}");
+        splash.record(format!("⚠ {message}"));
+    }
     let eager_gateway_bootstrap = eager_gateway_bootstrap_enabled(&config.runtime.terminal_host);
     let runtime_worktree_root = effective_worktree_root(&cwd, &config);
 
@@ -3118,6 +3155,95 @@ async fn write_runtime_daemon_summary(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn budget(
+        enforcement: brehon_types::BudgetEnforcement,
+        max_tokens: Option<u64>,
+        max_minutes: Option<u64>,
+    ) -> brehon_types::BudgetConfig {
+        brehon_types::BudgetConfig {
+            max_total_cost: None,
+            max_cost_per_task: None,
+            max_tokens_per_agent: max_tokens,
+            alert_threshold_percent: 80,
+            enforcement,
+            max_wall_clock_minutes: max_minutes,
+        }
+    }
+
+    #[test]
+    fn budget_warning_fires_for_soft_enforcement() {
+        let msg = budget_enforcement_off_warning(&budget(
+            brehon_types::BudgetEnforcement::Soft,
+            Some(1000),
+            None,
+        ))
+        .expect("Soft must warn");
+        assert!(msg.contains("KILL-SWITCH OFF"));
+    }
+
+    #[test]
+    fn budget_warning_fires_for_hard_with_no_cap() {
+        let msg = budget_enforcement_off_warning(&budget(
+            brehon_types::BudgetEnforcement::Hard,
+            None,
+            None,
+        ))
+        .expect("Hard-with-no-cap must warn");
+        assert!(msg.contains("never fire"));
+    }
+
+    #[test]
+    fn budget_warning_silent_for_hard_with_token_cap() {
+        assert!(budget_enforcement_off_warning(&budget(
+            brehon_types::BudgetEnforcement::Hard,
+            Some(1000),
+            None,
+        ))
+        .is_none());
+    }
+
+    #[test]
+    fn budget_warning_silent_for_hard_with_wall_clock_cap() {
+        assert!(budget_enforcement_off_warning(&budget(
+            brehon_types::BudgetEnforcement::Hard,
+            None,
+            Some(120),
+        ))
+        .is_none());
+    }
+
+    #[test]
+    fn budget_warning_fires_for_hard_with_only_cost_per_task() {
+        // max_cost_per_task is a per-task cap the run-total kill-switch does not
+        // enforce, so a Hard config whose only cap is max_cost_per_task must warn
+        // rather than leave the operator silently unprotected.
+        let cfg = brehon_types::BudgetConfig {
+            max_total_cost: None,
+            max_cost_per_task: Some(2.0),
+            max_tokens_per_agent: None,
+            alert_threshold_percent: 80,
+            enforcement: brehon_types::BudgetEnforcement::Hard,
+            max_wall_clock_minutes: None,
+        };
+        let msg = budget_enforcement_off_warning(&cfg).expect("cost-per-task-only Hard must warn");
+        assert!(msg.contains("never fire"));
+    }
+
+    #[test]
+    fn budget_warning_silent_for_hard_with_cost_cap() {
+        // max_total_cost IS an enforceable ceiling (the gate derives an
+        // approximate cost from the token rollup), so it must not warn.
+        let cfg = brehon_types::BudgetConfig {
+            max_total_cost: Some(25.0),
+            max_cost_per_task: None,
+            max_tokens_per_agent: None,
+            alert_threshold_percent: 80,
+            enforcement: brehon_types::BudgetEnforcement::Hard,
+            max_wall_clock_minutes: None,
+        };
+        assert!(budget_enforcement_off_warning(&cfg).is_none());
+    }
 
     #[test]
     fn cargo_target_dir_is_role_and_agent_scoped() {

@@ -39,6 +39,46 @@ pub struct DeliveryOutcome {
 
 pub(crate) const PROMPT_QUEUE_DELIVERY_METHOD: &str = "queued";
 
+/// Decide whether the budget kill-switch must refuse a NEW prompt at the MCP
+/// gateway, mirroring the TUI dispatch seam.
+///
+/// `brehon_root` is the resolved `.brehon` root (the rollup lives under
+/// `runtime/tasks/`); the budget policy is loaded from the project root. Under
+/// `Hard` enforcement with a configured token *or* cost cap we read the live
+/// run-total token rollup and refuse once it reaches the cap, using the shared
+/// [`BudgetConfig::hard_spend_breach`] kernel so this seam and the TUI gate
+/// refuse on identical thresholds. Fail-closed: if a Hard token/cost cap is set
+/// but the rollup is unreadable, we refuse rather than charge on. With no spend
+/// cap (or `Soft`) we never refuse here — Soft warnings surface in the TUI loop,
+/// not by blocking the durable queue.
+///
+/// The wall-clock ceiling is intentionally NOT enforced here: it needs the run
+/// clock, which the TUI tick owns. The TUI tick tears down in-flight PTYs on a
+/// wall-clock breach, so spend still stops; this seam only adds the earlier
+/// at-source refusal for the token/cost caps it can evaluate statelessly.
+///
+/// Returns `Some(reason)` to refuse, `None` to allow.
+fn budget_refusal_reason(brehon_root: &Path) -> Option<String> {
+    let config = load_project_config()?;
+    let budget = &config.budget;
+    if budget.enforcement != brehon_types::BudgetEnforcement::Hard {
+        return None;
+    }
+    // No token/cost cap to evaluate statelessly => nothing to refuse here.
+    if budget.max_tokens_per_agent.is_none() && budget.max_total_cost.is_none() {
+        return None;
+    }
+    match brehon_types::read_run_total_tokens(brehon_root) {
+        Ok(tokens) => budget.hard_spend_breach(tokens),
+        // Fail closed: a Hard token/cost cap is configured but spend is unknown.
+        Err(_) => Some(
+            "spend state is unreadable and a Hard token/cost cap is configured \
+             (failing closed)"
+                .to_string(),
+        ),
+    }
+}
+
 pub(crate) fn prepare_delivery_message(
     target: &str,
     from: &str,
@@ -65,6 +105,17 @@ fn try_deliver_entry(
             prompt_id: prompt_id_on_failure,
         };
     };
+
+    // Budget kill-switch: refuse NEW spend before the durable enqueue, mirroring
+    // research.rs's pre-write Err and the TUI dispatch seam. Keeps the queue
+    // clean and gives MCP callers immediate fail-closed feedback.
+    if let Some(reason) = budget_refusal_reason(&root) {
+        return DeliveryOutcome {
+            queued: false,
+            method: format!("budget exceeded: {reason}"),
+            prompt_id: prompt_id_on_failure,
+        };
+    }
 
     let session_name = resolved_runtime_session_name_for_prompt_queue(&root);
     let prompt_queue = SessionScopedQueue::new(&session_name, prompt_queue_root(&root));
@@ -2524,5 +2575,163 @@ mod tests {
         let (path, value) = find_prompt_ack_in_dir(&dir, "p1").expect("should find matching ack");
         assert_eq!(path.file_name().unwrap().to_str().unwrap(), "baz.json");
         assert_eq!(value.get("prompt_id").and_then(|v| v.as_str()), Some("p1"));
+    }
+
+    fn write_budget_config(project_root: &std::path::Path, body: &str) {
+        let brehon_dir = project_root.join(".brehon");
+        std::fs::create_dir_all(&brehon_dir).unwrap();
+        std::fs::write(brehon_dir.join("config.yaml"), body).unwrap();
+    }
+
+    fn write_task_rollup(brehon_root: &std::path::Path, task_id: &str, tokens: u64) {
+        let tasks = brehon_root.join("runtime").join("tasks");
+        std::fs::create_dir_all(&tasks).unwrap();
+        std::fs::write(
+            tasks.join(format!("{task_id}.json")),
+            serde_json::json!({
+                "task_id": task_id,
+                "task_type": "initiative",
+                "token_usage": { "tokens_used": tokens }
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn budget_gate_refuses_over_hard_cap_and_keeps_queue_clean() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let project = tempfile::tempdir().unwrap();
+        let brehon_root = project.path().join(".brehon");
+        write_budget_config(
+            project.path(),
+            "budget:\n  max_tokens_per_agent: 1000\n  enforcement: Hard\n",
+        );
+        write_task_rollup(&brehon_root, "I-1", 5_000);
+        let _env = ScopedEnv::set(&[("BREHON_ROOT", brehon_root.to_str().unwrap())]);
+
+        let outcome = try_deliver_message("worker-1", "supervisor", "do work");
+        assert!(!outcome.queued, "over-cap delivery must be refused");
+        assert!(
+            outcome.method.contains("budget exceeded"),
+            "method should explain refusal: {}",
+            outcome.method
+        );
+
+        // Pre-write refusal: nothing was enqueued to the durable prompt queue.
+        let queue_root = prompt_queue_root(&brehon_root);
+        let any_queued = std::fs::read_dir(&queue_root)
+            .map(|entries| {
+                entries.flatten().any(|entry| {
+                    let p = entry.path();
+                    p.is_dir()
+                        && std::fs::read_dir(&p)
+                            .map(|inner| inner.flatten().next().is_some())
+                            .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false);
+        assert!(!any_queued, "no prompt should be written when refused");
+    }
+
+    #[test]
+    fn budget_gate_allows_under_hard_cap() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let project = tempfile::tempdir().unwrap();
+        let brehon_root = project.path().join(".brehon");
+        write_budget_config(
+            project.path(),
+            "budget:\n  max_tokens_per_agent: 1000000\n  enforcement: Hard\n",
+        );
+        write_task_rollup(&brehon_root, "I-1", 10);
+        let _env = ScopedEnv::set(&[("BREHON_ROOT", brehon_root.to_str().unwrap())]);
+
+        let outcome = try_deliver_message("worker-1", "supervisor", "do work");
+        assert!(outcome.queued, "under-cap delivery must queue normally");
+    }
+
+    #[test]
+    fn budget_gate_allows_when_no_cap_configured() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let project = tempfile::tempdir().unwrap();
+        let brehon_root = project.path().join(".brehon");
+        // Hard enforcement but no token cap => never refuse here.
+        write_budget_config(project.path(), "budget:\n  enforcement: Hard\n");
+        write_task_rollup(&brehon_root, "I-1", 5_000_000);
+        let _env = ScopedEnv::set(&[("BREHON_ROOT", brehon_root.to_str().unwrap())]);
+
+        let outcome = try_deliver_message("worker-1", "supervisor", "do work");
+        assert!(
+            outcome.queued,
+            "no configured cap => owner's unlimited run must queue: {}",
+            outcome.method
+        );
+    }
+
+    #[test]
+    fn budget_gate_refuses_over_hard_cost_cap() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let project = tempfile::tempdir().unwrap();
+        let brehon_root = project.path().join(".brehon");
+        // Cost-only Hard cap: ~$2 of spend (2_000_000 tokens at the shared flat
+        // rate) over a $1 cap must refuse at the at-source seam.
+        write_budget_config(
+            project.path(),
+            "budget:\n  max_total_cost: 1.0\n  enforcement: Hard\n",
+        );
+        write_task_rollup(&brehon_root, "I-1", 2_000_000);
+        let _env = ScopedEnv::set(&[("BREHON_ROOT", brehon_root.to_str().unwrap())]);
+
+        let outcome = try_deliver_message("worker-1", "supervisor", "do work");
+        assert!(!outcome.queued, "over cost cap must be refused");
+        assert!(
+            outcome.method.contains("cost limit"),
+            "method should name the cost cap: {}",
+            outcome.method
+        );
+    }
+
+    #[test]
+    fn budget_gate_allows_under_hard_cost_cap() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let project = tempfile::tempdir().unwrap();
+        let brehon_root = project.path().join(".brehon");
+        write_budget_config(
+            project.path(),
+            "budget:\n  max_total_cost: 100.0\n  enforcement: Hard\n",
+        );
+        write_task_rollup(&brehon_root, "I-1", 10);
+        let _env = ScopedEnv::set(&[("BREHON_ROOT", brehon_root.to_str().unwrap())]);
+
+        let outcome = try_deliver_message("worker-1", "supervisor", "do work");
+        assert!(outcome.queued, "under cost cap must queue normally");
+    }
+
+    #[test]
+    fn budget_gate_fails_closed_when_spend_unreadable() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let project = tempfile::tempdir().unwrap();
+        let brehon_root = project.path().join(".brehon");
+        write_budget_config(
+            project.path(),
+            "budget:\n  max_tokens_per_agent: 1000\n  enforcement: Hard\n",
+        );
+        // Make runtime/tasks a FILE so the rollup scan errors (NotADirectory):
+        // an unreadable spend signal under a Hard cap must fail closed.
+        let runtime = brehon_root.join("runtime");
+        std::fs::create_dir_all(&runtime).unwrap();
+        std::fs::write(runtime.join("tasks"), "not a directory").unwrap();
+        let _env = ScopedEnv::set(&[("BREHON_ROOT", brehon_root.to_str().unwrap())]);
+
+        let outcome = try_deliver_message("worker-1", "supervisor", "do work");
+        assert!(
+            !outcome.queued,
+            "unreadable spend under a Hard cap must fail closed"
+        );
+        assert!(
+            outcome.method.contains("failing closed"),
+            "method should explain fail-closed: {}",
+            outcome.method
+        );
     }
 }

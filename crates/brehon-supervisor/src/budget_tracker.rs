@@ -108,9 +108,10 @@ impl BudgetTracker {
     }
 
     pub fn tokens_by_agent(&self) -> HashMap<String, u64> {
-        let mut result = HashMap::new();
+        let mut result: HashMap<String, u64> = HashMap::new();
         for (k, v) in self.state.read().tokens_by_agent.iter() {
-            *result.entry(k.clone()).or_insert(0) += v;
+            let entry = result.entry(k.clone()).or_insert(0_u64);
+            *entry = entry.saturating_add(*v);
         }
         result
     }
@@ -121,7 +122,7 @@ impl BudgetTracker {
         {
             let mut state = self.state.write();
 
-            state.total_tokens += usage.total_tokens;
+            state.total_tokens = state.total_tokens.saturating_add(usage.total_tokens);
             state
                 .tokens_by_agent
                 .push((usage.agent_id.clone(), usage.total_tokens));

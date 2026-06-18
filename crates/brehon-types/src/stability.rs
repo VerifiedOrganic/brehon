@@ -59,13 +59,17 @@ impl StabilityCounters {
     ///
     /// Useful for aggregating counters from multiple subsystems.
     pub fn merge(&mut self, other: &StabilityCounters) {
-        self.pending_requests += other.pending_requests;
-        self.pending_prompt_waiters += other.pending_prompt_waiters;
-        self.active_reviews += other.active_reviews;
-        self.completed_tasks += other.completed_tasks;
-        self.assignment_history += other.assignment_history;
-        self.blocked_sends += other.blocked_sends;
-        self.tokens_used += other.tokens_used;
+        self.pending_requests = self.pending_requests.saturating_add(other.pending_requests);
+        self.pending_prompt_waiters = self
+            .pending_prompt_waiters
+            .saturating_add(other.pending_prompt_waiters);
+        self.active_reviews = self.active_reviews.saturating_add(other.active_reviews);
+        self.completed_tasks = self.completed_tasks.saturating_add(other.completed_tasks);
+        self.assignment_history = self
+            .assignment_history
+            .saturating_add(other.assignment_history);
+        self.blocked_sends = self.blocked_sends.saturating_add(other.blocked_sends);
+        self.tokens_used = self.tokens_used.saturating_add(other.tokens_used);
     }
 
     /// Return true if any counter exceeds its corresponding soft bound.
@@ -463,6 +467,102 @@ fn json_u64_value(value: &Value) -> Option<u64> {
         .or_else(|| value.as_str().and_then(|value| value.trim().parse().ok()))
 }
 
+fn task_token_usage(task: &Map<String, Value>) -> Option<u64> {
+    task.get("token_usage")
+        .and_then(|usage| usage.get("tokens_used"))
+        .and_then(json_u64_value)
+        .or_else(|| task.get("tokens_used").and_then(json_u64_value))
+}
+
+/// Read the persisted token rollup for a single task.
+///
+/// Returns `Ok(Some(tokens))` when the task JSON exists and carries a
+/// `token_usage.tokens_used` (or legacy top-level `tokens_used`) field,
+/// `Ok(None)` when the file is absent or the field is missing, and `Err` only
+/// on an unexpected IO error reading an existing file. Distinguishing "missing"
+/// from a genuine zero lets the budget gate fail closed when spend state is
+/// unknown rather than treating unreadable state as zero spend.
+#[must_use = "the read token usage is the budget gate's spend signal"]
+pub fn read_task_token_usage(brehon_root: &Path, task_id: &str) -> IoResult<Option<u64>> {
+    let task_id = task_id.trim();
+    if task_id.is_empty() {
+        return Ok(None);
+    }
+    let path = task_json_path(brehon_root, task_id);
+    match std::fs::read_to_string(&path) {
+        Ok(content) => {
+            let Ok(task) = serde_json::from_str::<Map<String, Value>>(&content) else {
+                return Ok(None);
+            };
+            Ok(task_token_usage(&task))
+        }
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+/// Sum the persisted token rollup across the run's top-level container tasks.
+///
+/// The rollup written by [`record_task_token_usage`] accumulates each task's
+/// usage into its ancestors, so the run total is the sum over the topmost
+/// containers. Initiatives (`task_type == "initiative"` with no parent) are
+/// preferred; if no initiative exists, all parent-less tasks are summed. This
+/// avoids double counting children that already rolled up into their parents.
+///
+/// Returns `Err` when the tasks directory exists but cannot be read, which the
+/// budget gate treats as "spend unknown" and fails closed under a Hard cap.
+/// An absent tasks directory is a legitimately empty run and yields `Ok(0)`.
+#[must_use = "the run total is the budget gate's spend signal"]
+pub fn read_run_total_tokens(brehon_root: &Path) -> IoResult<u64> {
+    let dir = task_dir(brehon_root);
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(0),
+        Err(err) => return Err(err),
+    };
+
+    let mut initiative_total: u64 = 0;
+    let mut has_initiative = false;
+    let mut rootless_total: u64 = 0;
+
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().is_none_or(|ext| ext != "json")
+            || entry.file_name().to_string_lossy().starts_with('.')
+        {
+            continue;
+        }
+        let Some(task) = read_json::<Map<String, Value>>(&path) else {
+            continue;
+        };
+        let parentless = task
+            .get("parent_id")
+            .and_then(Value::as_str)
+            .map(|parent| parent.trim().is_empty())
+            .unwrap_or(true);
+        if !parentless {
+            continue;
+        }
+        let tokens = task_token_usage(&task).unwrap_or(0);
+        let is_initiative = task
+            .get("task_type")
+            .and_then(Value::as_str)
+            .is_some_and(|task_type| task_type == "initiative");
+        if is_initiative {
+            has_initiative = true;
+            initiative_total = initiative_total.saturating_add(tokens);
+        }
+        rootless_total = rootless_total.saturating_add(tokens);
+    }
+
+    Ok(if has_initiative {
+        initiative_total
+    } else {
+        rootless_total
+    })
+}
+
 pub fn increment_assignment_history(brehon_root: &Path, delta: usize) -> IoResult<usize> {
     let path = stability_meta_path(brehon_root);
     let _lock = acquire_file_lock(&path)?;
@@ -817,6 +917,96 @@ mod tests {
             assert_eq!(task["token_usage"]["tokens_used"], 750);
             assert!(task["token_usage"]["updated_at"].as_str().is_some());
         }
+    }
+
+    #[test]
+    fn read_task_token_usage_distinguishes_missing_from_zero() {
+        let root = tempfile::tempdir().unwrap();
+        let tasks = root.path().join("runtime").join("tasks");
+        std::fs::create_dir_all(&tasks).unwrap();
+
+        // Missing file -> None (unknown), not Some(0).
+        assert_eq!(
+            read_task_token_usage(root.path(), "T-missing").unwrap(),
+            None
+        );
+
+        record_task_token_usage(root.path(), "T-1", 0).unwrap_or_default();
+        std::fs::write(
+            tasks.join("T-1.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "task_id": "T-1",
+                "task_type": "task"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        // Present file without token_usage field -> None.
+        assert_eq!(read_task_token_usage(root.path(), "T-1").unwrap(), None);
+
+        record_task_token_usage(root.path(), "T-1", 321).unwrap();
+        assert_eq!(
+            read_task_token_usage(root.path(), "T-1").unwrap(),
+            Some(321)
+        );
+    }
+
+    #[test]
+    fn read_run_total_tokens_sums_initiative_rollup() {
+        let root = tempfile::tempdir().unwrap();
+        let tasks = root.path().join("runtime").join("tasks");
+        std::fs::create_dir_all(&tasks).unwrap();
+        for (id, task_type, parent_id) in [
+            ("I-1", "initiative", None),
+            ("E-1", "epic", Some("I-1")),
+            ("T-1", "task", Some("E-1")),
+        ] {
+            let mut task = serde_json::json!({
+                "task_id": id,
+                "task_type": task_type,
+                "status": "in_progress"
+            });
+            if let Some(parent_id) = parent_id {
+                task["parent_id"] = Value::String(parent_id.to_string());
+            }
+            std::fs::write(
+                tasks.join(format!("{id}.json")),
+                serde_json::to_string_pretty(&task).unwrap(),
+            )
+            .unwrap();
+        }
+
+        record_task_token_usage(root.path(), "T-1", 750).unwrap();
+        // The run total must equal the initiative rollup, not the sum of every
+        // task (which would triple count via the epic + task rows).
+        assert_eq!(read_run_total_tokens(root.path()).unwrap(), 750);
+    }
+
+    #[test]
+    fn read_run_total_tokens_falls_back_to_rootless_tasks() {
+        let root = tempfile::tempdir().unwrap();
+        let tasks = root.path().join("runtime").join("tasks");
+        std::fs::create_dir_all(&tasks).unwrap();
+        for id in ["T-a", "T-b"] {
+            std::fs::write(
+                tasks.join(format!("{id}.json")),
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "task_id": id,
+                    "task_type": "task"
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            record_task_token_usage(root.path(), id, 100).unwrap();
+        }
+        // No initiative present -> sum parent-less tasks.
+        assert_eq!(read_run_total_tokens(root.path()).unwrap(), 200);
+    }
+
+    #[test]
+    fn read_run_total_tokens_empty_run_is_zero() {
+        let root = tempfile::tempdir().unwrap();
+        assert_eq!(read_run_total_tokens(root.path()).unwrap(), 0);
     }
 
     #[test]

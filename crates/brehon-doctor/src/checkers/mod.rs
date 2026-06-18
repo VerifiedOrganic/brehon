@@ -1,5 +1,6 @@
 //! Diagnostic checkers for different aspects of Brehon state.
 
+pub mod budget;
 pub mod review;
 pub mod runtime;
 pub mod store_search;
@@ -44,6 +45,10 @@ pub fn run_all_checks(
     // Store/search checks
     let store_search_checker = store_search::StoreSearchChecker::new(brehon_root);
     findings.extend(store_search_checker.check()?);
+
+    // Budget enforcement policy check (kill-switch effectively off).
+    let budget_checker = budget::BudgetChecker::new(brehon_root);
+    findings.extend(budget_checker.check()?);
 
     Ok(findings)
 }

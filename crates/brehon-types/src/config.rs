@@ -1581,6 +1581,152 @@ pub struct BudgetConfig {
     pub alert_threshold_percent: u8,
     /// Enforcement mode.
     pub enforcement: BudgetEnforcement,
+    /// Maximum wall-clock minutes for the whole run (null = unlimited).
+    ///
+    /// On breach under `Hard` enforcement the run drains and tears down
+    /// in-flight spending sessions, mirroring the token/cost caps. Omission
+    /// means unlimited — the run is never wall-clock killed.
+    #[serde(default)]
+    pub max_wall_clock_minutes: Option<u64>,
+}
+
+/// Flat per-token cost (USD) used for the **approximate** total-cost cap.
+///
+/// The real `estimate_cost` pricing table is stale and falls back to roughly
+/// $1 per million tokens for the models actually in use, so deriving a cost
+/// from the run-total token rollup at this flat rate is no less accurate while
+/// keeping the run-loop gate and the MCP at-source seam on a single shared rate
+/// (the two must never disagree on whether a cost cap is breached). Token and
+/// wall-clock caps remain the trustworthy levers; cost is documented as coarse.
+pub const APPROX_COST_PER_TOKEN_USD: f64 = 1.0 / 1_000_000.0;
+
+impl BudgetConfig {
+    /// True when this policy configures at least one ceiling the live budget
+    /// kill-switch actually enforces: a run-total token cap, an (approximate)
+    /// total-cost cap, or a wall-clock ceiling.
+    ///
+    /// `max_cost_per_task` is intentionally excluded: it is a *per-task* cap
+    /// that the run-total kill-switch does not yet enforce. Counting it here
+    /// would let a `Hard` config whose only cap is `max_cost_per_task` look
+    /// armed while the kill-switch can never fire — silencing the "enforcement
+    /// effectively off" startup warning and doctor finding and leaving the run
+    /// silently unprotected. The startup warning, the doctor checker, and the
+    /// run-loop gate all consult this one predicate so their notion of "armed"
+    /// can never drift apart.
+    #[must_use]
+    pub fn has_enforceable_ceiling(&self) -> bool {
+        self.max_total_cost.is_some()
+            || self.max_tokens_per_agent.is_some()
+            || self.max_wall_clock_minutes.is_some()
+    }
+
+    /// Run-total spend breach under `Hard` enforcement, derived from a token
+    /// rollup. Returns the human-readable reason when `tokens` meets or exceeds
+    /// the token cap or the approximate cost cap; `None` otherwise (including
+    /// under `Soft` enforcement, where breaches warn rather than refuse).
+    ///
+    /// This is the shared spend kernel used by both the TUI run-loop gate and
+    /// the MCP at-source enqueue seam so the two refuse on identical thresholds.
+    /// Wall-clock and Soft/alert-threshold handling live in the run-loop gate,
+    /// which owns the run clock and the dashboard.
+    #[must_use]
+    pub fn hard_spend_breach(&self, tokens: u64) -> Option<String> {
+        if self.enforcement != BudgetEnforcement::Hard {
+            return None;
+        }
+        if let Some(max_tokens) = self.max_tokens_per_agent {
+            if max_tokens > 0 && tokens >= max_tokens {
+                return Some(format!(
+                    "token limit reached: {tokens} >= max_tokens_per_agent={max_tokens} (run total)"
+                ));
+            }
+        }
+        if let Some(max_cost) = self.max_total_cost {
+            if max_cost > 0.0 {
+                let observed_cost = tokens as f64 * APPROX_COST_PER_TOKEN_USD;
+                if observed_cost >= max_cost {
+                    return Some(format!(
+                        "estimated cost limit reached: ~${observed_cost:.2} >= \
+                         max_total_cost={max_cost:.2} (approximate, from {tokens} tokens)"
+                    ));
+                }
+            }
+        }
+        None
+    }
+}
+
+#[cfg(test)]
+mod budget_ceiling_tests {
+    use super::{BudgetConfig, BudgetEnforcement};
+
+    fn budget(
+        max_total_cost: Option<f64>,
+        max_cost_per_task: Option<f64>,
+        max_tokens_per_agent: Option<u64>,
+        max_wall_clock_minutes: Option<u64>,
+        enforcement: BudgetEnforcement,
+    ) -> BudgetConfig {
+        BudgetConfig {
+            max_total_cost,
+            max_cost_per_task,
+            max_tokens_per_agent,
+            alert_threshold_percent: 80,
+            enforcement,
+            max_wall_clock_minutes,
+        }
+    }
+
+    #[test]
+    fn cost_per_task_only_is_not_an_enforceable_ceiling() {
+        // The exact silent-unprotected hole: a Hard config whose only cap is
+        // max_cost_per_task must report NO enforceable ceiling so the startup
+        // warning and the doctor finding fire instead of staying silent.
+        let cfg = budget(None, Some(2.0), None, None, BudgetEnforcement::Hard);
+        assert!(!cfg.has_enforceable_ceiling());
+    }
+
+    #[test]
+    fn token_cost_or_wall_clock_each_count_as_a_ceiling() {
+        assert!(
+            budget(None, None, Some(1000), None, BudgetEnforcement::Hard).has_enforceable_ceiling()
+        );
+        assert!(
+            budget(Some(50.0), None, None, None, BudgetEnforcement::Hard).has_enforceable_ceiling()
+        );
+        assert!(
+            budget(None, None, None, Some(120), BudgetEnforcement::Hard).has_enforceable_ceiling()
+        );
+    }
+
+    #[test]
+    fn no_caps_is_not_a_ceiling() {
+        assert!(!budget(None, None, None, None, BudgetEnforcement::Soft).has_enforceable_ceiling());
+    }
+
+    #[test]
+    fn hard_spend_breach_fires_on_token_cap() {
+        let cfg = budget(None, None, Some(1000), None, BudgetEnforcement::Hard);
+        assert!(cfg.hard_spend_breach(1000).unwrap().contains("token limit"));
+        assert!(cfg.hard_spend_breach(999).is_none());
+    }
+
+    #[test]
+    fn hard_spend_breach_fires_on_cost_cap() {
+        // 2_000_000 tokens * $1/Mtok = ~$2.00 >= $1.00 cap.
+        let cfg = budget(Some(1.0), None, None, None, BudgetEnforcement::Hard);
+        assert!(cfg
+            .hard_spend_breach(2_000_000)
+            .unwrap()
+            .contains("cost limit"));
+        assert!(cfg.hard_spend_breach(500_000).is_none());
+    }
+
+    #[test]
+    fn hard_spend_breach_is_none_under_soft() {
+        let cfg = budget(None, None, Some(1), None, BudgetEnforcement::Soft);
+        assert!(cfg.hard_spend_breach(u64::MAX).is_none());
+    }
 }
 
 /// Budget enforcement mode.
@@ -2580,6 +2726,7 @@ mod tests {
                 max_tokens_per_agent: None,
                 alert_threshold_percent: 80,
                 enforcement: BudgetEnforcement::Soft,
+                max_wall_clock_minutes: None,
             },
             tui: TuiConfig {
                 default_layout: LayoutPreset::Balanced,

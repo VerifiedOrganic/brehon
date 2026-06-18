@@ -348,6 +348,7 @@ budget:
   max_tokens_per_agent: null
   alert_threshold_percent: 80
   enforcement: Soft
+  max_wall_clock_minutes: null # null = unlimited; the run is never wall-clock killed
 
 context:
   db_path: ".brehon/brehon.db"

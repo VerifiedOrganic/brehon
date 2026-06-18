@@ -59,7 +59,7 @@ impl TokenUsage {
         Self {
             input_tokens: input,
             output_tokens: output,
-            total_tokens: input + output,
+            total_tokens: input.saturating_add(output),
             model: None,
             agent_id: agent_id.into(),
             timestamp: Utc::now(),

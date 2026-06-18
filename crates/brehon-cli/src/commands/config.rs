@@ -257,7 +257,15 @@ pub fn describe(
                 "  max_tokens_per_agent: {:?}",
                 config.budget.max_tokens_per_agent
             );
+            info!(
+                "  alert_threshold_percent: {}",
+                config.budget.alert_threshold_percent
+            );
             info!("  enforcement: {:?}", config.budget.enforcement);
+            info!(
+                "  max_wall_clock_minutes: {:?}",
+                config.budget.max_wall_clock_minutes
+            );
         }
 
         "tui" => {

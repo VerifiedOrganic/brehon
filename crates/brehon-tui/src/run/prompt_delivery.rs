@@ -496,6 +496,15 @@ pub(super) fn dispatch_runtime_prompt(
     prompt: String,
     from: Option<String>,
 ) -> bool {
+    // Budget kill-switch: refuse NEW spend first, before any delivery branch.
+    // `false` is the existing "not dispatched" contract callers already handle.
+    if let Err(reason) = super::budget::dispatch_allowed(ctx) {
+        push_dashboard_event(
+            &ctx.dashboard_data,
+            format!("budget: prompt to {target} refused — {reason}"),
+        );
+        return false;
+    }
     if !ctx.runtime_agent_factory_host_owned {
         if ctx.mux.get(target).is_none() {
             return false;

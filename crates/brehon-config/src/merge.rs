@@ -259,6 +259,9 @@ fn merge_budget(base: BudgetConfig, overlay: BudgetConfig) -> BudgetConfig {
         max_tokens_per_agent: overlay.max_tokens_per_agent.or(base.max_tokens_per_agent),
         alert_threshold_percent: overlay.alert_threshold_percent,
         enforcement: overlay.enforcement,
+        max_wall_clock_minutes: overlay
+            .max_wall_clock_minutes
+            .or(base.max_wall_clock_minutes),
     }
 }
 
@@ -468,6 +471,7 @@ mod tests {
                 max_tokens_per_agent: None,
                 alert_threshold_percent: 80,
                 enforcement: BudgetEnforcement::Soft,
+                max_wall_clock_minutes: None,
             },
             tui: TuiConfig {
                 default_layout: LayoutPreset::Balanced,

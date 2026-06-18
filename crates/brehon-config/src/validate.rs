@@ -82,6 +82,7 @@ pub enum ValidationWarningKind {
     ProfilePolicyConflict,
     InvalidWorktreeRoot,
     LauncherEnvConflict,
+    BudgetPolicyConflict,
 }
 
 impl ValidationWarningKind {
@@ -160,6 +161,7 @@ impl std::fmt::Display for ValidationWarningKind {
             ValidationWarningKind::ProfilePolicyConflict => write!(f, "Profile policy conflict"),
             ValidationWarningKind::InvalidWorktreeRoot => write!(f, "Invalid worktree root"),
             ValidationWarningKind::LauncherEnvConflict => write!(f, "Launcher env conflict"),
+            ValidationWarningKind::BudgetPolicyConflict => write!(f, "Budget policy conflict"),
         }
     }
 }
@@ -173,6 +175,7 @@ pub fn validate(config: &BrehonConfig) -> Vec<ValidationWarning> {
     warnings.extend(validate_routing_policy(config));
     warnings.extend(validate_advisors(config));
     warnings.extend(validate_research(config));
+    warnings.extend(validate_budget(config));
     warnings.extend(validate_review_thresholds(config));
     warnings.extend(validate_review_panels(config));
     warnings.extend(validate_prompt_policy(config));
@@ -397,6 +400,40 @@ fn validate_advisors(config: &BrehonConfig) -> Vec<ValidationWarning> {
                 ));
             }
         }
+    }
+
+    warnings
+}
+
+fn validate_budget(config: &BrehonConfig) -> Vec<ValidationWarning> {
+    use brehon_types::BudgetEnforcement;
+
+    let mut warnings = Vec::new();
+    let budget = &config.budget;
+
+    // Hard enforcement with no enforceable ceiling is a no-op kill-switch: the
+    // operator asked for "actually stop" but configured nothing to stop on. The
+    // shared `has_enforceable_ceiling` predicate excludes max_cost_per_task (a
+    // per-task cap the run-total kill-switch does not yet enforce), keeping this
+    // validator, the startup warning, the doctor checker, and the gate in lockstep.
+    if budget.enforcement == BudgetEnforcement::Hard && !budget.has_enforceable_ceiling() {
+        warnings.push(ValidationWarning::non_fatal(
+            ValidationWarningKind::BudgetPolicyConflict,
+            "budget.enforcement is Hard but no enforceable cap is set \
+             (max_tokens_per_agent / max_total_cost / max_wall_clock_minutes are all \
+             null); max_cost_per_task is a per-task cap that is not yet enforced by the \
+             run-total kill-switch, so the kill-switch will never fire",
+        ));
+    }
+
+    if budget.alert_threshold_percent > 100 {
+        warnings.push(ValidationWarning::non_fatal(
+            ValidationWarningKind::BudgetPolicyConflict,
+            format!(
+                "budget.alert_threshold_percent={} is above 100; it is clamped to 100",
+                budget.alert_threshold_percent
+            ),
+        ));
     }
 
     warnings
@@ -2032,6 +2069,7 @@ mod tests {
                 max_tokens_per_agent: None,
                 alert_threshold_percent: 80,
                 enforcement: BudgetEnforcement::Soft,
+                max_wall_clock_minutes: None,
             },
             tui: TuiConfig {
                 default_layout: LayoutPreset::Balanced,
@@ -2080,6 +2118,97 @@ mod tests {
             "Expected no warnings, got: {:?}",
             warnings
         );
+    }
+
+    #[test]
+    fn budget_hard_without_any_cap_warns_non_fatal() {
+        use brehon_types::BudgetEnforcement;
+        let mut config = minimal_valid_config();
+        config.budget.enforcement = BudgetEnforcement::Hard;
+        config.budget.max_total_cost = None;
+        config.budget.max_cost_per_task = None;
+        config.budget.max_tokens_per_agent = None;
+        config.budget.max_wall_clock_minutes = None;
+
+        let warning = validate(&config)
+            .into_iter()
+            .find(|w| w.kind == ValidationWarningKind::BudgetPolicyConflict)
+            .expect("Hard-with-no-cap should warn");
+        assert!(!warning.is_fatal, "must not reject Hard");
+        assert!(
+            warning.message.contains("never fire"),
+            "{}",
+            warning.message
+        );
+    }
+
+    #[test]
+    fn budget_hard_with_a_cap_has_no_conflict() {
+        use brehon_types::BudgetEnforcement;
+        let mut config = minimal_valid_config();
+        config.budget.enforcement = BudgetEnforcement::Hard;
+        config.budget.max_tokens_per_agent = Some(1_000);
+
+        assert!(
+            !validate(&config)
+                .iter()
+                .any(|w| w.kind == ValidationWarningKind::BudgetPolicyConflict),
+            "a configured cap clears the conflict"
+        );
+    }
+
+    #[test]
+    fn budget_wall_clock_only_cap_clears_conflict() {
+        use brehon_types::BudgetEnforcement;
+        let mut config = minimal_valid_config();
+        config.budget.enforcement = BudgetEnforcement::Hard;
+        config.budget.max_tokens_per_agent = None;
+        config.budget.max_wall_clock_minutes = Some(120);
+
+        assert!(
+            !validate(&config)
+                .iter()
+                .any(|w| w.kind == ValidationWarningKind::BudgetPolicyConflict),
+            "a wall-clock ceiling is an enforceable cap"
+        );
+    }
+
+    #[test]
+    fn budget_hard_with_only_cost_per_task_warns() {
+        use brehon_types::BudgetEnforcement;
+        // max_cost_per_task is a per-task cap the run-total kill-switch does not
+        // enforce, so `config validate` must surface the same conflict the
+        // startup warning and doctor report — not pass clean.
+        let mut config = minimal_valid_config();
+        config.budget.enforcement = BudgetEnforcement::Hard;
+        config.budget.max_total_cost = None;
+        config.budget.max_cost_per_task = Some(2.0);
+        config.budget.max_tokens_per_agent = None;
+        config.budget.max_wall_clock_minutes = None;
+
+        let warning = validate(&config)
+            .into_iter()
+            .find(|w| w.kind == ValidationWarningKind::BudgetPolicyConflict)
+            .expect("cost-per-task-only Hard should warn");
+        assert!(!warning.is_fatal, "must not reject Hard");
+        assert!(
+            warning.message.contains("never fire"),
+            "{}",
+            warning.message
+        );
+    }
+
+    #[test]
+    fn budget_alert_threshold_over_100_warns() {
+        let mut config = minimal_valid_config();
+        config.budget.alert_threshold_percent = 150;
+
+        let warning = validate(&config)
+            .into_iter()
+            .find(|w| w.kind == ValidationWarningKind::BudgetPolicyConflict)
+            .expect("threshold > 100 should warn");
+        assert!(!warning.is_fatal);
+        assert!(warning.message.contains("clamped"), "{}", warning.message);
     }
 
     #[test]

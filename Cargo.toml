@@ -73,6 +73,12 @@ rmcp = { version = "0.16", features = ["server", "transport-io"] }
 portable-pty = "0.9"
 panesmith = { git = "https://github.com/VerifiedOrganic/panesmith.git", tag = "v0.2.2", features = ["crossterm"] }
 
+[profile.release]
+# Brehon spends real money autonomously for hours-to-days; overflow-checks keep
+# budget/token accumulation honest in the shipped binary rather than silently
+# wrapping a u64 += and defeating the kill-switch arithmetic.
+overflow-checks = true
+
 [profile.release-fast]
 inherits = "release"
 lto = "thin"

@@ -34,6 +34,7 @@
 
 mod advisors;
 mod automation;
+mod budget;
 mod composer;
 mod confirmed_state;
 mod crash_detection;
@@ -499,6 +500,12 @@ pub fn run_tui_with_panels_and_runtime_commands(
         last_panesmith_snapshot_panes: std::collections::BTreeSet::new(),
         force_panesmith_snapshot_refresh: true,
         project_config_loader,
+        last_budget_check: started_at,
+        budget_check_interval: budget::DEFAULT_BUDGET_CHECK_INTERVAL,
+        budget_torn_down: false,
+        budget_block_dispatch: None,
+        last_budget_warn: None,
+        budget_event_sink: Some(budget::default_budget_event_sink()),
         needs_redraw: true,
     };
 

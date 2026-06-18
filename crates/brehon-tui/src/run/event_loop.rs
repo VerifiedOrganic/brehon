@@ -227,6 +227,24 @@ pub(crate) struct EventLoopCtx {
     /// `brehon-cli` so this crate can stay free of a `brehon-config` dep.
     pub project_config_loader: super::research::ProjectConfigLoader,
 
+    // Budget kill-switch state (see `run::budget`).
+    /// Last time the budget gate was evaluated (self-throttle).
+    pub last_budget_check: Instant,
+    /// How often the budget gate re-reads spend and re-evaluates.
+    pub budget_check_interval: Duration,
+    /// One-shot latch: true once budget teardown has fired, so the inline
+    /// `mux.shutdown_all()` and the breach signal never repeat per tick.
+    pub budget_torn_down: bool,
+    /// Cached refusal reason set by `budget_tick`; read by the dispatch seam so
+    /// the hot path fails closed without a per-prompt filesystem read.
+    pub budget_block_dispatch: Option<String>,
+    /// Dedupe key for the last Soft budget warning pushed to the dashboard.
+    pub last_budget_warn: Option<String>,
+    /// Injected durable sink for budget-breach signals (optional). Avoids a new
+    /// exhaustively-matched `EventKind` variant; when `None` the operator signal
+    /// degrades to a dashboard event + `tracing::warn!`.
+    pub budget_event_sink: Option<super::budget::BudgetEventSink>,
+
     pub needs_redraw: bool,
 }
 
@@ -3225,6 +3243,12 @@ pub(super) fn new_headless_event_loop_ctx(
         last_panesmith_snapshot_panes: BTreeSet::new(),
         force_panesmith_snapshot_refresh: true,
         project_config_loader: crate::run::no_project_config_loader(),
+        last_budget_check: now - super::budget::DEFAULT_BUDGET_CHECK_INTERVAL,
+        budget_check_interval: super::budget::DEFAULT_BUDGET_CHECK_INTERVAL,
+        budget_torn_down: false,
+        budget_block_dispatch: None,
+        last_budget_warn: None,
+        budget_event_sink: Some(super::budget::default_budget_event_sink()),
         needs_redraw: false,
         runtime_agent_factory_host_owned,
         runtime_terminal_host_absolute_resize: false,
@@ -3972,6 +3996,7 @@ pub(super) fn run(ctx: &mut EventLoopCtx) -> io::Result<()> {
         }
 
         super::stall_handling::detect_and_handle_stalls(ctx);
+        super::budget::budget_tick(ctx);
     }
 
     Ok(())
@@ -3987,7 +4012,9 @@ pub(super) fn runtime_command_timestamp_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::run::budget;
     use crate::run::init_test_git_repo;
+    use crate::run::prompt_delivery::dispatch_runtime_prompt;
     use brehon_ports::RuntimeCommandRouter;
     use brehon_types::config::WorkerIdleBehavior;
     use ratatui::{TerminalOptions, Viewport};
@@ -4455,6 +4482,12 @@ mod tests {
                 last_panesmith_snapshot_panes: BTreeSet::new(),
                 force_panesmith_snapshot_refresh: true,
                 project_config_loader: crate::run::no_project_config_loader(),
+                last_budget_check: now - crate::run::budget::DEFAULT_BUDGET_CHECK_INTERVAL,
+                budget_check_interval: crate::run::budget::DEFAULT_BUDGET_CHECK_INTERVAL,
+                budget_torn_down: false,
+                budget_block_dispatch: None,
+                last_budget_warn: None,
+                budget_event_sink: None,
                 needs_redraw: false,
                 runtime_agent_factory_host_owned: host_owned,
                 runtime_terminal_host_absolute_resize: false,
@@ -5255,6 +5288,160 @@ TypeError: Cannot read properties of undefined"#,
         );
 
         drain_runtime_commands(&mut harness);
+    }
+
+    // ── Budget kill-switch integration ───────────────────────────────────
+    //
+    // Drives the REAL gate (`budget_tick` + the `dispatch_runtime_prompt`
+    // seam) against an injected fake spend source (a tempdir rollup over a
+    // Hard token cap, surfaced through the real config loader) and a fake
+    // event sink. Asserts: over-cap => new dispatch refused, teardown invoked
+    // once, and a breach event emitted. This is caused by the production gate,
+    // not hand-appended events.
+
+    fn write_budget_project_config(project_root: &std::path::Path, body: &str) {
+        let brehon_dir = project_root.join(".brehon");
+        std::fs::create_dir_all(&brehon_dir).unwrap();
+        std::fs::write(brehon_dir.join("config.yaml"), body).unwrap();
+    }
+
+    fn write_initiative_rollup(brehon_root: &std::path::Path, task_id: &str, tokens: u64) {
+        let tasks = brehon_root.join("runtime").join("tasks");
+        std::fs::create_dir_all(&tasks).unwrap();
+        std::fs::write(
+            tasks.join(format!("{task_id}.json")),
+            serde_json::json!({
+                "task_id": task_id,
+                "task_type": "initiative",
+                "token_usage": { "tokens_used": tokens }
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    fn project_config_loader_from_disk() -> crate::run::research::ProjectConfigLoader {
+        Arc::new(|project_root: &std::path::Path| {
+            brehon_config::load_config(Some(project_root)).ok()
+        })
+    }
+
+    #[test]
+    fn budget_tick_over_hard_cap_refuses_dispatch_and_tears_down_once() {
+        let mut mux = Mux::new(24, 80);
+        mux.add_pane(make_worker_pane("worker-1"));
+        let mut harness = harness_with_mux(mux);
+
+        // Project layout: <tempdir>/.brehon is the brehon_root; the config
+        // (Hard, 1000-token cap) lives under it; the rollup is 5000 tokens.
+        let project = tempfile::tempdir().unwrap();
+        let brehon_root = project.path().join(".brehon");
+        write_budget_project_config(
+            project.path(),
+            "budget:\n  max_tokens_per_agent: 1000\n  enforcement: Hard\n",
+        );
+        write_initiative_rollup(&brehon_root, "I-1", 5_000);
+
+        harness.ctx.dashboard_data.lock().unwrap().brehon_root = Some(brehon_root.clone());
+        harness.ctx.project_config_loader = project_config_loader_from_disk();
+
+        // Fake durable event sink.
+        let breaches: Arc<std::sync::Mutex<Vec<budget::BudgetBreachEvent>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink_breaches = breaches.clone();
+        harness.ctx.budget_event_sink = Some(Arc::new(move |event| {
+            sink_breaches.lock().unwrap().push(event);
+        }));
+
+        // Force the tick to run immediately.
+        harness.ctx.budget_check_interval = Duration::ZERO;
+        harness.ctx.last_budget_check = Instant::now() - Duration::from_secs(60);
+
+        // Before the breach, dispatch is allowed.
+        assert!(budget::dispatch_allowed(&harness.ctx).is_ok());
+
+        budget::budget_tick(&mut harness.ctx);
+
+        // (a) NEW dispatch is refused after the breach.
+        assert!(
+            !dispatch_runtime_prompt(&mut harness.ctx, "worker-1", "go".to_string(), None),
+            "dispatch must be refused once the Hard cap is breached"
+        );
+
+        // (b) Teardown invoked exactly once.
+        assert!(harness.ctx.budget_torn_down, "teardown latch must be set");
+        assert!(
+            harness.ctx.shutdown.load(Ordering::SeqCst),
+            "shutdown must be requested so the post-loop teardown fires"
+        );
+
+        // (c) A breach event was recorded through the injected sink.
+        {
+            let recorded = breaches.lock().unwrap();
+            assert_eq!(recorded.len(), 1, "exactly one breach event");
+            assert!(
+                recorded[0].reason.contains("token limit"),
+                "breach names the cap: {}",
+                recorded[0].reason
+            );
+            assert_eq!(
+                recorded[0].enforcement,
+                brehon_types::BudgetEnforcement::Hard
+            );
+        }
+
+        // (d) A budget-exceeded dashboard event is present.
+        {
+            let dash = harness.ctx.dashboard_data.lock().unwrap();
+            assert!(
+                dash.events
+                    .iter()
+                    .any(|e| e.description.contains("budget exceeded")),
+                "a budget-exceeded dashboard event must be present"
+            );
+        }
+
+        // One-shot: a second tick must NOT re-emit or re-kill.
+        harness.ctx.last_budget_check = Instant::now() - Duration::from_secs(60);
+        budget::budget_tick(&mut harness.ctx);
+        assert_eq!(
+            breaches.lock().unwrap().len(),
+            1,
+            "the one-shot latch must prevent a second breach event"
+        );
+    }
+
+    #[test]
+    fn budget_tick_no_cap_never_tears_down_owner_unlimited_run() {
+        let mut mux = Mux::new(24, 80);
+        mux.add_pane(make_worker_pane("worker-1"));
+        let mut harness = harness_with_mux(mux);
+
+        let project = tempfile::tempdir().unwrap();
+        let brehon_root = project.path().join(".brehon");
+        // Hard enforcement but NO numeric cap: an unlimited run.
+        write_budget_project_config(project.path(), "budget:\n  enforcement: Hard\n");
+        write_initiative_rollup(&brehon_root, "I-1", 50_000_000);
+
+        harness.ctx.dashboard_data.lock().unwrap().brehon_root = Some(brehon_root);
+        harness.ctx.project_config_loader = project_config_loader_from_disk();
+        harness.ctx.budget_check_interval = Duration::ZERO;
+        harness.ctx.last_budget_check = Instant::now() - Duration::from_secs(60);
+
+        budget::budget_tick(&mut harness.ctx);
+
+        assert!(
+            !harness.ctx.budget_torn_down,
+            "an unlimited run must never be torn down"
+        );
+        assert!(
+            !harness.ctx.shutdown.load(Ordering::SeqCst),
+            "an unlimited run must not request shutdown"
+        );
+        assert!(
+            budget::dispatch_allowed(&harness.ctx).is_ok(),
+            "dispatch must remain allowed for an unlimited run"
+        );
     }
 
     #[test]

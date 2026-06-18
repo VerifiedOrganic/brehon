@@ -112,6 +112,7 @@ fn test_config() -> BrehonConfig {
             max_tokens_per_agent: None,
             alert_threshold_percent: 80,
             enforcement: BudgetEnforcement::Soft,
+            max_wall_clock_minutes: None,
         },
         tui: TuiConfig {
             default_layout: LayoutPreset::Balanced,
@@ -514,4 +515,34 @@ fn sandbox_spec_roundtrip() {
     let json = serde_json::to_string(&spec).unwrap();
     let parsed: SandboxSpec = serde_json::from_str(&json).unwrap();
     assert_eq!(spec, parsed);
+}
+
+#[test]
+fn budget_config_max_wall_clock_minutes_defaults_when_omitted() {
+    // Legacy/embedded YAML that predates the new field must still deserialize.
+    let parsed: BudgetConfig = serde_yaml::from_str(
+        "max_total_cost: null\n\
+         max_cost_per_task: null\n\
+         max_tokens_per_agent: null\n\
+         alert_threshold_percent: 80\n\
+         enforcement: Soft\n",
+    )
+    .unwrap();
+    assert_eq!(parsed.max_wall_clock_minutes, None);
+}
+
+#[test]
+fn budget_config_roundtrips_with_wall_clock() {
+    let budget = BudgetConfig {
+        max_total_cost: Some(25.0),
+        max_cost_per_task: None,
+        max_tokens_per_agent: Some(1_000_000),
+        alert_threshold_percent: 80,
+        enforcement: BudgetEnforcement::Hard,
+        max_wall_clock_minutes: Some(720),
+    };
+    let json = serde_json::to_string(&budget).unwrap();
+    let parsed: BudgetConfig = serde_json::from_str(&json).unwrap();
+    assert_eq!(budget, parsed);
+    assert_eq!(parsed.max_wall_clock_minutes, Some(720));
 }
