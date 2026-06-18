@@ -3,6 +3,8 @@
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
 
+use brehon_types::TaskCompletionMode;
+
 use crate::error::McpError;
 use crate::server::ToolResult;
 use crate::tools::{error_result, text_result};
@@ -207,16 +209,22 @@ pub(super) async fn execute_promote(args: &Value) -> Result<ToolResult, McpError
             Value::String(merge_target.to_string()),
         );
     }
-    if let Some(integration_status) = source_task
-        .get("integration_status")
-        .and_then(|v| v.as_str())
-        .filter(|v| !v.is_empty())
-    {
-        new_task.insert(
-            "integration_status".into(),
-            Value::String(integration_status.to_string()),
-        );
-    }
+    // A promoted follow-up is a brand-new task that has earned no integration of
+    // its own, so it must NOT inherit the source task's integration_status — the
+    // source is typically already "integrated", and inheriting that let downstream
+    // shortcuts (reconcile-instead-of-review, recover_handoff, ready_closeout)
+    // treat an unreviewed follow-up as already integrated. Initialize it like a
+    // freshly created subtask instead (mirrors action_create): pending for
+    // merge-mode work, not_applicable otherwise.
+    let integration_status = if source_completion_mode == TaskCompletionMode::Merge {
+        "pending"
+    } else {
+        "not_applicable"
+    };
+    new_task.insert(
+        "integration_status".into(),
+        Value::String(integration_status.to_string()),
+    );
     if source_task
         .get("direct_to_main")
         .and_then(|v| v.as_bool())

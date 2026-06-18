@@ -12164,6 +12164,73 @@ async fn test_promote_followups_creates_child_task_and_marks_followups_tasked() 
 }
 
 #[tokio::test]
+async fn test_promote_followups_does_not_inherit_integration_status() {
+    // Regression: a promoted follow-up is a brand-new, unreviewed task. It must
+    // start integration_status="pending" (like any fresh merge subtask) and must
+    // NOT inherit the source task's "integrated" state. Inheriting it let
+    // downstream shortcuts (reconcile-instead-of-review, recover_handoff,
+    // ready_closeout) treat an unreviewed follow-up as already integrated.
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let workspace = make_test_root();
+    let brehon_root = workspace.path().join(".brehon");
+    std::fs::create_dir_all(&brehon_root).unwrap();
+    init_git_workspace(workspace.path());
+    let _env = ScopedEnv::set_with_defaults(&[
+        ("BREHON_ROOT", brehon_root.to_str().unwrap()),
+        ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
+        ("BREHON_AGENT_ROLE", "supervisor"),
+        ("BREHON_AGENT_NAME", "sup-1"),
+    ]);
+    let tool = TaskActionsTool::new();
+
+    let epic = create_epic_for_test(&tool, "Phase 1", Some("epic/test-followups")).await;
+    let epic_id = epic["task_id"].as_str().unwrap();
+    let subtask = create_subtask_for_test(&tool, "Implement queue repair", epic_id).await;
+    let subtask_id = subtask["task_id"].as_str().unwrap();
+
+    // Reproduce the real trigger: follow-ups are promoted from a task that has
+    // already been integrated, so the source carries integration_status=integrated.
+    let mut task = read_test_task(&brehon_root, subtask_id);
+    assert_eq!(task["completion_mode"], "merge");
+    task["integration_status"] = "integrated".into();
+    task["review_followups"] = serde_json::json!([
+        {
+            "followup_id": "FUP-1",
+            "status": "open",
+            "severity": "suggestion",
+            "description": "Split the helper into transport and policy concerns",
+            "created_at": "2026-04-10T00:00:00Z",
+            "updated_at": "2026-04-10T00:00:00Z"
+        }
+    ]);
+    std::fs::write(
+        brehon_root
+            .join("runtime")
+            .join("tasks")
+            .join(format!("{}.json", subtask_id)),
+        serde_json::to_string_pretty(&task).unwrap(),
+    )
+    .unwrap();
+
+    let promote = tool
+        .execute(serde_json::json!({
+            "action": "promote_followups",
+            "id": subtask_id
+        }))
+        .await
+        .unwrap();
+    assert!(promote.is_error.is_none(), "{}", extract_text(&promote));
+    let payload: Value = serde_json::from_str(&extract_text(&promote)).unwrap();
+    let followup_task_id = payload["followup_task_id"].as_str().unwrap();
+
+    let promoted_task = read_test_task(&brehon_root, followup_task_id);
+    assert_eq!(
+        promoted_task["integration_status"], "pending",
+        "promoted follow-up must start pending, not inherit the source task's integration_status"
+    );
+}
+
+#[tokio::test]
 async fn test_close_marks_promoted_followups_done_on_source_task() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let workspace = make_test_root();
