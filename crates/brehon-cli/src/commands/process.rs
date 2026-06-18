@@ -155,11 +155,27 @@ fn process_is_internal_helper(process: &BrehonProcess) -> bool {
     process.ppid == std::process::id() && matches!(process.executable.as_str(), "ps" | "kill")
 }
 
+/// Strip this project's identity env from a helper subprocess.
+///
+/// brehon sets `BREHON_ROOT` / `BREHON_WORKSPACE_ROOT` on its own process before
+/// reaping stale agents, so every child it spawns inherits them. The `ps`/`kill`
+/// helpers used to scan and terminate processes must not carry that identity, or
+/// `process_matches_scope` (which keys on those vars) flags brehon's own helper
+/// as a stale project agent — a transient, un-killable phantom "survivor" that
+/// blocks `brehon` startup. This was observed on hosts running atuin, whose
+/// injected env also corrupted `ps` executable parsing so the helper slipped
+/// past `process_is_internal_helper` as well.
+fn strip_helper_identity_env(command: &mut Command) -> &mut Command {
+    command
+        .env_remove("BREHON_ROOT")
+        .env_remove("BREHON_WORKSPACE_ROOT")
+}
+
 fn list_processes(project_path: Option<&Path>, all_projects: bool) -> Result<Vec<BrehonProcess>> {
-    let output = Command::new("ps")
-        .args(["eww", "-Ao", "pid=,ppid=,stat=,comm=,command="])
-        .output()
-        .context("failed to execute ps")?;
+    let mut ps = Command::new("ps");
+    ps.args(["eww", "-Ao", "pid=,ppid=,stat=,comm=,command="]);
+    strip_helper_identity_env(&mut ps);
+    let output = ps.output().context("failed to execute ps")?;
 
     if !output.status.success() {
         bail!(
@@ -239,11 +255,10 @@ fn send_signal(signal: &str, pids: &[u32]) -> Result<()> {
 
     let mut failures = Vec::new();
     for pid in pids {
-        let output = Command::new("kill")
-            .arg(signal)
-            .arg(pid.to_string())
-            .output()
-            .context("failed to execute kill")?;
+        let mut kill = Command::new("kill");
+        kill.arg(signal).arg(pid.to_string());
+        strip_helper_identity_env(&mut kill);
+        let output = kill.output().context("failed to execute kill")?;
         if output.status.success() {
             continue;
         }
@@ -422,6 +437,22 @@ pub fn execute_kill(project_path: Option<&Path>, args: &KillArgs) -> Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn helper_subprocess_strips_project_identity_env() {
+        // brehon's own ps/kill helpers must not inherit BREHON_ROOT /
+        // BREHON_WORKSPACE_ROOT, or process_matches_scope flags them as stale
+        // project agents and startup deadlocks on an un-killable phantom.
+        let mut command = Command::new("ps");
+        strip_helper_identity_env(&mut command);
+        let removed: Vec<String> = command
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(key, _)| key.to_string_lossy().into_owned())
+            .collect();
+        assert!(removed.contains(&"BREHON_ROOT".to_string()));
+        assert!(removed.contains(&"BREHON_WORKSPACE_ROOT".to_string()));
+    }
 
     #[test]
     fn parse_ps_line_extracts_session_name() {
