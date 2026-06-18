@@ -4,10 +4,12 @@
 //! and invokes AI for decisions when needed.
 
 use std::collections::HashSet;
+use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures_util::FutureExt;
 use tracing::{debug, error, info, warn};
 
 use brehon_ports::{AgentGateway, DecisionEngine, EventStore, NotificationSink, PortError};
@@ -115,27 +117,37 @@ impl Supervisor {
         self.hydrate_feedback_dedup_keys().await?;
 
         while self.running && !shutdown.load(Ordering::SeqCst) {
-            match self
-                .tick(
-                    &event_monitor,
-                    &budget_tracker,
-                    &escalation_manager,
-                    &nudge_sender,
-                    &stuck_detector,
-                    &mut heartbeat_runner,
-                )
-                .await
-            {
-                Ok(should_continue) => {
+            // tick() processes untrusted agent events; isolate a panicking
+            // iteration so one bad tick logs and the loop continues instead of
+            // unwinding out and ending the (potentially days-long) session.
+            // AssertUnwindSafe is required because tick borrows &mut self;
+            // supervisor state uses parking_lot locks (no poison), so continuing
+            // past a caught panic is sound. Relies on panic=unwind (see
+            // [profile.release] in the workspace Cargo.toml).
+            let tick = AssertUnwindSafe(self.tick(
+                &event_monitor,
+                &budget_tracker,
+                &escalation_manager,
+                &nudge_sender,
+                &stuck_detector,
+                &mut heartbeat_runner,
+            ))
+            .catch_unwind()
+            .await;
+            match tick {
+                Ok(Ok(should_continue)) => {
                     if !should_continue {
                         break;
                     }
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     error!(error = ?e, "Error in supervisor tick");
                     if self.state == SystemState::Draining {
                         break;
                     }
+                }
+                Err(_panic) => {
+                    error!("panic in supervisor tick; continuing");
                 }
             }
 
@@ -441,7 +453,138 @@ impl Supervisor {
 mod tests {
     use super::*;
     use brehon_test_harness::{InMemoryEventStore, MockDecisionEngine, MockGateway};
-    use brehon_types::SessionSpec;
+    use brehon_types::{ClaimId, EventFilter, QueueClaim, SessionSpec, ViewUpdate};
+    use std::sync::atomic::AtomicUsize;
+
+    /// Event store whose first `stream` call panics, then delegates to an inner
+    /// in-memory store. Used to prove the supervisor run loop survives a panic in
+    /// a single tick iteration instead of unwinding out and ending the session.
+    struct PanicOnceStream {
+        inner: InMemoryEventStore,
+        stream_calls: AtomicUsize,
+        shutdown: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl EventStore for PanicOnceStream {
+        async fn append(&self, event: Event) -> Result<EventId, PortError> {
+            self.inner.append(event).await
+        }
+
+        async fn append_atomic(
+            &self,
+            events: Vec<Event>,
+            views: Vec<ViewUpdate>,
+        ) -> Result<Vec<EventId>, PortError> {
+            self.inner.append_atomic(events, views).await
+        }
+
+        async fn append_and_enqueue(
+            &self,
+            event: Event,
+            queue: &str,
+            item_id: &str,
+            idempotency_key: Option<&str>,
+        ) -> Result<EventId, PortError> {
+            self.inner
+                .append_and_enqueue(event, queue, item_id, idempotency_key)
+                .await
+        }
+
+        async fn query(&self, filter: EventFilter) -> Result<Vec<Event>, PortError> {
+            self.inner.query(filter).await
+        }
+
+        async fn stream(
+            &self,
+            since: Option<EventId>,
+            limit: usize,
+        ) -> Result<Vec<(Event, EventId)>, PortError> {
+            // Startup hydration (hydrate_feedback_dedup_keys) streams with a large
+            // limit before the loop begins; let it pass through untouched so the
+            // induced panic lands inside a tick iteration, not before the loop.
+            const HYDRATE_LIMIT: usize = 1_000;
+            if limit == HYDRATE_LIMIT {
+                return self.inner.stream(since, limit).await;
+            }
+            let call = self.stream_calls.fetch_add(1, Ordering::SeqCst);
+            if call == 0 {
+                panic!("induced panic in event stream poll");
+            }
+            // Second tick: stop the loop so the test terminates deterministically.
+            self.shutdown.store(true, Ordering::SeqCst);
+            self.inner.stream(since, limit).await
+        }
+
+        async fn claim_next(
+            &self,
+            queue: &str,
+            consumer: &str,
+            lease_for: Duration,
+        ) -> Result<Option<QueueClaim>, PortError> {
+            self.inner.claim_next(queue, consumer, lease_for).await
+        }
+
+        async fn ack_claim(&self, claim_id: &ClaimId) -> Result<(), PortError> {
+            self.inner.ack_claim(claim_id).await
+        }
+
+        async fn renew_claim(
+            &self,
+            claim_id: &ClaimId,
+            lease_for: Duration,
+        ) -> Result<(), PortError> {
+            self.inner.renew_claim(claim_id, lease_for).await
+        }
+
+        async fn high_water_mark(&self) -> Result<EventId, PortError> {
+            self.inner.high_water_mark().await
+        }
+
+        async fn retain_events(&self, before: EventId) -> Result<usize, PortError> {
+            self.inner.retain_events(before).await
+        }
+
+        async fn expire_idempotency_keys(&self, older_than: Duration) -> Result<usize, PortError> {
+            self.inner.expire_idempotency_keys(older_than).await
+        }
+    }
+
+    #[tokio::test]
+    async fn supervisor_loop_survives_panicking_tick() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let store = Arc::new(PanicOnceStream {
+            inner: InMemoryEventStore::new(),
+            stream_calls: AtomicUsize::new(0),
+            shutdown: shutdown.clone(),
+        });
+        let gateway = Arc::new(MockGateway::new());
+        let decision = Arc::new(MockDecisionEngine::new());
+
+        let config = SupervisorConfig {
+            poll_interval: Duration::from_millis(1),
+            ..SupervisorConfig::default()
+        };
+        let mut supervisor = Supervisor::new(
+            config,
+            SupervisorDependencies {
+                event_store: store.clone(),
+                gateway,
+                decision_engine: decision,
+                notifications: None,
+            },
+        );
+
+        // The first tick panics inside the event-store poll. If panic isolation
+        // works, run() catches it, continues, and exits cleanly once the second
+        // tick sets the shutdown flag — so run() returns Ok rather than unwinding.
+        let result = supervisor.run(shutdown.clone()).await;
+        assert!(result.is_ok(), "run loop should survive a panicking tick");
+        assert!(
+            store.stream_calls.load(Ordering::SeqCst) >= 2,
+            "loop should have continued past the panicking first tick"
+        );
+    }
 
     #[tokio::test]
     async fn supervisor_config_defaults() {

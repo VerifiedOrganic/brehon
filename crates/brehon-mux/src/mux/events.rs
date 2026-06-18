@@ -16,6 +16,15 @@ use crate::pane::{
 use crate::pty::PtyEvent;
 use brehon_types::{PromptId, RuntimePaneBlockInfo, RuntimePaneBlockKind, RuntimePaneState};
 
+/// Result of formatting one ACP session event for the event bridge: what to
+/// forward (if anything) plus the updated "previous output" tracking flags.
+struct AcpBridgeEventOutput {
+    entry: Option<ActivityEntry>,
+    data: Option<Vec<u8>>,
+    last_event_was_output: bool,
+    last_output_ended_with_newline: bool,
+}
+
 impl Mux {
     const TERMINAL_PROMPT_PREFILTER_TAIL_CHARS: usize = 64;
     const TERMINAL_PROMPT_PREFILTER_TAIL_BYTES: usize =
@@ -1532,17 +1541,41 @@ impl Mux {
             let mut last_event_was_output = false;
             let mut last_output_ended_with_newline = true;
             while let Some(event) = rx.recv().await {
-                let (event, suppress_formatted_output) =
-                    normalize_gateway_tool_event(event, &mut active_tool_names);
-                let is_output = matches!(event, brehon_acp::updates::SessionEvent::Output { .. });
-                let output_ended_with_newline = match &event {
-                    brehon_acp::updates::SessionEvent::Output { text, .. } => {
-                        text.ends_with('\n') || text.ends_with('\r')
+                // Panic firewall: the per-event formatting below runs over
+                // untrusted, agent-produced session events. A panic in
+                // normalize/format/prefix logic must NOT unwind out and
+                // silently kill this pane's event-forwarding task (its
+                // JoinHandle is dropped, so nothing would observe the death).
+                // We isolate the PURE formatting in catch_unwind and keep the
+                // two `event_tx.send(...).await` sends OUTSIDE it (their order
+                // and the channel ordering are unchanged). AssertUnwindSafe is
+                // sound: on a caught panic we skip this one event and continue;
+                // `active_tool_names` is only a display-name cache, so a
+                // partially-mutated map is harmless. See
+                // docs/adr/0009-panic-unwind-firewalls.md.
+                let formatted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    Self::format_acp_bridge_event(
+                        event,
+                        &mut active_tool_names,
+                        last_event_was_output,
+                        last_output_ended_with_newline,
+                    )
+                }));
+                let formatted = match formatted {
+                    Ok(formatted) => formatted,
+                    Err(_panic) => {
+                        tracing::error!(
+                            pane = %pane_id_str,
+                            "panic formatting ACP event; skipping"
+                        );
+                        continue;
                     }
-                    _ => false,
                 };
 
-                if let Some(entry) = session_event_to_activity_entry(&event) {
+                last_event_was_output = formatted.last_event_was_output;
+                last_output_ended_with_newline = formatted.last_output_ended_with_newline;
+
+                if let Some(entry) = formatted.entry {
                     let _ = event_tx
                         .send(MuxEvent::ActivityEvent {
                             pane_id: pane_id_str.clone(),
@@ -1552,20 +1585,7 @@ impl Mux {
                         .await;
                 }
 
-                if !suppress_formatted_output
-                    && let Some(mut data) = format_acp_session_event(&event)
-                {
-                    if Self::should_prefix_output_after_hidden_boundary(
-                        &event,
-                        &data,
-                        last_event_was_output,
-                        last_output_ended_with_newline,
-                    ) {
-                        let mut prefixed = Vec::with_capacity(data.len() + 2);
-                        prefixed.extend_from_slice(b"\r\n");
-                        prefixed.extend_from_slice(&data);
-                        data = prefixed;
-                    }
+                if let Some(data) = formatted.data {
                     let _ = event_tx
                         .send(MuxEvent::PaneOutput {
                             pane_id: pane_id_str.clone(),
@@ -1573,13 +1593,6 @@ impl Mux {
                             generation,
                         })
                         .await;
-                }
-
-                if is_output {
-                    last_event_was_output = true;
-                    last_output_ended_with_newline = output_ended_with_newline;
-                } else {
-                    last_event_was_output = false;
                 }
             }
 
@@ -1590,6 +1603,64 @@ impl Mux {
                 })
                 .await;
         });
+    }
+
+    /// Pure (sync, no-IO) per-event formatting for the ACP event bridge.
+    ///
+    /// Splitting this out of [`Self::spawn_acp_event_bridge`] lets the bridge
+    /// wrap the untrusted formatting in `catch_unwind` while keeping the
+    /// `.await` channel sends outside the firewall. Returns the activity
+    /// entry / formatted pane output to send (if any) plus the updated
+    /// "previous output" tracking flags.
+    fn format_acp_bridge_event(
+        event: brehon_acp::updates::SessionEvent,
+        active_tool_names: &mut HashMap<String, String>,
+        last_event_was_output: bool,
+        last_output_ended_with_newline: bool,
+    ) -> AcpBridgeEventOutput {
+        let (event, suppress_formatted_output) =
+            normalize_gateway_tool_event(event, active_tool_names);
+        let is_output = matches!(event, brehon_acp::updates::SessionEvent::Output { .. });
+        let output_ended_with_newline = match &event {
+            brehon_acp::updates::SessionEvent::Output { text, .. } => {
+                text.ends_with('\n') || text.ends_with('\r')
+            }
+            _ => false,
+        };
+
+        let entry = session_event_to_activity_entry(&event);
+
+        let data = if !suppress_formatted_output {
+            format_acp_session_event(&event).map(|mut data| {
+                if Self::should_prefix_output_after_hidden_boundary(
+                    &event,
+                    &data,
+                    last_event_was_output,
+                    last_output_ended_with_newline,
+                ) {
+                    let mut prefixed = Vec::with_capacity(data.len() + 2);
+                    prefixed.extend_from_slice(b"\r\n");
+                    prefixed.extend_from_slice(&data);
+                    data = prefixed;
+                }
+                data
+            })
+        } else {
+            None
+        };
+
+        let (next_last_event_was_output, next_last_output_ended_with_newline) = if is_output {
+            (true, output_ended_with_newline)
+        } else {
+            (false, last_output_ended_with_newline)
+        };
+
+        AcpBridgeEventOutput {
+            entry,
+            data,
+            last_event_was_output: next_last_event_was_output,
+            last_output_ended_with_newline: next_last_output_ended_with_newline,
+        }
     }
 
     pub(crate) fn should_prefix_output_after_hidden_boundary(
@@ -1761,5 +1832,94 @@ impl Mux {
     /// Receive the next event (blocking)
     pub async fn recv(&mut self) -> Option<MuxEvent> {
         self.event_rx.recv().await
+    }
+}
+
+#[cfg(test)]
+mod acp_bridge_tests {
+    use super::*;
+    use brehon_acp::updates::SessionEvent;
+    use brehon_types::SessionId;
+
+    fn output(text: &str) -> SessionEvent {
+        SessionEvent::Output {
+            session_id: SessionId::new("session-1"),
+            text: text.to_string(),
+        }
+    }
+
+    /// The pure formatting extracted for the ACP-bridge panic firewall must
+    /// preserve the original loop's behavior: a plain Output event yields
+    /// forwarded pane data and updates the "previous output" tracking flags.
+    #[test]
+    fn format_acp_bridge_event_passes_output_through_and_tracks_state() {
+        let mut active_tool_names = HashMap::new();
+        let result =
+            Mux::format_acp_bridge_event(output("hello\n"), &mut active_tool_names, false, true);
+
+        assert!(
+            result.data.is_some(),
+            "plain output must be forwarded as pane data"
+        );
+        assert!(
+            result.last_event_was_output,
+            "an Output event must mark last_event_was_output"
+        );
+        assert!(
+            result.last_output_ended_with_newline,
+            "output ending in newline must set the newline flag"
+        );
+    }
+
+    /// A non-output event clears `last_event_was_output` but leaves the
+    /// newline flag untouched — mirroring the original inline loop semantics
+    /// (only the `false` branch updated `last_event_was_output`).
+    #[test]
+    fn format_acp_bridge_event_non_output_preserves_newline_flag() {
+        let mut active_tool_names = HashMap::new();
+        let prior_newline = true;
+        let result = Mux::format_acp_bridge_event(
+            SessionEvent::Progress {
+                session_id: SessionId::new("session-1"),
+                message: "working".to_string(),
+                percent: None,
+            },
+            &mut active_tool_names,
+            true,
+            prior_newline,
+        );
+
+        assert!(
+            !result.last_event_was_output,
+            "a non-output event must clear last_event_was_output"
+        );
+        assert_eq!(
+            result.last_output_ended_with_newline, prior_newline,
+            "a non-output event must leave the newline flag unchanged"
+        );
+    }
+
+    /// The firewall used by `spawn_acp_event_bridge`: a panic in the pure
+    /// formatting is caught so the bridge skips one event and keeps running
+    /// instead of silently dying. We prove the `catch_unwind` shape isolates
+    /// a panic and that a normal call still succeeds afterwards.
+    #[test]
+    fn format_acp_bridge_event_panic_is_catchable() {
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            panic!("simulated formatting panic");
+        }))
+        .is_err();
+        assert!(caught, "a formatting panic must be catchable, not fatal");
+
+        // After a caught panic the bridge continues; the next event still
+        // formats normally.
+        let mut active_tool_names = HashMap::new();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Mux::format_acp_bridge_event(output("after\n"), &mut active_tool_names, false, true)
+        }));
+        assert!(
+            result.is_ok(),
+            "a normal event after a caught panic must still format"
+        );
     }
 }

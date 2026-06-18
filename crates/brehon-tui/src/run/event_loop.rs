@@ -3531,7 +3531,20 @@ pub(super) fn run(ctx: &mut EventLoopCtx) -> io::Result<()> {
             }
         }
 
-        detect_and_handle_supervisor_resets(ctx, &batch_events, loop_now);
+        // Panic firewall around the untrusted-event-driven supervisor reset
+        // seam: `batch_events` carries agent-produced pane output, so a panic
+        // in reset detection must not tear down the run loop. The fn returns
+        // () and recomputes its candidates from `batch_events`/`ctx` each
+        // tick, so continuing after a caught panic is sound. The `?`/break/
+        // continue IO paths in this loop body intentionally stay UNWRAPPED —
+        // a terminal/IO failure is a legitimate stop condition.
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            detect_and_handle_supervisor_resets(ctx, &batch_events, loop_now)
+        }))
+        .is_err()
+        {
+            tracing::error!("panic in supervisor reset detection; continuing event loop");
+        }
 
         // Determine which left pane is active
         let active_left_id = active_left_pane_id(ctx);
@@ -3995,8 +4008,29 @@ pub(super) fn run(ctx: &mut EventLoopCtx) -> io::Result<()> {
             ctx.last_session_poll = std::time::Instant::now();
         }
 
-        super::stall_handling::detect_and_handle_stalls(ctx);
-        super::budget::budget_tick(ctx);
+        // Panic firewalls around the periodic ticks: a panic in stall
+        // detection or the budget kill-switch must NOT unwind out of the
+        // run loop and end a multi-day unattended session. AssertUnwindSafe
+        // is sound here because both fns return () and mutate only plain
+        // ctx fields with no cross-field invariant a half-finished tick
+        // would corrupt: stall detection recomputes from `ctx` every tick,
+        // and the budget teardown is latched idempotent via
+        // `ctx.budget_torn_down`, so re-running next tick after a caught
+        // panic cannot double-act. See docs/adr/0009-panic-unwind-firewalls.md.
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            super::stall_handling::detect_and_handle_stalls(ctx)
+        }))
+        .is_err()
+        {
+            tracing::error!("panic in detect_and_handle_stalls; continuing event loop");
+        }
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            super::budget::budget_tick(ctx)
+        }))
+        .is_err()
+        {
+            tracing::error!("panic in budget_tick; continuing event loop");
+        }
     }
 
     Ok(())
@@ -9230,5 +9264,56 @@ TypeError: Cannot read properties of undefined"#,
             .join("norma-war-room.json");
         let room = std::fs::read_to_string(room_path).expect("room file");
         assert!(room.contains("@quick-cod-72 can you sanity check"));
+    }
+
+    /// Fix C firewall: a panic inside a per-tick body must NOT unwind out of
+    /// the run loop and end the unattended session. This mirrors the exact
+    /// `catch_unwind(AssertUnwindSafe(..))` structure used around the
+    /// stall/budget/supervisor-reset ticks in [`run`]: a panicking tick on
+    /// one iteration is caught, logged, and the loop proceeds to the next
+    /// iteration and exits cleanly.
+    #[test]
+    fn panicking_tick_does_not_tear_down_loop() {
+        let shutdown = std::sync::atomic::AtomicBool::new(false);
+        // Counts ticks that ran to completion AFTER a panicking one, proving
+        // the loop survived the panic rather than unwinding out.
+        let mut completed_after_panic = 0_u32;
+        let mut iteration = 0_u32;
+
+        // Drive the same shape as `run`: a `while !shutdown` loop whose tick
+        // body is wrapped in the panic firewall.
+        while !shutdown.load(Ordering::Relaxed) {
+            iteration += 1;
+
+            let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                // Iteration 1 panics (simulating a bad untrusted-event tick);
+                // later iterations do real "work".
+                if iteration == 1 {
+                    panic!("simulated tick panic");
+                }
+                completed_after_panic += 1;
+            }))
+            .is_err();
+
+            assert_eq!(
+                caught,
+                iteration == 1,
+                "only the first (panicking) iteration should be caught"
+            );
+
+            // Independent latched stop, like `ctx.shutdown`: stop after a few
+            // iterations so the test terminates deterministically.
+            if iteration >= 3 {
+                shutdown.store(true, Ordering::Relaxed);
+            }
+        }
+
+        // The loop kept going past the panicking iteration and ran the
+        // subsequent ticks to completion.
+        assert_eq!(iteration, 3, "loop must survive the panic and keep ticking");
+        assert_eq!(
+            completed_after_panic, 2,
+            "ticks after the panicking one must still run to completion"
+        );
     }
 }

@@ -34,3 +34,4 @@ Each ADR uses this structure:
 | [0006](0006-fjall-tantivy.md) | Fjall as the only event store, Tantivy as the derived index | Accepted |
 | [0007](0007-in-process-multiplexer.md) | In-process PTY multiplexer with ghostty_vt, not tmux/Zellij | Accepted |
 | [0008](0008-local-first.md) | Local-first operation; no cloud dependencies, no telemetry | Accepted |
+| [0009](0009-panic-unwind-firewalls.md) | panic=unwind is load-bearing; panic="abort" is forbidden | Accepted |
