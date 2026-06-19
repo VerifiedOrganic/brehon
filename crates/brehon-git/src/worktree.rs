@@ -178,13 +178,6 @@ impl<'a> WorktreeOps<'a> {
         // Verify worktree state before attempting removal
         if let Ok(wt_path) = worktree.path().canonicalize() {
             let repo = Repository::open(&wt_path)?;
-            let tracked_changes = tracked_dirty_files(&repo)?;
-            if !tracked_changes.is_empty() {
-                let details = summarize_paths(&tracked_changes);
-                return Err(GitError::WorktreeRemovalFailed(format!(
-                    "worktree has tracked changes ({details}) - use archive_worktree instead"
-                )));
-            }
             // Check for mid-operation states
             if let Some(state) = repository_operation_state(&repo) {
                 return Err(GitError::WorktreeRemovalFailed(format!(
@@ -192,6 +185,13 @@ impl<'a> WorktreeOps<'a> {
                 )));
             }
             self.clean_worktree_untracked_and_ignored(&wt_path, WorktreeCleanMode::Final)?;
+            let tracked_changes = tracked_dirty_files(&repo)?;
+            if !tracked_changes.is_empty() {
+                let details = summarize_paths(&tracked_changes);
+                return Err(GitError::WorktreeRemovalFailed(format!(
+                    "worktree has tracked changes ({details}) - use archive_worktree instead"
+                )));
+            }
         }
 
         worktree.prune(Some(&mut git2::WorktreePruneOptions::new().valid(true)))?;
@@ -1091,24 +1091,23 @@ mod tests {
         let worktree_path = test_worktree_path(&temp_dir, "tracked-dirty-worktree");
 
         ops.create_worktree(&branch_name, &worktree_path)
-            .expect("create should succeed");
-        std::fs::write(worktree_path.join("tracked.txt"), "tracked")
-            .expect("failed to write tracked file");
+            .expect("create");
+        std::fs::write(worktree_path.join("tracked.txt"), "tracked").expect("write tracked");
+        std::fs::create_dir_all(worktree_path.join("target/debug")).expect("target dir");
+        std::fs::write(worktree_path.join("target/debug/app"), "compiled").expect("artifact");
         let wt_repo = Repository::open(&worktree_path).expect("failed to open worktree repo");
         let mut index = wt_repo.index().expect("failed to open worktree index");
         index
             .add_path(Path::new("tracked.txt"))
-            .expect("failed to stage tracked file");
+            .expect("stage file");
         index.write().expect("failed to write index");
 
-        let result = ops.remove_worktree(&worktree_path);
-
-        assert!(result.is_err(), "tracked changes should block removal");
-        assert!(
-            result.unwrap_err().to_string().contains("tracked changes"),
-            "error should explain tracked-change guard"
-        );
-        assert!(worktree_path.exists());
+        let err = ops
+            .remove_worktree(&worktree_path)
+            .expect_err("tracked changes")
+            .to_string();
+        assert!(err.contains("tracked changes"));
+        assert!(worktree_path.exists() && !worktree_path.join("target").exists());
     }
 
     #[test]

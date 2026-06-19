@@ -1,3 +1,4 @@
+mod agent_env;
 mod direct_tools;
 mod review;
 mod setup;
@@ -15,6 +16,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use agent_env::{
+    apply_agent_cargo_target_env, apply_agent_runtime_tmp_env, cleanup_session_runtime_tmp_dir,
+};
 use anyhow::Result;
 use async_trait::async_trait;
 use direct_tools::BrehonDirectToolBridgeFactory;
@@ -41,56 +45,6 @@ const EXPERIMENTAL_TERMINAL_HOST_EAGER_GATEWAY_BOOTSTRAP_ENV: &str =
 const TERMINAL_HOST_PREVIEW_PANE_ID: &str = "host-preview";
 const TERMINAL_HOST_STARTUP_PROMPT_DELAY_SECS: u64 = 5;
 const TERMINAL_HOST_STARTUP_PROMPT_STAGGER_MILLIS: u64 = 400;
-
-fn set_env_pair(pairs: &mut Vec<(String, String)>, key: &str, value: String) {
-    if let Some((_, existing)) = pairs.iter_mut().find(|(env_key, _)| env_key == key) {
-        *existing = value;
-    } else {
-        pairs.push((key.to_string(), value));
-    }
-}
-
-fn safe_target_component(value: &str, fallback: &str) -> String {
-    let sanitized = value
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
-                ch
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>()
-        .trim_matches('-')
-        .to_string();
-    if sanitized.is_empty() {
-        fallback.to_string()
-    } else {
-        sanitized
-    }
-}
-
-fn cargo_target_dir(root: &Path, role: &str, name: &str) -> PathBuf {
-    root.join(safe_target_component(role, "role"))
-        .join(safe_target_component(name, "agent"))
-}
-
-fn apply_agent_cargo_target_env(
-    env: &mut Vec<(String, String)>,
-    cargo_target_root: Option<&Path>,
-    role: &str,
-    name: &str,
-) {
-    let Some(root) = cargo_target_root else {
-        return;
-    };
-    let target_dir = cargo_target_dir(root, role, name);
-    set_env_pair(
-        env,
-        "CARGO_TARGET_DIR",
-        target_dir.to_string_lossy().to_string(),
-    );
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TerminalHostPreviewPane {
@@ -1622,6 +1576,13 @@ pub async fn execute(
                 "worker",
                 &name,
             );
+            apply_agent_runtime_tmp_env(
+                &mut worker_env,
+                &runtime_worktree_root,
+                &session_name,
+                "worker",
+                &name,
+            )?;
             worker_env_map.insert(name.clone(), worker_env);
             if let Some(effort) = reasoning_effort {
                 worker_reasoning_effort_map.insert(name.clone(), effort.to_string());
@@ -1682,6 +1643,13 @@ pub async fn execute(
                 "reviewer",
                 &name,
             );
+            apply_agent_runtime_tmp_env(
+                &mut reviewer_env,
+                &runtime_worktree_root,
+                &session_name,
+                "reviewer",
+                &name,
+            )?;
             reviewer_env_map.insert(name.clone(), reviewer_env);
             if let Some(effort) = reasoning_effort {
                 reviewer_reasoning_effort_map.insert(name.clone(), effort.to_string());
@@ -1734,6 +1702,13 @@ pub async fn execute(
                     "advisor",
                     &name,
                 );
+                apply_agent_runtime_tmp_env(
+                    &mut advisor_env,
+                    &runtime_worktree_root,
+                    &session_name,
+                    "advisor",
+                    &name,
+                )?;
                 advisor_env_map.insert(name.clone(), advisor_env);
                 if let Some(effort) = reasoning_effort {
                     advisor_reasoning_effort_map.insert(name.clone(), effort.to_string());
@@ -1785,6 +1760,13 @@ pub async fn execute(
                     "research",
                     &name,
                 );
+                apply_agent_runtime_tmp_env(
+                    &mut research_env,
+                    &runtime_worktree_root,
+                    &session_name,
+                    "research",
+                    &name,
+                )?;
                 research_env_map.insert(name.clone(), research_env);
                 if let Some(effort) = reasoning_effort {
                     research_reasoning_effort_map.insert(name.clone(), effort.to_string());
@@ -2040,6 +2022,13 @@ pub async fn execute(
         "supervisor",
         &config.roles.supervisor.name,
     );
+    apply_agent_runtime_tmp_env(
+        &mut supervisor_env,
+        &runtime_worktree_root,
+        &session_name,
+        "supervisor",
+        &config.roles.supervisor.name,
+    )?;
     let runtime_policy_gate: Arc<dyn PolicyGate> =
         Arc::new(brehon_policy::BasicPolicyGate::default());
     let RuntimeTerminalHostWiring {
@@ -3120,6 +3109,9 @@ pub async fn execute(
         cleanup_scoped_worktrees(&cwd, &research_cwds).await;
     }
 
+    progress.step("Cleaning up runtime temp files...");
+    cleanup_session_runtime_tmp_dir(&runtime_worktree_root, &session_name).await;
+
     if let Some(default_branch) = shared_root_default_branch.as_deref() {
         progress.step(format!(
             "Restoring shared root branch to '{}'...",
@@ -3247,40 +3239,6 @@ mod tests {
             max_wall_clock_minutes: None,
         };
         assert!(budget_enforcement_off_warning(&cfg).is_none());
-    }
-
-    #[test]
-    fn cargo_target_dir_is_role_and_agent_scoped() {
-        let root = Path::new("/tmp/brehon-cargo-targets");
-        assert_eq!(
-            cargo_target_dir(root, "worker", "swift-fox-94"),
-            PathBuf::from("/tmp/brehon-cargo-targets/worker/swift-fox-94")
-        );
-        assert_eq!(
-            cargo_target_dir(root, "reviewer/panel", "bad/name"),
-            PathBuf::from("/tmp/brehon-cargo-targets/reviewer-panel/bad-name")
-        );
-    }
-
-    #[test]
-    fn apply_agent_cargo_target_env_overrides_launcher_target_dir() {
-        let mut env = vec![(
-            "CARGO_TARGET_DIR".to_string(),
-            "/old/shared-target".to_string(),
-        )];
-
-        apply_agent_cargo_target_env(
-            &mut env,
-            Some(Path::new("/tmp/brehon-cargo-targets")),
-            "worker",
-            "worker-1",
-        );
-
-        assert_eq!(
-            env.iter()
-                .find_map(|(key, value)| (key == "CARGO_TARGET_DIR").then_some(value.as_str())),
-            Some("/tmp/brehon-cargo-targets/worker/worker-1")
-        );
     }
 
     #[test]
