@@ -26,14 +26,14 @@ use std::time::{Duration, Instant};
 /// `crates/brehon-pty/src/pty/core.rs`) until the next tick drains them.
 ///
 /// See § F8b in `tmp/tick-latency/GOAL_PROMPT.md`.
-const DRAIN_OUTPUT_MAX_BYTES_PER_CALL: usize = 256 * 1024;
+const DRAIN_OUTPUT_MAX_BYTES_PER_CALL: usize = 64 * 1024;
 
 /// Maximum number of `PtyEvent`s drained per `Pane::drain_output` call.
 /// Bounds wall-time even when each event is small (e.g. a burst of CPR
 /// queries or empty outputs from a sync-filtered Ink frame) — without
 /// this cap, the byte-budget alone could be defeated by thousands of
 /// tiny events that don't accumulate bytes but still cost FFI feeds.
-const DRAIN_OUTPUT_MAX_EVENTS_PER_CALL: usize = 64;
+const DRAIN_OUTPUT_MAX_EVENTS_PER_CALL: usize = 32;
 
 /// Result of one budgeted drain pass. Returned from
 /// `drain_events_with_budget` so `Pane::drain_output` can apply
@@ -783,16 +783,20 @@ mod budget_tests {
             !second.coalesced.is_empty(),
             "second drain returned no bytes — first call drained beyond cap"
         );
+        let mut total_drained = first.coalesced.len() + second.coalesced.len();
+        loop {
+            let next = drain_events_with_budget(
+                &recv,
+                DRAIN_OUTPUT_MAX_BYTES_PER_CALL,
+                DRAIN_OUTPUT_MAX_EVENTS_PER_CALL,
+            );
+            if next.coalesced.is_empty() {
+                break;
+            }
+            total_drained += next.coalesced.len();
+        }
         assert_eq!(
-            first.coalesced.len()
-                + second.coalesced.len()
-                + drain_events_with_budget(
-                    &recv,
-                    DRAIN_OUTPUT_MAX_BYTES_PER_CALL,
-                    DRAIN_OUTPUT_MAX_EVENTS_PER_CALL,
-                )
-                .coalesced
-                .len(),
+            total_drained,
             CHUNK * TOTAL_CHUNKS,
             "bytes lost or duplicated across budgeted drains"
         );

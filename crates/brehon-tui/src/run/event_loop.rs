@@ -3260,7 +3260,9 @@ pub(super) fn new_headless_event_loop_ctx(
 }
 
 pub(super) fn run(ctx: &mut EventLoopCtx) -> io::Result<()> {
+    let mut last_slow_tick_warn = Instant::now() - Duration::from_secs(60);
     while !ctx.shutdown.load(Ordering::Relaxed) {
+        let tick_started_at = Instant::now();
         drain_runtime_command_receiver(ctx);
         drain_runtime_events_from_daemon(ctx);
 
@@ -3282,7 +3284,7 @@ pub(super) fn run(ctx: &mut EventLoopCtx) -> io::Result<()> {
         let panesmith_snapshot_panes =
             visible_panesmith_snapshot_panes(ctx, visible_active_left_id.as_deref());
 
-        let (_total_bytes, batch_events) = ctx
+        let (total_bytes, batch_events) = ctx
             .mux
             .poll_batch_with_panesmith_snapshot_panes(&panesmith_snapshot_panes);
         ctx.mux.flush_pending_inbox_nudges(&ctx.rt);
@@ -4034,6 +4036,20 @@ pub(super) fn run(ctx: &mut EventLoopCtx) -> io::Result<()> {
         .is_err()
         {
             tracing::error!("panic in budget_tick; continuing event loop");
+        }
+
+        let tick_elapsed = tick_started_at.elapsed();
+        if tick_elapsed >= Duration::from_millis(250)
+            && last_slow_tick_warn.elapsed() >= Duration::from_secs(10)
+        {
+            tracing::warn!(
+                elapsed_ms = tick_elapsed.as_millis(),
+                mux_output_bytes = total_bytes,
+                mux_events = batch_events.len(),
+                pending_prompts = ctx.mux.pending_delayed_prompt_count(),
+                "slow TUI event loop tick"
+            );
+            last_slow_tick_warn = Instant::now();
         }
     }
 

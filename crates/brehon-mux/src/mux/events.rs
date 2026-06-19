@@ -785,7 +785,7 @@ impl Mux {
         Self::runtime_state_change(previous, pane.pane_state(), "activity ready")
     }
 
-    fn apply_queued_event(&mut self, event: &MuxEvent) -> bool {
+    pub(super) fn apply_queued_event(&mut self, event: &MuxEvent) -> bool {
         match event {
             MuxEvent::PaneOutput {
                 pane_id,
@@ -1320,11 +1320,12 @@ impl Mux {
         }
     }
 
-    /// Tick the pane state machine and dispatch at most one queued prompt per
-    /// pane that is currently `Ready`.
+    /// Tick the pane state machine and dispatch queued prompts for ready panes.
     ///
     /// Busy → Ready transitions are applied via `Pane::tick_state_machine`
-    /// before dispatch selection.
+    /// before dispatch selection. Prompt dispatch is bounded per tick so
+    /// startup fan-out cannot block the TUI loop on many synchronous delivery
+    /// attempts in one frame.
     pub fn tick_pane_state_machine(&mut self, rt: &tokio::runtime::Handle) {
         self.tick_pane_state_machine_at(rt, Instant::now());
     }
@@ -1340,6 +1341,7 @@ impl Mux {
 
     fn tick_pane_state_machine_impl(&mut self, rt: &tokio::runtime::Handle, now: Instant) {
         let pane_ids: Vec<String> = self.panes.keys().cloned().collect();
+        let mut prompt_dispatches = 0usize;
         for pane_id in pane_ids {
             self.tick_agy_or_opencode_supervisor_recovery(rt, &pane_id, now);
 
@@ -1369,8 +1371,11 @@ impl Mux {
             let pane_ready = self.panes.get(&pane_id).is_some_and(|pane| {
                 matches!(pane.pane_state(), None | Some(PaneState::Ready { .. }))
             });
-            if pane_ready {
-                self.try_dispatch_next_ready_queued_prompt(rt, &pane_id, now);
+            if pane_ready
+                && prompt_dispatches < super::types::MAX_READY_PROMPT_DISPATCHES_PER_TICK
+                && self.try_dispatch_next_ready_queued_prompt(rt, &pane_id, now)
+            {
+                prompt_dispatches += 1;
             }
         }
     }
@@ -1446,9 +1451,9 @@ impl Mux {
         rt: &tokio::runtime::Handle,
         pane_id: &str,
         now: Instant,
-    ) {
+    ) -> bool {
         let Some(queued) = self.take_next_ready_queued_prompt(pane_id, now) else {
-            return;
+            return false;
         };
         let QueuedPrompt {
             prompt_id,
@@ -1515,6 +1520,7 @@ impl Mux {
                 );
             }
         }
+        true
     }
 
     pub(super) fn spawn_acp_event_bridge(
@@ -1766,19 +1772,7 @@ impl Mux {
         let mut events = Vec::new();
         let mut total_bytes = 0;
 
-        // First drain the event queue
-        for _ in 0..self.max_queued_events_per_poll {
-            let Ok(event) = self.event_rx.try_recv() else {
-                break;
-            };
-            if !self.apply_queued_event(&event) {
-                continue;
-            }
-            if let MuxEvent::PaneOutput { data, .. } = &event {
-                total_bytes += data.len();
-            }
-            events.push(event);
-        }
+        self.drain_queued_events_for_poll(&mut events, &mut total_bytes);
 
         while let Some(event) = self.pending_panesmith_events.pop_front() {
             events.push(event);
@@ -1790,37 +1784,7 @@ impl Mux {
             None => events.extend(self.drain_panesmith_events_to_mux()),
         }
 
-        // Drain each pane using coalesced output (more efficient for high throughput)
-        for (id, pane) in self.panes.iter_mut() {
-            let (data, other_events) = pane.drain_output();
-            let generation = pane.current_generation();
-
-            if !data.is_empty() {
-                total_bytes += data.len();
-                // Include raw data for WebSocket clients
-                events.push(MuxEvent::PaneOutput {
-                    pane_id: id.clone(),
-                    data,
-                    generation,
-                });
-            }
-
-            // Forward non-output events
-            for event in other_events {
-                match event {
-                    PtyEvent::Exited(code) => {
-                        events.push(MuxEvent::PaneExited {
-                            pane_id: id.clone(),
-                            exit_code: code,
-                        });
-                    }
-                    PtyEvent::Error(e) => {
-                        tracing::error!("PTY error in pane {}: {}", id, e);
-                    }
-                    _ => {}
-                }
-            }
-        }
+        self.drain_pane_outputs_for_poll(&mut events, &mut total_bytes);
 
         for event in &events {
             self.publish_runtime_event_for_mux_event(event);

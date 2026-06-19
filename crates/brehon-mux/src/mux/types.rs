@@ -214,10 +214,20 @@ pub(super) const STARTUP_PROMPT_STAGGER_MILLIS: u64 = 400;
 ///
 /// This prevents chatty gateway sessions from starving the TUI render loop.
 pub(super) const DEFAULT_MAX_QUEUED_EVENTS_PER_POLL: usize = 256;
+/// Hard cap for queued events drained in one UI poll.
+pub(super) const MAX_QUEUED_EVENTS_PER_POLL: usize = 512;
+/// Maximum PTY/output bytes to process in one mux batch across all panes.
+///
+/// Pane-level drains stay individually bounded; this global cap prevents the
+/// sum of many active panes from turning one TUI tick into a large terminal
+/// parsing/rendering batch. Leftover bytes remain queued for later ticks.
+pub(super) const MAX_OUTPUT_BYTES_PER_POLL: usize = 256 * 1024;
 /// Default event channel capacity.
 pub(super) const DEFAULT_EVENT_CHANNEL_CAPACITY: usize = 256;
 /// Events per worker to add to the channel capacity and poll limit.
 pub(super) const EVENTS_PER_WORKER: usize = 128;
+/// Maximum delayed prompts synchronously dispatched from one state-machine tick.
+pub(super) const MAX_READY_PROMPT_DISPATCHES_PER_TICK: usize = 2;
 /// Minimum quiet time before sending a Claude Teams nudge.
 pub(super) const TEAMS_NUDGE_QUIET_THRESHOLD: std::time::Duration =
     std::time::Duration::from_millis(800);

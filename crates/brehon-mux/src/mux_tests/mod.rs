@@ -11,6 +11,7 @@ mod factory;
 mod opencode_recovery;
 mod scoping;
 mod suppression;
+mod tick_budget;
 
 pub fn fresh_temp_dir(prefix: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
