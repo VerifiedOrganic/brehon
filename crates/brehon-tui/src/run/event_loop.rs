@@ -435,6 +435,7 @@ pub(crate) enum RecoveryResetMarker {
 }
 
 const ENTRY_CHROME_FADE_DURATION: Duration = Duration::from_millis(200);
+const MAX_STALL_SCAN_ACTIVITY_DEFERRAL: Duration = Duration::from_secs(180);
 
 fn perform_manual_reset_request(ctx: &mut EventLoopCtx, pane_id: &str) -> bool {
     let Some((startup_prompt, success_message)) = manual_reset_plan(ctx, pane_id) else {
@@ -4038,7 +4039,23 @@ pub(super) fn run(ctx: &mut EventLoopCtx) -> io::Result<()> {
         // and the budget teardown is latched idempotent via
         // `ctx.budget_torn_down`, so re-running next tick after a caught
         // panic cannot double-act. See docs/adr/0009-panic-unwind-firewalls.md.
-        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let defer_stall_scan_for_activity = total_bytes > 0
+            || !batch_events.is_empty()
+            || !ctx.pending_queued_gateway_prompt_deliveries.is_empty();
+        let stall_scan_deferred_too_long = ctx.last_stall_check.elapsed()
+            >= ctx
+                .stall_check_interval
+                .saturating_add(MAX_STALL_SCAN_ACTIVITY_DEFERRAL);
+        if defer_stall_scan_for_activity && !stall_scan_deferred_too_long {
+            tracing::debug!(
+                mux_output_bytes = total_bytes,
+                mux_events = batch_events.len(),
+                pending_prompts = ctx.mux.pending_delayed_prompt_count(),
+                pending_gateway_prompt_deliveries =
+                    ctx.pending_queued_gateway_prompt_deliveries.len(),
+                "deferred heavy stall scan while TUI is processing active output or prompt fan-out"
+            );
+        } else if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             super::stall_handling::detect_and_handle_stalls(ctx)
         }))
         .is_err()

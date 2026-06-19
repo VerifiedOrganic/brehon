@@ -48,7 +48,8 @@ fn state_machine_caps_ready_prompt_dispatches_per_tick() {
         "only the bounded number of ready prompts should be attempted per tick"
     );
     assert_eq!(
-        still_due, 1,
+        still_due,
+        3usize.saturating_sub(super::super::types::MAX_READY_PROMPT_DISPATCHES_PER_TICK),
         "remaining due prompt should wait for next tick"
     );
     assert_eq!(
