@@ -896,6 +896,18 @@ own point on the same dials.
 - **Escalation.** `escalation.human_in_loop: true` keeps *you* as the final
   backstop when the robots are out of moves. Leave this on until you have a very
   good reason not to.
+- **External notifications.** `notifications` can send subscribed state changes
+  to Telegram. Enable the provider, expose `BREHON_TELEGRAM_BOT_TOKEN` and
+  `BREHON_TELEGRAM_CHAT_ID`, then subscribe to the events you care about:
+  `run.started`, `run.shutdown`, `run.crash_detected`, `run.health_warning`,
+  `task.completed`, `task.closed`, `task.blocked`, `epic.completed`,
+  `integration.started`, `integration.completed`, `integration.failed`,
+  `review.approved`, `review.rejected`, `budget.warning`,
+  `budget.kill_switch`, `recovery.performed`, and `agent.stalled`. Brehon queues
+  notification events under `.brehon/runtime/notifications/outbox` and the main
+  run process drains that outbox, so task MCP state changes do not need provider
+  secrets. Repeated delivery failures move to `.brehon/runtime/notifications/failed`
+  for inspection.
 
 ### "I want it faster / more parallel"
 

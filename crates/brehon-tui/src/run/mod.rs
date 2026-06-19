@@ -56,6 +56,7 @@ mod refresh;
 mod rendering;
 pub mod research;
 mod reviewer_selection;
+mod run_health;
 mod run_state_detail;
 mod self_improvement;
 mod session;
@@ -117,8 +118,6 @@ use session::*;
 #[allow(unused_imports)]
 use task_detail::*;
 
-// ── External imports for the main loop ──────────────────────────────────────
-
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -135,8 +134,6 @@ use brehon_types::config::{OrchestrationConfig, WorkerIdleBehavior};
 use terminal_guard::{
     enter_dashboard_terminal_session, restore_terminal_session, TerminalSessionGuard,
 };
-
-// ── Main loop ───────────────────────────────────────────────────────────────
 
 /// Run the TUI with default settings (no reviewer panels, empty dashboard).
 /// Build a `ProjectConfigLoader` that always returns `None`. Used by callers
@@ -513,6 +510,8 @@ pub fn run_tui_with_panels_and_runtime_commands(
         last_panesmith_snapshot_panes: std::collections::BTreeSet::new(),
         force_panesmith_snapshot_refresh: true,
         project_config_loader,
+        notification_outbox: notifications::NotificationOutboxState::live(),
+        run_health: run_health::RunHealthState::live(),
         last_budget_check: started_at,
         budget_check_interval: budget::DEFAULT_BUDGET_CHECK_INTERVAL,
         budget_torn_down: false,
@@ -524,6 +523,7 @@ pub fn run_tui_with_panels_and_runtime_commands(
 
     event_loop::run(&mut ctx)?;
 
+    run_health::finish_runtime_observability(&mut ctx);
     rt.block_on(ctx.mux.shutdown_all());
     notifications::notify_now_from_parts(
         &rt,
@@ -539,8 +539,6 @@ pub fn run_tui_with_panels_and_runtime_commands(
     terminal_guard.disarm();
     Ok(())
 }
-
-// ── Helpers ─────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 pub(crate) fn init_test_git_repo(path: &std::path::Path) {

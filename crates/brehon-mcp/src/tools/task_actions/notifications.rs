@@ -4,7 +4,7 @@ use serde_json::{Map, Value};
 
 use brehon_types::{NotificationEvent, NotificationEventKind, NotificationSeverity};
 
-use super::paths::project_root;
+use super::paths::brehon_root_dir;
 
 pub(super) fn publish_task_completed(task_id: &str, task: &Map<String, Value>, status: &str) {
     publish(
@@ -176,29 +176,16 @@ fn value_str(task: &Map<String, Value>, key: &str) -> String {
 }
 
 fn publish(event: NotificationEvent) {
-    let Some(root) = project_root() else {
+    let Some(root) = brehon_root_dir() else {
         return;
     };
     let Ok(handle) = tokio::runtime::Handle::try_current() else {
         tracing::warn!("external notification skipped: no active tokio runtime");
         return;
     };
-    handle.spawn(async move {
-        let config_result =
-            tokio::task::spawn_blocking(move || brehon_config::load_config(Some(&root))).await;
-        let config = match config_result {
-            Ok(Ok(config)) => config,
-            Ok(Err(err)) => {
-                tracing::warn!(error = %err, "external notification skipped: config load failed");
-                return;
-            }
-            Err(err) => {
-                tracing::warn!(error = %err, "external notification skipped: config load task failed");
-                return;
-            }
-        };
-        if let Err(err) = brehon_notify::deliver_notification(config.notifications, event).await {
-            tracing::warn!(error = %err, "external notification delivery failed");
+    handle.spawn_blocking(move || {
+        if let Err(err) = brehon_notify::enqueue_notification(&root, event) {
+            tracing::warn!(error = %err, "external notification enqueue failed");
         }
     });
 }
@@ -206,6 +193,8 @@ fn publish(event: NotificationEvent) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::{ScopedEnv, TEST_ENV_LOCK};
+    use std::time::{Duration, Instant};
 
     #[test]
     fn task_event_includes_context_fields() {
@@ -237,5 +226,41 @@ mod tests {
             event.fields.get("merge_target").map(String::as_str),
             Some("epic/notify")
         );
+    }
+
+    #[test]
+    fn publish_enqueues_outbox_item_under_brehon_root() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let root = tempfile::tempdir().expect("tempdir");
+        let _env = ScopedEnv::set(&[("BREHON_ROOT", root.path().to_str().expect("utf8 path"))]);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            publish(NotificationEvent::new(
+                NotificationEventKind::TaskCompleted,
+                NotificationSeverity::Info,
+                "Task completed",
+                "Task T-1 is ready for review.",
+            ));
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        });
+
+        let outbox = root.path().join("runtime/notifications/outbox");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let count = std::fs::read_dir(&outbox)
+                .map(|entries| entries.filter_map(Result::ok).count())
+                .unwrap_or(0);
+            if count == 1 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for notification outbox item"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 }

@@ -227,6 +227,12 @@ pub(crate) struct EventLoopCtx {
     /// `brehon-cli` so this crate can stay free of a `brehon-config` dep.
     pub project_config_loader: super::research::ProjectConfigLoader,
 
+    // External notification outbox drain state.
+    pub notification_outbox: super::notifications::NotificationOutboxState,
+
+    // Run health heartbeat / watchdog state.
+    pub run_health: super::run_health::RunHealthState,
+
     // Budget kill-switch state (see `run::budget`).
     /// Last time the budget gate was evaluated (self-throttle).
     pub last_budget_check: Instant,
@@ -3247,6 +3253,15 @@ pub(super) fn new_headless_event_loop_ctx(
         last_panesmith_snapshot_panes: BTreeSet::new(),
         force_panesmith_snapshot_refresh: true,
         project_config_loader: crate::run::no_project_config_loader(),
+        notification_outbox: super::notifications::NotificationOutboxState::idle(
+            now,
+            Duration::from_secs(60),
+        ),
+        run_health: super::run_health::RunHealthState::idle(
+            now,
+            Duration::from_secs(60),
+            Duration::from_secs(600),
+        ),
         last_budget_check: now - super::budget::DEFAULT_BUDGET_CHECK_INTERVAL,
         budget_check_interval: super::budget::DEFAULT_BUDGET_CHECK_INTERVAL,
         budget_torn_down: false,
@@ -4038,10 +4053,12 @@ pub(super) fn run(ctx: &mut EventLoopCtx) -> io::Result<()> {
             tracing::error!("panic in budget_tick; continuing event loop");
         }
 
+        super::notifications::service_outbox(ctx);
+
         let tick_elapsed = tick_started_at.elapsed();
-        if tick_elapsed >= Duration::from_millis(250)
-            && last_slow_tick_warn.elapsed() >= Duration::from_secs(10)
-        {
+        let slow_tick = tick_elapsed >= Duration::from_millis(250);
+        ctx.run_health.observe_tick(tick_elapsed, slow_tick);
+        if slow_tick && last_slow_tick_warn.elapsed() >= Duration::from_secs(10) {
             tracing::warn!(
                 elapsed_ms = tick_elapsed.as_millis(),
                 mux_output_bytes = total_bytes,
@@ -4051,6 +4068,19 @@ pub(super) fn run(ctx: &mut EventLoopCtx) -> io::Result<()> {
             );
             last_slow_tick_warn = Instant::now();
         }
+        if ctx.run_health.should_warn(tick_elapsed) {
+            super::notifications::notify_from_ctx(
+                ctx,
+                super::notifications::run_health_warning_event(
+                    tick_elapsed.as_millis(),
+                    total_bytes,
+                    batch_events.len(),
+                    ctx.mux.pending_delayed_prompt_count(),
+                ),
+            );
+            ctx.run_health.mark_warning();
+        }
+        super::run_health::service(ctx, tick_elapsed, total_bytes, batch_events.len());
     }
 
     Ok(())
@@ -4536,6 +4566,15 @@ mod tests {
                 last_panesmith_snapshot_panes: BTreeSet::new(),
                 force_panesmith_snapshot_refresh: true,
                 project_config_loader: crate::run::no_project_config_loader(),
+                notification_outbox: crate::run::notifications::NotificationOutboxState::idle(
+                    now,
+                    Duration::from_secs(60),
+                ),
+                run_health: crate::run::run_health::RunHealthState::idle(
+                    now,
+                    Duration::from_secs(60),
+                    Duration::from_secs(600),
+                ),
                 last_budget_check: now - crate::run::budget::DEFAULT_BUDGET_CHECK_INTERVAL,
                 budget_check_interval: crate::run::budget::DEFAULT_BUDGET_CHECK_INTERVAL,
                 budget_torn_down: false,

@@ -10,6 +10,41 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// Runtime health heartbeat written by the live TUI loop.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeHealthSnapshot {
+    /// Brehon runtime session name when one is available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_name: Option<String>,
+    /// Current producer status, e.g. "running" or "shutdown".
+    pub status: String,
+    /// Process id of the heartbeat writer.
+    pub pid: u32,
+    /// Unix timestamp in milliseconds when this snapshot was written.
+    pub updated_at_ms: u64,
+    /// Seconds elapsed since the run loop started.
+    pub elapsed_secs: u64,
+    /// Most recent event-loop tick duration.
+    pub last_tick_elapsed_ms: u64,
+    /// Maximum event-loop tick duration observed in this process.
+    pub max_tick_elapsed_ms: u64,
+    /// Count of ticks that exceeded the slow-tick warning threshold.
+    pub slow_tick_count: u64,
+    /// Mux output bytes drained by the most recent tick.
+    pub last_mux_output_bytes: usize,
+    /// Mux events drained by the most recent tick.
+    pub last_mux_events: usize,
+    /// Prompt deliveries still queued inside the mux.
+    pub pending_prompts: usize,
+    /// True while an async notification outbox drain task is running.
+    pub notification_drain_pending: bool,
+}
+
+/// Return the runtime health heartbeat path.
+pub fn runtime_health_snapshot_path(root: &Path) -> PathBuf {
+    root.join("runtime").join("run-health.json")
+}
+
 /// Identity attached to every runtime event.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeEventMeta {

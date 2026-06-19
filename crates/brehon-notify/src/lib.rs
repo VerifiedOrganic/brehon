@@ -3,14 +3,15 @@
 //! The orchestration crates call this crate at ownership boundaries and never
 //! wait on live delivery. Provider failures are logged and do not block work.
 
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use brehon_types::{
-    ExternalNotificationsConfig, NotificationEvent, NotificationEventKind,
+    write_json_atomic, ExternalNotificationsConfig, NotificationEvent, NotificationEventKind,
     NotificationProviderKind, TelegramNotificationConfig,
 };
 use reqwest::StatusCode;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Notification delivery error.
@@ -41,6 +42,17 @@ pub enum NotificationError {
     },
 }
 
+/// Notification outbox persistence error.
+#[derive(Debug, Error)]
+pub enum NotificationOutboxError {
+    /// Filesystem operation failed.
+    #[error("notification outbox filesystem operation failed: {0}")]
+    Io(#[from] std::io::Error),
+    /// Stored notification JSON was malformed.
+    #[error("notification outbox JSON is malformed: {0}")]
+    Json(#[from] serde_json::Error),
+}
+
 /// Summary of a best-effort notification dispatch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeliveryReport {
@@ -48,6 +60,73 @@ pub struct DeliveryReport {
     pub attempted: usize,
     /// Number of provider sends that succeeded.
     pub delivered: usize,
+}
+
+/// One durable notification queued for provider delivery.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NotificationOutboxItem {
+    /// Stable outbox item id.
+    pub id: String,
+    /// Unix timestamp in milliseconds when this item was queued.
+    pub queued_at_ms: u64,
+    /// Number of failed delivery attempts.
+    #[serde(default)]
+    pub attempts: u32,
+    /// Earliest Unix timestamp in milliseconds when delivery may be retried.
+    #[serde(default)]
+    pub next_attempt_at_ms: u64,
+    /// Last bounded delivery error, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    /// Provider-neutral event payload. Secrets are never stored here.
+    pub event: NotificationEvent,
+}
+
+/// Tunables for one outbox drain pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NotificationOutboxDrainOptions {
+    /// Maximum files listed per drain pass.
+    pub max_scan: usize,
+    /// Maximum due events delivered per drain pass.
+    pub max_deliveries: usize,
+    /// Failed attempts before an item is moved to `failed`.
+    pub max_attempts: u32,
+    /// Maximum retry delay in seconds.
+    pub max_backoff_secs: u64,
+}
+
+impl Default for NotificationOutboxDrainOptions {
+    fn default() -> Self {
+        Self {
+            max_scan: 256,
+            max_deliveries: 16,
+            max_attempts: 12,
+            max_backoff_secs: 5 * 60,
+        }
+    }
+}
+
+/// Summary of one durable outbox drain pass.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NotificationOutboxDrainReport {
+    /// JSON files examined.
+    pub scanned: usize,
+    /// Provider sends attempted.
+    pub attempted: usize,
+    /// Provider sends delivered successfully.
+    pub delivered: usize,
+    /// Items discarded because current config does not subscribe to them.
+    pub discarded: usize,
+    /// Items left in the outbox because their retry backoff has not elapsed.
+    pub deferred: usize,
+    /// Items updated for a future retry.
+    pub retry_scheduled: usize,
+    /// Items moved to the failed directory.
+    pub failed: usize,
+    /// Malformed files moved to the failed directory.
+    pub invalid: usize,
+    /// Filesystem or task-join errors that prevented full processing.
+    pub errors: usize,
 }
 
 impl DeliveryReport {
@@ -79,6 +158,118 @@ pub fn spawn_notification(
         }
     });
     true
+}
+
+/// Queue a provider-neutral notification event in `.brehon/runtime/notifications/outbox`.
+///
+/// This writes only the event payload and retry metadata. Provider secrets remain
+/// process-local environment variables read during delivery.
+pub fn enqueue_notification(
+    brehon_root: &Path,
+    event: NotificationEvent,
+) -> Result<PathBuf, NotificationOutboxError> {
+    let now_ms = unix_timestamp_ms();
+    let id = uuid::Uuid::new_v4().to_string();
+    let item = NotificationOutboxItem {
+        id: id.clone(),
+        queued_at_ms: now_ms,
+        attempts: 0,
+        next_attempt_at_ms: now_ms,
+        last_error: None,
+        event,
+    };
+    let path = outbox_dir(brehon_root).join(format!("{now_ms:020}-{id}.json"));
+    write_json_atomic(&path, &item)?;
+    Ok(path)
+}
+
+/// Drain due notification outbox items with bounded IO and provider work.
+pub async fn drain_notification_outbox(
+    config: ExternalNotificationsConfig,
+    brehon_root: PathBuf,
+    options: NotificationOutboxDrainOptions,
+) -> NotificationOutboxDrainReport {
+    let mut report = NotificationOutboxDrainReport::default();
+    let files = match pending_outbox_files(&brehon_root, options.max_scan).await {
+        Ok(files) => files,
+        Err(err) => {
+            report.errors += 1;
+            tracing::warn!(error = %err, "failed to list notification outbox");
+            return report;
+        }
+    };
+
+    let mut delivered_due = 0usize;
+    for path in files {
+        if delivered_due >= options.max_deliveries {
+            break;
+        }
+        report.scanned += 1;
+        let item = match read_outbox_item(path.clone()).await {
+            Ok(item) => item,
+            Err(err) => {
+                report.errors += 1;
+                if move_invalid_outbox_file(&brehon_root, path.clone()).await {
+                    report.invalid += 1;
+                }
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %err,
+                    "failed to read notification outbox item"
+                );
+                continue;
+            }
+        };
+
+        let now_ms = unix_timestamp_ms();
+        if item.next_attempt_at_ms > now_ms {
+            report.deferred += 1;
+            continue;
+        }
+
+        if !config.enabled || !config.has_subscriber_for(item.event.kind) {
+            if remove_outbox_file(path.clone()).await {
+                report.discarded += 1;
+            } else {
+                report.errors += 1;
+            }
+            continue;
+        }
+
+        delivered_due += 1;
+        match deliver_notification(config.clone(), item.event.clone()).await {
+            Ok(delivery) => {
+                report.attempted += delivery.attempted;
+                report.delivered += delivery.delivered;
+                if !remove_outbox_file(path.clone()).await {
+                    report.errors += 1;
+                }
+            }
+            Err(err) => {
+                report.attempted += 1;
+                let mut failed_item = item;
+                failed_item.attempts = failed_item.attempts.saturating_add(1);
+                failed_item.last_error = Some(truncate_body(&err.to_string()));
+                if failed_item.attempts >= options.max_attempts {
+                    if move_failed_outbox_item(&brehon_root, path.clone(), failed_item).await {
+                        report.failed += 1;
+                    } else {
+                        report.errors += 1;
+                    }
+                } else {
+                    failed_item.next_attempt_at_ms =
+                        now_ms.saturating_add(backoff_ms(failed_item.attempts, options));
+                    if rewrite_outbox_item(path.clone(), failed_item).await {
+                        report.retry_scheduled += 1;
+                    } else {
+                        report.errors += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    report
 }
 
 /// Deliver a notification immediately with provider-specific bounded timeouts.
@@ -206,12 +397,138 @@ fn truncate_body(body: &str) -> String {
     body.chars().take(MAX_BODY_CHARS).collect()
 }
 
+fn outbox_dir(root: &Path) -> PathBuf {
+    root.join("runtime").join("notifications").join("outbox")
+}
+
+fn failed_dir(root: &Path) -> PathBuf {
+    root.join("runtime").join("notifications").join("failed")
+}
+
+async fn pending_outbox_files(
+    root: &Path,
+    max_scan: usize,
+) -> Result<Vec<PathBuf>, NotificationOutboxError> {
+    let dir = outbox_dir(root);
+    let files = tokio::task::spawn_blocking(move || {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(err) => return Err(err),
+        };
+        let mut files = Vec::new();
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            if path
+                .extension()
+                .is_some_and(|extension| extension == "json")
+            {
+                files.push(path);
+            }
+        }
+        files.sort();
+        files.truncate(max_scan);
+        Ok(files)
+    })
+    .await
+    .map_err(join_error)?;
+    files.map_err(NotificationOutboxError::Io)
+}
+
+async fn read_outbox_item(
+    path: PathBuf,
+) -> Result<NotificationOutboxItem, NotificationOutboxError> {
+    tokio::task::spawn_blocking(move || {
+        let content = std::fs::read_to_string(&path)?;
+        let item = serde_json::from_str::<NotificationOutboxItem>(&content)?;
+        Ok(item)
+    })
+    .await
+    .map_err(join_error)?
+}
+
+async fn rewrite_outbox_item(path: PathBuf, item: NotificationOutboxItem) -> bool {
+    tokio::task::spawn_blocking(move || write_json_atomic(&path, &item).is_ok())
+        .await
+        .unwrap_or(false)
+}
+
+async fn remove_outbox_file(path: PathBuf) -> bool {
+    tokio::task::spawn_blocking(move || match std::fs::remove_file(&path) {
+        Ok(()) => true,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
+        Err(_) => false,
+    })
+    .await
+    .unwrap_or(false)
+}
+
+async fn move_failed_outbox_item(
+    root: &Path,
+    source: PathBuf,
+    item: NotificationOutboxItem,
+) -> bool {
+    let Some(file_name) = source.file_name().map(|name| name.to_owned()) else {
+        return false;
+    };
+    let destination = failed_dir(root).join(file_name);
+    tokio::task::spawn_blocking(move || {
+        write_json_atomic(&destination, &item)?;
+        match std::fs::remove_file(&source) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err),
+        }
+    })
+    .await
+    .is_ok_and(|result: std::io::Result<()>| result.is_ok())
+}
+
+async fn move_invalid_outbox_file(root: &Path, source: PathBuf) -> bool {
+    let Some(file_name) = source.file_name().map(|name| name.to_owned()) else {
+        return false;
+    };
+    let destination = failed_dir(root).join(file_name);
+    tokio::task::spawn_blocking(move || {
+        if let Some(parent) = destination.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        match std::fs::rename(&source, &destination) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err),
+        }
+    })
+    .await
+    .is_ok_and(|result: std::io::Result<()>| result.is_ok())
+}
+
+fn backoff_ms(attempts: u32, options: NotificationOutboxDrainOptions) -> u64 {
+    let shift = attempts.saturating_sub(1).min(10);
+    let secs = 5_u64
+        .saturating_mul(1_u64 << shift)
+        .min(options.max_backoff_secs.max(1));
+    secs.saturating_mul(1_000)
+}
+
+fn unix_timestamp_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
+}
+
+fn join_error(err: tokio::task::JoinError) -> NotificationOutboxError {
+    NotificationOutboxError::Io(std::io::Error::other(err.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use brehon_types::{
         NotificationEvent, NotificationEventKind, NotificationSeverity,
-        NotificationSubscriptionConfig,
+        NotificationSubscriptionConfig, TelegramNotificationConfig,
     };
 
     fn task_event() -> NotificationEvent {
@@ -258,5 +575,84 @@ mod tests {
             .await
             .expect_err("disabled provider should be explicit");
         assert!(matches!(err, NotificationError::NoEnabledProvider(_)));
+    }
+
+    #[test]
+    fn enqueue_notification_writes_atomic_outbox_item() {
+        let root = tempfile::tempdir().expect("tempdir");
+
+        let path = enqueue_notification(root.path(), task_event()).expect("enqueue");
+
+        assert!(path.starts_with(outbox_dir(root.path())));
+        let item: NotificationOutboxItem =
+            serde_json::from_str(&std::fs::read_to_string(path).expect("read item"))
+                .expect("parse item");
+        assert_eq!(item.event.kind, NotificationEventKind::TaskCompleted);
+        assert_eq!(item.attempts, 0);
+    }
+
+    #[tokio::test]
+    async fn drain_discards_currently_unsubscribed_events() {
+        let root = tempfile::tempdir().expect("tempdir");
+        enqueue_notification(root.path(), task_event()).expect("enqueue");
+
+        let report = drain_notification_outbox(
+            ExternalNotificationsConfig::default(),
+            root.path().to_path_buf(),
+            NotificationOutboxDrainOptions::default(),
+        )
+        .await;
+
+        assert_eq!(report.scanned, 1);
+        assert_eq!(report.discarded, 1);
+        assert!(pending_outbox_files(root.path(), 10)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn drain_retries_provider_failures_without_losing_item() {
+        let root = tempfile::tempdir().expect("tempdir");
+        enqueue_notification(root.path(), task_event()).expect("enqueue");
+        let missing_suffix = uuid::Uuid::new_v4();
+        let config = ExternalNotificationsConfig {
+            enabled: true,
+            providers: brehon_types::NotificationProvidersConfig {
+                telegram: TelegramNotificationConfig {
+                    enabled: true,
+                    bot_token_env: format!("BREHON_TEST_MISSING_TOKEN_{missing_suffix}"),
+                    chat_id_env: format!("BREHON_TEST_MISSING_CHAT_{missing_suffix}"),
+                    send_timeout_secs: 1,
+                },
+            },
+            subscriptions: vec![NotificationSubscriptionConfig {
+                provider: NotificationProviderKind::Telegram,
+                events: vec![NotificationEventKind::TaskCompleted],
+            }],
+        };
+
+        let report = drain_notification_outbox(
+            config,
+            root.path().to_path_buf(),
+            NotificationOutboxDrainOptions {
+                max_scan: 10,
+                max_deliveries: 10,
+                max_attempts: 3,
+                max_backoff_secs: 60,
+            },
+        )
+        .await;
+
+        assert_eq!(report.attempted, 1);
+        assert_eq!(report.retry_scheduled, 1);
+        let files = pending_outbox_files(root.path(), 10).await.unwrap();
+        assert_eq!(files.len(), 1);
+        let item: NotificationOutboxItem =
+            serde_json::from_str(&std::fs::read_to_string(&files[0]).expect("read item"))
+                .expect("parse item");
+        assert_eq!(item.attempts, 1);
+        assert!(item.last_error.is_some());
+        assert!(item.next_attempt_at_ms > item.queued_at_ms);
     }
 }

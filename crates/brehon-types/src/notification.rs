@@ -126,6 +126,9 @@ pub enum NotificationEventKind {
     /// Brehon detected a runtime crash or unclean recovery signal.
     #[serde(rename = "run.crash_detected")]
     RunCrashDetected,
+    /// The run loop observed sustained health degradation.
+    #[serde(rename = "run.health_warning")]
+    RunHealthWarning,
     /// A worker completed task handoff to review.
     #[serde(rename = "task.completed")]
     TaskCompleted,
@@ -174,6 +177,7 @@ impl NotificationEventKind {
             Self::RunStarted => "run.started",
             Self::RunShutdown => "run.shutdown",
             Self::RunCrashDetected => "run.crash_detected",
+            Self::RunHealthWarning => "run.health_warning",
             Self::TaskCompleted => "task.completed",
             Self::TaskClosed => "task.closed",
             Self::TaskBlocked => "task.blocked",
@@ -293,6 +297,9 @@ mod tests {
         let parsed: NotificationEventKind =
             serde_json::from_str("\"budget.kill_switch\"").expect("parse event kind");
         assert_eq!(parsed, NotificationEventKind::BudgetKillSwitch);
+        let parsed: NotificationEventKind =
+            serde_json::from_str("\"run.health_warning\"").expect("parse health warning");
+        assert_eq!(parsed, NotificationEventKind::RunHealthWarning);
     }
 
     #[test]
