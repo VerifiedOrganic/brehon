@@ -34,6 +34,7 @@
 
 mod advisors;
 mod automation;
+mod budget;
 mod composer;
 mod confirmed_state;
 mod crash_detection;
@@ -47,6 +48,7 @@ mod input;
 mod key_handling;
 mod keybind_overlay;
 mod layout;
+mod notifications;
 mod prompt_delivery;
 mod proof_detail;
 mod recovery;
@@ -54,6 +56,7 @@ mod refresh;
 mod rendering;
 pub mod research;
 mod reviewer_selection;
+mod run_health;
 mod run_state_detail;
 mod self_improvement;
 mod session;
@@ -115,8 +118,6 @@ use session::*;
 #[allow(unused_imports)]
 use task_detail::*;
 
-// ── External imports for the main loop ──────────────────────────────────────
-
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -134,8 +135,6 @@ use terminal_guard::{
     enter_dashboard_terminal_session, restore_terminal_session, TerminalSessionGuard,
 };
 
-// ── Main loop ───────────────────────────────────────────────────────────────
-
 /// Run the TUI with default settings (no reviewer panels, empty dashboard).
 /// Build a `ProjectConfigLoader` that always returns `None`. Used by callers
 /// that never reach research/config-dependent code paths (dashboards, demos,
@@ -145,7 +144,7 @@ pub fn no_project_config_loader() -> research::ProjectConfigLoader {
 }
 
 pub fn run_tui(shutdown: Arc<AtomicBool>, mux: Mux, rt: tokio::runtime::Handle) -> io::Result<()> {
-    let dashboard = Arc::new(std::sync::Mutex::new(DashboardData::default()));
+    let dashboard = Arc::new(parking_lot::Mutex::new(DashboardData::default()));
     run_tui_with_panels(
         shutdown,
         mux,
@@ -178,7 +177,7 @@ pub fn run_tui_with_panels(
     mux: Mux,
     rt: tokio::runtime::Handle,
     reviewer_panels: &[ReviewerPanel],
-    dashboard_data: Arc<std::sync::Mutex<DashboardData>>,
+    dashboard_data: Arc<parking_lot::Mutex<DashboardData>>,
     orchestration: OrchestrationConfig,
 ) -> io::Result<()> {
     run_tui_with_panels_and_runtime_commands(
@@ -206,7 +205,7 @@ pub fn run_dashboard_tui(
     rt: tokio::runtime::Handle,
     brehon_root: std::path::PathBuf,
 ) -> io::Result<()> {
-    let dashboard = Arc::new(std::sync::Mutex::new(DashboardData {
+    let dashboard = Arc::new(parking_lot::Mutex::new(DashboardData {
         brehon_root: Some(brehon_root),
         ..Default::default()
     }));
@@ -245,7 +244,7 @@ pub fn run_tui_with_panels_and_runtime_commands(
     mux: Mux,
     rt: tokio::runtime::Handle,
     reviewer_panels: &[ReviewerPanel],
-    dashboard_data: Arc<std::sync::Mutex<DashboardData>>,
+    dashboard_data: Arc<parking_lot::Mutex<DashboardData>>,
     orchestration: OrchestrationConfig,
     runtime_command_rx: Option<brehon_mux::MuxRuntimeCommandReceiver>,
     runtime_event_rx: Option<std::sync::mpsc::Receiver<brehon_types::RuntimeEvent>>,
@@ -400,6 +399,18 @@ pub fn run_tui_with_panels_and_runtime_commands(
     let last_session_poll = std::time::Instant::now();
     let session_poll_interval = Duration::from_secs(5);
     let runtime_session_name = mux.session_name().map(str::to_string);
+    notifications::notify_from_parts(
+        &rt,
+        &dashboard_data,
+        &project_config_loader,
+        notifications::run_started_event(
+            runtime_session_name.as_deref(),
+            worker_ids.len(),
+            all_reviewer_ids.len(),
+            advisor_ids.len(),
+            research_ids.len(),
+        ),
+    );
     let last_shared_root_issue: Option<String> = None;
     let pending_dashboard_refresh: Option<tokio::task::JoinHandle<DashboardRefreshSnapshot>> = None;
     let pending_queued_gateway_prompt_deliveries: Vec<AsyncQueuedGatewayPromptDeliveryTask> =
@@ -499,19 +510,35 @@ pub fn run_tui_with_panels_and_runtime_commands(
         last_panesmith_snapshot_panes: std::collections::BTreeSet::new(),
         force_panesmith_snapshot_refresh: true,
         project_config_loader,
+        notification_outbox: notifications::NotificationOutboxState::live(),
+        run_health: run_health::RunHealthState::live(),
+        last_budget_check: started_at,
+        budget_check_interval: budget::DEFAULT_BUDGET_CHECK_INTERVAL,
+        budget_torn_down: false,
+        budget_block_dispatch: None,
+        last_budget_warn: None,
+        budget_event_sink: Some(budget::default_budget_event_sink()),
         needs_redraw: true,
     };
 
     event_loop::run(&mut ctx)?;
 
+    run_health::finish_runtime_observability(&mut ctx);
     rt.block_on(ctx.mux.shutdown_all());
+    notifications::notify_now_from_parts(
+        &rt,
+        &ctx.dashboard_data,
+        &ctx.project_config_loader,
+        notifications::run_shutdown_event(
+            ctx.runtime_session_name.as_deref(),
+            ctx.started_at.elapsed().as_secs(),
+        ),
+    );
     shutdown.store(true, Ordering::SeqCst);
     restore_terminal_session();
     terminal_guard.disarm();
     Ok(())
 }
-
-// ── Helpers ─────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 pub(crate) fn init_test_git_repo(path: &std::path::Path) {

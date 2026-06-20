@@ -246,7 +246,6 @@ pub(super) fn enqueue_terminal_host_startup_prompt(
     let brehon_root = ctx
         .dashboard_data
         .lock()
-        .unwrap()
         .brehon_root
         .clone()
         .ok_or_else(|| "brehon root unavailable for terminal-host startup prompt".to_string())?;
@@ -496,6 +495,15 @@ pub(super) fn dispatch_runtime_prompt(
     prompt: String,
     from: Option<String>,
 ) -> bool {
+    // Budget kill-switch: refuse NEW spend first, before any delivery branch.
+    // `false` is the existing "not dispatched" contract callers already handle.
+    if let Err(reason) = super::budget::dispatch_allowed(ctx) {
+        push_dashboard_event(
+            &ctx.dashboard_data,
+            format!("budget: prompt to {target} refused — {reason}"),
+        );
+        return false;
+    }
     if !ctx.runtime_agent_factory_host_owned {
         if ctx.mux.get(target).is_none() {
             return false;
@@ -1623,7 +1631,7 @@ mod tests {
             false,
         )
         .unwrap();
-        ctx.dashboard_data.lock().unwrap().brehon_root = Some(brehon_root.clone());
+        ctx.dashboard_data.lock().brehon_root = Some(brehon_root.clone());
 
         assert!(!queue_queued_prompt_delivery_via_daemon(
             &mut ctx,

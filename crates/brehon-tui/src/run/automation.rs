@@ -56,7 +56,7 @@ impl RuntimeAutomationHarness {
         let (port, receiver) = MuxRuntimeCommandPort::channel_default();
         let router: Arc<dyn RuntimeCommandRouter> = Arc::new(LoopbackRuntimeCommandRouter { port });
         let ctx = new_headless_event_loop_ctx(mux, rt, Some(receiver), Some(router), false)?;
-        ctx.dashboard_data.lock().unwrap().brehon_root = Some(brehon_root.clone());
+        ctx.dashboard_data.lock().brehon_root = Some(brehon_root.clone());
         Ok(Self {
             brehon_root,
             ctx,

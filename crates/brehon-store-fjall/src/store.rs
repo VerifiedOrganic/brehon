@@ -5,9 +5,10 @@
 
 use async_trait::async_trait;
 use fjall::{Config, Keyspace, PartitionCreateOptions, PartitionHandle, PersistMode};
+use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, info};
 
@@ -30,6 +31,28 @@ const META_PARTITION: &str = "meta";
 const ARCHIVE_PARTITION: &str = "archive";
 const RUNS_PARTITION: &str = "runs";
 const PROOFS_PARTITION: &str = "proofs";
+
+/// Map the outcome of a `spawn_blocking` task that performed a fjall mutation
+/// into a `Result<T, PortError>`.
+///
+/// The synchronous fjall fsync (`PersistMode::SyncAll` + `batch.commit()`) is
+/// run on the blocking thread pool so it never parks a Tokio worker. A panic
+/// inside that closure (e.g. an unexpected fjall failure) surfaces here as a
+/// `JoinError`; we fail closed by turning it into a `PortError::Storage` rather
+/// than letting the panic propagate to the caller. This relies on the
+/// `panic = "unwind"` profile setting (documented in the workspace `Cargo.toml`):
+/// a future `panic = "abort"` would convert such a panic into a whole-process
+/// abort instead of a recoverable error.
+fn map_blocking<T>(
+    joined: Result<Result<T, StoreError>, tokio::task::JoinError>,
+) -> Result<T, PortError> {
+    match joined {
+        Ok(inner) => inner.map_err(PortError::from),
+        Err(join_err) => Err(PortError::Storage(format!(
+            "event store storage task panicked: {join_err}"
+        ))),
+    }
+}
 
 pub struct FjallEventStoreInner {
     _owner_lock: StoreOwnerLock,
@@ -120,15 +143,28 @@ impl FjallEventStore {
 
         let seq = Self::load_seq(&meta, &events)?;
 
-        if seq == 0 {
-            let version_bytes = SCHEMA_VERSION.to_le_bytes();
-            meta.insert(KEY_META_SCHEMA_VERSION, version_bytes)?;
-            debug!("Initialized schema version {}", SCHEMA_VERSION);
+        // Fail closed: a binary must refuse a store written by a newer schema
+        // rather than silently misread it. The migration runner owns the on-disk
+        // version encoding; when it stamps a fresh/unversioned store, persist the
+        // stamp immediately so a crash after open does not leave the store
+        // ambiguously unversioned.
+        let migration_report =
+            crate::migrations::MigrationRunner::new(meta.clone()).run_migrations()?;
+        if migration_report.migrations_applied() {
+            keyspace.persist(PersistMode::SyncAll)?;
+            debug!(
+                "Stamped fresh store schema version {}",
+                crate::migrations::CURRENT_SCHEMA_VERSION
+            );
         }
 
         let view_manager = ViewManager::new(keyspace.clone(), views.clone());
         let query_executor = QueryExecutor::new(events.clone(), meta.clone());
-        let queue_manager = QueueManager::new(queue.clone(), Self::queue_lock_scope(path));
+        let queue_manager = QueueManager::new(
+            keyspace.clone(),
+            queue.clone(),
+            Self::queue_lock_scope(path),
+        );
         let run_store = RunStoreManager::new(keyspace.clone(), runs);
         let views_watermark = Self::load_views_watermark(&meta)?;
         let events_watermark = Self::load_high_water_mark(&events)?;
@@ -531,8 +567,8 @@ impl FjallEventStore {
         }
     }
 
-    fn append_lock(&self) -> std::sync::MutexGuard<'_, ()> {
-        self.inner.append_lock.lock().expect("append lock poisoned")
+    fn append_lock(&self) -> parking_lot::MutexGuard<'_, ()> {
+        self.inner.append_lock.lock()
     }
 
     fn make_index_keys(&self, event: &Event, seq: u64) -> Vec<Vec<u8>> {
@@ -787,14 +823,89 @@ impl FjallEventStore {
 
         self.restore_seq_on_error(seq_before, result)
     }
+
+    /// Scan the idempotency index and SyncAll-commit removal of keys whose
+    /// referenced event predates `cutoff`. Synchronous (the scan and fsync run on
+    /// a blocking thread); takes no append_lock so ordering vs appends is
+    /// unaffected.
+    fn expire_idempotency_keys_inner(
+        &self,
+        cutoff: chrono::DateTime<chrono::Utc>,
+    ) -> Result<usize, StoreError> {
+        let prefix = b"meta:idempotency:";
+        let mut to_remove: Vec<Vec<u8>> = Vec::new();
+
+        for item in self.inner.meta.prefix(prefix) {
+            let (key, value) = item.map_err(|e| StoreError::Storage(e.to_string()))?;
+            if value.len() >= 8 {
+                let arr: [u8; 8] = value[..8]
+                    .try_into()
+                    .map_err(|_| StoreError::Storage("Invalid idempotency value".into()))?;
+                let event_id = u64::from_be_bytes(arr);
+                let log_k = log_key(event_id);
+                let event_timestamp = if let Ok(Some(bytes)) = self.inner.events.get(&log_k) {
+                    Self::deserialize_event(&bytes)
+                        .ok()
+                        .map(|e| e.event.timestamp)
+                } else {
+                    // Fallback: check archive partition for the event.
+                    let archive_k = archive_key(event_id);
+                    self.inner
+                        .archive
+                        .get(&archive_k)
+                        .ok()
+                        .flatten()
+                        .and_then(|bytes| Self::deserialize_event(&bytes).ok())
+                        .map(|e| e.event.timestamp)
+                };
+
+                match event_timestamp {
+                    Some(ts) if ts < cutoff => {
+                        to_remove.push(key.to_vec());
+                    }
+                    None => {
+                        // Event not found in hot log or archive; key is orphaned.
+                        to_remove.push(key.to_vec());
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        if to_remove.is_empty() {
+            return Ok(0);
+        }
+
+        let mut batch = self
+            .inner
+            .keyspace
+            .batch()
+            .durability(Some(PersistMode::SyncAll));
+        for key in &to_remove {
+            batch.remove(&self.inner.meta, key);
+        }
+        batch
+            .commit()
+            .map_err(|e| StoreError::Storage(e.to_string()))?;
+        Ok(to_remove.len())
+    }
 }
 
 #[async_trait]
 impl EventStore for FjallEventStore {
     async fn append(&self, event: Event) -> Result<EventId, PortError> {
-        let _guard = self.append_lock();
-        self.append_event_inner_locked(&event, None)
-            .map_err(PortError::from)
+        // The synchronous inner fn fsyncs under `append_lock`; run it on the
+        // blocking pool so the fsync never parks a Tokio worker. The std
+        // `MutexGuard` is created and dropped entirely inside the closure on the
+        // blocking thread, so it is never `Send`-required nor seen by async code.
+        let store = self.clone();
+        map_blocking(
+            tokio::task::spawn_blocking(move || {
+                let _guard = store.append_lock();
+                store.append_event_inner_locked(&event, None)
+            })
+            .await,
+        )
     }
 
     async fn append_atomic(
@@ -802,9 +913,14 @@ impl EventStore for FjallEventStore {
         events: Vec<Event>,
         views: Vec<ViewUpdate>,
     ) -> Result<Vec<EventId>, PortError> {
-        let _guard = self.append_lock();
-        self.append_atomic_inner_locked(events, views)
-            .map_err(PortError::from)
+        let store = self.clone();
+        map_blocking(
+            tokio::task::spawn_blocking(move || {
+                let _guard = store.append_lock();
+                store.append_atomic_inner_locked(events, views)
+            })
+            .await,
+        )
     }
 
     async fn append_and_enqueue(
@@ -814,9 +930,23 @@ impl EventStore for FjallEventStore {
         item_id: &str,
         idempotency_key: Option<&str>,
     ) -> Result<EventId, PortError> {
-        let _guard = self.append_lock();
-        self.append_and_enqueue_inner_locked(&event, queue, item_id, idempotency_key)
-            .map_err(PortError::from)
+        // Borrowed args must be owned to cross the 'static spawn_blocking boundary.
+        let store = self.clone();
+        let queue = queue.to_owned();
+        let item_id = item_id.to_owned();
+        let idempotency_key = idempotency_key.map(str::to_owned);
+        map_blocking(
+            tokio::task::spawn_blocking(move || {
+                let _guard = store.append_lock();
+                store.append_and_enqueue_inner_locked(
+                    &event,
+                    &queue,
+                    &item_id,
+                    idempotency_key.as_deref(),
+                )
+            })
+            .await,
+        )
     }
 
     async fn query(&self, filter: EventFilter) -> Result<Vec<Event>, PortError> {
@@ -875,24 +1005,41 @@ impl EventStore for FjallEventStore {
         consumer: &str,
         lease_for: Duration,
     ) -> Result<Option<QueueClaim>, PortError> {
-        self.inner
-            .queue_manager
-            .claim_next(queue, consumer, lease_for)
-            .map_err(PortError::from)
+        // The QueueManager fsyncs under its own `claim_lock`; keep that fsync off
+        // the runtime worker by delegating on the blocking pool. The `claim_lock`
+        // guard is taken inside the closure on the blocking thread.
+        let store = self.clone();
+        let queue = queue.to_owned();
+        let consumer = consumer.to_owned();
+        map_blocking(
+            tokio::task::spawn_blocking(move || {
+                store
+                    .inner
+                    .queue_manager
+                    .claim_next(&queue, &consumer, lease_for)
+            })
+            .await,
+        )
     }
 
     async fn ack_claim(&self, claim_id: &ClaimId) -> Result<(), PortError> {
-        self.inner
-            .queue_manager
-            .ack_claim(claim_id)
-            .map_err(PortError::from)
+        let store = self.clone();
+        let claim_id = claim_id.clone();
+        map_blocking(
+            tokio::task::spawn_blocking(move || store.inner.queue_manager.ack_claim(&claim_id))
+                .await,
+        )
     }
 
     async fn renew_claim(&self, claim_id: &ClaimId, lease_for: Duration) -> Result<(), PortError> {
-        self.inner
-            .queue_manager
-            .renew_claim(claim_id, lease_for)
-            .map_err(PortError::from)
+        let store = self.clone();
+        let claim_id = claim_id.clone();
+        map_blocking(
+            tokio::task::spawn_blocking(move || {
+                store.inner.queue_manager.renew_claim(&claim_id, lease_for)
+            })
+            .await,
+        )
     }
 
     async fn high_water_mark(&self) -> Result<EventId, PortError> {
@@ -901,77 +1048,28 @@ impl EventStore for FjallEventStore {
 
     async fn retain_events(&self, before: EventId) -> Result<usize, PortError> {
         let cutoff = before.as_u64().saturating_sub(1);
-        let archived = self
-            .archive_events_before(cutoff)
-            .map_err(PortError::from)?;
+        // archive_events_before takes `append_lock` and SyncAll-commits; the
+        // append_lock acquisition stays inside the closure on the blocking thread.
+        let store = self.clone();
+        let archived = map_blocking(
+            tokio::task::spawn_blocking(move || store.archive_events_before(cutoff)).await,
+        )?;
         Ok(archived as usize)
     }
 
     async fn expire_idempotency_keys(&self, older_than: Duration) -> Result<usize, PortError> {
+        // Compute the cutoff up front, then run the meta scan + SyncAll commit on
+        // the blocking pool so the fsync never parks a Tokio worker.
         let cutoff = chrono::Utc::now()
             .checked_sub_signed(
                 chrono::Duration::from_std(older_than).unwrap_or(chrono::Duration::MAX),
             )
             .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC);
 
-        let mut removed = 0usize;
-        let prefix = b"meta:idempotency:";
-
-        let mut to_remove: Vec<Vec<u8>> = Vec::new();
-
-        for item in self.inner.meta.prefix(prefix) {
-            let (key, value) = item.map_err(|e| PortError::Storage(e.to_string()))?;
-            if value.len() >= 8 {
-                let arr: [u8; 8] = value[..8]
-                    .try_into()
-                    .map_err(|_| PortError::Storage("Invalid idempotency value".into()))?;
-                let event_id = u64::from_be_bytes(arr);
-                let log_k = log_key(event_id);
-                let event_timestamp = if let Ok(Some(bytes)) = self.inner.events.get(&log_k) {
-                    Self::deserialize_event(&bytes)
-                        .ok()
-                        .map(|e| e.event.timestamp)
-                } else {
-                    // Fallback: check archive partition for the event.
-                    let archive_k = archive_key(event_id);
-                    self.inner
-                        .archive
-                        .get(&archive_k)
-                        .ok()
-                        .flatten()
-                        .and_then(|bytes| Self::deserialize_event(&bytes).ok())
-                        .map(|e| e.event.timestamp)
-                };
-
-                match event_timestamp {
-                    Some(ts) if ts < cutoff => {
-                        to_remove.push(key.to_vec());
-                    }
-                    None => {
-                        // Event not found in hot log or archive; key is orphaned.
-                        to_remove.push(key.to_vec());
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        if !to_remove.is_empty() {
-            let mut batch = self
-                .inner
-                .keyspace
-                .batch()
-                .durability(Some(PersistMode::SyncAll));
-            for key in &to_remove {
-                batch.remove(&self.inner.meta, key);
-            }
-            batch
-                .commit()
-                .map_err(|e| PortError::Storage(e.to_string()))?;
-            removed = to_remove.len();
-        }
-
-        Ok(removed)
+        let store = self.clone();
+        map_blocking(
+            tokio::task::spawn_blocking(move || store.expire_idempotency_keys_inner(cutoff)).await,
+        )
     }
 }
 
@@ -1005,6 +1103,64 @@ mod tests {
         let events = store.stream(None, 10).await.unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].0.kind, event.kind);
+    }
+
+    #[test]
+    fn fresh_store_stamps_current_schema_version() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("db");
+        let store = FjallEventStore::new(&db_path).unwrap();
+        drop(store);
+
+        // Reopen the meta partition directly and confirm the stamp uses the same
+        // little-endian encoding the version guard reads on open.
+        let keyspace = Config::new(&db_path).open().unwrap();
+        let meta = keyspace
+            .open_partition(META_PARTITION, PartitionCreateOptions::default())
+            .unwrap();
+        let stamped = meta
+            .get(KEY_META_SCHEMA_VERSION)
+            .unwrap()
+            .expect("fresh store must stamp the schema version");
+        let arr: [u8; 8] = stamped.as_ref().try_into().unwrap();
+        assert_eq!(
+            u64::from_le_bytes(arr),
+            crate::migrations::CURRENT_SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn refuses_to_open_store_written_by_newer_schema() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("db");
+
+        // Create the store, then stamp a future schema version into the meta
+        // partition out of band to simulate a newer binary having written it.
+        let store = FjallEventStore::new(&db_path).unwrap();
+        store.close().unwrap();
+
+        let future_version = crate::migrations::CURRENT_SCHEMA_VERSION + 1;
+        {
+            let keyspace = Config::new(&db_path).open().unwrap();
+            let meta = keyspace
+                .open_partition(META_PARTITION, PartitionCreateOptions::default())
+                .unwrap();
+            meta.insert(KEY_META_SCHEMA_VERSION, future_version.to_le_bytes())
+                .unwrap();
+            keyspace.persist(PersistMode::SyncAll).unwrap();
+        }
+
+        // A downgraded binary must fail closed rather than misread the store.
+        match FjallEventStore::new(&db_path) {
+            Ok(_) => panic!("opening a newer-schema store must fail closed"),
+            Err(err) => assert!(
+                matches!(
+                    err,
+                    StoreError::VersionMismatch { actual, .. } if actual == future_version
+                ),
+                "unexpected error opening newer-schema store: {err:?}"
+            ),
+        }
     }
 
     #[tokio::test]
@@ -2718,5 +2874,94 @@ mod tests {
             .get(idempotency_key("idem-1"))
             .unwrap()
             .is_none());
+    }
+
+    /// Regression guard for Fix A: the append path now fsyncs on the blocking
+    /// pool. Confirm it still appends, preserves EventId monotonicity, and is
+    /// queryable end-to-end after the spawn_blocking refactor.
+    #[tokio::test]
+    async fn append_via_spawn_blocking_round_trips_and_keeps_ids_monotonic() {
+        let dir = tempdir().unwrap();
+        let store = FjallEventStore::new(dir.path()).unwrap();
+
+        let mut last = 0u64;
+        for i in 0..32 {
+            let event = Event {
+                kind: EventKind::TaskCreated {
+                    task_id: format!("T{i}"),
+                },
+                timestamp: chrono::Utc::now(),
+                aggregate_id: format!("T{i}"),
+            };
+            let id = store.append(event).await.unwrap().as_u64();
+            assert_eq!(id, last + 1, "event ids must be gap-free and monotonic");
+            last = id;
+        }
+
+        let streamed = store.stream(None, 100).await.unwrap();
+        assert_eq!(streamed.len(), 32);
+        // Survives a restart: the blocking-pool fsync must still be durable.
+        let store2 = FjallEventStore::new(dir.path()).unwrap();
+        assert_eq!(store2.high_water_mark().await.unwrap().as_u64(), 32);
+    }
+
+    /// Fix A core property: the synchronous fsync must run on the blocking pool,
+    /// not park a runtime worker. On a single-worker (current_thread) runtime, a
+    /// blocking call directly on the worker would prevent any other task from
+    /// making progress. We drive many appends concurrently with `join_all` and a
+    /// cooperative heartbeat task; if appends blocked the lone worker, the
+    /// heartbeat would be starved and the appends could deadlock. Completing
+    /// proves the fsync was moved off the runtime worker.
+    #[test]
+    fn append_does_not_block_the_runtime_worker() {
+        use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async move {
+            let store = FjallEventStore::new(&path).unwrap();
+            let ticks = std::sync::Arc::new(AtomicU64::new(0));
+
+            // Cooperative heartbeat: yields each iteration. It can only advance
+            // if the single worker is not parked by a blocking fsync.
+            let hb_ticks = ticks.clone();
+            let heartbeat = tokio::spawn(async move {
+                for _ in 0..1_000 {
+                    hb_ticks.fetch_add(1, AtomicOrdering::SeqCst);
+                    tokio::task::yield_now().await;
+                }
+            });
+
+            let mut appends = Vec::new();
+            for i in 0..64 {
+                let store = store.clone();
+                appends.push(tokio::spawn(async move {
+                    let event = Event {
+                        kind: EventKind::TaskCreated {
+                            task_id: format!("HB{i}"),
+                        },
+                        timestamp: chrono::Utc::now(),
+                        aggregate_id: format!("HB{i}"),
+                    };
+                    store.append(event).await.unwrap();
+                }));
+            }
+
+            for handle in appends {
+                handle.await.unwrap();
+            }
+            heartbeat.await.unwrap();
+
+            // The heartbeat ran to completion alongside the blocking-pool fsyncs.
+            assert_eq!(ticks.load(AtomicOrdering::SeqCst), 1_000);
+            let events = store.stream(None, 256).await.unwrap();
+            assert_eq!(events.len(), 64);
+        });
     }
 }

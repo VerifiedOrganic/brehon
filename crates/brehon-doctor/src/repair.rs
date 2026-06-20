@@ -295,10 +295,7 @@ fn repair_orphaned_workers(runtime_dir: &Path, report: &mut RepairReport) {
             "Doctor repair recovered orphaned task from {status}; previous assignee {assignee} is not live."
         ));
         task["updated_at"] = Value::String(Utc::now().to_rfc3339());
-        match std::fs::write(
-            &path,
-            serde_json::to_string_pretty(&task).unwrap_or_default(),
-        ) {
+        match brehon_types::write_json_atomic(&path, &task) {
             Ok(()) => report.push(RepairAction::repaired(
                 "orphaned_worker_recovered",
                 task_id,
@@ -382,10 +379,7 @@ fn repair_impossible_task_states(runtime_dir: &Path, report: &mut RepairReport) 
             continue;
         }
         task["updated_at"] = Value::String(Utc::now().to_rfc3339());
-        match std::fs::write(
-            &path,
-            serde_json::to_string_pretty(&task).unwrap_or_default(),
-        ) {
+        match brehon_types::write_json_atomic(&path, &task) {
             Ok(()) => report.push(RepairAction::repaired(
                 "impossible_task_state_repaired",
                 task_id,

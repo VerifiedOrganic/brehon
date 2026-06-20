@@ -118,7 +118,7 @@ pub(crate) struct EventLoopCtx {
     pub runtime_terminal_host_absolute_resize: bool,
     pub rt: tokio::runtime::Handle,
     pub terminal: Terminal<ratatui::backend::CrosstermBackend<io::Stdout>>,
-    pub dashboard_data: Arc<std::sync::Mutex<DashboardData>>,
+    pub dashboard_data: Arc<parking_lot::Mutex<DashboardData>>,
     pub orchestration: OrchestrationConfig,
 
     pub tick_active: Duration,
@@ -226,6 +226,30 @@ pub(crate) struct EventLoopCtx {
     /// Loads the merged project `BrehonConfig` on demand. Injected from
     /// `brehon-cli` so this crate can stay free of a `brehon-config` dep.
     pub project_config_loader: super::research::ProjectConfigLoader,
+
+    // External notification outbox drain state.
+    pub notification_outbox: super::notifications::NotificationOutboxState,
+
+    // Run health heartbeat / watchdog state.
+    pub run_health: super::run_health::RunHealthState,
+
+    // Budget kill-switch state (see `run::budget`).
+    /// Last time the budget gate was evaluated (self-throttle).
+    pub last_budget_check: Instant,
+    /// How often the budget gate re-reads spend and re-evaluates.
+    pub budget_check_interval: Duration,
+    /// One-shot latch: true once budget teardown has fired, so the inline
+    /// `mux.shutdown_all()` and the breach signal never repeat per tick.
+    pub budget_torn_down: bool,
+    /// Cached refusal reason set by `budget_tick`; read by the dispatch seam so
+    /// the hot path fails closed without a per-prompt filesystem read.
+    pub budget_block_dispatch: Option<String>,
+    /// Dedupe key for the last Soft budget warning pushed to the dashboard.
+    pub last_budget_warn: Option<String>,
+    /// Injected durable sink for budget-breach signals (optional). Avoids a new
+    /// exhaustively-matched `EventKind` variant; when `None` the operator signal
+    /// degrades to a dashboard event + `tracing::warn!`.
+    pub budget_event_sink: Option<super::budget::BudgetEventSink>,
 
     pub needs_redraw: bool,
 }
@@ -411,6 +435,7 @@ pub(crate) enum RecoveryResetMarker {
 }
 
 const ENTRY_CHROME_FADE_DURATION: Duration = Duration::from_millis(200);
+const MAX_STALL_SCAN_ACTIVITY_DEFERRAL: Duration = Duration::from_secs(180);
 
 fn perform_manual_reset_request(ctx: &mut EventLoopCtx, pane_id: &str) -> bool {
     let Some((startup_prompt, success_message)) = manual_reset_plan(ctx, pane_id) else {
@@ -836,7 +861,7 @@ fn attach_focused_panesmith_pane(ctx: &mut EventLoopCtx) -> io::Result<()> {
 
 fn open_composer(ctx: &mut EventLoopCtx) {
     if ctx.group_tab == GroupTab::Advisors {
-        let brehon_root = ctx.dashboard_data.lock().unwrap().brehon_root.clone();
+        let brehon_root = ctx.dashboard_data.lock().brehon_root.clone();
         let room_id = active_advisor_room_id(brehon_root.as_deref());
         let mention_candidates = live_worker_ids(ctx);
         ctx.selection = None;
@@ -849,7 +874,7 @@ fn open_composer(ctx: &mut EventLoopCtx) {
     }
 
     if ctx.group_tab == GroupTab::Research {
-        let brehon_root = ctx.dashboard_data.lock().unwrap().brehon_root.clone();
+        let brehon_root = ctx.dashboard_data.lock().brehon_root.clone();
         let task_id = ctx.research_room_view.selected_task_id.clone().or_else(|| {
             active_research_room_task_id(brehon_root.as_deref(), &ctx.project_config_loader)
         });
@@ -901,7 +926,7 @@ fn submit_composer_message(ctx: &mut EventLoopCtx, submission: ComposerSubmissio
                 return;
             }
         };
-        let Some(brehon_root) = ctx.dashboard_data.lock().unwrap().brehon_root.clone() else {
+        let Some(brehon_root) = ctx.dashboard_data.lock().brehon_root.clone() else {
             state.status =
                 Some("Cannot post advisor message: .brehon root is unavailable.".to_string());
             ctx.input_mode = InputMode::Composer(state);
@@ -999,7 +1024,7 @@ This is a notification only: do not change task ownership, do not join the advis
     }
 
     if state.is_research_room() {
-        let Some(brehon_root) = ctx.dashboard_data.lock().unwrap().brehon_root.clone() else {
+        let Some(brehon_root) = ctx.dashboard_data.lock().brehon_root.clone() else {
             state.status =
                 Some("Cannot queue research request: .brehon root is unavailable.".to_string());
             ctx.input_mode = InputMode::Composer(state);
@@ -1046,7 +1071,7 @@ This is a notification only: do not change task ownership, do not join the advis
         return;
     }
 
-    let Some(brehon_root) = ctx.dashboard_data.lock().unwrap().brehon_root.clone() else {
+    let Some(brehon_root) = ctx.dashboard_data.lock().brehon_root.clone() else {
         state.status = Some("Cannot queue directive: .brehon root is unavailable.".to_string());
         ctx.input_mode = InputMode::Composer(state);
         return;
@@ -1405,7 +1430,7 @@ pub(super) fn process_pending_queued_gateway_prompt_deliveries(ctx: &mut EventLo
                     clear_prompt_retry_meta(&task.path);
                     if let (Some(id), Some(root)) = (
                         task.prompt_id.as_deref(),
-                        ctx.dashboard_data.lock().unwrap().brehon_root.clone(),
+                        ctx.dashboard_data.lock().brehon_root.clone(),
                     ) {
                         if let Err(err) = super::helpers::write_prompt_delivery_ack(
                             &root,
@@ -1502,7 +1527,7 @@ pub(super) fn process_pending_queued_gateway_prompt_deliveries(ctx: &mut EventLo
                             error: err_text.clone(),
                         }),
                     );
-                    let brehon_root = ctx.dashboard_data.lock().unwrap().brehon_root.clone();
+                    let brehon_root = ctx.dashboard_data.lock().brehon_root.clone();
                     let Some(root) = brehon_root.as_ref() else {
                         tracing::warn!(
                             target = %task.target,
@@ -1556,7 +1581,7 @@ pub(super) fn process_pending_queued_gateway_prompt_deliveries(ctx: &mut EventLo
                             error: err_text.clone(),
                         }),
                     );
-                    let brehon_root = ctx.dashboard_data.lock().unwrap().brehon_root.clone();
+                    let brehon_root = ctx.dashboard_data.lock().brehon_root.clone();
                     let Some(root) = brehon_root.as_ref() else {
                         tracing::warn!(
                             target = %task.target,
@@ -1955,7 +1980,7 @@ fn handle_runtime_command_error(
             );
             push_dashboard_event(&ctx.dashboard_data, message.clone());
             tracing::warn!(pane = %pane_id, error = %detail, "{message}");
-            let brehon_root = ctx.dashboard_data.lock().unwrap().brehon_root.clone();
+            let brehon_root = ctx.dashboard_data.lock().brehon_root.clone();
             if let Some(brehon_root) = brehon_root {
                 if let Some(task_id) = owning_task_id {
                     let blocked_task_result = block_task_for_prompt_block_recovery_failure(
@@ -2138,7 +2163,7 @@ fn apply_runtime_reset_success(
     success_message: &str,
     marker: Option<RecoveryResetMarker>,
 ) {
-    let brehon_root = ctx.dashboard_data.lock().unwrap().brehon_root.clone();
+    let brehon_root = ctx.dashboard_data.lock().brehon_root.clone();
     if let Some(root) = brehon_root.as_ref() {
         clear_agent_health_marker(root, pane_id);
     }
@@ -3000,6 +3025,10 @@ pub(super) fn detect_and_handle_supervisor_resets(
         let summary = format!(
             "reset supervisor {pane_id} after detected {reason}; reloading coordination context"
         );
+        super::notifications::notify_from_ctx(
+            ctx,
+            super::notifications::crash_detected_event(&pane_id, reason),
+        );
         let reset_reason = format!("supervisor runtime failure: {reason}");
         let command = RuntimeCommand {
             command_id: format!("supervisor-reset-{}", uuid::Uuid::new_v4()),
@@ -3119,7 +3148,7 @@ pub(super) fn new_headless_event_loop_ctx(
             viewport: Viewport::Fixed(Rect::new(0, 0, 80, 24)),
         },
     )?;
-    let dashboard_data = Arc::new(std::sync::Mutex::new(DashboardData::default()));
+    let dashboard_data = Arc::new(parking_lot::Mutex::new(DashboardData::default()));
     let runtime_session_name = mux.session_name().map(str::to_string);
 
     let structured_mode = mux
@@ -3225,6 +3254,21 @@ pub(super) fn new_headless_event_loop_ctx(
         last_panesmith_snapshot_panes: BTreeSet::new(),
         force_panesmith_snapshot_refresh: true,
         project_config_loader: crate::run::no_project_config_loader(),
+        notification_outbox: super::notifications::NotificationOutboxState::idle(
+            now,
+            Duration::from_secs(60),
+        ),
+        run_health: super::run_health::RunHealthState::idle(
+            now,
+            Duration::from_secs(60),
+            Duration::from_secs(600),
+        ),
+        last_budget_check: now - super::budget::DEFAULT_BUDGET_CHECK_INTERVAL,
+        budget_check_interval: super::budget::DEFAULT_BUDGET_CHECK_INTERVAL,
+        budget_torn_down: false,
+        budget_block_dispatch: None,
+        last_budget_warn: None,
+        budget_event_sink: Some(super::budget::default_budget_event_sink()),
         needs_redraw: false,
         runtime_agent_factory_host_owned,
         runtime_terminal_host_absolute_resize: false,
@@ -3232,7 +3276,9 @@ pub(super) fn new_headless_event_loop_ctx(
 }
 
 pub(super) fn run(ctx: &mut EventLoopCtx) -> io::Result<()> {
+    let mut last_slow_tick_warn = Instant::now() - Duration::from_secs(60);
     while !ctx.shutdown.load(Ordering::Relaxed) {
+        let tick_started_at = Instant::now();
         drain_runtime_command_receiver(ctx);
         drain_runtime_events_from_daemon(ctx);
 
@@ -3254,7 +3300,7 @@ pub(super) fn run(ctx: &mut EventLoopCtx) -> io::Result<()> {
         let panesmith_snapshot_panes =
             visible_panesmith_snapshot_panes(ctx, visible_active_left_id.as_deref());
 
-        let (_total_bytes, batch_events) = ctx
+        let (total_bytes, batch_events) = ctx
             .mux
             .poll_batch_with_panesmith_snapshot_panes(&panesmith_snapshot_panes);
         ctx.mux.flush_pending_inbox_nudges(&ctx.rt);
@@ -3289,6 +3335,11 @@ pub(super) fn run(ctx: &mut EventLoopCtx) -> io::Result<()> {
                                     "Stopping Brehon immediately after shared-root mutation detection: {issue}"
                                 ),
                             );
+                            tracing::error!(
+                                issue = %issue,
+                                "shared repo root mutated during run; shutting down all panes"
+                            );
+                            ctx.rt.block_on(ctx.mux.shutdown_all());
                             ctx.shutdown.store(true, Ordering::SeqCst);
                             break;
                         }
@@ -3340,7 +3391,7 @@ pub(super) fn run(ctx: &mut EventLoopCtx) -> io::Result<()> {
             }
         }
 
-        let brehon_root = ctx.dashboard_data.lock().unwrap().brehon_root.clone();
+        let brehon_root = ctx.dashboard_data.lock().brehon_root.clone();
         if let Some(root) = brehon_root.as_ref() {
             let mut active_worker_panes = std::collections::BTreeSet::new();
             for ev in &batch_events {
@@ -3375,7 +3426,7 @@ pub(super) fn run(ctx: &mut EventLoopCtx) -> io::Result<()> {
                 let refreshed_tasks = read_task_files(root);
                 let refreshed_sessions = read_session_files(root);
                 sync_worker_task_contexts(&mut ctx.mux, &refreshed_tasks, &refreshed_sessions);
-                ctx.dashboard_data.lock().unwrap().tasks = refreshed_tasks;
+                ctx.dashboard_data.lock().tasks = refreshed_tasks;
                 ctx.needs_redraw = true;
                 for (worker, task_id, new_status) in promoted_tasks {
                     tracing::info!(
@@ -3507,12 +3558,25 @@ pub(super) fn run(ctx: &mut EventLoopCtx) -> io::Result<()> {
             }
         }
 
-        detect_and_handle_supervisor_resets(ctx, &batch_events, loop_now);
+        // Panic firewall around the untrusted-event-driven supervisor reset
+        // seam: `batch_events` carries agent-produced pane output, so a panic
+        // in reset detection must not tear down the run loop. The fn returns
+        // () and recomputes its candidates from `batch_events`/`ctx` each
+        // tick, so continuing after a caught panic is sound. The `?`/break/
+        // continue IO paths in this loop body intentionally stay UNWRAPPED —
+        // a terminal/IO failure is a legitimate stop condition.
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            detect_and_handle_supervisor_resets(ctx, &batch_events, loop_now)
+        }))
+        .is_err()
+        {
+            tracing::error!("panic in supervisor reset detection; continuing event loop");
+        }
 
         // Determine which left pane is active
         let active_left_id = active_left_pane_id(ctx);
         let focused_id = ctx.mux.focused_id().map(str::to_string);
-        let dashboard_snapshot = ctx.dashboard_data.lock().unwrap().clone();
+        let dashboard_snapshot = ctx.dashboard_data.lock().clone();
         let runtime_status = if ctx.runtime_agent_factory_host_owned {
             dashboard_snapshot
                 .brehon_root
@@ -3953,7 +4017,7 @@ pub(super) fn run(ctx: &mut EventLoopCtx) -> io::Result<()> {
                 }
             }
 
-            let brehon_root = ctx.dashboard_data.lock().unwrap().brehon_root.clone();
+            let brehon_root = ctx.dashboard_data.lock().brehon_root.clone();
             if let Some(ref root) = brehon_root {
                 if ctx.pending_dashboard_refresh.is_none() {
                     let root = root.clone();
@@ -3971,7 +4035,74 @@ pub(super) fn run(ctx: &mut EventLoopCtx) -> io::Result<()> {
             ctx.last_session_poll = std::time::Instant::now();
         }
 
-        super::stall_handling::detect_and_handle_stalls(ctx);
+        // Panic firewalls around the periodic ticks: a panic in stall
+        // detection or the budget kill-switch must NOT unwind out of the
+        // run loop and end a multi-day unattended session. AssertUnwindSafe
+        // is sound here because both fns return () and mutate only plain
+        // ctx fields with no cross-field invariant a half-finished tick
+        // would corrupt: stall detection recomputes from `ctx` every tick,
+        // and the budget teardown is latched idempotent via
+        // `ctx.budget_torn_down`, so re-running next tick after a caught
+        // panic cannot double-act. See docs/adr/0009-panic-unwind-firewalls.md.
+        let defer_stall_scan_for_activity = total_bytes > 0
+            || !batch_events.is_empty()
+            || !ctx.pending_queued_gateway_prompt_deliveries.is_empty();
+        let stall_scan_deferred_too_long = ctx.last_stall_check.elapsed()
+            >= ctx
+                .stall_check_interval
+                .saturating_add(MAX_STALL_SCAN_ACTIVITY_DEFERRAL);
+        if defer_stall_scan_for_activity && !stall_scan_deferred_too_long {
+            tracing::debug!(
+                mux_output_bytes = total_bytes,
+                mux_events = batch_events.len(),
+                pending_prompts = ctx.mux.pending_delayed_prompt_count(),
+                pending_gateway_prompt_deliveries =
+                    ctx.pending_queued_gateway_prompt_deliveries.len(),
+                "deferred heavy stall scan while TUI is processing active output or prompt fan-out"
+            );
+        } else if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            super::stall_handling::detect_and_handle_stalls(ctx)
+        }))
+        .is_err()
+        {
+            tracing::error!("panic in detect_and_handle_stalls; continuing event loop");
+        }
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            super::budget::budget_tick(ctx)
+        }))
+        .is_err()
+        {
+            tracing::error!("panic in budget_tick; continuing event loop");
+        }
+
+        super::notifications::service_outbox(ctx);
+
+        let tick_elapsed = tick_started_at.elapsed();
+        let slow_tick = tick_elapsed >= Duration::from_millis(250);
+        ctx.run_health.observe_tick(tick_elapsed, slow_tick);
+        if slow_tick && last_slow_tick_warn.elapsed() >= Duration::from_secs(10) {
+            tracing::warn!(
+                elapsed_ms = tick_elapsed.as_millis(),
+                mux_output_bytes = total_bytes,
+                mux_events = batch_events.len(),
+                pending_prompts = ctx.mux.pending_delayed_prompt_count(),
+                "slow TUI event loop tick"
+            );
+            last_slow_tick_warn = Instant::now();
+        }
+        if ctx.run_health.should_warn(tick_elapsed) {
+            super::notifications::notify_from_ctx(
+                ctx,
+                super::notifications::run_health_warning_event(
+                    tick_elapsed.as_millis(),
+                    total_bytes,
+                    batch_events.len(),
+                    ctx.mux.pending_delayed_prompt_count(),
+                ),
+            );
+            ctx.run_health.mark_warning();
+        }
+        super::run_health::service(ctx, tick_elapsed, total_bytes, batch_events.len());
     }
 
     Ok(())
@@ -3987,7 +4118,9 @@ pub(super) fn runtime_command_timestamp_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::run::budget;
     use crate::run::init_test_git_repo;
+    use crate::run::prompt_delivery::dispatch_runtime_prompt;
     use brehon_ports::RuntimeCommandRouter;
     use brehon_types::config::WorkerIdleBehavior;
     use ratatui::{TerminalOptions, Viewport};
@@ -4366,7 +4499,7 @@ mod tests {
             },
         )
         .expect("fixed terminal");
-        let dashboard_data = Arc::new(std::sync::Mutex::new(DashboardData::default()));
+        let dashboard_data = Arc::new(parking_lot::Mutex::new(DashboardData::default()));
         let runtime_session_name = mux.session_name().map(str::to_string);
 
         TestHarness {
@@ -4455,6 +4588,21 @@ mod tests {
                 last_panesmith_snapshot_panes: BTreeSet::new(),
                 force_panesmith_snapshot_refresh: true,
                 project_config_loader: crate::run::no_project_config_loader(),
+                notification_outbox: crate::run::notifications::NotificationOutboxState::idle(
+                    now,
+                    Duration::from_secs(60),
+                ),
+                run_health: crate::run::run_health::RunHealthState::idle(
+                    now,
+                    Duration::from_secs(60),
+                    Duration::from_secs(600),
+                ),
+                last_budget_check: now - crate::run::budget::DEFAULT_BUDGET_CHECK_INTERVAL,
+                budget_check_interval: crate::run::budget::DEFAULT_BUDGET_CHECK_INTERVAL,
+                budget_torn_down: false,
+                budget_block_dispatch: None,
+                last_budget_warn: None,
+                budget_event_sink: None,
                 needs_redraw: false,
                 runtime_agent_factory_host_owned: host_owned,
                 runtime_terminal_host_absolute_resize: false,
@@ -5257,6 +5405,160 @@ TypeError: Cannot read properties of undefined"#,
         drain_runtime_commands(&mut harness);
     }
 
+    // ── Budget kill-switch integration ───────────────────────────────────
+    //
+    // Drives the REAL gate (`budget_tick` + the `dispatch_runtime_prompt`
+    // seam) against an injected fake spend source (a tempdir rollup over a
+    // Hard token cap, surfaced through the real config loader) and a fake
+    // event sink. Asserts: over-cap => new dispatch refused, teardown invoked
+    // once, and a breach event emitted. This is caused by the production gate,
+    // not hand-appended events.
+
+    fn write_budget_project_config(project_root: &std::path::Path, body: &str) {
+        let brehon_dir = project_root.join(".brehon");
+        std::fs::create_dir_all(&brehon_dir).unwrap();
+        std::fs::write(brehon_dir.join("config.yaml"), body).unwrap();
+    }
+
+    fn write_initiative_rollup(brehon_root: &std::path::Path, task_id: &str, tokens: u64) {
+        let tasks = brehon_root.join("runtime").join("tasks");
+        std::fs::create_dir_all(&tasks).unwrap();
+        std::fs::write(
+            tasks.join(format!("{task_id}.json")),
+            serde_json::json!({
+                "task_id": task_id,
+                "task_type": "initiative",
+                "token_usage": { "tokens_used": tokens }
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    fn project_config_loader_from_disk() -> crate::run::research::ProjectConfigLoader {
+        Arc::new(|project_root: &std::path::Path| {
+            brehon_config::load_config(Some(project_root)).ok()
+        })
+    }
+
+    #[test]
+    fn budget_tick_over_hard_cap_refuses_dispatch_and_tears_down_once() {
+        let mut mux = Mux::new(24, 80);
+        mux.add_pane(make_worker_pane("worker-1"));
+        let mut harness = harness_with_mux(mux);
+
+        // Project layout: <tempdir>/.brehon is the brehon_root; the config
+        // (Hard, 1000-token cap) lives under it; the rollup is 5000 tokens.
+        let project = tempfile::tempdir().unwrap();
+        let brehon_root = project.path().join(".brehon");
+        write_budget_project_config(
+            project.path(),
+            "budget:\n  max_tokens_per_agent: 1000\n  enforcement: Hard\n",
+        );
+        write_initiative_rollup(&brehon_root, "I-1", 5_000);
+
+        harness.ctx.dashboard_data.lock().brehon_root = Some(brehon_root.clone());
+        harness.ctx.project_config_loader = project_config_loader_from_disk();
+
+        // Fake durable event sink.
+        let breaches: Arc<std::sync::Mutex<Vec<budget::BudgetBreachEvent>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink_breaches = breaches.clone();
+        harness.ctx.budget_event_sink = Some(Arc::new(move |event| {
+            sink_breaches.lock().unwrap().push(event);
+        }));
+
+        // Force the tick to run immediately.
+        harness.ctx.budget_check_interval = Duration::ZERO;
+        harness.ctx.last_budget_check = Instant::now() - Duration::from_secs(60);
+
+        // Before the breach, dispatch is allowed.
+        assert!(budget::dispatch_allowed(&harness.ctx).is_ok());
+
+        budget::budget_tick(&mut harness.ctx);
+
+        // (a) NEW dispatch is refused after the breach.
+        assert!(
+            !dispatch_runtime_prompt(&mut harness.ctx, "worker-1", "go".to_string(), None),
+            "dispatch must be refused once the Hard cap is breached"
+        );
+
+        // (b) Teardown invoked exactly once.
+        assert!(harness.ctx.budget_torn_down, "teardown latch must be set");
+        assert!(
+            harness.ctx.shutdown.load(Ordering::SeqCst),
+            "shutdown must be requested so the post-loop teardown fires"
+        );
+
+        // (c) A breach event was recorded through the injected sink.
+        {
+            let recorded = breaches.lock().unwrap();
+            assert_eq!(recorded.len(), 1, "exactly one breach event");
+            assert!(
+                recorded[0].reason.contains("token limit"),
+                "breach names the cap: {}",
+                recorded[0].reason
+            );
+            assert_eq!(
+                recorded[0].enforcement,
+                brehon_types::BudgetEnforcement::Hard
+            );
+        }
+
+        // (d) A budget-exceeded dashboard event is present.
+        {
+            let dash = harness.ctx.dashboard_data.lock();
+            assert!(
+                dash.events
+                    .iter()
+                    .any(|e| e.description.contains("budget exceeded")),
+                "a budget-exceeded dashboard event must be present"
+            );
+        }
+
+        // One-shot: a second tick must NOT re-emit or re-kill.
+        harness.ctx.last_budget_check = Instant::now() - Duration::from_secs(60);
+        budget::budget_tick(&mut harness.ctx);
+        assert_eq!(
+            breaches.lock().unwrap().len(),
+            1,
+            "the one-shot latch must prevent a second breach event"
+        );
+    }
+
+    #[test]
+    fn budget_tick_no_cap_never_tears_down_owner_unlimited_run() {
+        let mut mux = Mux::new(24, 80);
+        mux.add_pane(make_worker_pane("worker-1"));
+        let mut harness = harness_with_mux(mux);
+
+        let project = tempfile::tempdir().unwrap();
+        let brehon_root = project.path().join(".brehon");
+        // Hard enforcement but NO numeric cap: an unlimited run.
+        write_budget_project_config(project.path(), "budget:\n  enforcement: Hard\n");
+        write_initiative_rollup(&brehon_root, "I-1", 50_000_000);
+
+        harness.ctx.dashboard_data.lock().brehon_root = Some(brehon_root);
+        harness.ctx.project_config_loader = project_config_loader_from_disk();
+        harness.ctx.budget_check_interval = Duration::ZERO;
+        harness.ctx.last_budget_check = Instant::now() - Duration::from_secs(60);
+
+        budget::budget_tick(&mut harness.ctx);
+
+        assert!(
+            !harness.ctx.budget_torn_down,
+            "an unlimited run must never be torn down"
+        );
+        assert!(
+            !harness.ctx.shutdown.load(Ordering::SeqCst),
+            "an unlimited run must not request shutdown"
+        );
+        assert!(
+            budget::dispatch_allowed(&harness.ctx).is_ok(),
+            "dispatch must remain allowed for an unlimited run"
+        );
+    }
+
     #[test]
     fn dead_worker_recycle_routes_without_idle_threshold() {
         let mut mux = Mux::new(24, 80);
@@ -5302,12 +5604,7 @@ TypeError: Cannot read properties of undefined"#,
             .ctx
             .last_activity
             .insert("worker-1".to_string(), now - Duration::from_secs(5));
-        harness
-            .ctx
-            .dashboard_data
-            .lock()
-            .expect("dashboard")
-            .brehon_root = Some(brehon_root.clone());
+        harness.ctx.dashboard_data.lock().brehon_root = Some(brehon_root.clone());
 
         crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
 
@@ -5340,12 +5637,7 @@ TypeError: Cannot read properties of undefined"#,
         let mut harness = harness_with_mux(mux);
         harness.ctx.stall_check_interval = Duration::ZERO;
         harness.ctx.last_stall_check = Instant::now() - Duration::from_secs(60);
-        harness
-            .ctx
-            .dashboard_data
-            .lock()
-            .expect("dashboard")
-            .brehon_root = Some(brehon_root.clone());
+        harness.ctx.dashboard_data.lock().brehon_root = Some(brehon_root.clone());
 
         crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
 
@@ -5399,12 +5691,7 @@ TypeError: Cannot read properties of undefined"#,
         let mut harness = harness_with_mux(mux);
         harness.ctx.stall_check_interval = Duration::ZERO;
         harness.ctx.last_stall_check = Instant::now() - Duration::from_secs(60);
-        harness
-            .ctx
-            .dashboard_data
-            .lock()
-            .expect("dashboard")
-            .brehon_root = Some(brehon_root.clone());
+        harness.ctx.dashboard_data.lock().brehon_root = Some(brehon_root.clone());
 
         crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
 
@@ -5435,12 +5722,7 @@ TypeError: Cannot read properties of undefined"#,
         let mut harness = harness_with_mux(mux);
         harness.ctx.stall_check_interval = Duration::ZERO;
         harness.ctx.last_stall_check = Instant::now() - Duration::from_secs(60);
-        harness
-            .ctx
-            .dashboard_data
-            .lock()
-            .expect("dashboard")
-            .brehon_root = Some(brehon_root.clone());
+        harness.ctx.dashboard_data.lock().brehon_root = Some(brehon_root.clone());
 
         crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
 
@@ -5483,12 +5765,7 @@ TypeError: Cannot read properties of undefined"#,
         let mut harness = harness_with_mux(mux);
         harness.ctx.stall_check_interval = Duration::ZERO;
         harness.ctx.last_stall_check = Instant::now() - Duration::from_secs(60);
-        harness
-            .ctx
-            .dashboard_data
-            .lock()
-            .expect("dashboard")
-            .brehon_root = Some(brehon_root.clone());
+        harness.ctx.dashboard_data.lock().brehon_root = Some(brehon_root.clone());
 
         crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
 
@@ -5520,12 +5797,7 @@ TypeError: Cannot read properties of undefined"#,
         let mut harness = harness_with_mux(mux);
         harness.ctx.stall_check_interval = Duration::ZERO;
         harness.ctx.last_stall_check = Instant::now() - Duration::from_secs(60);
-        harness
-            .ctx
-            .dashboard_data
-            .lock()
-            .expect("dashboard")
-            .brehon_root = Some(brehon_root.clone());
+        harness.ctx.dashboard_data.lock().brehon_root = Some(brehon_root.clone());
 
         crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
 
@@ -5574,7 +5846,7 @@ TypeError: Cannot read properties of undefined"#,
 
         drain_runtime_commands(&mut harness);
 
-        let dashboard = harness.ctx.dashboard_data.lock().expect("dashboard");
+        let dashboard = harness.ctx.dashboard_data.lock();
         let found = dashboard.events.iter().any(|event| {
             event
                 .description
@@ -5624,12 +5896,7 @@ TypeError: Cannot read properties of undefined"#,
             .ctx
             .last_activity
             .insert("worker-1".to_string(), now - Duration::from_secs(5));
-        harness
-            .ctx
-            .dashboard_data
-            .lock()
-            .expect("dashboard")
-            .brehon_root = Some(brehon_root.clone());
+        harness.ctx.dashboard_data.lock().brehon_root = Some(brehon_root.clone());
 
         crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
 
@@ -5642,7 +5909,7 @@ TypeError: Cannot read properties of undefined"#,
 
         drain_runtime_commands(&mut harness);
 
-        let dashboard = harness.ctx.dashboard_data.lock().expect("dashboard");
+        let dashboard = harness.ctx.dashboard_data.lock();
         let found = dashboard.events.iter().any(|event| {
             event
                 .description
@@ -5706,12 +5973,7 @@ TypeError: Cannot read properties of undefined"#,
         let mut harness = harness_with_mux(mux);
         harness.ctx.stall_check_interval = Duration::ZERO;
         harness.ctx.last_stall_check = Instant::now() - Duration::from_secs(60);
-        harness
-            .ctx
-            .dashboard_data
-            .lock()
-            .expect("dashboard")
-            .brehon_root = Some(brehon_root.clone());
+        harness.ctx.dashboard_data.lock().brehon_root = Some(brehon_root.clone());
 
         crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
 
@@ -5754,12 +6016,7 @@ TypeError: Cannot read properties of undefined"#,
         let mut harness = harness_with_mux(mux);
         harness.ctx.stall_check_interval = Duration::ZERO;
         harness.ctx.last_stall_check = Instant::now() - Duration::from_secs(60);
-        harness
-            .ctx
-            .dashboard_data
-            .lock()
-            .expect("dashboard")
-            .brehon_root = Some(brehon_root.clone());
+        harness.ctx.dashboard_data.lock().brehon_root = Some(brehon_root.clone());
 
         crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
 
@@ -5803,12 +6060,7 @@ TypeError: Cannot read properties of undefined"#,
         let mut harness = harness_with_mux(mux);
         harness.ctx.stall_check_interval = Duration::ZERO;
         harness.ctx.last_stall_check = Instant::now() - Duration::from_secs(60);
-        harness
-            .ctx
-            .dashboard_data
-            .lock()
-            .expect("dashboard")
-            .brehon_root = Some(brehon_root.clone());
+        harness.ctx.dashboard_data.lock().brehon_root = Some(brehon_root.clone());
 
         crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
 
@@ -5850,12 +6102,7 @@ TypeError: Cannot read properties of undefined"#,
         let mut harness = harness_with_mux(mux);
         harness.ctx.stall_check_interval = Duration::ZERO;
         harness.ctx.last_stall_check = Instant::now() - Duration::from_secs(60);
-        harness
-            .ctx
-            .dashboard_data
-            .lock()
-            .expect("dashboard")
-            .brehon_root = Some(brehon_root.clone());
+        harness.ctx.dashboard_data.lock().brehon_root = Some(brehon_root.clone());
 
         crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
 
@@ -5900,12 +6147,7 @@ TypeError: Cannot read properties of undefined"#,
         let mut harness = harness_with_mux(mux);
         harness.ctx.stall_check_interval = Duration::ZERO;
         harness.ctx.last_stall_check = Instant::now() - Duration::from_secs(60);
-        harness
-            .ctx
-            .dashboard_data
-            .lock()
-            .expect("dashboard")
-            .brehon_root = Some(brehon_root.clone());
+        harness.ctx.dashboard_data.lock().brehon_root = Some(brehon_root.clone());
 
         crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
         let routed = recv_route(&harness.rx);
@@ -5945,12 +6187,7 @@ TypeError: Cannot read properties of undefined"#,
         harness.ctx.runtime_command_router = None;
         harness.ctx.stall_check_interval = Duration::ZERO;
         harness.ctx.last_stall_check = Instant::now() - Duration::from_secs(60);
-        harness
-            .ctx
-            .dashboard_data
-            .lock()
-            .expect("dashboard")
-            .brehon_root = Some(brehon_root.clone());
+        harness.ctx.dashboard_data.lock().brehon_root = Some(brehon_root.clone());
 
         crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
 
@@ -5999,12 +6236,7 @@ TypeError: Cannot read properties of undefined"#,
         );
         harness.ctx.stall_check_interval = Duration::ZERO;
         harness.ctx.last_stall_check = Instant::now() - Duration::from_secs(60);
-        harness
-            .ctx
-            .dashboard_data
-            .lock()
-            .expect("dashboard")
-            .brehon_root = Some(brehon_root.clone());
+        harness.ctx.dashboard_data.lock().brehon_root = Some(brehon_root.clone());
 
         crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
 
@@ -6072,12 +6304,7 @@ TypeError: Cannot read properties of undefined"#,
         );
         harness.ctx.stall_check_interval = Duration::ZERO;
         harness.ctx.last_stall_check = Instant::now() - Duration::from_secs(60);
-        harness
-            .ctx
-            .dashboard_data
-            .lock()
-            .expect("dashboard")
-            .brehon_root = Some(brehon_root.clone());
+        harness.ctx.dashboard_data.lock().brehon_root = Some(brehon_root.clone());
 
         crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
 
@@ -6130,25 +6357,13 @@ TypeError: Cannot read properties of undefined"#,
             merged_task.get("status").and_then(|value| value.as_str()),
             Some("merged")
         );
-        let first_event_count = harness
-            .ctx
-            .dashboard_data
-            .lock()
-            .expect("dashboard")
-            .events
-            .len();
+        let first_event_count = harness.ctx.dashboard_data.lock().events.len();
 
         harness.ctx.last_stall_check = Instant::now() - Duration::from_secs(60);
         crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
 
         let second_marker = std::fs::read_to_string(&health_path).expect("marker after resweep");
-        let second_event_count = harness
-            .ctx
-            .dashboard_data
-            .lock()
-            .expect("dashboard")
-            .events
-            .len();
+        let second_event_count = harness.ctx.dashboard_data.lock().events.len();
         assert_eq!(
             first_marker, second_marker,
             "task-backed queued recycle failures that cannot rewrite a terminal task should converge to a one-shot terminal marker"
@@ -6176,12 +6391,7 @@ TypeError: Cannot read properties of undefined"#,
         );
         harness.ctx.stall_check_interval = Duration::ZERO;
         harness.ctx.last_stall_check = Instant::now() - Duration::from_secs(60);
-        harness
-            .ctx
-            .dashboard_data
-            .lock()
-            .expect("dashboard")
-            .brehon_root = Some(brehon_root.clone());
+        harness.ctx.dashboard_data.lock().brehon_root = Some(brehon_root.clone());
 
         crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
 
@@ -6196,24 +6406,12 @@ TypeError: Cannot read properties of undefined"#,
                 .contains("worker-1"),
             "queued recycle failures should suppress the live blocked worker in memory when the recovery-failed marker cannot be persisted"
         );
-        let first_event_count = harness
-            .ctx
-            .dashboard_data
-            .lock()
-            .expect("dashboard")
-            .events
-            .len();
+        let first_event_count = harness.ctx.dashboard_data.lock().events.len();
 
         harness.ctx.last_stall_check = Instant::now() - Duration::from_secs(60);
         crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
 
-        let second_event_count = harness
-            .ctx
-            .dashboard_data
-            .lock()
-            .expect("dashboard")
-            .events
-            .len();
+        let second_event_count = harness.ctx.dashboard_data.lock().events.len();
         assert_eq!(
             first_event_count, second_event_count,
             "once in-memory suppression is recorded for a queued recycle failure, later stall sweeps should not retry the same blocked worker"
@@ -6240,12 +6438,7 @@ TypeError: Cannot read properties of undefined"#,
         );
         harness.ctx.stall_check_interval = Duration::ZERO;
         harness.ctx.last_stall_check = Instant::now() - Duration::from_secs(60);
-        harness
-            .ctx
-            .dashboard_data
-            .lock()
-            .expect("dashboard")
-            .brehon_root = Some(brehon_root.clone());
+        harness.ctx.dashboard_data.lock().brehon_root = Some(brehon_root.clone());
 
         crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
 
@@ -6283,25 +6476,13 @@ TypeError: Cannot read properties of undefined"#,
                 .and_then(|value| value.as_str()),
             Some("perm-1")
         );
-        let first_event_count = harness
-            .ctx
-            .dashboard_data
-            .lock()
-            .expect("dashboard")
-            .events
-            .len();
+        let first_event_count = harness.ctx.dashboard_data.lock().events.len();
 
         harness.ctx.last_stall_check = Instant::now() - Duration::from_secs(60);
         crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
 
         let second_marker = std::fs::read_to_string(&health_path).expect("marker after resweep");
-        let second_event_count = harness
-            .ctx
-            .dashboard_data
-            .lock()
-            .expect("dashboard")
-            .events
-            .len();
+        let second_event_count = harness.ctx.dashboard_data.lock().events.len();
         assert_eq!(
             first_marker, second_marker,
             "queued recycle rejection for a taskless prompt-blocked worker should converge to a one-shot terminal marker"
@@ -6335,12 +6516,7 @@ TypeError: Cannot read properties of undefined"#,
             .ctx
             .last_activity
             .insert("worker-1".to_string(), now - Duration::from_secs(5));
-        harness
-            .ctx
-            .dashboard_data
-            .lock()
-            .expect("dashboard")
-            .brehon_root = Some(brehon_root.clone());
+        harness.ctx.dashboard_data.lock().brehon_root = Some(brehon_root.clone());
 
         crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
 
@@ -6404,12 +6580,7 @@ TypeError: Cannot read properties of undefined"#,
             .ctx
             .last_activity
             .insert("worker-1".to_string(), now - Duration::from_secs(5));
-        harness
-            .ctx
-            .dashboard_data
-            .lock()
-            .expect("dashboard")
-            .brehon_root = Some(brehon_root.clone());
+        harness.ctx.dashboard_data.lock().brehon_root = Some(brehon_root.clone());
 
         crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
 
@@ -6452,12 +6623,7 @@ TypeError: Cannot read properties of undefined"#,
             .ctx
             .last_activity
             .insert("worker-1".to_string(), now);
-        harness
-            .ctx
-            .dashboard_data
-            .lock()
-            .expect("dashboard")
-            .brehon_root = Some(brehon_root.clone());
+        harness.ctx.dashboard_data.lock().brehon_root = Some(brehon_root.clone());
 
         crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
 
@@ -6503,12 +6669,7 @@ TypeError: Cannot read properties of undefined"#,
             .ctx
             .last_activity
             .insert("worker-1".to_string(), now);
-        harness
-            .ctx
-            .dashboard_data
-            .lock()
-            .expect("dashboard")
-            .brehon_root = Some(brehon_root.clone());
+        harness.ctx.dashboard_data.lock().brehon_root = Some(brehon_root.clone());
 
         crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
 
@@ -6572,12 +6733,7 @@ TypeError: Cannot read properties of undefined"#,
             .ctx
             .last_activity
             .insert("worker-1".to_string(), now);
-        harness
-            .ctx
-            .dashboard_data
-            .lock()
-            .expect("dashboard")
-            .brehon_root = Some(brehon_root.clone());
+        harness.ctx.dashboard_data.lock().brehon_root = Some(brehon_root.clone());
 
         crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
 
@@ -6646,12 +6802,7 @@ TypeError: Cannot read properties of undefined"#,
             .ctx
             .last_activity
             .insert("worker-1".to_string(), now);
-        harness
-            .ctx
-            .dashboard_data
-            .lock()
-            .expect("dashboard")
-            .brehon_root = Some(brehon_root.clone());
+        harness.ctx.dashboard_data.lock().brehon_root = Some(brehon_root.clone());
 
         crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
 
@@ -6695,12 +6846,7 @@ TypeError: Cannot read properties of undefined"#,
             .ctx
             .last_activity
             .insert("worker-1".to_string(), now - Duration::from_secs(5));
-        harness
-            .ctx
-            .dashboard_data
-            .lock()
-            .expect("dashboard")
-            .brehon_root = Some(brehon_root.clone());
+        harness.ctx.dashboard_data.lock().brehon_root = Some(brehon_root.clone());
 
         crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
 
@@ -6755,12 +6901,7 @@ TypeError: Cannot read properties of undefined"#,
             .ctx
             .last_activity
             .insert("worker-1".to_string(), now - Duration::from_secs(5));
-        harness
-            .ctx
-            .dashboard_data
-            .lock()
-            .expect("dashboard")
-            .brehon_root = Some(brehon_root.clone());
+        harness.ctx.dashboard_data.lock().brehon_root = Some(brehon_root.clone());
 
         crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
 
@@ -6821,12 +6962,7 @@ TypeError: Cannot read properties of undefined"#,
         harness.ctx.auto_recover_threshold = Duration::from_secs(60 * 60);
         harness.ctx.stall_check_interval = Duration::ZERO;
         harness.ctx.last_stall_check = now - Duration::from_secs(60);
-        harness
-            .ctx
-            .dashboard_data
-            .lock()
-            .expect("dashboard")
-            .brehon_root = Some(brehon_root.clone());
+        harness.ctx.dashboard_data.lock().brehon_root = Some(brehon_root.clone());
 
         crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
 
@@ -6902,12 +7038,7 @@ TypeError: Cannot read properties of undefined"#,
             .ctx
             .last_activity
             .insert("worker-1".to_string(), now - Duration::from_secs(5));
-        harness
-            .ctx
-            .dashboard_data
-            .lock()
-            .expect("dashboard")
-            .brehon_root = Some(brehon_root.clone());
+        harness.ctx.dashboard_data.lock().brehon_root = Some(brehon_root.clone());
 
         crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
 
@@ -6981,12 +7112,7 @@ TypeError: Cannot read properties of undefined"#,
             .ctx
             .last_activity
             .insert("worker-2".to_string(), now - Duration::from_secs(5));
-        harness
-            .ctx
-            .dashboard_data
-            .lock()
-            .expect("dashboard")
-            .brehon_root = Some(brehon_root.clone());
+        harness.ctx.dashboard_data.lock().brehon_root = Some(brehon_root.clone());
 
         crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
 
@@ -7053,12 +7179,7 @@ TypeError: Cannot read properties of undefined"#,
             .ctx
             .last_activity
             .insert("worker-1".to_string(), now - Duration::from_secs(5));
-        harness
-            .ctx
-            .dashboard_data
-            .lock()
-            .expect("dashboard")
-            .brehon_root = Some(brehon_root.clone());
+        harness.ctx.dashboard_data.lock().brehon_root = Some(brehon_root.clone());
 
         crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
 
@@ -7222,12 +7343,7 @@ TypeError: Cannot read properties of undefined"#,
             .ctx
             .last_activity
             .insert("worker-1".to_string(), now - Duration::from_secs(5));
-        harness
-            .ctx
-            .dashboard_data
-            .lock()
-            .expect("dashboard")
-            .brehon_root = Some(brehon_root.clone());
+        harness.ctx.dashboard_data.lock().brehon_root = Some(brehon_root.clone());
 
         crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
 
@@ -7287,12 +7403,7 @@ TypeError: Cannot read properties of undefined"#,
         harness.ctx.runtime_command_router = None;
         harness.ctx.stall_check_interval = Duration::ZERO;
         harness.ctx.last_stall_check = Instant::now() - Duration::from_secs(60);
-        harness
-            .ctx
-            .dashboard_data
-            .lock()
-            .expect("dashboard")
-            .brehon_root = Some(brehon_root.clone());
+        harness.ctx.dashboard_data.lock().brehon_root = Some(brehon_root.clone());
 
         crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
 
@@ -7351,12 +7462,7 @@ TypeError: Cannot read properties of undefined"#,
         harness.ctx.runtime_command_router = None;
         harness.ctx.stall_check_interval = Duration::ZERO;
         harness.ctx.last_stall_check = Instant::now() - Duration::from_secs(60);
-        harness
-            .ctx
-            .dashboard_data
-            .lock()
-            .expect("dashboard")
-            .brehon_root = Some(brehon_root.clone());
+        harness.ctx.dashboard_data.lock().brehon_root = Some(brehon_root.clone());
 
         crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
 
@@ -7391,25 +7497,13 @@ TypeError: Cannot read properties of undefined"#,
             terminal_task.get("status").and_then(|value| value.as_str()),
             Some("merged")
         );
-        let first_event_count = harness
-            .ctx
-            .dashboard_data
-            .lock()
-            .expect("dashboard")
-            .events
-            .len();
+        let first_event_count = harness.ctx.dashboard_data.lock().events.len();
 
         harness.ctx.last_stall_check = Instant::now() - Duration::from_secs(60);
         crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
 
         let second_marker = std::fs::read_to_string(&health_path).expect("marker after resweep");
-        let second_event_count = harness
-            .ctx
-            .dashboard_data
-            .lock()
-            .expect("dashboard")
-            .events
-            .len();
+        let second_event_count = harness.ctx.dashboard_data.lock().events.len();
         assert_eq!(
             first_marker, second_marker,
             "terminal task prompt-blocked reviewer failures should converge to a one-shot terminal marker"
@@ -7447,12 +7541,7 @@ TypeError: Cannot read properties of undefined"#,
         harness.ctx.runtime_command_router = None;
         harness.ctx.stall_check_interval = Duration::ZERO;
         harness.ctx.last_stall_check = Instant::now() - Duration::from_secs(60);
-        harness
-            .ctx
-            .dashboard_data
-            .lock()
-            .expect("dashboard")
-            .brehon_root = Some(brehon_root.clone());
+        harness.ctx.dashboard_data.lock().brehon_root = Some(brehon_root.clone());
 
         crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
 
@@ -7477,24 +7566,12 @@ TypeError: Cannot read properties of undefined"#,
             merged_task.get("status").and_then(|value| value.as_str()),
             Some("merged")
         );
-        let first_event_count = harness
-            .ctx
-            .dashboard_data
-            .lock()
-            .expect("dashboard")
-            .events
-            .len();
+        let first_event_count = harness.ctx.dashboard_data.lock().events.len();
 
         harness.ctx.last_stall_check = Instant::now() - Duration::from_secs(60);
         crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
 
-        let second_event_count = harness
-            .ctx
-            .dashboard_data
-            .lock()
-            .expect("dashboard")
-            .events
-            .len();
+        let second_event_count = harness.ctx.dashboard_data.lock().events.len();
         assert_eq!(
             first_event_count, second_event_count,
             "once in-memory suppression is recorded for a live blocked reviewer, later stall sweeps should not retry the same failed recovery"
@@ -7516,12 +7593,7 @@ TypeError: Cannot read properties of undefined"#,
         harness.ctx.runtime_command_router = None;
         harness.ctx.stall_check_interval = Duration::ZERO;
         harness.ctx.last_stall_check = Instant::now() - Duration::from_secs(60);
-        harness
-            .ctx
-            .dashboard_data
-            .lock()
-            .expect("dashboard")
-            .brehon_root = Some(brehon_root.clone());
+        harness.ctx.dashboard_data.lock().brehon_root = Some(brehon_root.clone());
 
         crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
 
@@ -7573,12 +7645,7 @@ TypeError: Cannot read properties of undefined"#,
         harness.ctx.runtime_command_router = None;
         harness.ctx.stall_check_interval = Duration::ZERO;
         harness.ctx.last_stall_check = Instant::now() - Duration::from_secs(60);
-        harness
-            .ctx
-            .dashboard_data
-            .lock()
-            .expect("dashboard")
-            .brehon_root = Some(brehon_root.clone());
+        harness.ctx.dashboard_data.lock().brehon_root = Some(brehon_root.clone());
 
         crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
 
@@ -7591,26 +7658,14 @@ TypeError: Cannot read properties of undefined"#,
             .join("tasks")
             .join("T-owned.json");
         let first_task = std::fs::read_to_string(&task_path).expect("task file after first sweep");
-        let first_event_count = harness
-            .ctx
-            .dashboard_data
-            .lock()
-            .expect("dashboard")
-            .events
-            .len();
+        let first_event_count = harness.ctx.dashboard_data.lock().events.len();
 
         harness.ctx.last_stall_check = Instant::now() - Duration::from_secs(60);
         crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
 
         let second_task =
             std::fs::read_to_string(&task_path).expect("task file after second sweep");
-        let second_event_count = harness
-            .ctx
-            .dashboard_data
-            .lock()
-            .expect("dashboard")
-            .events
-            .len();
+        let second_event_count = harness.ctx.dashboard_data.lock().events.len();
         assert_eq!(
             first_task, second_task,
             "once prompt-blocked recovery marks the task blocked, later stall sweeps should not rewrite the task file for the same pane"
@@ -7635,12 +7690,7 @@ TypeError: Cannot read properties of undefined"#,
         harness.ctx.runtime_command_router = None;
         harness.ctx.stall_check_interval = Duration::ZERO;
         harness.ctx.last_stall_check = Instant::now() - Duration::from_secs(60);
-        harness
-            .ctx
-            .dashboard_data
-            .lock()
-            .expect("dashboard")
-            .brehon_root = Some(brehon_root.clone());
+        harness.ctx.dashboard_data.lock().brehon_root = Some(brehon_root.clone());
 
         crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
 
@@ -7650,25 +7700,13 @@ TypeError: Cannot read properties of undefined"#,
             marker.get("reason").and_then(|value| value.as_str()),
             Some("prompt_blocked_recovery_failed")
         );
-        let first_event_count = harness
-            .ctx
-            .dashboard_data
-            .lock()
-            .expect("dashboard")
-            .events
-            .len();
+        let first_event_count = harness.ctx.dashboard_data.lock().events.len();
 
         harness.ctx.last_stall_check = Instant::now() - Duration::from_secs(60);
         crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
 
         let second_marker = std::fs::read_to_string(&health_path).expect("marker after resweep");
-        let second_event_count = harness
-            .ctx
-            .dashboard_data
-            .lock()
-            .expect("dashboard")
-            .events
-            .len();
+        let second_event_count = harness.ctx.dashboard_data.lock().events.len();
         assert_eq!(
             first_marker,
             second_marker,
@@ -7695,12 +7733,7 @@ TypeError: Cannot read properties of undefined"#,
         harness.ctx.runtime_command_router = None;
         harness.ctx.stall_check_interval = Duration::ZERO;
         harness.ctx.last_stall_check = Instant::now() - Duration::from_secs(60);
-        harness
-            .ctx
-            .dashboard_data
-            .lock()
-            .expect("dashboard")
-            .brehon_root = Some(brehon_root.clone());
+        harness.ctx.dashboard_data.lock().brehon_root = Some(brehon_root.clone());
 
         crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
 
@@ -7711,21 +7744,9 @@ TypeError: Cannot read properties of undefined"#,
             marker.get("reason").and_then(|value| value.as_str()),
             Some("prompt_blocked_recovery_failed")
         );
-        let first_event_count = harness
-            .ctx
-            .dashboard_data
-            .lock()
-            .expect("dashboard")
-            .events
-            .len();
+        let first_event_count = harness.ctx.dashboard_data.lock().events.len();
         assert!(
-            harness
-                .ctx
-                .dashboard_data
-                .lock()
-                .expect("dashboard")
-                .tasks
-                .is_empty(),
+            harness.ctx.dashboard_data.lock().tasks.is_empty(),
             "marker-only taskless recovery should not trigger an unrelated task refresh"
         );
 
@@ -7733,13 +7754,7 @@ TypeError: Cannot read properties of undefined"#,
         crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
 
         let second_marker = std::fs::read_to_string(&health_path).expect("marker after resweep");
-        let second_event_count = harness
-            .ctx
-            .dashboard_data
-            .lock()
-            .expect("dashboard")
-            .events
-            .len();
+        let second_event_count = harness.ctx.dashboard_data.lock().events.len();
         assert_eq!(
             first_marker, second_marker,
             "taskless prompt-blocked worker failures should keep a one-shot terminal marker instead of retrying the same failed recovery"
@@ -7777,12 +7792,7 @@ TypeError: Cannot read properties of undefined"#,
             .ctx
             .last_activity
             .insert("worker-1".to_string(), now - Duration::from_secs(5));
-        harness
-            .ctx
-            .dashboard_data
-            .lock()
-            .expect("dashboard")
-            .brehon_root = Some(brehon_root.clone());
+        harness.ctx.dashboard_data.lock().brehon_root = Some(brehon_root.clone());
 
         crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
 
@@ -7871,12 +7881,7 @@ TypeError: Cannot read properties of undefined"#,
             .ctx
             .last_activity
             .insert("reviewer-1".to_string(), now - Duration::from_secs(5));
-        harness
-            .ctx
-            .dashboard_data
-            .lock()
-            .expect("dashboard")
-            .brehon_root = Some(brehon_root.clone());
+        harness.ctx.dashboard_data.lock().brehon_root = Some(brehon_root.clone());
 
         crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
 
@@ -7916,12 +7921,7 @@ TypeError: Cannot read properties of undefined"#,
             .ctx
             .last_activity
             .insert("reviewer-1".to_string(), now - Duration::from_secs(5));
-        harness
-            .ctx
-            .dashboard_data
-            .lock()
-            .expect("dashboard")
-            .brehon_root = Some(brehon_root.clone());
+        harness.ctx.dashboard_data.lock().brehon_root = Some(brehon_root.clone());
 
         crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
 
@@ -7965,12 +7965,7 @@ TypeError: Cannot read properties of undefined"#,
             .ctx
             .last_activity
             .insert("reviewer-1".to_string(), now - Duration::from_secs(5));
-        harness
-            .ctx
-            .dashboard_data
-            .lock()
-            .expect("dashboard")
-            .brehon_root = Some(brehon_root.clone());
+        harness.ctx.dashboard_data.lock().brehon_root = Some(brehon_root.clone());
 
         crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
 
@@ -8023,12 +8018,7 @@ TypeError: Cannot read properties of undefined"#,
             .ctx
             .last_activity
             .insert("reviewer-1".to_string(), now - Duration::from_secs(5));
-        harness
-            .ctx
-            .dashboard_data
-            .lock()
-            .expect("dashboard")
-            .brehon_root = Some(brehon_root.clone());
+        harness.ctx.dashboard_data.lock().brehon_root = Some(brehon_root.clone());
 
         crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
 
@@ -8056,12 +8046,7 @@ TypeError: Cannot read properties of undefined"#,
         harness.ctx.review_obligation_reset_threshold = Duration::from_secs(60);
         harness.ctx.stall_check_interval = Duration::ZERO;
         harness.ctx.last_stall_check = now - Duration::from_secs(60);
-        harness
-            .ctx
-            .dashboard_data
-            .lock()
-            .expect("dashboard")
-            .brehon_root = Some(brehon_root.clone());
+        harness.ctx.dashboard_data.lock().brehon_root = Some(brehon_root.clone());
 
         crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
 
@@ -8113,12 +8098,7 @@ TypeError: Cannot read properties of undefined"#,
         harness.ctx.review_obligation_reset_threshold = Duration::from_secs(60);
         harness.ctx.stall_check_interval = Duration::ZERO;
         harness.ctx.last_stall_check = now - Duration::from_secs(60);
-        harness
-            .ctx
-            .dashboard_data
-            .lock()
-            .expect("dashboard")
-            .brehon_root = Some(brehon_root.clone());
+        harness.ctx.dashboard_data.lock().brehon_root = Some(brehon_root.clone());
 
         crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
 
@@ -8169,12 +8149,7 @@ TypeError: Cannot read properties of undefined"#,
             .ctx
             .last_activity
             .insert("reviewer-1".to_string(), now - Duration::from_secs(5));
-        harness
-            .ctx
-            .dashboard_data
-            .lock()
-            .expect("dashboard")
-            .brehon_root = Some(brehon_root.clone());
+        harness.ctx.dashboard_data.lock().brehon_root = Some(brehon_root.clone());
 
         crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
 
@@ -8236,12 +8211,7 @@ TypeError: Cannot read properties of undefined"#,
             .ctx
             .last_activity
             .insert("reviewer-1".to_string(), now - Duration::from_secs(5));
-        harness
-            .ctx
-            .dashboard_data
-            .lock()
-            .expect("dashboard")
-            .brehon_root = Some(brehon_root.clone());
+        harness.ctx.dashboard_data.lock().brehon_root = Some(brehon_root.clone());
         harness.ctx.runtime_command_router = None;
 
         crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
@@ -8251,7 +8221,7 @@ TypeError: Cannot read properties of undefined"#,
             "T-review".to_string(),
             "REV-review".to_string()
         )));
-        let dashboard = harness.ctx.dashboard_data.lock().expect("dashboard");
+        let dashboard = harness.ctx.dashboard_data.lock();
         assert!(dashboard.events.iter().any(|event| {
             event.description
                 == "reported review-obligation hard failure for reviewer reviewer-1 on T-review / REV-review"
@@ -8282,12 +8252,7 @@ TypeError: Cannot read properties of undefined"#,
             .ctx
             .last_activity
             .insert("reviewer-reset".to_string(), now - Duration::from_secs(5));
-        harness
-            .ctx
-            .dashboard_data
-            .lock()
-            .expect("dashboard")
-            .brehon_root = Some(brehon_root.clone());
+        harness.ctx.dashboard_data.lock().brehon_root = Some(brehon_root.clone());
 
         crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
 
@@ -8430,12 +8395,7 @@ TypeError: Cannot read properties of undefined"#,
         let now = Instant::now();
         harness.ctx.stall_check_interval = Duration::ZERO;
         harness.ctx.last_stall_check = now - Duration::from_secs(60);
-        harness
-            .ctx
-            .dashboard_data
-            .lock()
-            .expect("dashboard")
-            .brehon_root = Some(brehon_root.clone());
+        harness.ctx.dashboard_data.lock().brehon_root = Some(brehon_root.clone());
         harness.ctx.review_obligation_notifications_sent.insert(
             (
                 "reviewer-1".to_string(),
@@ -8514,12 +8474,7 @@ TypeError: Cannot read properties of undefined"#,
         let mut harness = harness_with_mux(mux);
         harness.ctx.stall_check_interval = Duration::ZERO;
         harness.ctx.last_stall_check = Instant::now() - Duration::from_secs(60);
-        harness
-            .ctx
-            .dashboard_data
-            .lock()
-            .expect("dashboard")
-            .brehon_root = Some(brehon_root.clone());
+        harness.ctx.dashboard_data.lock().brehon_root = Some(brehon_root.clone());
 
         crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
 
@@ -8579,12 +8534,7 @@ TypeError: Cannot read properties of undefined"#,
         let mut harness = harness_with_mux(mux);
         harness.ctx.stall_check_interval = Duration::ZERO;
         harness.ctx.last_stall_check = Instant::now() - Duration::from_secs(60);
-        harness
-            .ctx
-            .dashboard_data
-            .lock()
-            .expect("dashboard")
-            .brehon_root = Some(brehon_root.clone());
+        harness.ctx.dashboard_data.lock().brehon_root = Some(brehon_root.clone());
 
         crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
 
@@ -8645,12 +8595,7 @@ TypeError: Cannot read properties of undefined"#,
         mux.add_pane(make_supervisor_pane("claude-supervisor"));
         apply_taskless_prompt_blocked_runtime_state(&mut mux, "claude-supervisor");
         let mut harness = harness_with_mux(mux);
-        harness
-            .ctx
-            .dashboard_data
-            .lock()
-            .expect("dashboard")
-            .brehon_root = Some(brehon_root.clone());
+        harness.ctx.dashboard_data.lock().brehon_root = Some(brehon_root.clone());
 
         crate::run::prompt_delivery::deliver_pending_prompts(&mut harness.ctx, &brehon_root);
 
@@ -8729,12 +8674,7 @@ TypeError: Cannot read properties of undefined"#,
             "ready event should mark supervisor pane ready"
         );
         let mut harness = harness_with_mux(mux);
-        harness
-            .ctx
-            .dashboard_data
-            .lock()
-            .expect("dashboard")
-            .brehon_root = Some(brehon_root.clone());
+        harness.ctx.dashboard_data.lock().brehon_root = Some(brehon_root.clone());
 
         crate::run::prompt_delivery::deliver_pending_prompts(&mut harness.ctx, &brehon_root);
 
@@ -8791,12 +8731,7 @@ TypeError: Cannot read properties of undefined"#,
         let mut mux = Mux::new(24, 80);
         mux.add_pane(make_terminal_worker_pane("worker-1"));
         let mut harness = harness_with_mux(mux);
-        harness
-            .ctx
-            .dashboard_data
-            .lock()
-            .expect("dashboard")
-            .brehon_root = Some(brehon_root.clone());
+        harness.ctx.dashboard_data.lock().brehon_root = Some(brehon_root.clone());
 
         crate::run::prompt_delivery::deliver_pending_prompts(&mut harness.ctx, &brehon_root);
 
@@ -8858,12 +8793,7 @@ TypeError: Cannot read properties of undefined"#,
         let mut mux = Mux::new(24, 80);
         mux.add_pane(make_worker_pane("live-worker"));
         let mut harness = harness_with_mux(mux);
-        harness
-            .ctx
-            .dashboard_data
-            .lock()
-            .expect("dashboard")
-            .brehon_root = Some(brehon_root.clone());
+        harness.ctx.dashboard_data.lock().brehon_root = Some(brehon_root.clone());
 
         crate::run::prompt_delivery::deliver_pending_prompts(&mut harness.ctx, &brehon_root);
 
@@ -8907,12 +8837,7 @@ TypeError: Cannot read properties of undefined"#,
         let mut mux = Mux::new(24, 80);
         mux.add_pane(make_worker_pane("live-worker"));
         let mut harness = harness_with_mux(mux);
-        harness
-            .ctx
-            .dashboard_data
-            .lock()
-            .expect("dashboard")
-            .brehon_root = Some(brehon_root.clone());
+        harness.ctx.dashboard_data.lock().brehon_root = Some(brehon_root.clone());
 
         crate::run::prompt_delivery::deliver_pending_prompts(&mut harness.ctx, &brehon_root);
 
@@ -8945,12 +8870,7 @@ TypeError: Cannot read properties of undefined"#,
         let mut mux = Mux::new(24, 80);
         mux.add_pane(make_supervisor_pane("supervisor"));
         let mut harness = harness_with_host_owned_mux(mux);
-        harness
-            .ctx
-            .dashboard_data
-            .lock()
-            .expect("dashboard")
-            .brehon_root = Some(brehon_root.clone());
+        harness.ctx.dashboard_data.lock().brehon_root = Some(brehon_root.clone());
 
         let mut state = ComposerState::new("supervisor", None);
         state.workflow = super::super::types::ComposerWorkflow::BreakDown;
@@ -9000,12 +8920,7 @@ TypeError: Cannot read properties of undefined"#,
         let mut mux = Mux::new(24, 80);
         mux.add_pane(make_worker_pane("quick-cod-72"));
         let mut harness = harness_with_host_owned_mux(mux);
-        harness
-            .ctx
-            .dashboard_data
-            .lock()
-            .expect("dashboard")
-            .brehon_root = Some(brehon_root.clone());
+        harness.ctx.dashboard_data.lock().brehon_root = Some(brehon_root.clone());
 
         let mut state = ComposerState::new_advisor("norma-war-room")
             .with_mention_candidates(vec!["quick-cod-72".to_string()]);
@@ -9043,5 +8958,56 @@ TypeError: Cannot read properties of undefined"#,
             .join("norma-war-room.json");
         let room = std::fs::read_to_string(room_path).expect("room file");
         assert!(room.contains("@quick-cod-72 can you sanity check"));
+    }
+
+    /// Fix C firewall: a panic inside a per-tick body must NOT unwind out of
+    /// the run loop and end the unattended session. This mirrors the exact
+    /// `catch_unwind(AssertUnwindSafe(..))` structure used around the
+    /// stall/budget/supervisor-reset ticks in [`run`]: a panicking tick on
+    /// one iteration is caught, logged, and the loop proceeds to the next
+    /// iteration and exits cleanly.
+    #[test]
+    fn panicking_tick_does_not_tear_down_loop() {
+        let shutdown = std::sync::atomic::AtomicBool::new(false);
+        // Counts ticks that ran to completion AFTER a panicking one, proving
+        // the loop survived the panic rather than unwinding out.
+        let mut completed_after_panic = 0_u32;
+        let mut iteration = 0_u32;
+
+        // Drive the same shape as `run`: a `while !shutdown` loop whose tick
+        // body is wrapped in the panic firewall.
+        while !shutdown.load(Ordering::Relaxed) {
+            iteration += 1;
+
+            let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                // Iteration 1 panics (simulating a bad untrusted-event tick);
+                // later iterations do real "work".
+                if iteration == 1 {
+                    panic!("simulated tick panic");
+                }
+                completed_after_panic += 1;
+            }))
+            .is_err();
+
+            assert_eq!(
+                caught,
+                iteration == 1,
+                "only the first (panicking) iteration should be caught"
+            );
+
+            // Independent latched stop, like `ctx.shutdown`: stop after a few
+            // iterations so the test terminates deterministically.
+            if iteration >= 3 {
+                shutdown.store(true, Ordering::Relaxed);
+            }
+        }
+
+        // The loop kept going past the panicking iteration and ran the
+        // subsequent ticks to completion.
+        assert_eq!(iteration, 3, "loop must survive the panic and keep ticking");
+        assert_eq!(
+            completed_after_panic, 2,
+            "ticks after the panicking one must still run to completion"
+        );
     }
 }

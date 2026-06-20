@@ -58,7 +58,7 @@ mod tests {
         std::fs::create_dir_all(&brehon_dir).unwrap();
         std::fs::write(
             brehon_dir.join("config.yaml"),
-            "security:\n  sandbox_profile: None\n",
+            "orchestration:\n  worktree_isolation: false\nsecurity:\n  sandbox_profile: None\n",
         )
         .unwrap();
     }

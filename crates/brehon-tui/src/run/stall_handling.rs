@@ -646,7 +646,7 @@ pub(super) fn recover_stale_deferred_prompt_delivery(
 }
 
 fn brehon_root_for_quarantine(ctx: &EventLoopCtx) -> Option<std::path::PathBuf> {
-    ctx.dashboard_data.lock().ok()?.brehon_root.clone()
+    ctx.dashboard_data.lock().brehon_root.clone()
 }
 
 fn queue_worker_context_reset(
@@ -1985,7 +1985,7 @@ fn refresh_stall_recovery_snapshot(
     *tasks_snapshot = read_task_files(brehon_root);
     *sessions_snapshot = read_session_files(brehon_root);
     sync_worker_task_contexts(&mut ctx.mux, tasks_snapshot, sessions_snapshot);
-    ctx.dashboard_data.lock().unwrap().tasks = tasks_snapshot.clone();
+    ctx.dashboard_data.lock().tasks = tasks_snapshot.clone();
     ctx.needs_redraw = true;
 }
 
@@ -2350,7 +2350,7 @@ pub(super) fn detect_and_handle_stalls(ctx: &mut EventLoopCtx) {
             .or_insert(now);
     }
 
-    let brehon_root = ctx.dashboard_data.lock().unwrap().brehon_root.clone();
+    let brehon_root = ctx.dashboard_data.lock().brehon_root.clone();
     let (mut tasks_snapshot, mut sessions_snapshot) = if let Some(ref root) = brehon_root {
         (read_task_files(root), read_session_files(root))
     } else {
@@ -2407,7 +2407,7 @@ pub(super) fn detect_and_handle_stalls(ctx: &mut EventLoopCtx) {
             };
             if recovery.task_files_modified() {
                 tasks_snapshot = read_task_files(root);
-                ctx.dashboard_data.lock().unwrap().tasks = tasks_snapshot.clone();
+                ctx.dashboard_data.lock().tasks = tasks_snapshot.clone();
             }
         }
 
@@ -2553,7 +2553,7 @@ pub(super) fn detect_and_handle_stalls(ctx: &mut EventLoopCtx) {
                 now,
             ) {
                 tasks_snapshot = read_task_files(root);
-                ctx.dashboard_data.lock().unwrap().tasks = tasks_snapshot.clone();
+                ctx.dashboard_data.lock().tasks = tasks_snapshot.clone();
                 continue;
             }
             let startup_prompt = if pane_needs_post_spawn_prompt(&ctx.mux, &worker_id) {
@@ -2626,7 +2626,7 @@ pub(super) fn detect_and_handle_stalls(ctx: &mut EventLoopCtx) {
                 format!("reset quarantined worker {} {}", worker_id, reset_summary),
             );
             tasks_snapshot = read_task_files(root);
-            ctx.dashboard_data.lock().unwrap().tasks = tasks_snapshot.clone();
+            ctx.dashboard_data.lock().tasks = tasks_snapshot.clone();
         }
     }
 

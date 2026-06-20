@@ -80,7 +80,7 @@ pub(crate) fn perform_manual_pane_reset(
     mux: &mut Mux,
     pane_id: &str,
     rt: &tokio::runtime::Handle,
-    dashboard_data: &Arc<std::sync::Mutex<DashboardData>>,
+    dashboard_data: &Arc<parking_lot::Mutex<DashboardData>>,
     last_activity: &mut HashMap<String, Instant>,
     pending_self_improve_prompt: &mut HashMap<String, Instant>,
     host_owned: bool,

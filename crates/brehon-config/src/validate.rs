@@ -8,6 +8,7 @@
 //! - Unsupported terminal mode requests
 
 mod runtime_policy;
+mod security_policy;
 
 use std::{collections::HashSet, sync::LazyLock};
 
@@ -23,6 +24,7 @@ use brehon_types::{
 };
 
 use runtime_policy::validate_runtime_policy;
+use security_policy::validate_security_policy;
 
 const SUPPORTED_RUNTIME_WORKFLOWS: &[&str] = &["rate_limit.quarantine_recommendation"];
 static VALID_PERMISSION_PROFILES: LazyLock<HashSet<&'static str>> =
@@ -74,6 +76,7 @@ pub enum ValidationWarningKind {
     RuntimeWorkflowConflict,
     RuntimeTerminalHostConflict,
     RuntimePolicyConflict,
+    SecurityPolicyConflict,
     SupervisorTerminalContract,
     LauncherCapabilityConflict,
     RoutingPolicyConflict,
@@ -82,6 +85,8 @@ pub enum ValidationWarningKind {
     ProfilePolicyConflict,
     InvalidWorktreeRoot,
     LauncherEnvConflict,
+    BudgetPolicyConflict,
+    NotificationPolicyConflict,
 }
 
 impl ValidationWarningKind {
@@ -93,6 +98,7 @@ impl ValidationWarningKind {
                 | ValidationWarningKind::RuntimeWorkflowConflict
                 | ValidationWarningKind::RuntimeTerminalHostConflict
                 | ValidationWarningKind::RuntimePolicyConflict
+                | ValidationWarningKind::SecurityPolicyConflict
                 | ValidationWarningKind::SupervisorTerminalContract
                 | ValidationWarningKind::LauncherCapabilityConflict
                 | ValidationWarningKind::RoutingPolicyConflict
@@ -101,6 +107,7 @@ impl ValidationWarningKind {
                 | ValidationWarningKind::ProfilePolicyConflict
                 | ValidationWarningKind::InvalidWorktreeRoot
                 | ValidationWarningKind::LauncherEnvConflict
+                | ValidationWarningKind::NotificationPolicyConflict
         )
     }
 }
@@ -148,6 +155,9 @@ impl std::fmt::Display for ValidationWarningKind {
             ValidationWarningKind::RuntimePolicyConflict => {
                 write!(f, "Runtime policy conflict")
             }
+            ValidationWarningKind::SecurityPolicyConflict => {
+                write!(f, "Security policy conflict")
+            }
             ValidationWarningKind::SupervisorTerminalContract => {
                 write!(f, "Supervisor terminal contract")
             }
@@ -160,6 +170,10 @@ impl std::fmt::Display for ValidationWarningKind {
             ValidationWarningKind::ProfilePolicyConflict => write!(f, "Profile policy conflict"),
             ValidationWarningKind::InvalidWorktreeRoot => write!(f, "Invalid worktree root"),
             ValidationWarningKind::LauncherEnvConflict => write!(f, "Launcher env conflict"),
+            ValidationWarningKind::BudgetPolicyConflict => write!(f, "Budget policy conflict"),
+            ValidationWarningKind::NotificationPolicyConflict => {
+                write!(f, "Notification policy conflict")
+            }
         }
     }
 }
@@ -173,6 +187,8 @@ pub fn validate(config: &BrehonConfig) -> Vec<ValidationWarning> {
     warnings.extend(validate_routing_policy(config));
     warnings.extend(validate_advisors(config));
     warnings.extend(validate_research(config));
+    warnings.extend(validate_budget(config));
+    warnings.extend(validate_notifications(config));
     warnings.extend(validate_review_thresholds(config));
     warnings.extend(validate_review_panels(config));
     warnings.extend(validate_prompt_policy(config));
@@ -181,6 +197,7 @@ pub fn validate(config: &BrehonConfig) -> Vec<ValidationWarning> {
     warnings.extend(validate_runtime_workflows(config));
     warnings.extend(validate_runtime_policy(config));
     warnings.extend(validate_runtime_terminal_host(config));
+    warnings.extend(validate_security_policy(config));
     warnings.extend(validate_supervisor_terminal_contract(config));
     warnings.extend(validate_circular_references(config));
     warnings.extend(validate_concurrency(config));
@@ -400,6 +417,130 @@ fn validate_advisors(config: &BrehonConfig) -> Vec<ValidationWarning> {
     }
 
     warnings
+}
+
+fn validate_budget(config: &BrehonConfig) -> Vec<ValidationWarning> {
+    use brehon_types::BudgetEnforcement;
+
+    let mut warnings = Vec::new();
+    let budget = &config.budget;
+
+    // Hard enforcement with no enforceable ceiling is a no-op kill-switch: the
+    // operator asked for "actually stop" but configured nothing to stop on. The
+    // shared `has_enforceable_ceiling` predicate excludes max_cost_per_task (a
+    // per-task cap the run-total kill-switch does not yet enforce), keeping this
+    // validator, the startup warning, the doctor checker, and the gate in lockstep.
+    if budget.enforcement == BudgetEnforcement::Hard && !budget.has_enforceable_ceiling() {
+        warnings.push(ValidationWarning::non_fatal(
+            ValidationWarningKind::BudgetPolicyConflict,
+            "budget.enforcement is Hard but no enforceable cap is set \
+             (max_tokens_per_agent / max_total_cost / max_wall_clock_minutes are all \
+             null); max_cost_per_task is a per-task cap that is not yet enforced by the \
+             run-total kill-switch, so the kill-switch will never fire",
+        ));
+    }
+
+    if budget.alert_threshold_percent > 100 {
+        warnings.push(ValidationWarning::non_fatal(
+            ValidationWarningKind::BudgetPolicyConflict,
+            format!(
+                "budget.alert_threshold_percent={} is above 100; it is clamped to 100",
+                budget.alert_threshold_percent
+            ),
+        ));
+    }
+
+    warnings
+}
+
+fn validate_notifications(config: &BrehonConfig) -> Vec<ValidationWarning> {
+    let mut warnings = Vec::new();
+    let notifications = &config.notifications;
+    if !notifications.enabled {
+        return warnings;
+    }
+
+    if notifications.subscriptions.is_empty() {
+        warnings.push(ValidationWarning::non_fatal(
+            ValidationWarningKind::NotificationPolicyConflict,
+            "notifications.enabled=true but subscriptions is empty; no external notifications will be delivered",
+        ));
+    }
+
+    for subscription in &notifications.subscriptions {
+        if subscription.events.is_empty() {
+            warnings.push(ValidationWarning::new(
+                ValidationWarningKind::NotificationPolicyConflict,
+                format!(
+                    "notifications subscription for provider {:?} has no events",
+                    subscription.provider
+                ),
+            ));
+        }
+
+        match subscription.provider {
+            brehon_types::NotificationProviderKind::Telegram => {
+                if !notifications.providers.telegram.enabled {
+                    warnings.push(ValidationWarning::new(
+                        ValidationWarningKind::NotificationPolicyConflict,
+                        "notifications subscribes Telegram events but providers.telegram.enabled=false",
+                    ));
+                }
+            }
+        }
+    }
+
+    let telegram = &notifications.providers.telegram;
+    if telegram.enabled {
+        validate_notification_env_name(
+            "notifications.providers.telegram.bot_token_env",
+            &telegram.bot_token_env,
+            &mut warnings,
+        );
+        validate_notification_env_name(
+            "notifications.providers.telegram.chat_id_env",
+            &telegram.chat_id_env,
+            &mut warnings,
+        );
+        if telegram.send_timeout_secs == 0 {
+            warnings.push(ValidationWarning::new(
+                ValidationWarningKind::NotificationPolicyConflict,
+                "notifications.providers.telegram.send_timeout_secs must be greater than 0",
+            ));
+        }
+    }
+
+    warnings
+}
+
+fn validate_notification_env_name(
+    field: &str,
+    env_name: &str,
+    warnings: &mut Vec<ValidationWarning>,
+) {
+    let trimmed = env_name.trim();
+    if trimmed.is_empty() {
+        warnings.push(ValidationWarning::new(
+            ValidationWarningKind::NotificationPolicyConflict,
+            format!("{field} must name an environment variable"),
+        ));
+        return;
+    }
+    match std::env::var(trimmed) {
+        Ok(value) if !value.trim().is_empty() => {}
+        Ok(_) | Err(std::env::VarError::NotPresent) => {
+            warnings.push(ValidationWarning::non_fatal(
+                ValidationWarningKind::NotificationPolicyConflict,
+                format!("{field} points to unset/empty environment variable {trimmed}; provider delivery will be skipped until it is set"),
+            ));
+        }
+        Err(std::env::VarError::NotUnicode(_)) => {
+            warnings.push(ValidationWarning::new(
+                ValidationWarningKind::NotificationPolicyConflict,
+                format!("{field} points to non-unicode environment variable {trimmed}"),
+            ));
+        }
+    }
 }
 
 fn validate_research(config: &BrehonConfig) -> Vec<ValidationWarning> {
@@ -1821,8 +1962,12 @@ fn validate_retention(config: &BrehonConfig) -> Vec<ValidationWarning> {
 
 #[cfg(test)]
 mod tests {
+    #[path = "validate_security_policy_tests.rs"]
+    mod security_policy_tests;
     #[path = "validate_supervisor_terminal_contract_tests.rs"]
     mod supervisor_terminal_contract_tests;
+    #[path = "validate_worktree_root_tests.rs"]
+    mod worktree_root_tests;
 
     use super::*;
     use brehon_types::{
@@ -2026,12 +2171,14 @@ mod tests {
                 worktree_cleanup: brehon_types::WorktreeCleanupConfig::default(),
             },
             runtime: RuntimeConfig::default(),
+            notifications: brehon_types::ExternalNotificationsConfig::default(),
             budget: BudgetConfig {
                 max_total_cost: None,
                 max_cost_per_task: None,
                 max_tokens_per_agent: None,
                 alert_threshold_percent: 80,
                 enforcement: BudgetEnforcement::Soft,
+                max_wall_clock_minutes: None,
             },
             tui: TuiConfig {
                 default_layout: LayoutPreset::Balanced,
@@ -2080,6 +2227,163 @@ mod tests {
             "Expected no warnings, got: {:?}",
             warnings
         );
+    }
+
+    #[test]
+    fn budget_hard_without_any_cap_warns_non_fatal() {
+        use brehon_types::BudgetEnforcement;
+        let mut config = minimal_valid_config();
+        config.budget.enforcement = BudgetEnforcement::Hard;
+        config.budget.max_total_cost = None;
+        config.budget.max_cost_per_task = None;
+        config.budget.max_tokens_per_agent = None;
+        config.budget.max_wall_clock_minutes = None;
+
+        let warning = validate(&config)
+            .into_iter()
+            .find(|w| w.kind == ValidationWarningKind::BudgetPolicyConflict)
+            .expect("Hard-with-no-cap should warn");
+        assert!(!warning.is_fatal, "must not reject Hard");
+        assert!(
+            warning.message.contains("never fire"),
+            "{}",
+            warning.message
+        );
+    }
+
+    #[test]
+    fn budget_hard_with_a_cap_has_no_conflict() {
+        use brehon_types::BudgetEnforcement;
+        let mut config = minimal_valid_config();
+        config.budget.enforcement = BudgetEnforcement::Hard;
+        config.budget.max_tokens_per_agent = Some(1_000);
+
+        assert!(
+            !validate(&config)
+                .iter()
+                .any(|w| w.kind == ValidationWarningKind::BudgetPolicyConflict),
+            "a configured cap clears the conflict"
+        );
+    }
+
+    #[test]
+    fn budget_wall_clock_only_cap_clears_conflict() {
+        use brehon_types::BudgetEnforcement;
+        let mut config = minimal_valid_config();
+        config.budget.enforcement = BudgetEnforcement::Hard;
+        config.budget.max_tokens_per_agent = None;
+        config.budget.max_wall_clock_minutes = Some(120);
+
+        assert!(
+            !validate(&config)
+                .iter()
+                .any(|w| w.kind == ValidationWarningKind::BudgetPolicyConflict),
+            "a wall-clock ceiling is an enforceable cap"
+        );
+    }
+
+    #[test]
+    fn budget_hard_with_only_cost_per_task_warns() {
+        use brehon_types::BudgetEnforcement;
+        // max_cost_per_task is a per-task cap the run-total kill-switch does not
+        // enforce, so `config validate` must surface the same conflict the
+        // startup warning and doctor report — not pass clean.
+        let mut config = minimal_valid_config();
+        config.budget.enforcement = BudgetEnforcement::Hard;
+        config.budget.max_total_cost = None;
+        config.budget.max_cost_per_task = Some(2.0);
+        config.budget.max_tokens_per_agent = None;
+        config.budget.max_wall_clock_minutes = None;
+
+        let warning = validate(&config)
+            .into_iter()
+            .find(|w| w.kind == ValidationWarningKind::BudgetPolicyConflict)
+            .expect("cost-per-task-only Hard should warn");
+        assert!(!warning.is_fatal, "must not reject Hard");
+        assert!(
+            warning.message.contains("never fire"),
+            "{}",
+            warning.message
+        );
+    }
+
+    #[test]
+    fn notifications_enabled_without_subscriptions_warns_non_fatal() {
+        let mut config = minimal_valid_config();
+        config.notifications.enabled = true;
+
+        let warning = validate(&config)
+            .into_iter()
+            .find(|w| w.kind == ValidationWarningKind::NotificationPolicyConflict)
+            .expect("enabled notification config with no subscriptions should warn");
+        assert!(!warning.is_fatal, "no subscriptions is a warning");
+        assert!(
+            warning.message.contains("subscriptions is empty"),
+            "{}",
+            warning.message
+        );
+    }
+
+    #[test]
+    fn notifications_reject_subscribed_disabled_provider() {
+        let mut config = minimal_valid_config();
+        config.notifications.enabled = true;
+        config.notifications.subscriptions = vec![brehon_types::NotificationSubscriptionConfig {
+            provider: brehon_types::NotificationProviderKind::Telegram,
+            events: vec![brehon_types::NotificationEventKind::TaskCompleted],
+        }];
+
+        let warning = validate(&config)
+            .into_iter()
+            .find(|w| w.kind == ValidationWarningKind::NotificationPolicyConflict)
+            .expect("subscribed disabled provider should warn");
+        assert!(warning.is_fatal, "disabled subscribed provider is invalid");
+        assert!(
+            warning.message.contains("providers.telegram.enabled=false"),
+            "{}",
+            warning.message
+        );
+    }
+
+    #[test]
+    fn notifications_warn_non_fatal_when_telegram_env_is_unset() {
+        let mut config = minimal_valid_config();
+        config.notifications.enabled = true;
+        config.notifications.providers.telegram.enabled = true;
+        config.notifications.providers.telegram.bot_token_env =
+            "BREHON_TEST_TELEGRAM_TOKEN_NOT_SET".into();
+        config.notifications.providers.telegram.chat_id_env =
+            "BREHON_TEST_TELEGRAM_CHAT_NOT_SET".into();
+        config.notifications.subscriptions = vec![brehon_types::NotificationSubscriptionConfig {
+            provider: brehon_types::NotificationProviderKind::Telegram,
+            events: vec![brehon_types::NotificationEventKind::TaskCompleted],
+        }];
+
+        let warnings = validate(&config);
+        let notification_warnings = warnings
+            .iter()
+            .filter(|w| w.kind == ValidationWarningKind::NotificationPolicyConflict)
+            .collect::<Vec<_>>();
+        assert_eq!(notification_warnings.len(), 2, "{warnings:?}");
+        assert!(
+            notification_warnings
+                .iter()
+                .all(|warning| !warning.is_fatal),
+            "{notification_warnings:?}"
+        );
+    }
+
+    #[test]
+    fn budget_alert_threshold_over_100_warns() {
+        let mut config = minimal_valid_config();
+        config.budget.alert_threshold_percent = 150;
+
+        let warning = validate(&config)
+            .into_iter()
+            .find(|w| w.kind == ValidationWarningKind::BudgetPolicyConflict)
+            .expect("threshold > 100 should warn");
+        assert!(!warning.is_fatal);
+        assert!(warning.message.contains("clamped"), "{}", warning.message);
     }
 
     #[test]
@@ -4067,108 +4371,6 @@ rooms:
         assert!(!warnings.iter().any(|warning| {
             warning.kind == ValidationWarningKind::ReviewPanelConflict
                 && warning.message.contains("share_after_submit")
-        }));
-    }
-
-    #[test]
-    fn worktree_root_validation_accepts_none() {
-        let config = minimal_valid_config();
-        let warnings = validate(&config);
-        assert!(!warnings
-            .iter()
-            .any(|w| w.kind == ValidationWarningKind::InvalidWorktreeRoot));
-    }
-
-    #[test]
-    fn worktree_root_validation_accepts_valid_absolute_path() {
-        let mut config = minimal_valid_config();
-        config.orchestration.worktree_root = Some("/tmp/brehon-worktrees".into());
-        let warnings = validate(&config);
-        assert!(!warnings
-            .iter()
-            .any(|w| w.kind == ValidationWarningKind::InvalidWorktreeRoot));
-    }
-
-    #[test]
-    fn worktree_root_validation_rejects_relative_path() {
-        let mut config = minimal_valid_config();
-        config.orchestration.worktree_root = Some(".brehon/worktrees".into());
-        let warnings = validate(&config);
-        assert!(warnings.iter().any(|w| {
-            w.kind == ValidationWarningKind::InvalidWorktreeRoot
-                && w.is_fatal
-                && w.message.contains("must be an absolute path")
-        }));
-    }
-
-    #[test]
-    fn worktree_root_validation_rejects_empty_string() {
-        let mut config = minimal_valid_config();
-        config.orchestration.worktree_root = Some("".into());
-        let warnings = validate(&config);
-        assert!(warnings.iter().any(|w| {
-            w.kind == ValidationWarningKind::InvalidWorktreeRoot
-                && w.is_fatal
-                && w.message.contains("must not be empty")
-        }));
-    }
-
-    #[test]
-    fn worktree_root_validation_rejects_path_traversal() {
-        let mut config = minimal_valid_config();
-        config.orchestration.worktree_root = Some("../outside".into());
-        let warnings = validate(&config);
-        assert!(warnings.iter().any(|w| {
-            w.kind == ValidationWarningKind::InvalidWorktreeRoot
-                && w.is_fatal
-                && w.message.contains("path traversal")
-        }));
-    }
-
-    #[test]
-    fn worktree_root_validation_rejects_embedded_traversal() {
-        let mut config = minimal_valid_config();
-        config.orchestration.worktree_root = Some("/safe/../unsafe".into());
-        let warnings = validate(&config);
-        assert!(warnings.iter().any(|w| {
-            w.kind == ValidationWarningKind::InvalidWorktreeRoot
-                && w.is_fatal
-                && w.message.contains("path traversal")
-        }));
-    }
-
-    #[test]
-    fn worktree_root_validation_rejects_null_bytes() {
-        let mut config = minimal_valid_config();
-        config.orchestration.worktree_root = Some("/tmp/brehon\0worktrees".into());
-        let warnings = validate(&config);
-        assert!(warnings.iter().any(|w| {
-            w.kind == ValidationWarningKind::InvalidWorktreeRoot
-                && w.is_fatal
-                && w.message.contains("null bytes")
-        }));
-    }
-
-    #[test]
-    fn worktree_root_validation_accepts_dotdot_as_path_component_prefix() {
-        let mut config = minimal_valid_config();
-        config.orchestration.worktree_root = Some("/tmp/..cache/build".into());
-        let warnings = validate(&config);
-        assert!(!warnings
-            .iter()
-            .any(|w| w.kind == ValidationWarningKind::InvalidWorktreeRoot));
-    }
-
-    #[test]
-    fn cargo_target_root_validation_uses_same_absolute_path_rules() {
-        let mut config = minimal_valid_config();
-        config.orchestration.cargo_target_root = Some("relative/cargo-targets".into());
-        let warnings = validate(&config);
-        assert!(warnings.iter().any(|w| {
-            w.kind == ValidationWarningKind::InvalidWorktreeRoot
-                && w.is_fatal
-                && w.message.contains("orchestration.cargo_target_root")
-                && w.message.contains("must be an absolute path")
         }));
     }
 }

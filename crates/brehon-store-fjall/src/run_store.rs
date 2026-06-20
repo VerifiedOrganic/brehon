@@ -3,7 +3,8 @@
 use async_trait::async_trait;
 use chrono::{Duration as ChronoDuration, Utc};
 use fjall::{Keyspace, PartitionHandle, PersistMode};
-use std::sync::{Arc, Mutex};
+use parking_lot::Mutex;
+use std::sync::Arc;
 
 use brehon_ports::{
     ClaimRelease, ClaimRequest, RetryAttemptRequest, RetryAttemptStarted, RunCompletion,
@@ -204,7 +205,7 @@ impl RunStoreManager {
 
     /// Create a run record.
     pub fn create_run(&self, mut record: RunRecord) -> RunStoreResult<RunRecord> {
-        let _guard = self.mutation_lock.lock().expect("run store lock poisoned");
+        let _guard = self.mutation_lock.lock();
 
         if self.get_run_locked(&record.run_id)?.is_some() {
             return Err(RunStoreError::InvalidStatusTransition {
@@ -231,7 +232,7 @@ impl RunStoreManager {
 
     /// Claim a run record.
     pub fn claim_run(&self, request: ClaimRequest) -> RunStoreResult<RunRecord> {
-        let _guard = self.mutation_lock.lock().expect("run store lock poisoned");
+        let _guard = self.mutation_lock.lock();
         let mut record = self.load_required(&request.run_id)?;
 
         if record.status == RunStatus::RetryQueued && !record.retry_is_due_at(request.claimed_at) {
@@ -279,7 +280,7 @@ impl RunStoreManager {
         run_id: &RunId,
         generation: ClaimGeneration,
     ) -> RunStoreResult<RunRecord> {
-        let _guard = self.mutation_lock.lock().expect("run store lock poisoned");
+        let _guard = self.mutation_lock.lock();
         let mut record = self.load_required(run_id)?;
 
         Self::ensure_generation(&record, generation)?;
@@ -303,7 +304,7 @@ impl RunStoreManager {
 
     /// Release a current claim.
     pub fn release_claim(&self, release: ClaimRelease) -> RunStoreResult<RunRecord> {
-        let _guard = self.mutation_lock.lock().expect("run store lock poisoned");
+        let _guard = self.mutation_lock.lock();
         let mut record = self.load_required(&release.run_id)?;
 
         Self::ensure_generation(&record, release.generation)?;
@@ -329,7 +330,7 @@ impl RunStoreManager {
 
     /// Complete a current run.
     pub fn complete_run(&self, completion: RunCompletion) -> RunStoreResult<RunRecord> {
-        let _guard = self.mutation_lock.lock().expect("run store lock poisoned");
+        let _guard = self.mutation_lock.lock();
         let mut record = self.load_required(&completion.run_id)?;
 
         Self::ensure_generation(&record, completion.generation)?;
@@ -355,7 +356,7 @@ impl RunStoreManager {
 
     /// Fail a current run.
     pub fn fail_run(&self, failure: RunFailure) -> RunStoreResult<RunRecord> {
-        let _guard = self.mutation_lock.lock().expect("run store lock poisoned");
+        let _guard = self.mutation_lock.lock();
         let mut record = self.load_required(&failure.run_id)?;
 
         Self::ensure_generation(&record, failure.generation)?;
@@ -381,7 +382,7 @@ impl RunStoreManager {
 
     /// Record a continuation prompt on a current run.
     pub fn record_continuation(&self, continuation: RunContinuation) -> RunStoreResult<RunRecord> {
-        let _guard = self.mutation_lock.lock().expect("run store lock poisoned");
+        let _guard = self.mutation_lock.lock();
         let mut record = self.load_required(&continuation.run_id)?;
 
         Self::ensure_generation(&record, continuation.generation)?;
@@ -413,7 +414,7 @@ impl RunStoreManager {
 
     /// Queue a current run for retry.
     pub fn queue_retry(&self, retry: RunRetry) -> RunStoreResult<RunRecord> {
-        let _guard = self.mutation_lock.lock().expect("run store lock poisoned");
+        let _guard = self.mutation_lock.lock();
         let mut record = self.load_required(&retry.run_id)?;
 
         Self::ensure_generation(&record, retry.generation)?;
@@ -445,7 +446,7 @@ impl RunStoreManager {
         &self,
         request: RetryAttemptRequest,
     ) -> RunStoreResult<RetryAttemptStarted> {
-        let _guard = self.mutation_lock.lock().expect("run store lock poisoned");
+        let _guard = self.mutation_lock.lock();
         let mut queued = self.load_required(&request.queued_run_id)?;
 
         Self::ensure_generation(&queued, request.generation)?;
@@ -522,13 +523,13 @@ impl RunStoreManager {
 
     /// Get a run by id.
     pub fn get_run(&self, run_id: &RunId) -> RunStoreResult<Option<RunRecord>> {
-        let _guard = self.mutation_lock.lock().expect("run store lock poisoned");
+        let _guard = self.mutation_lock.lock();
         self.get_run_locked(run_id)
     }
 
     /// Return all non-terminal runs.
     pub fn active_runs(&self) -> RunStoreResult<Vec<RunRecord>> {
-        let _guard = self.mutation_lock.lock().expect("run store lock poisoned");
+        let _guard = self.mutation_lock.lock();
         let mut records = Vec::new();
 
         for item in self.runs.prefix(b"index:run:active-role:") {
@@ -550,7 +551,7 @@ impl RunStoreManager {
 
     /// Return all runs for a task.
     pub fn runs_for_task(&self, task_id: &TaskId) -> RunStoreResult<Vec<RunRecord>> {
-        let _guard = self.mutation_lock.lock().expect("run store lock poisoned");
+        let _guard = self.mutation_lock.lock();
         let mut records = Vec::new();
 
         for item in self.runs.prefix(&run_task_index_prefix(task_id.as_str())) {
@@ -569,14 +570,38 @@ impl RunStoreManager {
     }
 }
 
+/// Map the outcome of a `spawn_blocking` run-store mutation into a
+/// `RunStoreResult`. The synchronous fjall fsync (`PersistMode::SyncAll`) runs on
+/// the blocking pool so it never parks a Tokio worker; a panic inside the closure
+/// (e.g. an unexpected fjall failure) surfaces here as a `JoinError`, which we fail
+/// closed into a `RunStoreError::Storage` rather than propagating the panic. This
+/// relies on the `panic = "unwind"` profile setting documented in the workspace
+/// `Cargo.toml`.
+fn map_run_store_blocking<T>(
+    joined: Result<RunStoreResult<T>, tokio::task::JoinError>,
+) -> RunStoreResult<T> {
+    match joined {
+        Ok(inner) => inner,
+        Err(join_err) => Err(RunStoreError::Storage(format!(
+            "run store storage task panicked: {join_err}"
+        ))),
+    }
+}
+
 #[async_trait]
 impl RunStore for FjallEventStore {
     async fn create_run(&self, record: RunRecord) -> RunStoreResult<RunRecord> {
-        self.run_store().create_run(record)
+        let store = self.clone();
+        map_run_store_blocking(
+            tokio::task::spawn_blocking(move || store.run_store().create_run(record)).await,
+        )
     }
 
     async fn claim_run(&self, request: ClaimRequest) -> RunStoreResult<RunRecord> {
-        self.run_store().claim_run(request)
+        let store = self.clone();
+        map_run_store_blocking(
+            tokio::task::spawn_blocking(move || store.run_store().claim_run(request)).await,
+        )
     }
 
     async fn renew_claim(
@@ -584,49 +609,87 @@ impl RunStore for FjallEventStore {
         run_id: &RunId,
         generation: ClaimGeneration,
     ) -> RunStoreResult<RunRecord> {
-        self.run_store().renew_claim(run_id, generation)
+        let store = self.clone();
+        let run_id = run_id.clone();
+        map_run_store_blocking(
+            tokio::task::spawn_blocking(move || store.run_store().renew_claim(&run_id, generation))
+                .await,
+        )
     }
 
     async fn release_claim(&self, release: ClaimRelease) -> RunStoreResult<RunRecord> {
-        self.run_store().release_claim(release)
+        let store = self.clone();
+        map_run_store_blocking(
+            tokio::task::spawn_blocking(move || store.run_store().release_claim(release)).await,
+        )
     }
 
     async fn complete_run(&self, completion: RunCompletion) -> RunStoreResult<RunRecord> {
-        self.run_store().complete_run(completion)
+        let store = self.clone();
+        map_run_store_blocking(
+            tokio::task::spawn_blocking(move || store.run_store().complete_run(completion)).await,
+        )
     }
 
     async fn record_continuation(
         &self,
         continuation: RunContinuation,
     ) -> RunStoreResult<RunRecord> {
-        self.run_store().record_continuation(continuation)
+        let store = self.clone();
+        map_run_store_blocking(
+            tokio::task::spawn_blocking(move || {
+                store.run_store().record_continuation(continuation)
+            })
+            .await,
+        )
     }
 
     async fn fail_run(&self, failure: RunFailure) -> RunStoreResult<RunRecord> {
-        self.run_store().fail_run(failure)
+        let store = self.clone();
+        map_run_store_blocking(
+            tokio::task::spawn_blocking(move || store.run_store().fail_run(failure)).await,
+        )
     }
 
     async fn queue_retry(&self, retry: RunRetry) -> RunStoreResult<RunRecord> {
-        self.run_store().queue_retry(retry)
+        let store = self.clone();
+        map_run_store_blocking(
+            tokio::task::spawn_blocking(move || store.run_store().queue_retry(retry)).await,
+        )
     }
 
     async fn start_retry_attempt(
         &self,
         request: RetryAttemptRequest,
     ) -> RunStoreResult<RetryAttemptStarted> {
-        self.run_store().start_retry_attempt(request)
+        let store = self.clone();
+        map_run_store_blocking(
+            tokio::task::spawn_blocking(move || store.run_store().start_retry_attempt(request))
+                .await,
+        )
     }
 
     async fn get_run(&self, run_id: &RunId) -> RunStoreResult<Option<RunRecord>> {
-        self.run_store().get_run(run_id)
+        let store = self.clone();
+        let run_id = run_id.clone();
+        map_run_store_blocking(
+            tokio::task::spawn_blocking(move || store.run_store().get_run(&run_id)).await,
+        )
     }
 
     async fn active_runs(&self) -> RunStoreResult<Vec<RunRecord>> {
-        self.run_store().active_runs()
+        let store = self.clone();
+        map_run_store_blocking(
+            tokio::task::spawn_blocking(move || store.run_store().active_runs()).await,
+        )
     }
 
     async fn runs_for_task(&self, task_id: &TaskId) -> RunStoreResult<Vec<RunRecord>> {
-        self.run_store().runs_for_task(task_id)
+        let store = self.clone();
+        let task_id = task_id.clone();
+        map_run_store_blocking(
+            tokio::task::spawn_blocking(move || store.run_store().runs_for_task(&task_id)).await,
+        )
     }
 }
 

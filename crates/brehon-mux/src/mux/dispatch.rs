@@ -536,7 +536,9 @@ impl Mux {
             .get(pane_id)
             .and_then(|pane| pane.pty_writer_handle())
         {
-            let mut w = writer.lock().expect("PTY writer mutex poisoned");
+            let mut w = writer
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             if let Err(err) = w.write_all(&data) {
                 tracing::warn!(pane = %pane_id, error = %err, "PTY input dispatch failed");
             }
@@ -602,7 +604,9 @@ impl Mux {
         if let Some(pane) = self.panes.get_mut(pane_id) {
             pane.set_pending_inbox_nudge(false);
         }
-        let mut w = writer.lock().expect("PTY writer mutex poisoned");
+        let mut w = writer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Err(err) = w.write_all(b"\r").and_then(|_| w.flush()) {
             tracing::warn!(
                 pane = %pane_id,

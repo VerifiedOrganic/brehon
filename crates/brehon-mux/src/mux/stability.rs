@@ -3,10 +3,11 @@
 use crate::error::{Error, Result};
 use crate::pane::{PaneKind, PaneState};
 use brehon_types::{RuntimeCommandKind, RuntimePaneBlockInfo};
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::sync::mpsc::{self, Sender};
-use std::sync::{Mutex, OnceLock};
 
 use super::Mux;
 
@@ -79,9 +80,7 @@ fn agent_health_writer() -> Option<&'static Sender<AgentHealthWrite>> {
 }
 
 pub fn suppress_pending_agent_health_marker_writes(agent_name: &str) {
-    let mut epochs = agent_health_epochs()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut epochs = agent_health_epochs().lock();
     advance_agent_health_epoch_locked(&mut epochs, agent_name);
 }
 
@@ -101,9 +100,7 @@ pub(crate) fn write_agent_health_marker(agent_name: &str, error: &str) {
 pub(crate) fn write_agent_prompt_blocked_marker(agent_name: &str, blocked: &RuntimePaneBlockInfo) {
     let agent_name = agent_name.to_string();
     let epoch = {
-        let mut epochs = agent_health_epochs()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut epochs = agent_health_epochs().lock();
         advance_agent_health_epoch_locked(&mut epochs, &agent_name)
     };
     let payload = serde_json::json!({
@@ -140,9 +137,7 @@ fn write_agent_health_payload_async_commit(
         return;
     };
     let data = serde_json::to_string_pretty(payload).unwrap_or_else(|_| "{}".to_string());
-    let epochs = agent_health_epochs()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let epochs = agent_health_epochs().lock();
     if epochs.get(agent_name).copied() != Some(epoch) {
         return;
     }
@@ -157,9 +152,7 @@ fn write_agent_health_payload_async_commit(
 
     let mut should_commit = false;
     {
-        let epochs = agent_health_epochs()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let epochs = agent_health_epochs().lock();
         if epochs.get(agent_name).copied() == Some(epoch) {
             should_commit = true;
         }
@@ -183,9 +176,7 @@ fn write_agent_health_payload_sync(agent_name: &str, payload: serde_json::Value)
         return;
     };
     {
-        let mut epochs = agent_health_epochs()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut epochs = agent_health_epochs().lock();
         advance_agent_health_epoch_locked(&mut epochs, agent_name);
     }
     let _ = std::fs::create_dir_all(&dir);
@@ -199,9 +190,7 @@ pub(crate) fn clear_agent_health_marker(agent_name: &str) {
     let Some(path) = agent_health_path(agent_name) else {
         return;
     };
-    let mut epochs = agent_health_epochs()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut epochs = agent_health_epochs().lock();
     advance_agent_health_epoch_locked(&mut epochs, agent_name);
     let _ = std::fs::remove_file(path);
 }

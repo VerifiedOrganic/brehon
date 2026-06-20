@@ -1,8 +1,8 @@
-static TEAMS_INBOX_WRITE_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
+static TEAMS_INBOX_WRITE_LOCK: std::sync::OnceLock<parking_lot::Mutex<()>> =
     std::sync::OnceLock::new();
 
-fn teams_inbox_write_lock() -> &'static std::sync::Mutex<()> {
-    TEAMS_INBOX_WRITE_LOCK.get_or_init(|| std::sync::Mutex::new(()))
+fn teams_inbox_write_lock() -> &'static parking_lot::Mutex<()> {
+    TEAMS_INBOX_WRITE_LOCK.get_or_init(|| parking_lot::Mutex::new(()))
 }
 
 fn write_inbox_file_atomic(inbox_path: &std::path::Path, content: &str) -> Result<()> {
@@ -48,9 +48,7 @@ impl TeamsManager {
             std::fs::create_dir_all(parent)?;
         }
 
-        let _guard = teams_inbox_write_lock()
-            .lock()
-            .expect("Teams inbox write lock poisoned");
+        let _guard = teams_inbox_write_lock().lock();
 
         if !inbox_path.exists() {
             write_inbox_file_atomic(&inbox_path, "[]")?;

@@ -25,6 +25,7 @@ mod format;
 mod lifecycle;
 mod panesmith;
 mod policy;
+mod poll_budget;
 mod runtime;
 mod stability;
 mod supervisor_recovery;
@@ -97,6 +98,11 @@ pub struct Mux {
     direct_tool_bridge_factory: Option<Arc<dyn brehon_acp::DirectToolBridgeFactory>>,
     /// Maximum queued events to drain from the mux channel per UI poll.
     max_queued_events_per_poll: usize,
+    /// Next pane index to start output draining from.
+    ///
+    /// Rotating the start index keeps a continuously chatty early pane from
+    /// starving later panes when the global per-poll output budget is hit.
+    next_output_drain_index: usize,
     /// Optional side-channel sink for terminal-host agnostic runtime events.
     runtime_event_sink: Option<Arc<dyn RuntimeEventSink>>,
     /// Optional policy gate for audited mutating runtime operations.
@@ -128,6 +134,7 @@ impl Mux {
             worktree_isolation: false,
             direct_tool_bridge_factory: None,
             max_queued_events_per_poll: types::DEFAULT_MAX_QUEUED_EVENTS_PER_POLL,
+            next_output_drain_index: 0,
             runtime_event_sink: None,
             policy_gate: None,
         }

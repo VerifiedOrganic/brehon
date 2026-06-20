@@ -17,6 +17,7 @@ members = [
     "crates/brehon-protocol",
     "crates/brehon-recording",
     "crates/brehon-runtime",
+    "crates/brehon-notify",
     "crates/brehon-doctor",
     # Adapters
     "crates/brehon-adapter-sdk",
@@ -72,6 +73,22 @@ strum = { version = "0.27", features = ["derive"] }
 rmcp = { version = "0.16", features = ["server", "transport-io"] }
 portable-pty = "0.9"
 panesmith = { git = "https://github.com/VerifiedOrganic/panesmith.git", tag = "v0.2.2", features = ["crossterm"] }
+
+[profile.release]
+# Brehon spends real money autonomously for hours-to-days; overflow-checks keep
+# budget/token accumulation honest in the shipped binary rather than silently
+# wrapping a u64 += and defeating the kill-switch arithmetic.
+overflow-checks = true
+# panic=unwind is LOAD-BEARING, not a default we tolerate. Brehon's
+# never-crash/never-wedge firewalls depend on unwinding: catch_unwind around the
+# MCP tool dispatch (crates/brehon-mcp/src/server.rs), the TUI per-tick
+# stall/budget guards and the main run-loop iteration
+# (crates/brehon-tui/src/run/event_loop.rs), the mux ACP event bridge
+# (crates/brehon-mux/src/mux/events.rs), and JoinError panic monitoring on
+# daemon background tasks. panic="abort" would convert every caught panic into a
+# whole-session crash mid unattended run. See
+# docs/adr/0009-panic-unwind-firewalls.md. release-fast inherits this profile.
+panic = "unwind"
 
 [profile.release-fast]
 inherits = "release"

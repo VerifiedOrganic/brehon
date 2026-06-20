@@ -1,6 +1,8 @@
 //! Session and dashboard refresh logic.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
+use parking_lot::Mutex;
 
 use brehon_mux::{Mux, PaneKind, PaneState};
 
@@ -112,12 +114,12 @@ pub(crate) fn apply_dashboard_refresh_snapshot(
     }
     apply_reviewer_selection_state(panels, reviewer_selection, selected_panel, selected_member);
     sync_worker_task_contexts(mux, &tasks, &sessions);
-    let brehon_root = { dashboard_data.lock().unwrap().brehon_root.clone() };
+    let brehon_root = { dashboard_data.lock().brehon_root.clone() };
     if let Some(brehon_root) = brehon_root {
         sync_reviewer_review_contexts(mux, &brehon_root, &tasks);
     }
 
-    let mut data = dashboard_data.lock().unwrap();
+    let mut data = dashboard_data.lock();
     data.tasks = tasks;
     for pane in mux.panes() {
         let name = pane.id().to_string();

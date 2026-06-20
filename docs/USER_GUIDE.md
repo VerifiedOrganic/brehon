@@ -321,27 +321,52 @@ Brehon ships with a budget system. Here is how it is configured in this repo:
 
 ```yaml
 budget:
-  max_total_cost: null        # no ceiling
-  max_cost_per_task: null     # no per-task ceiling
-  max_tokens_per_agent: null  # no per-agent ceiling
-  alert_threshold_percent: 80 # warn at 80% of... null
-  enforcement: Soft           # warn, never block
+  max_total_cost: null          # no ceiling (approximate cost — see note)
+  max_cost_per_task: null       # no per-task ceiling
+  max_tokens_per_agent: null    # no run-total token ceiling
+  alert_threshold_percent: 80   # under Soft, warn at 80% of a configured cap
+  enforcement: Soft             # warn, never block
+  max_wall_clock_minutes: null  # no wall-clock ceiling for the whole run
 ```
 
-Every limit is `null`. Enforcement is `Soft`, which means even if you set a
-limit, Brehon will *mention* that you blew past it rather than stop. The brakes
-are installed. They are also, out of the box, disconnected. This is a defensible
-default for the author, who watches the thing run and has made peace with the
-bill. It is a terrible default for you on day one.
+**Omission means unlimited.** Every cap defaults to `null`, which is *no
+ceiling*. Leaving a field out (or `null`) does not mean "use a safe default" —
+it means the run may spend without bound until you stop it by hand. This is a
+deliberate default: the author runs Brehon for days at a time and does not want
+a surprise hard stop mid-run. It is a poor default for you on day one, so set a
+cap before your first real run. Brehon prints a loud `BUDGET KILL-SWITCH OFF`
+warning at startup (and `brehon doctor` reports a finding) whenever enforcement
+is effectively off, so you are never *silently* unprotected.
 
-**Before your first real run, set these:**
+Enforcement is `Soft` out of the box, which means even if you set a limit Brehon
+will *warn* that you blew past it rather than stop. The brakes are installed but,
+by default, disconnected.
+
+**Before your first real run, set `Hard` and at least one cap:**
 
 ```yaml
 budget:
-  max_total_cost: 25.00       # dollars, or whatever your config's cost unit is
-  max_cost_per_task: 2.00
-  enforcement: Hard           # actually stop, don't just sigh
+  max_tokens_per_agent: 5000000  # run-total token ceiling (the reliable lever)
+  max_wall_clock_minutes: 720    # hard stop after 12 hours of wall-clock
+  max_total_cost: 25.00          # approximate dollar ceiling (see note)
+  enforcement: Hard              # actually stop: refuse new prompts and tear
+                                 # down in-flight spending sessions
 ```
+
+Under `enforcement: Hard` with a cap configured, the live run loop reads the
+real per-run token spend on a short interval and, on breach, **refuses to
+dispatch new prompts and tears down the in-flight spending sessions** (the same
+drain + terminate path used at shutdown). The same happens when
+`max_wall_clock_minutes` elapses. If spend state ever becomes unreadable while a
+Hard token/cost cap is set, Brehon **fails closed** — it pauses new dispatch
+rather than charging on.
+
+> **A note on cost vs. tokens.** `max_tokens_per_agent` (the run-total token
+> ceiling) and `max_wall_clock_minutes` are the trustworthy levers — they are
+> enforced against a real, monotonic, restart-surviving spend signal.
+> `max_total_cost` is an *approximate* derived estimate (the pricing table is
+> coarse for the models actually in use), so prefer the token and wall-clock
+> caps for anything you actually care about stopping.
 
 Start low enough that a runaway loop wakes you up by *stopping*, not by
 appearing on a statement at the end of the month.
@@ -594,16 +619,19 @@ config — does not assume you want one:
 
 ```yaml
 budget:
-  max_total_cost: 5.00      # tiny on purpose; this is a test flight
-  max_cost_per_task: 2.00
-  enforcement: Hard         # actually stop, don't just sigh and continue
+  max_tokens_per_agent: 2000000  # run-total token ceiling — the reliable lever
+  max_wall_clock_minutes: 60     # and a 1-hour wall-clock stop, belt and braces
+  enforcement: Hard              # actually stop: refuse new prompts + tear down
 ```
 
-Five units. If a single task somehow blows through five units, you want it to
-*stop and tell you*, because something is wrong and you'd rather learn that now,
-for five units, than later, for considerably more. You can raise this the moment
-you trust the thing. You will trust it faster if your first run can't surprise
-you.
+A small ceiling on purpose. If a test flight somehow blows through two million
+tokens or runs for an hour, you want it to *stop and tell you*, because
+something is wrong and you'd rather learn that now than later for considerably
+more. Under `Hard`, hitting a cap refuses new prompts and tears down the
+in-flight spending sessions — it does not just sigh and continue. You can raise
+these the moment you trust the thing. (Prefer the token and wall-clock caps over
+`max_total_cost`, which is only an approximate dollar estimate. And remember:
+omitting a cap means *unlimited*, not "safe default".)
 
 ### Step 4 — Give it exactly one task
 
@@ -853,10 +881,14 @@ own point on the same dials.
 
 ### "I want it safer" (the brakes)
 
-- **`budget`** is the seatbelt. Set `max_total_cost` and `max_cost_per_task`,
-  and set `enforcement: Hard` so it *stops* rather than merely tutting at you.
-  `alert_threshold_percent` warns you on the way up. We have now mentioned this
-  enough times that it should be muscle memory.
+- **`budget`** is the seatbelt. Set `max_tokens_per_agent` (a run-total token
+  ceiling) and/or `max_wall_clock_minutes` (a whole-run time stop), and set
+  `enforcement: Hard` so a breach *stops* the run — refusing new prompts and
+  tearing down in-flight spending sessions — rather than merely tutting at you.
+  `max_total_cost` works too but is an approximate estimate; prefer the token and
+  wall-clock caps. `alert_threshold_percent` warns you on the way up under
+  `Soft`. Omitting a cap means *unlimited*, so set at least one. We have now
+  mentioned this enough times that it should be muscle memory.
 - **Stuck detection.** `supervisor.stuck_detection` decides when a quiet worker
   is "stuck" vs "thinking," and `supervisor.nudge` controls how soon it gets a
   soft nudge vs real guidance. Tighten these if workers wander off; loosen them
@@ -864,6 +896,18 @@ own point on the same dials.
 - **Escalation.** `escalation.human_in_loop: true` keeps *you* as the final
   backstop when the robots are out of moves. Leave this on until you have a very
   good reason not to.
+- **External notifications.** `notifications` can send subscribed state changes
+  to Telegram. Enable the provider, expose `BREHON_TELEGRAM_BOT_TOKEN` and
+  `BREHON_TELEGRAM_CHAT_ID`, then subscribe to the events you care about:
+  `run.started`, `run.shutdown`, `run.crash_detected`, `run.health_warning`,
+  `task.completed`, `task.closed`, `task.blocked`, `epic.completed`,
+  `integration.started`, `integration.completed`, `integration.failed`,
+  `review.approved`, `review.rejected`, `budget.warning`,
+  `budget.kill_switch`, `recovery.performed`, and `agent.stalled`. Brehon queues
+  notification events under `.brehon/runtime/notifications/outbox` and the main
+  run process drains that outbox, so task MCP state changes do not need provider
+  secrets. Repeated delivery failures move to `.brehon/runtime/notifications/failed`
+  for inspection.
 
 ### "I want it faster / more parallel"
 

@@ -26,14 +26,14 @@ use std::time::{Duration, Instant};
 /// `crates/brehon-pty/src/pty/core.rs`) until the next tick drains them.
 ///
 /// See § F8b in `tmp/tick-latency/GOAL_PROMPT.md`.
-const DRAIN_OUTPUT_MAX_BYTES_PER_CALL: usize = 256 * 1024;
+const DRAIN_OUTPUT_MAX_BYTES_PER_CALL: usize = 64 * 1024;
 
 /// Maximum number of `PtyEvent`s drained per `Pane::drain_output` call.
 /// Bounds wall-time even when each event is small (e.g. a burst of CPR
 /// queries or empty outputs from a sync-filtered Ink frame) — without
 /// this cap, the byte-budget alone could be defeated by thousands of
 /// tiny events that don't accumulate bytes but still cost FFI feeds.
-const DRAIN_OUTPUT_MAX_EVENTS_PER_CALL: usize = 64;
+const DRAIN_OUTPUT_MAX_EVENTS_PER_CALL: usize = 32;
 
 /// Result of one budgeted drain pass. Returned from
 /// `drain_events_with_budget` so `Pane::drain_output` can apply
@@ -110,7 +110,7 @@ pub struct PaneInjector {
     pub cli_type: AgentAdapter,
     pub writer: Arc<Mutex<Box<dyn Write + Send>>>,
     pub ink_generation: Arc<AtomicU64>,
-    pub pending_ink: Arc<std::sync::Mutex<Option<(String, Instant, u64)>>>,
+    pub pending_ink: Arc<parking_lot::Mutex<Option<(String, Instant, u64)>>>,
 }
 
 impl PaneInjector {
@@ -125,13 +125,19 @@ impl PaneInjector {
                 "pre-submit interrupt: sending double-tap Ctrl-C reset"
             );
             {
-                let mut w = self.writer.lock().expect("PTY writer mutex poisoned");
+                let mut w = self
+                    .writer
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
                 w.write_all(&[0x03])?;
                 w.flush()?;
             }
             tokio::time::sleep(PRE_SUBMIT_INTER_INTERRUPT_DELAY).await;
             {
-                let mut w = self.writer.lock().expect("PTY writer mutex poisoned");
+                let mut w = self
+                    .writer
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
                 w.write_all(&[0x03])?;
                 w.flush()?;
             }
@@ -140,7 +146,10 @@ impl PaneInjector {
         if uses_ink_echo_injection(&self.cli_type) {
             let text = prompt.trim();
             {
-                let mut w = self.writer.lock().expect("PTY writer mutex poisoned");
+                let mut w = self
+                    .writer
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
                 w.write_all(text.as_bytes())?;
                 w.flush()?;
             }
@@ -157,9 +166,7 @@ impl PaneInjector {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                 + 1;
             let deadline = Instant::now() + Duration::from_secs(3);
-            if let Ok(mut pending) = self.pending_ink.lock() {
-                *pending = Some((needle, deadline, generation));
-            }
+            *self.pending_ink.lock() = Some((needle, deadline, generation));
 
             let writer = self.writer.clone();
             let pending_state = Arc::clone(&self.pending_ink);
@@ -167,11 +174,8 @@ impl PaneInjector {
                 tokio::time::sleep(Duration::from_secs(3)).await;
                 let still_ours = pending_state
                     .lock()
-                    .map(|p| {
-                        p.as_ref()
-                            .map(|(_, _, g)| *g == generation)
-                            .unwrap_or(false)
-                    })
+                    .as_ref()
+                    .map(|(_, _, g)| *g == generation)
                     .unwrap_or(false);
                 if still_ours {
                     tracing::warn!(
@@ -179,18 +183,21 @@ impl PaneInjector {
                         "Ink echo fallback: echo detection did not fire, \
                              sending Enter via guaranteed timer"
                     );
-                    let mut w = writer.lock().expect("PTY writer mutex poisoned");
+                    let mut w = writer
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
                     let _ = w.write_all(b"\r");
                     let _ = w.flush();
-                    if let Ok(mut p) = pending_state.lock() {
-                        *p = None;
-                    }
+                    *pending_state.lock() = None;
                 }
             });
         } else if uses_delayed_submit_injection(&self.cli_type) {
             let payload = format!("\x15{}", prompt.trim());
             {
-                let mut w = self.writer.lock().expect("PTY writer mutex poisoned");
+                let mut w = self
+                    .writer
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
                 w.write_all(payload.as_bytes())?;
                 w.flush()?;
             }
@@ -204,14 +211,19 @@ impl PaneInjector {
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_millis(75)).await;
                 if submit_generation.load(std::sync::atomic::Ordering::Relaxed) == generation {
-                    let mut w = writer.lock().expect("PTY writer mutex poisoned");
+                    let mut w = writer
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
                     let _ = w.write_all(b"\r");
                     let _ = w.flush();
                 }
             });
         } else {
             let payload = format!("\x15{}\r", prompt.trim());
-            let mut w = self.writer.lock().expect("PTY writer mutex poisoned");
+            let mut w = self
+                .writer
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             w.write_all(payload.as_bytes())?;
             w.flush()?;
         }
@@ -220,7 +232,10 @@ impl PaneInjector {
 
     /// Send a minimal PTY nudge (plain Enter) to trigger a new turn.
     pub async fn nudge_inbox(&self) -> Result<()> {
-        let mut w = self.writer.lock().expect("PTY writer mutex poisoned");
+        let mut w = self
+            .writer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         w.write_all(b"\r")?;
         w.flush()?;
         Ok(())
@@ -241,7 +256,10 @@ impl PaneInjector {
     pub async fn inject_prompt_echo_verified(&self, prompt: &str) -> Result<()> {
         let text = prompt.trim();
         {
-            let mut w = self.writer.lock().expect("PTY writer mutex poisoned");
+            let mut w = self
+                .writer
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             w.write_all(text.as_bytes())?;
             w.flush()?;
         }
@@ -258,9 +276,7 @@ impl PaneInjector {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             + 1;
         let deadline = Instant::now() + Duration::from_secs(3);
-        if let Ok(mut pending) = self.pending_ink.lock() {
-            *pending = Some((needle, deadline, generation));
-        }
+        *self.pending_ink.lock() = Some((needle, deadline, generation));
 
         let writer = self.writer.clone();
         let pending_state = Arc::clone(&self.pending_ink);
@@ -268,11 +284,8 @@ impl PaneInjector {
             tokio::time::sleep(Duration::from_secs(3)).await;
             let still_ours = pending_state
                 .lock()
-                .map(|p| {
-                    p.as_ref()
-                        .map(|(_, _, g)| *g == generation)
-                        .unwrap_or(false)
-                })
+                .as_ref()
+                .map(|(_, _, g)| *g == generation)
                 .unwrap_or(false);
             if still_ours {
                 tracing::warn!(
@@ -280,12 +293,12 @@ impl PaneInjector {
                     "Echo-verified inject fallback: viewport scan did not find typed \
                      text, sending Enter via guaranteed timer"
                 );
-                let mut w = writer.lock().expect("PTY writer mutex poisoned");
+                let mut w = writer
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
                 let _ = w.write_all(b"\r");
                 let _ = w.flush();
-                if let Ok(mut p) = pending_state.lock() {
-                    *p = None;
-                }
+                *pending_state.lock() = None;
             }
         });
         Ok(())
@@ -293,7 +306,10 @@ impl PaneInjector {
 
     /// Write raw bytes to the PTY.
     pub async fn write(&self, data: &[u8]) -> Result<()> {
-        let mut w = self.writer.lock().expect("PTY writer mutex poisoned");
+        let mut w = self
+            .writer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         w.write_all(data)?;
         w.flush()?;
         Ok(())
@@ -350,7 +366,9 @@ impl Pane {
         // section is a sync `write_all` + `flush` on a `Box<dyn Write>`,
         // so contention is bounded by I/O wall time. `lock()` here is
         // the right call — try_lock would be a needless optimisation.
-        let mut w = writer.lock().expect("PTY writer mutex poisoned");
+        let mut w = writer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Err(e) = w.write_all(&payload) {
             tracing::debug!("CPR reply write failed: {}", e);
             return;
@@ -442,10 +460,7 @@ impl Pane {
     /// a mutex lock + `is_none()` check — no viewport scanning occurs.
     pub(super) fn check_ink_echo_submit(&mut self) {
         let should_submit = {
-            let pending = match self.pending_ink_submit.lock() {
-                Ok(p) => p,
-                Err(_) => return,
-            };
+            let pending = self.pending_ink_submit.lock();
             let (needle, deadline, _gen) = match pending.as_ref() {
                 Some(v) => v,
                 None => return,
@@ -497,8 +512,8 @@ impl Pane {
                 // clear state to avoid infinite retry.
                 PaneBackend::None => true,
             };
-            if should_clear && let Ok(mut pending) = self.pending_ink_submit.lock() {
-                *pending = None;
+            if should_clear {
+                *self.pending_ink_submit.lock() = None;
             }
         }
     }
@@ -768,16 +783,20 @@ mod budget_tests {
             !second.coalesced.is_empty(),
             "second drain returned no bytes — first call drained beyond cap"
         );
+        let mut total_drained = first.coalesced.len() + second.coalesced.len();
+        loop {
+            let next = drain_events_with_budget(
+                &recv,
+                DRAIN_OUTPUT_MAX_BYTES_PER_CALL,
+                DRAIN_OUTPUT_MAX_EVENTS_PER_CALL,
+            );
+            if next.coalesced.is_empty() {
+                break;
+            }
+            total_drained += next.coalesced.len();
+        }
         assert_eq!(
-            first.coalesced.len()
-                + second.coalesced.len()
-                + drain_events_with_budget(
-                    &recv,
-                    DRAIN_OUTPUT_MAX_BYTES_PER_CALL,
-                    DRAIN_OUTPUT_MAX_EVENTS_PER_CALL,
-                )
-                .coalesced
-                .len(),
+            total_drained,
             CHUNK * TOTAL_CHUNKS,
             "bytes lost or duplicated across budgeted drains"
         );

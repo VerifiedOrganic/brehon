@@ -33,6 +33,7 @@ mod integration_state;
 mod lifecycle;
 mod locking;
 mod migration;
+mod notifications;
 mod paths;
 mod persistence;
 mod proof;

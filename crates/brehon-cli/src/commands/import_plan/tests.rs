@@ -7,13 +7,12 @@ use super::ExtractMode;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-use std::sync::Mutex;
 
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use tempfile::TempDir;
 
-static IMPORT_PLAN_TEST_LOCK: Mutex<()> = Mutex::new(());
+use crate::commands::TEST_ENV_LOCK as IMPORT_PLAN_TEST_LOCK;
 
 fn sample_plan() -> &'static str {
     r#"# Sample Plan

@@ -15,3 +15,6 @@ pub mod runtime;
 pub mod serve;
 pub mod task;
 pub mod test;
+
+#[cfg(test)]
+pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

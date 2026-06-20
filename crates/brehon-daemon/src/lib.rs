@@ -5,6 +5,7 @@
 //! policy without taking PTY ownership away from the mux.
 
 use std::collections::HashMap;
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
@@ -27,6 +28,7 @@ use brehon_types::{
     TerminalHostCapabilities,
 };
 use brehon_workflow::{WorkflowEngine, WorkflowLoopStats};
+use futures_util::FutureExt;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex, RwLock};
@@ -362,8 +364,23 @@ impl RuntimeSidecar {
         let detection_sink = daemon.clone();
         let detection_state = status.inner.clone();
         let detection_task = tokio::spawn(async move {
-            let stats =
-                run_detection_loop(&mut detection_stream, detector.as_ref(), &detection_sink).await;
+            // Monitor the spawned detection loop for panic: run_detection_loop lives
+            // in brehon-detect and observes untrusted agent events. If it panics, the
+            // unwind would skip the detection_running=false store below, leaving the
+            // sidecar status falsely reporting a live detector. Catch the panic, log
+            // it, and flip the liveness flag so a dead detector is observable rather
+            // than silently masked. Relies on panic=unwind (see [profile.release]).
+            let stats = AssertUnwindSafe(run_detection_loop(
+                &mut detection_stream,
+                detector.as_ref(),
+                &detection_sink,
+            ))
+            .catch_unwind()
+            .await
+            .unwrap_or_else(|_panic| {
+                tracing::error!("panic in runtime detection loop; detector stopped");
+                DetectionLoopStats::default()
+            });
             detection_state
                 .detection_running
                 .store(false, Ordering::SeqCst);
@@ -374,9 +391,23 @@ impl RuntimeSidecar {
         let workflow_daemon = daemon.clone();
         let workflow_state = status.inner.clone();
         let workflow_task = tokio::spawn(async move {
-            let stats =
-                run_daemon_workflow_loop(&mut workflow_stream, &workflow_engine, &workflow_daemon)
-                    .await;
+            // Defense-in-depth: run_daemon_workflow_loop already isolates per-event
+            // panics, but a panic in a stream/publish/route await would otherwise
+            // unwind past the workflow_running=false store below and leave the
+            // sidecar status falsely reporting a live workflow loop. Catch it, log,
+            // and flip the liveness flag. Relies on panic=unwind (see
+            // [profile.release] in the workspace Cargo.toml).
+            let stats = AssertUnwindSafe(run_daemon_workflow_loop(
+                &mut workflow_stream,
+                &workflow_engine,
+                &workflow_daemon,
+            ))
+            .catch_unwind()
+            .await
+            .unwrap_or_else(|_panic| {
+                tracing::error!("panic in runtime workflow loop; workflow stopped");
+                WorkflowLoopStats::default()
+            });
             workflow_state
                 .workflow_running
                 .store(false, Ordering::SeqCst);
@@ -441,13 +472,29 @@ impl RuntimeDaemonHeartbeat {
         let interval = interval.max(Duration::from_secs(1));
         let task = tokio::spawn(async move {
             loop {
-                if let Err(err) = Self::write_current_status(&path, &daemon, sidecar.as_ref()).await
+                // Isolate each heartbeat iteration: a panic in write_current_status
+                // must not silently kill this unmonitored background task and stop
+                // health snapshots for the rest of the session. A normal Err still
+                // takes the existing warn path. Relies on panic=unwind (see
+                // [profile.release] in the workspace Cargo.toml).
+                match AssertUnwindSafe(Self::write_current_status(&path, &daemon, sidecar.as_ref()))
+                    .catch_unwind()
+                    .await
                 {
-                    tracing::warn!(
-                        path = %path.display(),
-                        error = %err,
-                        "Failed to write runtime daemon heartbeat"
-                    );
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => {
+                        tracing::warn!(
+                            path = %path.display(),
+                            error = %err,
+                            "Failed to write runtime daemon heartbeat"
+                        );
+                    }
+                    Err(_panic) => {
+                        tracing::error!(
+                            path = %path.display(),
+                            "panic in runtime daemon heartbeat iteration; continuing"
+                        );
+                    }
                 }
                 tokio::time::sleep(interval).await;
             }
@@ -481,12 +528,29 @@ impl RuntimeDaemonCommandInbox {
         let interval = interval.max(Duration::from_millis(250));
         let task = tokio::spawn(async move {
             loop {
-                if let Err(err) = process_command_inbox_once(&root, &daemon).await {
-                    tracing::warn!(
-                        path = %root.display(),
-                        error = %err,
-                        "Failed to process runtime daemon command inbox"
-                    );
+                // Isolate each inbox iteration: a panic in process_command_inbox_once
+                // (which parses untrusted file-backed operator commands) must not
+                // silently kill this unmonitored background task. A normal Err still
+                // takes the existing warn path. Relies on panic=unwind (see
+                // [profile.release] in the workspace Cargo.toml).
+                match AssertUnwindSafe(process_command_inbox_once(&root, &daemon))
+                    .catch_unwind()
+                    .await
+                {
+                    Ok(Ok(_processed)) => {}
+                    Ok(Err(err)) => {
+                        tracing::warn!(
+                            path = %root.display(),
+                            error = %err,
+                            "Failed to process runtime daemon command inbox"
+                        );
+                    }
+                    Err(_panic) => {
+                        tracing::error!(
+                            path = %root.display(),
+                            "panic in runtime daemon command inbox iteration; continuing"
+                        );
+                    }
                 }
                 tokio::time::sleep(interval).await;
             }
@@ -1472,7 +1536,19 @@ async fn run_daemon_workflow_loop(
         };
 
         stats.observed_events = stats.observed_events.saturating_add(1);
-        for emission in engine.observe_emissions(event) {
+        // Isolate untrusted workflow observation: a panic in observe_emissions
+        // must not unwind out and kill this spawned task (which is only aborted on
+        // shutdown, never monitored for panic). Skip the offending event and keep
+        // running. Relies on panic=unwind (see [profile.release] in Cargo.toml).
+        let emissions =
+            match std::panic::catch_unwind(AssertUnwindSafe(|| engine.observe_emissions(event))) {
+                Ok(emissions) => emissions,
+                Err(_panic) => {
+                    tracing::error!("panic observing workflow event; skipping");
+                    continue;
+                }
+            };
+        for emission in emissions {
             stats.emitted_actions = stats.emitted_actions.saturating_add(1);
             let brehon_workflow::WorkflowEmission {
                 audit_event,
@@ -3545,5 +3621,56 @@ mod tests {
             .await
             .expect_err("stopped daemon rejects commands");
         assert!(matches!(err, PortError::Runtime(_)));
+    }
+
+    /// Reproduces the panic-isolation contract used by the daemon's spawned
+    /// background loops (heartbeat / command inbox): a panic in one iteration is
+    /// caught and the loop continues, instead of unwinding out and silently
+    /// killing the unmonitored task. Without the catch_unwind firewall the first
+    /// iteration's panic would abort the spawned task and the second iteration
+    /// would never run.
+    #[tokio::test]
+    async fn spawned_loop_survives_panicking_iteration() {
+        let iterations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let done = Arc::new(tokio::sync::Notify::new());
+
+        let task_iters = iterations.clone();
+        let task_done = done.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                let iter = task_iters.fetch_add(1, Ordering::SeqCst);
+                // Mirror the production loop body: wrap a fallible/panicking async
+                // step in AssertUnwindSafe(...).catch_unwind().await.
+                let outcome = AssertUnwindSafe(async {
+                    if iter == 0 {
+                        panic!("induced panic in iteration 0");
+                    }
+                    Ok::<(), PortError>(())
+                })
+                .catch_unwind()
+                .await;
+                match outcome {
+                    Ok(Ok(())) => {}
+                    Ok(Err(_err)) => {}
+                    Err(_panic) => {
+                        // Caught: continue the loop instead of dying.
+                    }
+                }
+                if iter >= 1 {
+                    task_done.notify_one();
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        });
+
+        // If the panic killed the task, this notify never fires and the await
+        // below would hang; the JoinHandle below would also report a panic.
+        done.notified().await;
+        task.await.expect("loop task should not have panicked out");
+        assert!(
+            iterations.load(Ordering::SeqCst) >= 2,
+            "loop must continue past the panicking first iteration"
+        );
     }
 }

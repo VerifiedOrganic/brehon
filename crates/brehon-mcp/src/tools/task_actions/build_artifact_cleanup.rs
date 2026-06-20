@@ -534,7 +534,7 @@ mod tests {
         std::fs::write(root.join("README.md"), "seed\n").unwrap();
         std::fs::write(
             root.join("Cargo.toml"),
-            "[package]\nname = \"cleanup-fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            "[package]\nname = \"cleanup-fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n",
         )
         .unwrap();
         std::fs::create_dir_all(root.join("src")).unwrap();
@@ -595,7 +595,7 @@ mod tests {
         let report =
             cleanup_brehon_worktree_allowlisted_artifacts("after_worker_handoff", &worktree);
 
-        assert_eq!(report["status"], "removed");
+        assert_eq!(report["status"], "removed", "{report:#}");
         assert!(!worktree.join("target").exists());
     }
 
@@ -751,7 +751,7 @@ mod tests {
         let report =
             cleanup_brehon_worktree_allowlisted_artifacts("after_worker_handoff", &worktree);
 
-        assert_eq!(report["status"], "removed");
+        assert_eq!(report["status"], "removed", "{report:#}");
         assert!(worktree.join(".mcp.json").exists());
         assert!(worktree.join("opencode.json").exists());
         assert!(worktree.join(".agents/mcp_config.json").exists());

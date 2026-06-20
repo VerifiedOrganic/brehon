@@ -40,9 +40,7 @@ impl Pane {
         self.synthetic_prev_was_cr = false;
         self.supervisor_pending_structured_output.clear();
         self.pending_messages.clear();
-        if let Ok(mut pending) = self.pending_ink_submit.lock() {
-            *pending = None;
-        }
+        *self.pending_ink_submit.lock() = None;
         self.ink_submit_generation
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(())
@@ -466,10 +464,7 @@ impl Pane {
     }
 
     pub(crate) fn has_pending_ink_submit(&self) -> bool {
-        self.pending_ink_submit
-            .lock()
-            .map(|pending| pending.is_some())
-            .unwrap_or(false)
+        self.pending_ink_submit.lock().is_some()
     }
 
     pub(crate) fn has_nonempty_ink_prompt_marker(&self) -> bool {

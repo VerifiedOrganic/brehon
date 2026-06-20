@@ -271,11 +271,14 @@ pub struct Pane {
     pub(crate) agent_session_id: Option<String>,
     /// Text waiting for echo confirmation before submitting (Ink-based CLIs).
     /// Contains (needle text to detect, deadline for fallback, generation).
-    /// Behind Arc<std::sync::Mutex> so inject_prompt can share it with a
+    /// Behind Arc<parking_lot::Mutex> so inject_prompt can share it with a
     /// spawned tokio fallback timer that guarantees Enter delivery.
+    /// parking_lot avoids poison propagation: a panic while holding this
+    /// lock never bricks subsequent acquisitions for the session.
     /// The generation counter prevents stale timers from sending Enter for
     /// a newer injection.
-    pub(crate) pending_ink_submit: std::sync::Arc<std::sync::Mutex<Option<(String, Instant, u64)>>>,
+    pub(crate) pending_ink_submit:
+        std::sync::Arc<parking_lot::Mutex<Option<(String, Instant, u64)>>>,
     /// Monotonic counter for ink echo injection generations.
     pub(crate) ink_submit_generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Tracks whether the last synthetic output byte was '\r' so lone '\n'

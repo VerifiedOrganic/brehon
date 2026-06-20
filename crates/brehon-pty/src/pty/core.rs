@@ -377,7 +377,10 @@ impl Pty {
     /// which never `.await`s — holding a sync mutex around it is correct
     /// and cheap.
     pub async fn write(&self, data: &[u8]) -> Result<()> {
-        let mut writer = self.writer.lock().expect("PTY writer mutex poisoned");
+        let mut writer = self
+            .writer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         writer
             .write_all(data)
             .map_err(|e| Error::pty(format!("Write failed: {e}")))?;
