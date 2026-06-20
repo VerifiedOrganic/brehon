@@ -201,6 +201,10 @@ pub(crate) struct GatewaySpawnConfig {
     pub(crate) protocol: GatewayProtocol,
     pub(crate) tool_prefix: Option<String>,
     pub(crate) base_url: Option<String>,
+    /// Max concurrent in-flight requests Brehon routes to this endpoint. Several
+    /// panes that share one `base_url` are serialized onto its slots by the
+    /// per-endpoint concurrency gate. `None` (or 0) = unlimited.
+    pub(crate) max_concurrency: Option<usize>,
     pub(crate) api_key_env: Option<String>,
     pub(crate) headers: Vec<(String, String)>,
     pub(crate) model: Option<String>,

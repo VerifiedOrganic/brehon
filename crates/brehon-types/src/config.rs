@@ -228,6 +228,18 @@ pub struct AgentConnectionConfig {
     /// Maximum native tool calls to execute concurrently.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_parallel_tool_calls: Option<usize>,
+    /// Maximum concurrent in-flight requests Brehon routes to this launcher's
+    /// endpoint. Lanes that share one local OpenAI-compatible server (a single
+    /// llama.cpp / llama-swap instance) should set the same value so Brehon
+    /// serializes onto its limited slots instead of stampeding it or thrashing
+    /// model swaps. `None` (or 0) = unlimited, the cloud default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrency: Option<usize>,
+    /// Approximate per-sequence context window (tokens) for this endpoint,
+    /// forwarded to the Brehon-native runtime so it trims history to fit. Set
+    /// for local servers with small windows; leave unset for hosted endpoints.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<usize>,
     /// Assistant message extension fields preserved across native tool-call subturns.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub assistant_message_passthrough_fields: Vec<String>,
@@ -276,6 +288,16 @@ impl AgentConnectionConfig {
 
     pub fn max_parallel_tool_calls(&self) -> Option<usize> {
         self.max_parallel_tool_calls
+    }
+
+    /// Per-endpoint in-flight request cap, normalized so `Some(0)` (a
+    /// meaningless "zero concurrency") reads as unlimited like `None`.
+    pub fn max_concurrency(&self) -> Option<usize> {
+        self.max_concurrency.filter(|cap| *cap > 0)
+    }
+
+    pub fn context_window(&self) -> Option<usize> {
+        self.context_window
     }
 
     pub fn assistant_message_passthrough_fields(&self) -> &[String] {
@@ -2532,6 +2554,8 @@ mod tests {
             permission_mode: None,
             profile: None,
             max_parallel_tool_calls: None,
+            max_concurrency: None,
+            context_window: None,
             assistant_message_passthrough_fields: Vec::new(),
             reasoning_effort_param: None,
             extra_body: None,

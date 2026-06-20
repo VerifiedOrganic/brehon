@@ -300,6 +300,7 @@ fn custom_interactive_agent(name: &str, command: &str, args: &[&str]) -> AgentAd
         command: Some(command.to_string()),
         args: args.iter().map(|arg| arg.to_string()).collect(),
         base_url: None,
+        max_concurrency: None,
         api_key_env: None,
         headers: Vec::new(),
         capabilities: HarnessCapabilities {

@@ -616,6 +616,7 @@ fn grok_adapter(name: &str) -> AgentAdapter {
             "stdio".to_string(),
         ],
         base_url: None,
+        max_concurrency: None,
         api_key_env: None,
         headers: Vec::new(),
         capabilities: HarnessCapabilities {
@@ -639,6 +640,7 @@ fn custom_acp_adapter(name: &str) -> AgentAdapter {
         command: Some("my-agent".to_string()),
         args: vec!["--stdio".to_string()],
         base_url: None,
+        max_concurrency: None,
         api_key_env: None,
         headers: Vec::new(),
         capabilities: HarnessCapabilities {
@@ -1520,6 +1522,7 @@ fn test_custom_acp_worker_uses_stdio_gateway_protocol() {
         command: Some("goose".to_string()),
         args: vec!["acp".to_string(), "--stdio".to_string()],
         base_url: None,
+        max_concurrency: None,
         api_key_env: None,
         headers: Vec::new(),
         capabilities: HarnessCapabilities {
@@ -1740,6 +1743,7 @@ fn test_custom_codex_app_server_worker_uses_codex_ws_gateway_protocol() {
             "app-server".to_string(),
         ],
         base_url: None,
+        max_concurrency: None,
         api_key_env: None,
         headers: Vec::new(),
         capabilities: HarnessCapabilities {
@@ -1831,6 +1835,7 @@ fn test_custom_codex_app_server_worker_accepts_long_form_safe_bootstrap() {
             "app-server".to_string(),
         ],
         base_url: None,
+        max_concurrency: None,
         api_key_env: None,
         headers: Vec::new(),
         capabilities: HarnessCapabilities {
@@ -1908,6 +1913,7 @@ fn test_custom_codex_app_server_worker_accepts_short_form_safe_bootstrap() {
             "app-server".to_string(),
         ],
         base_url: None,
+        max_concurrency: None,
         api_key_env: None,
         headers: Vec::new(),
         capabilities: HarnessCapabilities {
@@ -1977,6 +1983,7 @@ fn test_custom_codex_app_server_worker_requires_instructions_bootstrap() {
             "app-server".to_string(),
         ],
         base_url: None,
+        max_concurrency: None,
         api_key_env: None,
         headers: Vec::new(),
         capabilities: HarnessCapabilities {
@@ -2025,6 +2032,7 @@ fn test_custom_acp_reviewer_uses_stdio_gateway_protocol() {
         command: Some("goose".to_string()),
         args: vec!["acp".to_string()],
         base_url: None,
+        max_concurrency: None,
         api_key_env: None,
         headers: Vec::new(),
         capabilities: HarnessCapabilities {
@@ -2089,6 +2097,7 @@ fn test_custom_acp_supervisor_is_rejected_without_pty_contract() {
         command: Some("goose".to_string()),
         args: vec!["acp".to_string()],
         base_url: None,
+        max_concurrency: None,
         api_key_env: None,
         headers: Vec::new(),
         capabilities: HarnessCapabilities {
@@ -2141,6 +2150,7 @@ fn test_custom_pty_supervisor_uses_pty_launch_contract() {
         command: Some("sh".to_string()),
         args: vec!["-lc".to_string(), "cat".to_string()],
         base_url: None,
+        max_concurrency: None,
         api_key_env: None,
         headers: Vec::new(),
         capabilities: HarnessCapabilities {
@@ -2226,6 +2236,7 @@ fn test_custom_acp_sidecar_supervisor_has_pty_and_gateway_contract() {
         command: Some("sh".to_string()),
         args: vec!["-lc".to_string(), "cat".to_string()],
         base_url: None,
+        max_concurrency: None,
         api_key_env: None,
         headers: Vec::new(),
         capabilities: HarnessCapabilities {
@@ -2320,6 +2331,7 @@ fn test_native_agent_acp_reviewer_passes_model_as_env_and_arg() {
         command: Some("agora-native-agent".to_string()),
         args: vec!["--worker".to_string()],
         base_url: None,
+        max_concurrency: None,
         api_key_env: None,
         headers: Vec::new(),
         capabilities: HarnessCapabilities {
@@ -2388,6 +2400,7 @@ fn test_custom_acp_sidecar_supervisor_rejects_non_interactive_transport() {
         command: Some("native-agent".to_string()),
         args: vec![],
         base_url: None,
+        max_concurrency: None,
         api_key_env: None,
         headers: Vec::new(),
         capabilities: HarnessCapabilities {
@@ -2446,6 +2459,7 @@ fn test_custom_openai_worker_uses_managed_api_gateway_protocol() {
         command: None,
         args: vec![],
         base_url: Some("https://ollama.example/v1".to_string()),
+        max_concurrency: None,
         api_key_env: Some("OLLAMA_API_KEY".to_string()),
         headers: vec![("x-provider".to_string(), "ollama-cloud".to_string())],
         capabilities: HarnessCapabilities {
@@ -2503,6 +2517,7 @@ fn test_custom_openai_supervisor_is_rejected_without_pty_command() {
         command: None,
         args: vec![],
         base_url: Some("https://api.openai.example/v1".to_string()),
+        max_concurrency: None,
         api_key_env: Some("OPENAI_API_KEY".to_string()),
         headers: Vec::new(),
         capabilities: HarnessCapabilities {

@@ -41,6 +41,9 @@ pub struct CustomAgentConfig {
     pub args: Vec<String>,
     /// Base URL for direct OpenAI-compatible adapters.
     pub base_url: Option<String>,
+    /// Max concurrent in-flight requests Brehon routes to this endpoint, shared
+    /// across every lane pointed at the same `base_url`. `None` = unlimited.
+    pub max_concurrency: Option<usize>,
     /// Environment variable containing the API key for direct adapters.
     pub api_key_env: Option<String>,
     /// Extra static headers for direct adapters.
@@ -237,6 +240,7 @@ mod tests {
             command: Some("custom".into()),
             args: vec![],
             base_url: None,
+            max_concurrency: None,
             api_key_env: None,
             headers: vec![],
             capabilities: HarnessCapabilities {
@@ -262,6 +266,7 @@ mod tests {
             command: Some("custom".into()),
             args: vec![],
             base_url: None,
+            max_concurrency: None,
             api_key_env: None,
             headers: vec![],
             capabilities: HarnessCapabilities {

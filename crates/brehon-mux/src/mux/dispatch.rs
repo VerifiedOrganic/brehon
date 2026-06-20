@@ -1268,6 +1268,39 @@ impl Mux {
     /// Callers that already have a durable queue on disk should use this API so
     /// the queue remains the source of truth until the transport actually
     /// accepts the prompt.
+    /// Per-endpoint concurrency backpressure.
+    ///
+    /// Returns `Some(busy_peers)` when the endpoint this pane targets is already
+    /// at its configured `max_concurrency` and the prompt should be deferred (the
+    /// caller turns this into a retried `Queued` result); `None` when delivery may
+    /// proceed. Fails open: returns `None` whenever the cap or endpoint is
+    /// unknown, so a misconfiguration can never wedge a run — it only ever
+    /// relaxes serialization.
+    fn endpoint_capacity_backpressure(&self, pane_id: &str) -> Option<usize> {
+        let spawn_config = self.panes.get(pane_id)?.gateway_spawn_config.as_ref()?;
+        let cap = spawn_config.max_concurrency.filter(|cap| *cap > 0)?;
+        let endpoint = spawn_config.base_url.as_deref()?;
+        let busy_peers = self.count_busy_endpoint_peers(endpoint, pane_id);
+        (busy_peers >= cap).then_some(busy_peers)
+    }
+
+    /// Count panes other than `exclude_pane` that share `endpoint` (same
+    /// `base_url`) and are currently processing a turn, i.e. occupying one of the
+    /// endpoint's slots.
+    fn count_busy_endpoint_peers(&self, endpoint: &str, exclude_pane: &str) -> usize {
+        self.panes
+            .iter()
+            .filter(|(id, _)| id.as_str() != exclude_pane)
+            .filter(|(_, pane)| {
+                pane.gateway_spawn_config
+                    .as_ref()
+                    .and_then(|config| config.base_url.as_deref())
+                    == Some(endpoint)
+                    && pane.is_processing()
+            })
+            .count()
+    }
+
     pub async fn attempt_prompt_delivery(
         &mut self,
         pane_id: &str,
@@ -1319,6 +1352,18 @@ impl Mux {
         }
         if let Some(reason) = self.pane_unavailable_reason(pane_id) {
             return Ok(PromptDeliveryAttempt::Rejected { reason });
+        }
+
+        // Per-endpoint concurrency gate: when several panes share one local
+        // OpenAI-compatible endpoint (a single llama.cpp / llama-swap server),
+        // serialize their requests onto its limited slots. Deferring returns
+        // Queued, which the durable prompt queue retries once a peer frees the
+        // endpoint — mirroring the existing policy-Defer backpressure path.
+        if let Some(ahead_of) = self.endpoint_capacity_backpressure(pane_id) {
+            return Ok(PromptDeliveryAttempt::Queued {
+                prompt_id,
+                ahead_of,
+            });
         }
 
         let pane = self.panes.get(pane_id);
@@ -2220,5 +2265,111 @@ impl Mux {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod endpoint_gate_tests {
+    use super::*;
+    use crate::pane::Pane;
+    use brehon_acp::GatewayProtocol;
+
+    fn gateway_spawn_config(
+        base_url: Option<&str>,
+        max_concurrency: Option<usize>,
+    ) -> GatewaySpawnConfig {
+        GatewaySpawnConfig {
+            command: None,
+            args: Vec::new(),
+            env: Vec::new(),
+            cwd: String::new(),
+            protocol: GatewayProtocol::OpenAiCompatibleChat,
+            tool_prefix: None,
+            base_url: base_url.map(str::to_string),
+            max_concurrency,
+            api_key_env: None,
+            headers: Vec::new(),
+            model: None,
+            sidecar_socket_path: None,
+            sidecar_ready_path: None,
+            sidecar_connect_timeout_ms: None,
+        }
+    }
+
+    fn add_gateway_pane(
+        mux: &mut Mux,
+        name: &str,
+        base_url: Option<&str>,
+        max_concurrency: Option<usize>,
+        busy: bool,
+    ) {
+        let mut pane = Pane::director(name, 24, 80).unwrap();
+        pane.gateway_spawn_config = Some(gateway_spawn_config(base_url, max_concurrency));
+        if busy {
+            pane.set_pane_busy(
+                PromptId::new(format!("p-{name}")),
+                Generation::default(),
+                Instant::now(),
+            );
+        }
+        mux.add_pane(pane);
+    }
+
+    #[test]
+    fn no_cap_never_defers_even_with_busy_peer() {
+        let mut mux = Mux::new(24, 80);
+        add_gateway_pane(&mut mux, "a", Some("http://x/v1"), None, true);
+        add_gateway_pane(&mut mux, "b", Some("http://x/v1"), None, false);
+        assert_eq!(mux.endpoint_capacity_backpressure("b"), None);
+    }
+
+    #[test]
+    fn cap_one_defers_when_a_peer_is_busy() {
+        let mut mux = Mux::new(24, 80);
+        add_gateway_pane(&mut mux, "a", Some("http://x/v1"), Some(1), true);
+        add_gateway_pane(&mut mux, "b", Some("http://x/v1"), Some(1), false);
+        assert_eq!(mux.endpoint_capacity_backpressure("b"), Some(1));
+    }
+
+    #[test]
+    fn cap_one_allows_when_all_peers_idle() {
+        let mut mux = Mux::new(24, 80);
+        add_gateway_pane(&mut mux, "a", Some("http://x/v1"), Some(1), false);
+        add_gateway_pane(&mut mux, "b", Some("http://x/v1"), Some(1), false);
+        assert_eq!(mux.endpoint_capacity_backpressure("b"), None);
+    }
+
+    #[test]
+    fn busy_peers_on_other_endpoints_do_not_count() {
+        let mut mux = Mux::new(24, 80);
+        add_gateway_pane(&mut mux, "a", Some("http://A/v1"), Some(1), true);
+        add_gateway_pane(&mut mux, "b", Some("http://B/v1"), Some(1), false);
+        assert_eq!(mux.endpoint_capacity_backpressure("b"), None);
+    }
+
+    #[test]
+    fn cap_two_defers_only_once_two_peers_are_busy() {
+        let mut mux = Mux::new(24, 80);
+        add_gateway_pane(&mut mux, "a", Some("http://x/v1"), Some(2), true);
+        add_gateway_pane(&mut mux, "b", Some("http://x/v1"), Some(2), false);
+        assert_eq!(mux.endpoint_capacity_backpressure("b"), None);
+        add_gateway_pane(&mut mux, "c", Some("http://x/v1"), Some(2), true);
+        assert_eq!(mux.endpoint_capacity_backpressure("b"), Some(2));
+    }
+
+    #[test]
+    fn missing_base_url_fails_open() {
+        let mut mux = Mux::new(24, 80);
+        add_gateway_pane(&mut mux, "a", None, Some(1), true);
+        add_gateway_pane(&mut mux, "b", None, Some(1), false);
+        assert_eq!(mux.endpoint_capacity_backpressure("b"), None);
+    }
+
+    #[test]
+    fn zero_cap_is_treated_as_unlimited() {
+        let mut mux = Mux::new(24, 80);
+        add_gateway_pane(&mut mux, "a", Some("http://x/v1"), Some(0), true);
+        add_gateway_pane(&mut mux, "b", Some("http://x/v1"), Some(0), false);
+        assert_eq!(mux.endpoint_capacity_backpressure("b"), None);
     }
 }
