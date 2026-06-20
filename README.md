@@ -234,6 +234,12 @@ yours to tune** — the [User Guide](docs/USER_GUIDE.md)'s "Turning the dials"
 section is a tour of the cost and quality knobs, and the schema validator
 (`brehon-config/src/validate/`) is the authoritative form.
 
+**Running fully local?** Brehon can drive a panel of locally-hosted models
+(llama.cpp / llama-swap, Ollama, etc.) with no paid API. See
+[docs/LOCAL_MODELS.md](docs/LOCAL_MODELS.md) for the setup guide and
+[docs/brehon-local-config.yaml](docs/brehon-local-config.yaml) for a
+copy-pasteable config.
+
 ## CLI Reference
 
 | Command                       | Purpose                                                              |
@@ -323,6 +329,7 @@ crates/
   ghostty_vt           vendored terminal-emulation bindings
 docs/
   USER_GUIDE.md        the practical guide — start here
+  LOCAL_MODELS.md      running on local models (llama.cpp / llama-swap)
   ARCHITECTURE.md      detailed system walkthrough
   adr/                 architecture decision records
 ```

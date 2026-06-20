@@ -2446,4 +2446,36 @@ mod endpoint_gate_tests {
         assert!(!mux.endpoint_has_concurrency_cap("zero-cap"));
         assert!(!mux.endpoint_has_concurrency_cap("no-url"));
     }
+
+    #[test]
+    fn begin_async_gateway_delivery_defers_when_endpoint_at_capacity() {
+        // End-to-end through the live gateway delivery entry point (not just the
+        // decision fn): a busy peer on a cap-1 shared endpoint must defer the
+        // next lane's delivery to Queued. The gate short-circuits before
+        // ensure_gateway_session, so no real gateway is required.
+        let mut mux = Mux::new(24, 80);
+        add_gateway_pane(
+            &mut mux,
+            "worker-a",
+            Some("http://127.0.0.1:8080/v1"),
+            Some(1),
+            true,
+        );
+        add_gateway_pane(
+            &mut mux,
+            "worker-b",
+            Some("http://127.0.0.1:8080/v1"),
+            Some(1),
+            false,
+        );
+
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let dispatch = rt
+            .block_on(mux.begin_async_gateway_prompt_delivery(rt.handle(), "worker-b", "do work"))
+            .expect("dispatch should succeed");
+        assert!(
+            matches!(dispatch, AsyncGatewayPromptDispatch::Queued { .. }),
+            "worker-b must be deferred while worker-a holds the only endpoint slot"
+        );
+    }
 }
