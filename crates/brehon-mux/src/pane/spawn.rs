@@ -866,6 +866,16 @@ impl Pane {
             args.push("--model".to_string());
             args.push(model.to_string());
         }
+        // Carry the endpoint identity (base_url) and per-endpoint concurrency cap
+        // for custom agents (e.g. NativeAgent over ACP, which resolves to
+        // AdapterKind::NativeAgent -> HarnessControlPlane::Acp). The native agent
+        // talks to base_url itself via --base-url, but the mux still needs it as
+        // the endpoint key so panes sharing one local server serialize through
+        // the per-endpoint concurrency gate.
+        let (endpoint_base_url, endpoint_max_concurrency) = match &cli_type {
+            AgentAdapter::Custom(custom) => (custom.base_url.clone(), custom.max_concurrency),
+            _ => (None, None),
+        };
         let spawn_config = GatewaySpawnConfig {
             command: Some(config.command),
             args,
@@ -873,8 +883,8 @@ impl Pane {
             cwd,
             protocol: gateway_protocol_for(&cli_type),
             tool_prefix: None,
-            base_url: None,
-            max_concurrency: None,
+            base_url: endpoint_base_url,
+            max_concurrency: endpoint_max_concurrency,
             api_key_env: None,
             headers: Vec::new(),
             model,
@@ -948,6 +958,13 @@ impl Pane {
             .as_ref()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|| ".".to_string());
+        // See gateway_pane_from_config: carry the endpoint key + concurrency cap
+        // for custom (e.g. NativeAgent sidecar) agents so the per-endpoint gate
+        // can serialize panes sharing one local server.
+        let (endpoint_base_url, endpoint_max_concurrency) = match &cli_type {
+            AgentAdapter::Custom(custom) => (custom.base_url.clone(), custom.max_concurrency),
+            _ => (None, None),
+        };
         let spawn_config = GatewaySpawnConfig {
             command: None,
             args: Vec::new(),
@@ -955,8 +972,8 @@ impl Pane {
             cwd,
             protocol: GatewayProtocol::AcpUnixSocket,
             tool_prefix: None,
-            base_url: None,
-            max_concurrency: None,
+            base_url: endpoint_base_url,
+            max_concurrency: endpoint_max_concurrency,
             api_key_env: None,
             headers: Vec::new(),
             model: None,

@@ -1826,6 +1826,64 @@ fn test_custom_codex_app_server_worker_uses_codex_ws_gateway_protocol() {
 }
 
 #[test]
+fn test_custom_acp_agent_carries_endpoint_base_url_and_max_concurrency() {
+    // Regression guard: a custom ACP agent (the shape NativeAgent local lanes
+    // resolve to) must propagate base_url + max_concurrency into its
+    // GatewaySpawnConfig so the per-endpoint concurrency gate can serialize
+    // lanes that share one local server. The ACP spawn path previously
+    // hardcoded these to None, silently disabling the gate.
+    let cwd = std::env::temp_dir().join(format!("brehon-local-acp-pane-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&cwd).expect("create pane cwd");
+
+    let adapter = AgentAdapter::Custom(CustomAgentConfig {
+        name: "local-worker".to_string(),
+        command: Some("brehon-native-agent".to_string()),
+        args: vec!["--worker".to_string()],
+        base_url: Some("http://127.0.0.1:8080/v1".to_string()),
+        max_concurrency: Some(1),
+        api_key_env: None,
+        headers: Vec::new(),
+        capabilities: HarnessCapabilities {
+            supports_hooks: false,
+            supports_subagents: false,
+            supports_textbox_submit: false,
+            supports_teams: false,
+            one_shot: false,
+            uses_ink_prompt: false,
+            prompt_injection_strategy: PromptInjectionStrategy::ImmediateSubmit,
+            tool_prefix: std::borrow::Cow::Borrowed("mcp_brehon_"),
+            transport: HarnessTransport::AppServer,
+            preferred_control_plane: HarnessControlPlane::Acp,
+        },
+    });
+
+    let pane = Pane::worker(
+        "local-worker-1",
+        cwd.clone(),
+        None,
+        "supervisor",
+        &adapter,
+        None,
+        None,
+        24,
+        80,
+        None,
+        None,
+        None,
+    )
+    .expect("create custom ACP local worker pane");
+
+    assert!(pane.is_gateway_backed());
+    let config = pane
+        .gateway_spawn_config()
+        .expect("gateway config should exist");
+    assert_eq!(config.base_url.as_deref(), Some("http://127.0.0.1:8080/v1"));
+    assert_eq!(config.max_concurrency, Some(1));
+
+    let _ = std::fs::remove_dir_all(cwd);
+}
+
+#[test]
 fn test_custom_codex_app_server_worker_accepts_long_form_safe_bootstrap() {
     let cwd = std::env::temp_dir().join(format!(
         "brehon-custom-codex-pane-long-safe-{}",

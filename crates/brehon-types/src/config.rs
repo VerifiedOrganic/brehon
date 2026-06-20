@@ -296,8 +296,11 @@ impl AgentConnectionConfig {
         self.max_concurrency.filter(|cap| *cap > 0)
     }
 
+    /// Per-endpoint context window in tokens, normalized so `Some(0)` reads as
+    /// `None` (no trimming) — matching `max_concurrency`/`max_tool_rounds`
+    /// 0-handling instead of failing native-agent startup on a zero window.
     pub fn context_window(&self) -> Option<usize> {
-        self.context_window
+        self.context_window.filter(|window| *window > 0)
     }
 
     pub fn assistant_message_passthrough_fields(&self) -> &[String] {

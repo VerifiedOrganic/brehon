@@ -204,6 +204,7 @@ brehon config validate     # checks the config parses and lanes resolve
 brehon doctor              # probes configured local endpoints (up? which model? context?)
 ```
 
-`brehon doctor` will report, for each launcher with a `base_url`, whether the
-endpoint answers and which model(s) it advertises — a fast way to catch "server
-isn't running" or "wrong port" before starting a run.
+`brehon doctor` will report, for each OpenAI-compatible launcher (`adapter:
+OpenAiCompatible` or `NativeAgent`) with a `base_url`, whether the endpoint
+answers and which model(s) it advertises — a fast way to catch "server isn't
+running" or "wrong port" before starting a run.
