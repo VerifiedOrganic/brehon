@@ -3335,6 +3335,11 @@ pub(super) fn run(ctx: &mut EventLoopCtx) -> io::Result<()> {
                                     "Stopping Brehon immediately after shared-root mutation detection: {issue}"
                                 ),
                             );
+                            tracing::error!(
+                                issue = %issue,
+                                "shared repo root mutated during run; shutting down all panes"
+                            );
+                            ctx.rt.block_on(ctx.mux.shutdown_all());
                             ctx.shutdown.store(true, Ordering::SeqCst);
                             break;
                         }

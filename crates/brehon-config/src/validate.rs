@@ -8,6 +8,7 @@
 //! - Unsupported terminal mode requests
 
 mod runtime_policy;
+mod security_policy;
 
 use std::{collections::HashSet, sync::LazyLock};
 
@@ -23,6 +24,7 @@ use brehon_types::{
 };
 
 use runtime_policy::validate_runtime_policy;
+use security_policy::validate_security_policy;
 
 const SUPPORTED_RUNTIME_WORKFLOWS: &[&str] = &["rate_limit.quarantine_recommendation"];
 static VALID_PERMISSION_PROFILES: LazyLock<HashSet<&'static str>> =
@@ -74,6 +76,7 @@ pub enum ValidationWarningKind {
     RuntimeWorkflowConflict,
     RuntimeTerminalHostConflict,
     RuntimePolicyConflict,
+    SecurityPolicyConflict,
     SupervisorTerminalContract,
     LauncherCapabilityConflict,
     RoutingPolicyConflict,
@@ -95,6 +98,7 @@ impl ValidationWarningKind {
                 | ValidationWarningKind::RuntimeWorkflowConflict
                 | ValidationWarningKind::RuntimeTerminalHostConflict
                 | ValidationWarningKind::RuntimePolicyConflict
+                | ValidationWarningKind::SecurityPolicyConflict
                 | ValidationWarningKind::SupervisorTerminalContract
                 | ValidationWarningKind::LauncherCapabilityConflict
                 | ValidationWarningKind::RoutingPolicyConflict
@@ -151,6 +155,9 @@ impl std::fmt::Display for ValidationWarningKind {
             ValidationWarningKind::RuntimePolicyConflict => {
                 write!(f, "Runtime policy conflict")
             }
+            ValidationWarningKind::SecurityPolicyConflict => {
+                write!(f, "Security policy conflict")
+            }
             ValidationWarningKind::SupervisorTerminalContract => {
                 write!(f, "Supervisor terminal contract")
             }
@@ -190,6 +197,7 @@ pub fn validate(config: &BrehonConfig) -> Vec<ValidationWarning> {
     warnings.extend(validate_runtime_workflows(config));
     warnings.extend(validate_runtime_policy(config));
     warnings.extend(validate_runtime_terminal_host(config));
+    warnings.extend(validate_security_policy(config));
     warnings.extend(validate_supervisor_terminal_contract(config));
     warnings.extend(validate_circular_references(config));
     warnings.extend(validate_concurrency(config));
@@ -1954,8 +1962,12 @@ fn validate_retention(config: &BrehonConfig) -> Vec<ValidationWarning> {
 
 #[cfg(test)]
 mod tests {
+    #[path = "validate_security_policy_tests.rs"]
+    mod security_policy_tests;
     #[path = "validate_supervisor_terminal_contract_tests.rs"]
     mod supervisor_terminal_contract_tests;
+    #[path = "validate_worktree_root_tests.rs"]
+    mod worktree_root_tests;
 
     use super::*;
     use brehon_types::{
@@ -4359,108 +4371,6 @@ rooms:
         assert!(!warnings.iter().any(|warning| {
             warning.kind == ValidationWarningKind::ReviewPanelConflict
                 && warning.message.contains("share_after_submit")
-        }));
-    }
-
-    #[test]
-    fn worktree_root_validation_accepts_none() {
-        let config = minimal_valid_config();
-        let warnings = validate(&config);
-        assert!(!warnings
-            .iter()
-            .any(|w| w.kind == ValidationWarningKind::InvalidWorktreeRoot));
-    }
-
-    #[test]
-    fn worktree_root_validation_accepts_valid_absolute_path() {
-        let mut config = minimal_valid_config();
-        config.orchestration.worktree_root = Some("/tmp/brehon-worktrees".into());
-        let warnings = validate(&config);
-        assert!(!warnings
-            .iter()
-            .any(|w| w.kind == ValidationWarningKind::InvalidWorktreeRoot));
-    }
-
-    #[test]
-    fn worktree_root_validation_rejects_relative_path() {
-        let mut config = minimal_valid_config();
-        config.orchestration.worktree_root = Some(".brehon/worktrees".into());
-        let warnings = validate(&config);
-        assert!(warnings.iter().any(|w| {
-            w.kind == ValidationWarningKind::InvalidWorktreeRoot
-                && w.is_fatal
-                && w.message.contains("must be an absolute path")
-        }));
-    }
-
-    #[test]
-    fn worktree_root_validation_rejects_empty_string() {
-        let mut config = minimal_valid_config();
-        config.orchestration.worktree_root = Some("".into());
-        let warnings = validate(&config);
-        assert!(warnings.iter().any(|w| {
-            w.kind == ValidationWarningKind::InvalidWorktreeRoot
-                && w.is_fatal
-                && w.message.contains("must not be empty")
-        }));
-    }
-
-    #[test]
-    fn worktree_root_validation_rejects_path_traversal() {
-        let mut config = minimal_valid_config();
-        config.orchestration.worktree_root = Some("../outside".into());
-        let warnings = validate(&config);
-        assert!(warnings.iter().any(|w| {
-            w.kind == ValidationWarningKind::InvalidWorktreeRoot
-                && w.is_fatal
-                && w.message.contains("path traversal")
-        }));
-    }
-
-    #[test]
-    fn worktree_root_validation_rejects_embedded_traversal() {
-        let mut config = minimal_valid_config();
-        config.orchestration.worktree_root = Some("/safe/../unsafe".into());
-        let warnings = validate(&config);
-        assert!(warnings.iter().any(|w| {
-            w.kind == ValidationWarningKind::InvalidWorktreeRoot
-                && w.is_fatal
-                && w.message.contains("path traversal")
-        }));
-    }
-
-    #[test]
-    fn worktree_root_validation_rejects_null_bytes() {
-        let mut config = minimal_valid_config();
-        config.orchestration.worktree_root = Some("/tmp/brehon\0worktrees".into());
-        let warnings = validate(&config);
-        assert!(warnings.iter().any(|w| {
-            w.kind == ValidationWarningKind::InvalidWorktreeRoot
-                && w.is_fatal
-                && w.message.contains("null bytes")
-        }));
-    }
-
-    #[test]
-    fn worktree_root_validation_accepts_dotdot_as_path_component_prefix() {
-        let mut config = minimal_valid_config();
-        config.orchestration.worktree_root = Some("/tmp/..cache/build".into());
-        let warnings = validate(&config);
-        assert!(!warnings
-            .iter()
-            .any(|w| w.kind == ValidationWarningKind::InvalidWorktreeRoot));
-    }
-
-    #[test]
-    fn cargo_target_root_validation_uses_same_absolute_path_rules() {
-        let mut config = minimal_valid_config();
-        config.orchestration.cargo_target_root = Some("relative/cargo-targets".into());
-        let warnings = validate(&config);
-        assert!(warnings.iter().any(|w| {
-            w.kind == ValidationWarningKind::InvalidWorktreeRoot
-                && w.is_fatal
-                && w.message.contains("orchestration.cargo_target_root")
-                && w.message.contains("must be an absolute path")
         }));
     }
 }

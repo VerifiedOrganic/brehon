@@ -1331,6 +1331,7 @@ pub async fn execute(
 
     let config = load_config_with_override(Some(&cwd), config_override)?;
     ensure_runtime_terminal_host_supported(&config)?;
+    ensure_worktree_sandbox_enforced(&config)?;
     if let Some(message) = budget_enforcement_off_warning(&config.budget) {
         // Loud, unmissable: this run can spend without bound. Caps default to
         // unlimited by design (so the owner's multi-day runs are not surprise
@@ -3124,6 +3125,22 @@ pub async fn execute(
     Ok(())
 }
 
+fn ensure_worktree_sandbox_enforced(config: &brehon_types::config::BrehonConfig) -> Result<()> {
+    if config.orchestration.worktree_isolation
+        && matches!(
+            config.security.sandbox_profile,
+            brehon_types::config::SandboxProfile::None
+        )
+    {
+        anyhow::bail!(
+            "Refusing to start with orchestration.worktree_isolation=true and security.sandbox_profile=None. \
+             Isolated unattended runs require a provider sandbox so agent filesystem writes cannot escape their assigned worktrees. \
+             Set security.sandbox_profile to OsDefault or disable worktree isolation only for a deliberate unsafe local run."
+        );
+    }
+    Ok(())
+}
+
 async fn write_runtime_daemon_summary(
     brehon_root: &Path,
     session_name: &str,
@@ -4344,6 +4361,27 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
 
         assert_eq!(summary["status"]["running"], false);
+    }
+
+    #[test]
+    fn worktree_sandbox_guard_rejects_unsafe_isolated_run() {
+        let mut config = brehon_config::parse_defaults().expect("default config");
+        config.orchestration.worktree_isolation = true;
+        config.security.sandbox_profile = brehon_types::config::SandboxProfile::None;
+
+        let err = ensure_worktree_sandbox_enforced(&config)
+            .expect_err("unsafe isolated run should fail closed");
+
+        assert!(err.to_string().contains("security.sandbox_profile=None"));
+    }
+
+    #[test]
+    fn worktree_sandbox_guard_allows_os_default_isolated_run() {
+        let mut config = brehon_config::parse_defaults().expect("default config");
+        config.orchestration.worktree_isolation = true;
+        config.security.sandbox_profile = brehon_types::config::SandboxProfile::OsDefault;
+
+        ensure_worktree_sandbox_enforced(&config).expect("OsDefault sandbox should be allowed");
     }
 
     #[tokio::test]
