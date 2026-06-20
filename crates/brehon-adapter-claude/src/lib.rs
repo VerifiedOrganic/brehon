@@ -396,7 +396,7 @@ mod tests {
         std::fs::create_dir_all(&brehon_dir).unwrap();
         std::fs::write(
             brehon_dir.join("config.yaml"),
-            "security:\n  sandbox_profile: None\n",
+            "orchestration:\n  worktree_isolation: false\nsecurity:\n  sandbox_profile: None\n",
         )
         .unwrap();
         let params = ClaudeSpawnParams::new(
@@ -417,7 +417,7 @@ mod tests {
             config
                 .args
                 .contains(&"--dangerously-skip-permissions".to_string()),
-            "unsafe config on disk should derive skip-permissions"
+            "unsafe config without worktree isolation should derive skip-permissions"
         );
         let _ = std::fs::remove_dir_all(&workdir);
     }
