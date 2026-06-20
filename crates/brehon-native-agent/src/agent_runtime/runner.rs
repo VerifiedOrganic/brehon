@@ -51,6 +51,9 @@ pub(crate) struct AgentTurnConfig {
     /// so small local context windows stay off the overflow cliff. `None`
     /// preserves the message-count-only behavior used by cloud endpoints.
     pub(crate) context_window_tokens: Option<usize>,
+    /// Per-turn consecutive-tool-round ceiling. `None` (or `Some(0)`) disables
+    /// the cap, leaving the doom-loop/repeat detectors as the only guard.
+    pub(crate) max_tool_rounds: Option<usize>,
     pub(crate) provider_idle_timeout: Duration,
     pub(crate) max_parallel_tool_calls: usize,
     pub(crate) assistant_message_passthrough_fields: Vec<String>,
@@ -95,7 +98,8 @@ impl AgentTurnRunner {
             &self.config.agent_name,
             &self.config.agent_type,
         );
-        let mut orchestrator = ToolOrchestrator::new();
+        let mut orchestrator =
+            ToolOrchestrator::new().with_max_tool_rounds(self.config.max_tool_rounds);
         orchestrator.begin_turn();
 
         let mut response_text = String::new();
@@ -713,6 +717,7 @@ mod tests {
                 extra_body: None,
                 max_history_messages: 20,
                 context_window_tokens: None,
+                max_tool_rounds: None,
                 provider_idle_timeout,
                 max_parallel_tool_calls: 8,
                 assistant_message_passthrough_fields: Vec::new(),

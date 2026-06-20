@@ -104,6 +104,8 @@ struct NativeRuntimeInner {
     /// endpoint. When set, history is trimmed to fit; `None` keeps the
     /// message-count-only behavior for endpoints with large/unknown windows.
     context_window: Option<usize>,
+    /// Per-turn consecutive-tool-round ceiling for the agent loop.
+    max_tool_rounds: Option<usize>,
     provider_idle_timeout: Duration,
     terminals: NativeTerminalManager,
 }
@@ -163,6 +165,7 @@ impl NativeRuntime {
         let permission_mode = effective_permission_mode(cli)?;
         let max_parallel_tool_calls = effective_max_parallel_tool_calls(cli);
         let context_window = effective_context_window(cli)?;
+        let max_tool_rounds = effective_max_tool_rounds(cli);
         let provider_idle_timeout = effective_stream_idle_timeout(cli)?;
         let permission_policy = parse_permission_policy(cli.permission_policy_json.as_deref())?;
         let extra_body = parse_extra_body(cli.extra_body_json.as_deref())?;
@@ -192,6 +195,7 @@ impl NativeRuntime {
                 permission_grants: new_permission_grant_store(),
                 extra_body,
                 context_window,
+                max_tool_rounds,
                 provider_idle_timeout,
                 terminals: NativeTerminalManager::default(),
             }),
@@ -460,6 +464,7 @@ impl NativeRuntime {
                 extra_body: self.inner.extra_body.clone(),
                 max_history_messages: MAX_HISTORY_MESSAGES,
                 context_window_tokens: self.inner.context_window.map(history_token_budget),
+                max_tool_rounds: self.inner.max_tool_rounds,
                 provider_idle_timeout: self.inner.provider_idle_timeout,
                 max_parallel_tool_calls: self.inner.max_parallel_tool_calls,
                 assistant_message_passthrough_fields: self
@@ -721,6 +726,16 @@ fn effective_context_window(cli: &Cli) -> anyhow::Result<Option<usize>> {
     }
 }
 
+fn effective_max_tool_rounds(cli: &Cli) -> Option<usize> {
+    cli.max_tool_rounds
+        .or_else(|| {
+            std::env::var("BREHON_AGENT_MAX_TOOL_ROUNDS")
+                .ok()
+                .and_then(|value| value.trim().parse::<usize>().ok())
+        })
+        .filter(|max| *max > 0)
+}
+
 fn effective_permission_mode(cli: &Cli) -> anyhow::Result<PermissionMode> {
     match cli.permission_mode.as_deref() {
         Some(mode) => PermissionMode::parse(mode),
@@ -936,6 +951,7 @@ mod tests {
             permission_mode: permission_mode.map(str::to_string),
             max_parallel_tool_calls: None,
             context_window: None,
+            max_tool_rounds: None,
             stream_idle_timeout_secs: None,
             assistant_message_passthrough_fields: Vec::new(),
             permission_policy_json: None,

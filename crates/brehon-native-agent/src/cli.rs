@@ -39,6 +39,11 @@ pub struct Cli {
     /// Maximum native tool calls to execute concurrently.
     #[arg(long)]
     pub max_parallel_tool_calls: Option<usize>,
+    /// Hard ceiling on consecutive tool-call rounds in a single turn. When
+    /// exceeded the turn fails cleanly instead of looping unbounded. Falls back
+    /// to BREHON_AGENT_MAX_TOOL_ROUNDS; unset (or 0) means no ceiling.
+    #[arg(long)]
+    pub max_tool_rounds: Option<usize>,
     /// Approximate per-sequence context window (tokens) of the endpoint. When
     /// set, conversation history is trimmed to fit so small local context
     /// windows stay off llama.cpp's hard context-overflow error. Falls back to
