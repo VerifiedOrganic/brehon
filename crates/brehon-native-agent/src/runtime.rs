@@ -10,7 +10,7 @@ use brehon_types::{build_native_agent_system_prompt, config::PermissionsConfig};
 use serde_json::{json, Value};
 use tokio::sync::{Mutex, Notify};
 
-use crate::agent_runtime::message::{trim_message_history, AgentMessage, AgentRole};
+use crate::agent_runtime::message::{apply_history_limits, AgentMessage, AgentRole};
 use crate::agent_runtime::runner::{AgentTurnConfig, AgentTurnRunner};
 use crate::cli::Cli;
 use crate::permissions::{new_permission_grant_store, PermissionGrantStore};
@@ -100,6 +100,10 @@ struct NativeRuntimeInner {
     permission_policy: PermissionsConfig,
     permission_grants: PermissionGrantStore,
     extra_body: Option<Value>,
+    /// Approximate per-sequence context window (tokens) of the configured
+    /// endpoint. When set, history is trimmed to fit; `None` keeps the
+    /// message-count-only behavior for endpoints with large/unknown windows.
+    context_window: Option<usize>,
     provider_idle_timeout: Duration,
     terminals: NativeTerminalManager,
 }
@@ -158,6 +162,7 @@ impl NativeRuntime {
             std::env::var("BREHON_SUPERVISOR_NAME").unwrap_or_else(|_| "supervisor".into());
         let permission_mode = effective_permission_mode(cli)?;
         let max_parallel_tool_calls = effective_max_parallel_tool_calls(cli);
+        let context_window = effective_context_window(cli)?;
         let provider_idle_timeout = effective_stream_idle_timeout(cli)?;
         let permission_policy = parse_permission_policy(cli.permission_policy_json.as_deref())?;
         let extra_body = parse_extra_body(cli.extra_body_json.as_deref())?;
@@ -186,6 +191,7 @@ impl NativeRuntime {
                 permission_policy,
                 permission_grants: new_permission_grant_store(),
                 extra_body,
+                context_window,
                 provider_idle_timeout,
                 terminals: NativeTerminalManager::default(),
             }),
@@ -398,7 +404,7 @@ impl NativeRuntime {
                 .get_mut(session_id)
                 .ok_or_else(|| format!("unknown session {session_id}"))?;
             session.messages.push(AgentMessage::user(prompt));
-            trim_messages(&mut session.messages);
+            trim_messages(&mut session.messages, self.inner.context_window);
             let bootstrap_context = !session.context_bootstrapped;
             session.context_bootstrapped = true;
             (
@@ -453,6 +459,7 @@ impl NativeRuntime {
                 reasoning_effort_param: self.inner.reasoning_effort_param.clone(),
                 extra_body: self.inner.extra_body.clone(),
                 max_history_messages: MAX_HISTORY_MESSAGES,
+                context_window_tokens: self.inner.context_window.map(history_token_budget),
                 provider_idle_timeout: self.inner.provider_idle_timeout,
                 max_parallel_tool_calls: self.inner.max_parallel_tool_calls,
                 assistant_message_passthrough_fields: self
@@ -563,7 +570,7 @@ Brehon MCP tools may still be callable. If a required coordination tool fails, r
                 .into_iter()
                 .filter(|message| message.role() != AgentRole::System),
         );
-        trim_messages(&mut turn_messages);
+        trim_messages(&mut turn_messages, self.inner.context_window);
         turn_messages
     }
 
@@ -679,8 +686,39 @@ fn prompt_text(params: &Value) -> Result<String, String> {
     }
 }
 
-fn trim_messages(messages: &mut Vec<AgentMessage>) {
-    trim_message_history(messages, MAX_HISTORY_MESSAGES);
+fn trim_messages(messages: &mut Vec<AgentMessage>, context_window: Option<usize>) {
+    apply_history_limits(
+        messages,
+        MAX_HISTORY_MESSAGES,
+        context_window.map(history_token_budget),
+    );
+}
+
+/// Reserve a quarter of the context window for the model's generated output and
+/// the tool schema sent alongside history; the remainder is the history budget.
+/// Approximate by design — paired with the conservative token estimate it keeps
+/// the common case off llama.cpp's hard context-overflow error.
+fn history_token_budget(context_window: usize) -> usize {
+    context_window.saturating_sub(context_window / 4).max(1)
+}
+
+fn effective_context_window(cli: &Cli) -> anyhow::Result<Option<usize>> {
+    let value = match cli.context_window {
+        Some(value) => Some(value),
+        None => std::env::var("BREHON_AGENT_CONTEXT_WINDOW")
+            .ok()
+            .map(|value| {
+                value
+                    .trim()
+                    .parse::<usize>()
+                    .map_err(|err| anyhow::anyhow!("invalid BREHON_AGENT_CONTEXT_WINDOW: {err}"))
+            })
+            .transpose()?,
+    };
+    match value {
+        Some(0) => Err(anyhow::anyhow!("context window must be greater than zero")),
+        other => Ok(other),
+    }
 }
 
 fn effective_permission_mode(cli: &Cli) -> anyhow::Result<PermissionMode> {
@@ -897,6 +935,7 @@ mod tests {
             extra_body_json: None,
             permission_mode: permission_mode.map(str::to_string),
             max_parallel_tool_calls: None,
+            context_window: None,
             stream_idle_timeout_secs: None,
             assistant_message_passthrough_fields: Vec::new(),
             permission_policy_json: None,

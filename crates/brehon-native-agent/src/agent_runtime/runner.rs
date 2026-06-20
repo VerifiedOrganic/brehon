@@ -14,7 +14,7 @@ use crate::agent_runtime::dispatch::{dispatch_tool_calls, emit_runtime_event};
 use crate::agent_runtime::events::RuntimeEvent;
 use crate::agent_runtime::executor::ToolExecutor;
 use crate::agent_runtime::message::{
-    sanitize_provider_message_history, trim_message_history, AgentMessage,
+    apply_history_limits, sanitize_provider_message_history, AgentMessage,
 };
 use crate::agent_runtime::orchestrator::{ToolLoopControl, ToolOrchestrator};
 use crate::agent_runtime::turn::{TurnState, TurnStopReason};
@@ -46,6 +46,11 @@ pub(crate) struct AgentTurnConfig {
     pub(crate) reasoning_effort_param: Option<String>,
     pub(crate) extra_body: Option<Value>,
     pub(crate) max_history_messages: usize,
+    /// Optional approximate token budget for retained history. When set, history
+    /// is trimmed to fit this many tokens (in addition to the message-count cap)
+    /// so small local context windows stay off the overflow cliff. `None`
+    /// preserves the message-count-only behavior used by cloud endpoints.
+    pub(crate) context_window_tokens: Option<usize>,
     pub(crate) provider_idle_timeout: Duration,
     pub(crate) max_parallel_tool_calls: usize,
     pub(crate) assistant_message_passthrough_fields: Vec<String>,
@@ -170,7 +175,11 @@ impl AgentTurnRunner {
 Continue the same task now. Use available tools when the prompt requires tool-backed work; \
 otherwise provide a concise final answer.",
                 ));
-                trim_message_history(&mut messages, self.config.max_history_messages);
+                apply_history_limits(
+                    &mut messages,
+                    self.config.max_history_messages,
+                    self.config.context_window_tokens,
+                );
                 continue;
             }
             empty_assistant_turns = 0;
@@ -183,7 +192,11 @@ otherwise provide a concise final answer.",
             }
 
             messages.push(assistant.history_message);
-            trim_message_history(&mut messages, self.config.max_history_messages);
+            apply_history_limits(
+                &mut messages,
+                self.config.max_history_messages,
+                self.config.context_window_tokens,
+            );
 
             if let Some(text) = assistant_text {
                 let text = format!("{text}\n");
@@ -206,7 +219,11 @@ otherwise provide a concise final answer.",
                     )
                     .await;
                     messages.push(AgentMessage::user(TOOL_REQUIRED_NUDGE));
-                    trim_message_history(&mut messages, self.config.max_history_messages);
+                    apply_history_limits(
+                        &mut messages,
+                        self.config.max_history_messages,
+                        self.config.context_window_tokens,
+                    );
                     continue;
                 }
                 turn_state.set_stop_reason(TurnStopReason::Stop);
@@ -244,7 +261,11 @@ otherwise provide a concise final answer.",
                     result.content,
                     result.is_error,
                 ));
-                trim_message_history(&mut messages, self.config.max_history_messages);
+                apply_history_limits(
+                    &mut messages,
+                    self.config.max_history_messages,
+                    self.config.context_window_tokens,
+                );
             }
         }
     }
@@ -691,6 +712,7 @@ mod tests {
                 reasoning_effort_param: None,
                 extra_body: None,
                 max_history_messages: 20,
+                context_window_tokens: None,
                 provider_idle_timeout,
                 max_parallel_tool_calls: 8,
                 assistant_message_passthrough_fields: Vec::new(),

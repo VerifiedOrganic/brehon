@@ -247,6 +247,98 @@ pub(crate) fn trim_message_history(messages: &mut Vec<AgentMessage>, max_message
     *messages = trimmed;
 }
 
+/// Conservative chars-per-token divisor for budget estimation.
+///
+/// Real BPE tokenizers average ~4 chars/token for English and code. We divide by
+/// 3 instead so the estimate OVER-counts tokens: it is far safer to trim history
+/// a little early than to overflow a local llama.cpp context window, which (with
+/// context shift disabled by default) fails the request hard rather than
+/// truncating. The provider/tokenizer is the ground truth; this is only a
+/// client-side guard to keep the common case off the overflow cliff.
+const CHARS_PER_TOKEN_ESTIMATE: usize = 3;
+
+/// Flat per-message structural overhead (role tags, JSON envelope, tool-call
+/// wrapping) added on top of the content estimate.
+const PER_MESSAGE_TOKEN_OVERHEAD: usize = 8;
+
+/// Best-effort token estimate for a single message as it will be serialized to
+/// the provider. Sized on the OpenAI JSON form so tool-call arguments and tool
+/// results (the bulky parts) are counted.
+pub(crate) fn estimate_message_tokens(message: &AgentMessage) -> usize {
+    let serialized_len = serde_json::to_string(&message.to_openai_json())
+        .map(|json| json.len())
+        .unwrap_or_else(|_| message.text_content().len());
+    serialized_len / CHARS_PER_TOKEN_ESTIMATE + PER_MESSAGE_TOKEN_OVERHEAD
+}
+
+/// Trim history to fit within an approximate token budget.
+///
+/// Always keeps the leading system messages (they carry the role contract and
+/// Brehon runtime context) and as much of the most recent tail as fits, newest
+/// first. If the system messages alone exceed the budget the most recent message
+/// is still retained so the live turn can proceed — the server will then surface
+/// a real overflow rather than us silently dropping the current prompt.
+pub(crate) fn trim_message_history_to_token_budget(
+    messages: &mut Vec<AgentMessage>,
+    max_tokens: usize,
+) {
+    let total: usize = messages.iter().map(estimate_message_tokens).sum();
+    if total <= max_tokens {
+        sanitize_tool_result_adjacency(messages);
+        return;
+    }
+
+    let leading_system = messages
+        .iter()
+        .take_while(|message| message.role() == AgentRole::System)
+        .cloned()
+        .collect::<Vec<_>>();
+    let system_tokens: usize = leading_system.iter().map(estimate_message_tokens).sum();
+    let mut remaining = max_tokens.saturating_sub(system_tokens);
+
+    let mut kept_tail_rev = Vec::new();
+    let tail = messages
+        .iter()
+        .skip(leading_system.len())
+        .filter(|message| message.role() != AgentRole::System);
+    for message in tail.collect::<Vec<_>>().into_iter().rev() {
+        let cost = estimate_message_tokens(message);
+        if cost <= remaining {
+            remaining -= cost;
+            kept_tail_rev.push(message.clone());
+        } else if kept_tail_rev.is_empty() {
+            // Keep at least the most recent message even if it alone exceeds the
+            // remaining budget; dropping the live turn would be pointless.
+            kept_tail_rev.push(message.clone());
+            break;
+        } else {
+            break;
+        }
+    }
+    kept_tail_rev.reverse();
+
+    let mut trimmed = Vec::with_capacity(leading_system.len() + kept_tail_rev.len());
+    trimmed.extend(leading_system);
+    trimmed.extend(kept_tail_rev);
+    sanitize_tool_result_adjacency(&mut trimmed);
+    *messages = trimmed;
+}
+
+/// Apply both history limits: the coarse message-count cap, then (when a context
+/// window is configured) the token budget. The token budget is the operative
+/// limit for small local context windows; the count cap remains a cheap upper
+/// bound that preserves prior behavior when no window is configured.
+pub(crate) fn apply_history_limits(
+    messages: &mut Vec<AgentMessage>,
+    max_messages: usize,
+    token_budget: Option<usize>,
+) {
+    trim_message_history(messages, max_messages);
+    if let Some(token_budget) = token_budget {
+        trim_message_history_to_token_budget(messages, token_budget);
+    }
+}
+
 pub(crate) fn sanitize_provider_message_history(messages: &mut Vec<AgentMessage>) {
     let last_user_index = messages
         .iter()
@@ -418,6 +510,75 @@ mod tests {
         assert_eq!(messages[1].text_content(), "context");
         assert_eq!(messages[2].text_content(), "two");
         assert_eq!(messages[3].text_content(), "three");
+    }
+
+    #[test]
+    fn token_budget_trim_is_noop_when_within_budget() {
+        let mut messages = vec![
+            AgentMessage::system("sys"),
+            AgentMessage::user("one"),
+            AgentMessage::assistant(Some("two".to_string()), Vec::new()),
+        ];
+        let before = messages.clone();
+
+        trim_message_history_to_token_budget(&mut messages, usize::MAX);
+
+        assert_eq!(messages, before);
+    }
+
+    #[test]
+    fn token_budget_trim_keeps_system_and_recent_tail_within_budget() {
+        let system = AgentMessage::system("system prompt");
+        let oldest = AgentMessage::user("oldest user turn payload");
+        let middle = AgentMessage::assistant(Some("middle assistant turn".to_string()), Vec::new());
+        let newest = AgentMessage::user("newest user turn");
+
+        // Budget room for system + newest two only (oldest must be dropped).
+        let budget = estimate_message_tokens(&system)
+            + estimate_message_tokens(&middle)
+            + estimate_message_tokens(&newest);
+
+        let mut messages = vec![system, oldest, middle, newest];
+        trim_message_history_to_token_budget(&mut messages, budget);
+
+        let kept: Vec<String> = messages.iter().map(AgentMessage::text_content).collect();
+        assert_eq!(
+            kept,
+            vec!["system prompt", "middle assistant turn", "newest user turn"]
+        );
+        let total: usize = messages.iter().map(estimate_message_tokens).sum();
+        assert!(total <= budget, "trimmed history must fit the budget");
+    }
+
+    #[test]
+    fn token_budget_trim_always_keeps_system_plus_latest_when_over_budget() {
+        let mut messages = vec![
+            AgentMessage::system("system"),
+            AgentMessage::user("older"),
+            AgentMessage::user("latest live prompt"),
+        ];
+
+        // Budget of 0 still must not drop the system message or the live turn.
+        trim_message_history_to_token_budget(&mut messages, 0);
+
+        let kept: Vec<String> = messages.iter().map(AgentMessage::text_content).collect();
+        assert_eq!(kept, vec!["system", "latest live prompt"]);
+    }
+
+    #[test]
+    fn apply_history_limits_without_window_matches_count_trim() {
+        let mut with_window = vec![
+            AgentMessage::system("sys"),
+            AgentMessage::user("one"),
+            AgentMessage::assistant(Some("two".to_string()), Vec::new()),
+            AgentMessage::user("three"),
+        ];
+        let mut count_only = with_window.clone();
+
+        apply_history_limits(&mut with_window, 3, None);
+        trim_message_history(&mut count_only, 3);
+
+        assert_eq!(with_window, count_only);
     }
 
     #[test]
