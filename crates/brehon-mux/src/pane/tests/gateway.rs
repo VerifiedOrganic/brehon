@@ -1676,9 +1676,19 @@ fn test_grok_acp_worker_receives_brehon_mcp_server() {
 
 #[test]
 fn test_grok_reviewer_uses_acp_stdio_gateway_protocol() {
+    // Use an isolated, freshly-created cwd rather than bare /tmp: the grok
+    // sandbox profile is "workspace" only when the cwd has no git metadata, and
+    // on a developer box /tmp is often itself a git working tree (or contains a
+    // stray /tmp/.git), which would flip the profile to a custom per-repo one
+    // and fail this assertion. A unique temp subdir keeps the test hermetic.
+    let cwd = std::env::temp_dir().join(format!("brehon-grok-pane-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&cwd).expect("create grok pane cwd");
+    let cwd = std::fs::canonicalize(&cwd).expect("canonicalize grok pane cwd");
+    let cwd_str = cwd.to_string_lossy().to_string();
+
     let pane = Pane::reviewer_with_agent_type(
         "reviewer-1",
-        PathBuf::from("/tmp"),
+        cwd.clone(),
         None,
         None,
         24,
@@ -1704,14 +1714,20 @@ fn test_grok_reviewer_uses_acp_stdio_gateway_protocol() {
         config
             .args
             .windows(2)
-            .any(|window| window == ["--cwd", "/tmp"])
+            .any(|window| window == ["--cwd", cwd_str.as_str()]),
+        "expected --cwd {cwd_str} in args: {:?}",
+        config.args
     );
     assert!(
         config
             .args
             .windows(2)
-            .any(|window| window == ["--sandbox", "workspace"])
+            .any(|window| window == ["--sandbox", "workspace"]),
+        "expected --sandbox workspace in args: {:?}",
+        config.args
     );
+
+    let _ = std::fs::remove_dir_all(&cwd);
     let mcp_servers = config
         .env
         .iter()
