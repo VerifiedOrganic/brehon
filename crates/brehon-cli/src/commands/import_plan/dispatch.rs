@@ -431,13 +431,18 @@ fn ensure_git_repo(project_root: &Path) -> Result<()> {
     Ok(())
 }
 
+fn resolve_import_project_root(project_root: &Path) -> PathBuf {
+    let normalized = normalize_project_root(project_root);
+    normalized.canonicalize().unwrap_or(normalized)
+}
+
 pub async fn execute(
     project_root: &Path,
     plan_path: &Path,
     dry_run: bool,
     mode: ExtractMode,
 ) -> Result<()> {
-    let project_root = normalize_project_root(project_root);
+    let project_root = resolve_import_project_root(project_root);
     ensure_git_repo(&project_root)?;
     let config = brehon_config::load_config(Some(&project_root)).with_context(|| {
         format!(
@@ -891,8 +896,9 @@ pub async fn execute_extract(
     output_path: Option<&Path>,
     mode: ExtractMode,
 ) -> Result<()> {
-    ensure_git_repo(project_root)?;
-    let plan = load_plan_document(project_root, plan_path, mode).await?;
+    let project_root = resolve_import_project_root(project_root);
+    ensure_git_repo(&project_root)?;
+    let plan = load_plan_document(&project_root, plan_path, mode).await?;
     let rendered = serde_json::to_string_pretty(&plan)?;
 
     if let Some(output_path) = output_path {
