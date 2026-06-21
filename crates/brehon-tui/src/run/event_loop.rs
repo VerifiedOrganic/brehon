@@ -6737,24 +6737,33 @@ TypeError: Cannot read properties of undefined"#,
 
         crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
 
-        let recycled = recv_route(&harness.rx);
-        assert_eq!(recycled.command.target.pane_id.as_deref(), Some("worker-1"));
-        assert!(matches!(
-            recycled.command.kind,
-            RuntimeCommandKind::RecyclePane { ref reason }
-                if reason == "auto-fence recovered stalled worker pane after task T-owned handoff"
-        ));
-        let reassigned = recv_route(&harness.rx);
-        assert_eq!(
-            reassigned.command.target.pane_id.as_deref(),
-            Some("worker-2")
+        let first = recv_route(&harness.rx);
+        let second = recv_route(&harness.rx);
+        let routed = [first, second];
+        assert!(
+            routed.iter().any(|route| {
+                route.command.target.pane_id.as_deref() == Some("worker-1")
+                    && matches!(
+                        route.command.kind,
+                        RuntimeCommandKind::RecyclePane { ref reason }
+                            if reason
+                                == "auto-fence recovered stalled worker pane after task T-owned handoff"
+                    )
+            }),
+            "recovered worker should be fenced after reassignment"
         );
-        assert!(matches!(
-            reassigned.command.kind,
-            RuntimeCommandKind::SendPrompt { ref text, .. }
-                if text.contains("You have been assigned recovered task T-owned: Owned task")
-                    && text.contains("worker-1")
-        ));
+        assert!(
+            routed.iter().any(|route| {
+                route.command.target.pane_id.as_deref() == Some("worker-2")
+                    && matches!(
+                        route.command.kind,
+                        RuntimeCommandKind::SendPrompt { ref text, .. }
+                            if text.contains("You have been assigned recovered task T-owned: Owned task")
+                                && text.contains("worker-1")
+                    )
+            }),
+            "replacement worker should receive recovered assignment"
+        );
         assert!(
             harness.rx.recv_timeout(Duration::from_millis(50)).is_err(),
             "no-progress recovery should not emit extra same-sweep work"

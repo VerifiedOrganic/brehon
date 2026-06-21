@@ -720,10 +720,7 @@ fn effective_context_window(cli: &Cli) -> anyhow::Result<Option<usize>> {
             })
             .transpose()?,
     };
-    match value {
-        Some(0) => Err(anyhow::anyhow!("context window must be greater than zero")),
-        other => Ok(other),
-    }
+    Ok(value.filter(|window| *window > 0))
 }
 
 fn effective_max_tool_rounds(cli: &Cli) -> Option<usize> {
@@ -1027,6 +1024,15 @@ mod tests {
             runtime.inner.max_parallel_tool_calls,
             HARD_MAX_PARALLEL_TOOL_CALLS
         );
+    }
+
+    #[test]
+    fn context_window_zero_is_treated_as_unset() {
+        let mut cli = fake_cli(true, false, None);
+        cli.context_window = Some(0);
+        let runtime = NativeRuntime::from_cli(&cli).unwrap();
+
+        assert_eq!(runtime.inner.context_window, None);
     }
 
     #[test]

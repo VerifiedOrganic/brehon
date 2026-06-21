@@ -24,20 +24,12 @@ use super::types::{
     TEAMS_NUDGE_QUIET_THRESHOLD,
 };
 
+mod endpoint_gate;
 mod prompt_queue;
 
 pub(super) fn gateway_env_value<'a>(env: &'a [(String, String)], key: &str) -> Option<&'a str> {
     env.iter()
         .find_map(|(env_key, value)| (env_key == key).then_some(value.as_str()))
-}
-
-/// Normalize an endpoint base_url into a comparison key so trivially-different
-/// spellings of one server (trailing slash, surrounding whitespace) share a
-/// single concurrency pool. Host-vs-IP equivalence (localhost vs 127.0.0.1) is
-/// intentionally NOT resolved — operators should spell the shared endpoint
-/// consistently (the recommended pattern is one launcher reused by all lanes).
-fn normalize_endpoint_key(base_url: &str) -> String {
-    base_url.trim().trim_end_matches('/').to_string()
 }
 
 pub(super) fn is_opencode_acp_spawn(spawn_config: &GatewaySpawnConfig) -> bool {
@@ -701,22 +693,6 @@ impl Mux {
 
         self.ensure_gateway_session(pane_id).await?;
 
-        // Occupy the endpoint slot synchronously before spawning the send. A
-        // review panel fans out to several lanes in one drain pass; because
-        // delivery Busy is otherwise only set when the send completes, every
-        // lane would pass the gate before any reached Busy and all would fire at
-        // once. `begin_async_gateway_prompt_delivery` takes `&mut self`, so
-        // dispatches are already serialized — marking the pane Busy here makes
-        // each one visible to the next dispatch's gate check. Only done for
-        // capped local endpoints (zero effect on cloud panes), and bounded by
-        // the existing 30s/10min Busy-clearing net so a failed send self-heals.
-        if self.endpoint_has_concurrency_cap(pane_id) {
-            let now = Instant::now();
-            if let Some(pane) = self.panes.get_mut(pane_id) {
-                pane.set_pane_busy(prompt_id.clone(), generation, now);
-            }
-        }
-
         let session_id = self
             .panes
             .get(pane_id)
@@ -733,6 +709,22 @@ impl Mux {
             .as_ref()
             .cloned()
             .ok_or_else(|| Error::pty("Agent gateway not configured"))?;
+
+        // Occupy the endpoint slot synchronously before spawning the send. A
+        // review panel fans out to several lanes in one drain pass; because
+        // delivery Busy is otherwise only set when the send completes, every
+        // lane would pass the gate before any reached Busy and all would fire at
+        // once. `begin_async_gateway_prompt_delivery` takes `&mut self`, so
+        // dispatches are already serialized; marking the pane Busy here makes
+        // each one visible to the next dispatch's gate check. This happens
+        // after all fallible setup above so setup failures cannot leave a
+        // speculative Busy state behind.
+        if self.endpoint_has_concurrency_cap(pane_id) {
+            let now = Instant::now();
+            if let Some(pane) = self.panes.get_mut(pane_id) {
+                pane.set_pane_busy(prompt_id.clone(), generation, now);
+            }
+        }
 
         let prompt_turn = brehon_types::PromptTurn {
             prompt_id: prompt_id.clone(),
@@ -1301,56 +1293,6 @@ impl Mux {
             prompt_id,
             generation,
         })
-    }
-
-    /// Attempt a single prompt delivery without mutating mux-owned retry state.
-    ///
-    /// Callers that already have a durable queue on disk should use this API so
-    /// the queue remains the source of truth until the transport actually
-    /// accepts the prompt.
-    /// Per-endpoint concurrency backpressure.
-    ///
-    /// Returns `Some(busy_peers)` when the endpoint this pane targets is already
-    /// at its configured `max_concurrency` and the prompt should be deferred (the
-    /// caller turns this into a retried `Queued` result); `None` when delivery may
-    /// proceed. Fails open: returns `None` whenever the cap or endpoint is
-    /// unknown, so a misconfiguration can never wedge a run — it only ever
-    /// relaxes serialization.
-    fn endpoint_capacity_backpressure(&self, pane_id: &str) -> Option<usize> {
-        let spawn_config = self.panes.get(pane_id)?.gateway_spawn_config.as_ref()?;
-        let cap = spawn_config.max_concurrency.filter(|cap| *cap > 0)?;
-        let endpoint = normalize_endpoint_key(spawn_config.base_url.as_deref()?);
-        let busy_peers = self.count_busy_endpoint_peers(&endpoint, pane_id);
-        (busy_peers >= cap).then_some(busy_peers)
-    }
-
-    /// Whether this pane targets a local endpoint with an enforceable
-    /// concurrency cap (both a `base_url` key and `max_concurrency > 0`).
-    fn endpoint_has_concurrency_cap(&self, pane_id: &str) -> bool {
-        self.panes
-            .get(pane_id)
-            .and_then(|pane| pane.gateway_spawn_config.as_ref())
-            .is_some_and(|config| {
-                config.base_url.is_some() && config.max_concurrency.is_some_and(|cap| cap > 0)
-            })
-    }
-
-    /// Count panes other than `exclude_pane` that share `endpoint` (same
-    /// normalized `base_url`) and are currently occupying one of the endpoint's
-    /// slots (processing a turn or mid-delivery, both surfaced as `Busy`).
-    fn count_busy_endpoint_peers(&self, endpoint: &str, exclude_pane: &str) -> usize {
-        self.panes
-            .iter()
-            .filter(|(id, _)| id.as_str() != exclude_pane)
-            .filter(|(_, pane)| {
-                pane.is_processing()
-                    && pane
-                        .gateway_spawn_config
-                        .as_ref()
-                        .and_then(|config| config.base_url.as_deref())
-                        .is_some_and(|base_url| normalize_endpoint_key(base_url) == endpoint)
-            })
-            .count()
     }
 
     pub async fn attempt_prompt_delivery(
@@ -2317,165 +2259,5 @@ impl Mux {
                 }
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod endpoint_gate_tests {
-    use super::*;
-    use crate::pane::Pane;
-    use brehon_acp::GatewayProtocol;
-
-    fn gateway_spawn_config(
-        base_url: Option<&str>,
-        max_concurrency: Option<usize>,
-    ) -> GatewaySpawnConfig {
-        GatewaySpawnConfig {
-            command: None,
-            args: Vec::new(),
-            env: Vec::new(),
-            cwd: String::new(),
-            protocol: GatewayProtocol::OpenAiCompatibleChat,
-            tool_prefix: None,
-            base_url: base_url.map(str::to_string),
-            max_concurrency,
-            api_key_env: None,
-            headers: Vec::new(),
-            model: None,
-            sidecar_socket_path: None,
-            sidecar_ready_path: None,
-            sidecar_connect_timeout_ms: None,
-        }
-    }
-
-    fn add_gateway_pane(
-        mux: &mut Mux,
-        name: &str,
-        base_url: Option<&str>,
-        max_concurrency: Option<usize>,
-        busy: bool,
-    ) {
-        let mut pane = Pane::director(name, 24, 80).unwrap();
-        pane.gateway_spawn_config = Some(gateway_spawn_config(base_url, max_concurrency));
-        if busy {
-            pane.set_pane_busy(
-                PromptId::new(format!("p-{name}")),
-                Generation::default(),
-                Instant::now(),
-            );
-        }
-        mux.add_pane(pane);
-    }
-
-    #[test]
-    fn no_cap_never_defers_even_with_busy_peer() {
-        let mut mux = Mux::new(24, 80);
-        add_gateway_pane(&mut mux, "a", Some("http://x/v1"), None, true);
-        add_gateway_pane(&mut mux, "b", Some("http://x/v1"), None, false);
-        assert_eq!(mux.endpoint_capacity_backpressure("b"), None);
-    }
-
-    #[test]
-    fn cap_one_defers_when_a_peer_is_busy() {
-        let mut mux = Mux::new(24, 80);
-        add_gateway_pane(&mut mux, "a", Some("http://x/v1"), Some(1), true);
-        add_gateway_pane(&mut mux, "b", Some("http://x/v1"), Some(1), false);
-        assert_eq!(mux.endpoint_capacity_backpressure("b"), Some(1));
-    }
-
-    #[test]
-    fn cap_one_allows_when_all_peers_idle() {
-        let mut mux = Mux::new(24, 80);
-        add_gateway_pane(&mut mux, "a", Some("http://x/v1"), Some(1), false);
-        add_gateway_pane(&mut mux, "b", Some("http://x/v1"), Some(1), false);
-        assert_eq!(mux.endpoint_capacity_backpressure("b"), None);
-    }
-
-    #[test]
-    fn busy_peers_on_other_endpoints_do_not_count() {
-        let mut mux = Mux::new(24, 80);
-        add_gateway_pane(&mut mux, "a", Some("http://A/v1"), Some(1), true);
-        add_gateway_pane(&mut mux, "b", Some("http://B/v1"), Some(1), false);
-        assert_eq!(mux.endpoint_capacity_backpressure("b"), None);
-    }
-
-    #[test]
-    fn cap_two_defers_only_once_two_peers_are_busy() {
-        let mut mux = Mux::new(24, 80);
-        add_gateway_pane(&mut mux, "a", Some("http://x/v1"), Some(2), true);
-        add_gateway_pane(&mut mux, "b", Some("http://x/v1"), Some(2), false);
-        assert_eq!(mux.endpoint_capacity_backpressure("b"), None);
-        add_gateway_pane(&mut mux, "c", Some("http://x/v1"), Some(2), true);
-        assert_eq!(mux.endpoint_capacity_backpressure("b"), Some(2));
-    }
-
-    #[test]
-    fn missing_base_url_fails_open() {
-        let mut mux = Mux::new(24, 80);
-        add_gateway_pane(&mut mux, "a", None, Some(1), true);
-        add_gateway_pane(&mut mux, "b", None, Some(1), false);
-        assert_eq!(mux.endpoint_capacity_backpressure("b"), None);
-    }
-
-    #[test]
-    fn zero_cap_is_treated_as_unlimited() {
-        let mut mux = Mux::new(24, 80);
-        add_gateway_pane(&mut mux, "a", Some("http://x/v1"), Some(0), true);
-        add_gateway_pane(&mut mux, "b", Some("http://x/v1"), Some(0), false);
-        assert_eq!(mux.endpoint_capacity_backpressure("b"), None);
-    }
-
-    #[test]
-    fn trailing_slash_and_whitespace_share_one_endpoint_pool() {
-        let mut mux = Mux::new(24, 80);
-        add_gateway_pane(&mut mux, "a", Some("http://x:8080/v1/"), Some(1), true);
-        add_gateway_pane(&mut mux, "b", Some(" http://x:8080/v1 "), Some(1), false);
-        // Different spellings of the same server must count as one pool.
-        assert_eq!(mux.endpoint_capacity_backpressure("b"), Some(1));
-    }
-
-    #[test]
-    fn endpoint_has_concurrency_cap_requires_base_url_and_positive_cap() {
-        let mut mux = Mux::new(24, 80);
-        add_gateway_pane(&mut mux, "capped", Some("http://x/v1"), Some(1), false);
-        add_gateway_pane(&mut mux, "no-cap", Some("http://x/v1"), None, false);
-        add_gateway_pane(&mut mux, "zero-cap", Some("http://x/v1"), Some(0), false);
-        add_gateway_pane(&mut mux, "no-url", None, Some(1), false);
-        assert!(mux.endpoint_has_concurrency_cap("capped"));
-        assert!(!mux.endpoint_has_concurrency_cap("no-cap"));
-        assert!(!mux.endpoint_has_concurrency_cap("zero-cap"));
-        assert!(!mux.endpoint_has_concurrency_cap("no-url"));
-    }
-
-    #[test]
-    fn begin_async_gateway_delivery_defers_when_endpoint_at_capacity() {
-        // End-to-end through the live gateway delivery entry point (not just the
-        // decision fn): a busy peer on a cap-1 shared endpoint must defer the
-        // next lane's delivery to Queued. The gate short-circuits before
-        // ensure_gateway_session, so no real gateway is required.
-        let mut mux = Mux::new(24, 80);
-        add_gateway_pane(
-            &mut mux,
-            "worker-a",
-            Some("http://127.0.0.1:8080/v1"),
-            Some(1),
-            true,
-        );
-        add_gateway_pane(
-            &mut mux,
-            "worker-b",
-            Some("http://127.0.0.1:8080/v1"),
-            Some(1),
-            false,
-        );
-
-        let rt = tokio::runtime::Runtime::new().expect("runtime");
-        let dispatch = rt
-            .block_on(mux.begin_async_gateway_prompt_delivery(rt.handle(), "worker-b", "do work"))
-            .expect("dispatch should succeed");
-        assert!(
-            matches!(dispatch, AsyncGatewayPromptDispatch::Queued { .. }),
-            "worker-b must be deferred while worker-a holds the only endpoint slot"
-        );
     }
 }

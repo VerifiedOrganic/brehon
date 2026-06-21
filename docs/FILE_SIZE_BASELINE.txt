@@ -24,7 +24,7 @@
 1981 crates/brehon-cli/src/commands/run/review.rs
 5582 crates/brehon-cli/src/commands/run/setup.rs
 1242 crates/brehon-cli/src/ui.rs
-1856 crates/brehon-config/src/lib.rs
+1858 crates/brehon-config/src/lib.rs
 4466 crates/brehon-config/src/validate.rs
 3676 crates/brehon-daemon/src/lib.rs
 1114 crates/brehon-doctor/src/checkers/runtime.rs
@@ -54,16 +54,16 @@
 3797 crates/brehon-mux/src/mux_tests/activity.rs
 1237 crates/brehon-mux/src/mux_tests/basic.rs
 2342 crates/brehon-mux/src/mux_tests/delivery.rs
-2081 crates/brehon-mux/src/mux_tests/factory.rs
+2085 crates/brehon-mux/src/mux_tests/factory.rs
 1120 crates/brehon-mux/src/pane/activity.rs
 3031 crates/brehon-mux/src/pane/spawn.rs
 1437 crates/brehon-mux/src/pane/terminal.rs
-2589 crates/brehon-mux/src/pane/tests/gateway.rs
+2678 crates/brehon-mux/src/pane/tests/gateway.rs
 1263 crates/brehon-mux/src/teams.rs
-984 crates/brehon-native-agent/src/agent_runtime/runner.rs
+1011 crates/brehon-native-agent/src/agent_runtime/runner.rs
 1323 crates/brehon-native-agent/src/permissions.rs
 1060 crates/brehon-native-agent/src/provider.rs
-1115 crates/brehon-native-agent/src/runtime.rs
+1176 crates/brehon-native-agent/src/runtime.rs
 1482 crates/brehon-native-agent/src/tools.rs
 1629 crates/brehon-orchestrator/src/orchestrator.rs
 950 crates/brehon-pty/src/pty/core.rs
@@ -78,7 +78,7 @@
 2884 crates/brehon-tui/src/run/dashboard.rs
 9047 crates/brehon-tui/src/run/event_loop.rs
 957 crates/brehon-tui/src/run/helpers/mod.rs
-8285 crates/brehon-tui/src/run/mod.rs
+8286 crates/brehon-tui/src/run/mod.rs
 1647 crates/brehon-tui/src/run/prompt_delivery.rs
 2147 crates/brehon-tui/src/run/recovery.rs
 1858 crates/brehon-tui/src/run/rendering.rs
@@ -86,7 +86,7 @@
 3657 crates/brehon-tui/src/run/stall_handling.rs
 923 crates/brehon-tui/src/run/task_detail.rs
 1007 crates/brehon-tui/src/run/types.rs
-3129 crates/brehon-types/src/config.rs
+3156 crates/brehon-types/src/config.rs
 1157 crates/brehon-types/src/stability.rs
 1108 crates/ghostty_vt_sys/zig/zig-pkg/uucode-0.2.0-zig-0.16-2826a37/resources/wcwidth/unicode_width.rs
 1038 vendor/panesmith/crates/panesmith/src/lib.rs

@@ -96,10 +96,13 @@ fn local_endpoint_report(project_path: Option<&Path>) -> Option<String> {
                 } else {
                     models.join(", ")
                 };
-                format!("  ✓ {} ({}) — {}", target.launcher, target.base_url, models)
+                format!(
+                    "  [ok] {} ({}) - {}",
+                    target.launcher, target.base_url, models
+                )
             }
             ProbeOutcome::Unreachable { detail } => format!(
-                "  ✗ {} ({}) — unreachable: {detail}",
+                "  [fail] {} ({}) - unreachable: {detail}",
                 target.launcher, target.base_url
             ),
         };
@@ -121,10 +124,14 @@ fn select_probe_targets(config: &BrehonConfig) -> Vec<ProbeTarget> {
             )
         })
         .filter_map(|(name, launcher)| {
-            launcher.base_url.as_ref().map(|base_url| ProbeTarget {
-                launcher: name.clone(),
-                base_url: base_url.clone(),
-            })
+            launcher
+                .base_url
+                .as_ref()
+                .filter(|base_url| is_loopback_http_url(base_url))
+                .map(|base_url| ProbeTarget {
+                    launcher: name.clone(),
+                    base_url: base_url.clone(),
+                })
         })
         .collect();
     // Deterministic order, then probe each endpoint once even if several lanes
@@ -136,6 +143,23 @@ fn select_probe_targets(config: &BrehonConfig) -> Vec<ProbeTarget> {
     });
     targets.dedup_by(|a, b| a.base_url == b.base_url);
     targets
+}
+
+fn is_loopback_http_url(base_url: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(base_url.trim()) else {
+        return false;
+    };
+    if !matches!(url.scheme(), "http" | "https") {
+        return false;
+    }
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.parse::<std::net::IpAddr>()
+        .is_ok_and(|addr| addr.is_loopback())
 }
 
 /// Probe `{base_url}/models` and return the advertised model ids.
@@ -202,6 +226,17 @@ mod tests {
         assert!(parse_model_ids(&serde_json::json!({})).is_empty());
         assert!(parse_model_ids(&serde_json::json!({"data": "nope"})).is_empty());
         assert!(parse_model_ids(&serde_json::json!({"data": [{"name": "x"}]})).is_empty());
+    }
+
+    #[test]
+    fn loopback_url_detection_accepts_only_local_http_endpoints() {
+        assert!(is_loopback_http_url("http://127.0.0.1:8080/v1"));
+        assert!(is_loopback_http_url("https://localhost:8080/v1"));
+        assert!(is_loopback_http_url("http://[::1]:8080/v1"));
+        assert!(!is_loopback_http_url("http://192.168.1.10:8080/v1"));
+        assert!(!is_loopback_http_url("https://api.openai.com/v1"));
+        assert!(!is_loopback_http_url("file:///tmp/socket"));
+        assert!(!is_loopback_http_url("not a url"));
     }
 
     #[test]
