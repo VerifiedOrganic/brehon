@@ -6,7 +6,7 @@ use super::ExtractMode;
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
@@ -14,23 +14,10 @@ use tempfile::TempDir;
 
 use crate::commands::TEST_ENV_LOCK as IMPORT_PLAN_TEST_LOCK;
 
-struct CurrentDirGuard {
-    original: PathBuf,
-}
-
-impl CurrentDirGuard {
-    fn set(path: &Path) -> Self {
-        let original = std::env::current_dir().unwrap();
-        std::env::set_current_dir(path).unwrap();
-        Self { original }
-    }
-}
-
-impl Drop for CurrentDirGuard {
-    fn drop(&mut self) {
-        let _ = std::env::set_current_dir(&self.original);
-    }
-}
+#[path = "tests/extraction_output.rs"]
+mod extraction_output;
+#[path = "tests/import_regressions.rs"]
+mod import_regressions;
 
 fn sample_plan() -> &'static str {
     r#"# Sample Plan
@@ -308,73 +295,6 @@ fn extracted_phase_id_matches_accepts_phase_slug_aliases() {
     assert!(extracted_phase_id_matches("10", "Phase 10"));
     assert!(extracted_phase_id_matches("4", "phase_4"));
     assert!(!extracted_phase_id_matches("4", "phase-5"));
-}
-
-#[test]
-fn parse_claude_json_output_extracts_structured_output() {
-    let payload = serde_json::json!([
-        {
-            "type": "assistant",
-            "message": {
-                "content": [
-                    {
-                        "type": "tool_use",
-                        "name": "StructuredOutput",
-                        "input": serde_json::from_str::<Value>(&normalized_plan_json()).unwrap()
-                    }
-                ]
-            }
-        },
-        {
-            "type": "result",
-            "structured_output": serde_json::from_str::<Value>(&normalized_plan_json()).unwrap()
-        }
-    ]);
-
-    let plan: PlanDocument = json_from_text_output(&payload.to_string()).unwrap();
-    assert_eq!(plan.title, "Normalized Plan");
-    assert_eq!(plan.phases.len(), 1);
-}
-
-#[test]
-fn parse_claude_result_object_extracts_structured_output() {
-    let payload = serde_json::json!({
-        "type": "result",
-        "subtype": "success",
-        "structured_output": serde_json::from_str::<Value>(&normalized_plan_json()).unwrap()
-    });
-
-    let plan: PlanDocument = json_from_text_output(&payload.to_string()).unwrap();
-    assert_eq!(plan.title, "Normalized Plan");
-    assert_eq!(plan.phases.len(), 1);
-}
-
-#[test]
-fn parse_claude_result_object_extracts_result_text_json() {
-    let payload = serde_json::json!({
-        "type": "result",
-        "subtype": "success",
-        "result": format!(
-            "Here is the normalized plan:\n```json\n{}\n```",
-            normalized_plan_json()
-        )
-    });
-
-    let plan: PlanDocument = json_from_text_output(&payload.to_string()).unwrap();
-    assert_eq!(plan.title, "Normalized Plan");
-    assert_eq!(plan.phases.len(), 1);
-}
-
-#[test]
-fn parse_text_output_uses_balanced_json_candidate() {
-    let output = format!(
-        "I checked {{the prose plan}} and produced this:\n```json\n{}\n```",
-        normalized_plan_json()
-    );
-
-    let plan: PlanDocument = json_from_text_output(&output).unwrap();
-    assert_eq!(plan.title, "Normalized Plan");
-    assert_eq!(plan.phases.len(), 1);
 }
 
 #[test]
@@ -824,94 +744,6 @@ async fn extract_plan_uses_direct_parser_for_structured_markdown() {
 }
 
 #[tokio::test]
-async fn extract_plan_supervisor_result_wrapper_writes_normalized_json() {
-    let _lock = IMPORT_PLAN_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let dir = TempDir::new().unwrap();
-    init_git_repo(dir.path()).unwrap();
-
-    let bin_dir = dir.path().join("bin");
-    fs::create_dir_all(&bin_dir).unwrap();
-    let fake_claude = bin_dir.join("claude");
-    fs::write(
-        &fake_claude,
-        r#"#!/bin/sh
-cat >/dev/null
-printf '%s' "$FAKE_EXTRACT_RESPONSE"
-"#,
-    )
-    .unwrap();
-    let mut perms = fs::metadata(&fake_claude).unwrap().permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&fake_claude, perms).unwrap();
-
-    fs::create_dir_all(dir.path().join(".brehon")).unwrap();
-    let mut config = brehon_config::parse_defaults().unwrap();
-    config.roles.supervisor.name = "claude-code".to_string();
-    config.launchers.insert(
-        "claude-code".to_string(),
-        brehon_types::AgentConnectionConfig {
-            adapter: brehon_types::agent::AdapterKind::Acp,
-            command: Some("claude".to_string()),
-            args: vec![],
-            provider: None,
-            transport: None,
-            control_plane: None,
-            base_url: None,
-            api_key_env: None,
-            permission_mode: None,
-            profile: None,
-            max_parallel_tool_calls: None,
-            assistant_message_passthrough_fields: Vec::new(),
-            reasoning_effort_param: None,
-            extra_body: None,
-            env: std::collections::HashMap::new(),
-            headers: std::collections::HashMap::new(),
-        },
-    );
-    fs::write(
-        dir.path().join(".brehon/config.yaml"),
-        serde_yaml::to_string(&config).unwrap(),
-    )
-    .unwrap();
-
-    let plan_path = dir.path().join("continuity.md");
-    fs::write(&plan_path, prose_only_plan()).unwrap();
-    let output_path = dir.path().join("normalized.json");
-
-    let path = std::env::var("PATH").unwrap_or_default();
-    let fake_response = serde_json::json!({
-        "type": "result",
-        "subtype": "success",
-        "result": format!("```json\n{}\n```", normalized_plan_json())
-    })
-    .to_string();
-    let _env = ScopedEnv::set(&[
-        ("PATH", format!("{}:{}", bin_dir.display(), path)),
-        ("FAKE_EXTRACT_RESPONSE", fake_response),
-    ]);
-
-    execute_extract(
-        dir.path(),
-        &plan_path,
-        Some(&output_path),
-        ExtractMode::Supervisor,
-    )
-    .await
-    .unwrap();
-
-    let extracted: Value =
-        serde_json::from_str(&fs::read_to_string(&output_path).unwrap()).unwrap();
-    assert_eq!(extracted["title"], "Normalized Plan");
-    assert_eq!(extracted["phases"][0]["id"], "1");
-    assert_eq!(
-        extracted["phases"][0]["epics"][0]["tasks"][0]["source_id"],
-        "1.1"
-    );
-}
-
-#[tokio::test]
 async fn direct_mode_does_not_fall_back_to_supervisor_for_prose_plan() {
     let _lock = IMPORT_PLAN_TEST_LOCK
         .lock()
@@ -1085,77 +917,6 @@ async fn import_normalized_plan_json_creates_records() {
         .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
         .count();
     assert_eq!(entries, 10);
-}
-
-#[tokio::test]
-async fn import_plan_with_relative_dot_path_uses_repo_identity_for_worktrees() {
-    let _lock = IMPORT_PLAN_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let dir = TempDir::new().unwrap();
-    init_git_repo(dir.path()).unwrap();
-    let plan_path = dir.path().join("plan.json");
-    fs::write(&plan_path, normalized_plan_json()).unwrap();
-    std::process::Command::new("git")
-        .args(["add", "plan.json"])
-        .current_dir(dir.path())
-        .output()
-        .unwrap();
-    let mut commit_plan = std::process::Command::new("git");
-    commit_plan
-        .args([
-            "-c",
-            "commit.gpgsign=false",
-            "commit",
-            "-m",
-            "normalized plan",
-        ])
-        .env("GIT_AUTHOR_NAME", "Test")
-        .env("GIT_AUTHOR_EMAIL", "test@example.com")
-        .env("GIT_COMMITTER_NAME", "Test")
-        .env("GIT_COMMITTER_EMAIL", "test@example.com")
-        .current_dir(dir.path());
-    commit_plan.output().unwrap();
-
-    let _cwd = CurrentDirGuard::set(dir.path());
-    execute(
-        Path::new("."),
-        Path::new("plan.json"),
-        false,
-        ExtractMode::Auto,
-    )
-    .await
-    .unwrap();
-
-    let config = brehon_config::load_config(Some(dir.path())).unwrap();
-    let expected_worktree_root = crate::commands::run::effective_worktree_root(dir.path(), &config);
-    let tasks_dir = dir.path().join(".brehon").join("runtime").join("tasks");
-    let tasks = fs::read_dir(&tasks_dir)
-        .unwrap()
-        .flatten()
-        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
-        .map(|entry| {
-            serde_json::from_str::<Value>(&fs::read_to_string(entry.path()).unwrap()).unwrap()
-        })
-        .collect::<Vec<_>>();
-
-    let worktree = tasks
-        .iter()
-        .filter_map(|task| task["integration_worktree"].as_str())
-        .find(|path| path.contains("/initiative/") || path.contains("/epic/"))
-        .expect("import should create integration worktrees");
-    let worktree = Path::new(worktree);
-    assert!(
-        worktree.starts_with(&expected_worktree_root),
-        "expected worktree '{}' to start with repo-scoped root '{}'",
-        worktree.display(),
-        expected_worktree_root.display()
-    );
-    assert!(
-        !worktree.to_string_lossy().contains("/worktrees/unknown-"),
-        "relative '.' project path must not produce unknown repo identity: {}",
-        worktree.display()
-    );
 }
 
 #[tokio::test]
