@@ -2,6 +2,30 @@ use std::collections::HashMap;
 
 use crate::*;
 
+#[test]
+fn endpoint_knob_getters_treat_zero_as_unset() {
+    // context_window / max_concurrency of 0 must read as "off" (None), matching
+    // the documented semantics, not be forwarded as a literal 0 (which would
+    // fail native-agent startup for context_window).
+    let launcher: AgentConnectionConfig = serde_json::from_value(serde_json::json!({
+        "adapter": "NativeAgent",
+        "context_window": 0,
+        "max_concurrency": 0,
+    }))
+    .expect("launcher should deserialize");
+    assert_eq!(launcher.context_window(), None);
+    assert_eq!(launcher.max_concurrency(), None);
+
+    let launcher: AgentConnectionConfig = serde_json::from_value(serde_json::json!({
+        "adapter": "NativeAgent",
+        "context_window": 32768,
+        "max_concurrency": 1,
+    }))
+    .expect("launcher should deserialize");
+    assert_eq!(launcher.context_window(), Some(32768));
+    assert_eq!(launcher.max_concurrency(), Some(1));
+}
+
 fn test_config() -> BrehonConfig {
     BrehonConfig {
         version: 1,
@@ -20,6 +44,8 @@ fn test_config() -> BrehonConfig {
                     permission_mode: None,
                     profile: None,
                     max_parallel_tool_calls: None,
+                    max_concurrency: None,
+                    context_window: None,
                     assistant_message_passthrough_fields: Vec::new(),
                     reasoning_effort_param: None,
                     extra_body: None,
@@ -41,6 +67,8 @@ fn test_config() -> BrehonConfig {
                     permission_mode: None,
                     profile: None,
                     max_parallel_tool_calls: None,
+                    max_concurrency: None,
+                    context_window: None,
                     assistant_message_passthrough_fields: Vec::new(),
                     reasoning_effort_param: None,
                     extra_body: None,
@@ -334,6 +362,8 @@ fn effective_permission_profile_lane_with_missing_launcher_does_not_fallback_to_
             permission_mode: None,
             profile: Some(PermissionProfile::Operator),
             max_parallel_tool_calls: None,
+            max_concurrency: None,
+            context_window: None,
             assistant_message_passthrough_fields: Vec::new(),
             reasoning_effort_param: None,
             extra_body: None,

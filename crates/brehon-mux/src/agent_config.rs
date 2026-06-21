@@ -113,6 +113,7 @@ pub fn custom_agent_from_fields(fields: &HashMap<String, String>) -> Option<Cust
         command: Some(command),
         args,
         base_url: None,
+        max_concurrency: None,
         api_key_env: None,
         headers: Vec::new(),
         capabilities: HarnessCapabilities {
@@ -156,6 +157,7 @@ mod tests {
             command: Some("aider".to_string()),
             args: vec!["--yes".to_string()],
             base_url: None,
+            max_concurrency: None,
             api_key_env: None,
             headers: Vec::new(),
             capabilities: HarnessCapabilities {
@@ -191,6 +193,7 @@ mod tests {
             command: Some("my-claude".to_string()),
             args: vec![],
             base_url: None,
+            max_concurrency: None,
             api_key_env: None,
             headers: Vec::new(),
             capabilities: HarnessCapabilities {

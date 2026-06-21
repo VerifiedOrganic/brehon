@@ -14,6 +14,7 @@ fn grok_adapter(name: &str) -> AgentAdapter {
             "stdio".to_string(),
         ],
         base_url: None,
+        max_concurrency: None,
         api_key_env: None,
         headers: Vec::new(),
         capabilities: HarnessCapabilities {

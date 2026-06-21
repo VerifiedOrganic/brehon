@@ -34,6 +34,38 @@ impl Mux {
         self.active_gateway_operations.remove(pane_id);
     }
 
+    fn clear_speculative_endpoint_busy(
+        &mut self,
+        pane_id: &str,
+        generation: Generation,
+        now: Instant,
+    ) -> Option<(
+        Option<RuntimePaneState>,
+        RuntimePaneState,
+        String,
+        Option<RuntimePaneBlockInfo>,
+    )> {
+        let pane = self.panes.get_mut(pane_id)?;
+        let capped_endpoint = pane.gateway_spawn_config.as_ref().is_some_and(|config| {
+            config.base_url.is_some() && config.max_concurrency.is_some_and(|cap| cap > 0)
+        });
+        if !capped_endpoint {
+            return None;
+        }
+        let previous = pane.pane_state().map(Self::runtime_pane_state_for_state);
+        if !matches!(
+            pane.pane_state(),
+            Some(PaneState::Busy {
+                generation: busy_generation,
+                ..
+            }) if *busy_generation == generation
+        ) {
+            return None;
+        }
+        pane.set_pane_ready(now);
+        Self::runtime_state_change(previous, pane.pane_state(), "async prompt delivery failed")
+    }
+
     fn is_gateway_turn_completion(entry: &ActivityEntry) -> bool {
         if entry.kind != ActivityKind::Operation {
             return false;
@@ -1143,6 +1175,8 @@ impl Mux {
                                 error: format!("prompt delivery rejected: {reason:?}"),
                             }),
                         );
+                        state_change =
+                            self.clear_speculative_endpoint_busy(pane_id, *generation, now);
                     }
                     Err(err) => {
                         if Self::is_busy_gateway_delivery_error(&err.error) {
@@ -1190,6 +1224,8 @@ impl Mux {
                             from.as_deref(),
                             Err(err.clone()),
                         );
+                        state_change =
+                            self.clear_speculative_endpoint_busy(pane_id, *generation, now);
                     }
                 }
                 if let Some((previous, current, reason, blocked)) = state_change {

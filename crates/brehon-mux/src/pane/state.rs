@@ -333,6 +333,14 @@ impl Pane {
         self.pane_state.as_ref()
     }
 
+    /// Whether the agent in this pane is currently processing a turn, i.e. its
+    /// endpoint is actively in use. Used by the per-endpoint concurrency gate to
+    /// count in-flight peers sharing one local server. Reads the authoritative
+    /// `Busy` lifecycle state, so a misclassification under-counts (fails open).
+    pub fn is_processing(&self) -> bool {
+        matches!(self.pane_state(), Some(PaneState::Busy { .. }))
+    }
+
     /// Store the latest pane state without applying Ready/Busy dead-state guards.
     ///
     /// This is intended for lifecycle transitions that must be able to write

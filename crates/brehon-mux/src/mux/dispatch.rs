@@ -24,6 +24,7 @@ use super::types::{
     TEAMS_NUDGE_QUIET_THRESHOLD,
 };
 
+mod endpoint_gate;
 mod prompt_queue;
 
 pub(super) fn gateway_env_value<'a>(env: &'a [(String, String)], key: &str) -> Option<&'a str> {
@@ -675,6 +676,21 @@ impl Mux {
             });
         }
 
+        // Per-endpoint concurrency gate (see endpoint_capacity_backpressure):
+        // when several panes share one local OpenAI-compatible server, defer
+        // delivery while the endpoint is at capacity so we serialize onto its
+        // limited slots instead of stampeding it / thrashing model swaps. The
+        // caller re-queues a Queued result with backoff, matching the live-turn
+        // defer above. This is the gateway-path equivalent of the gate in
+        // attempt_prompt_delivery, and is the path the local-model deployment
+        // actually uses.
+        if let Some(ahead_of) = self.endpoint_capacity_backpressure(pane_id) {
+            return Ok(AsyncGatewayPromptDispatch::Queued {
+                prompt_id,
+                ahead_of,
+            });
+        }
+
         self.ensure_gateway_session(pane_id).await?;
 
         let session_id = self
@@ -693,6 +709,22 @@ impl Mux {
             .as_ref()
             .cloned()
             .ok_or_else(|| Error::pty("Agent gateway not configured"))?;
+
+        // Occupy the endpoint slot synchronously before spawning the send. A
+        // review panel fans out to several lanes in one drain pass; because
+        // delivery Busy is otherwise only set when the send completes, every
+        // lane would pass the gate before any reached Busy and all would fire at
+        // once. `begin_async_gateway_prompt_delivery` takes `&mut self`, so
+        // dispatches are already serialized; marking the pane Busy here makes
+        // each one visible to the next dispatch's gate check. This happens
+        // after all fallible setup above so setup failures cannot leave a
+        // speculative Busy state behind.
+        if self.endpoint_has_concurrency_cap(pane_id) {
+            let now = Instant::now();
+            if let Some(pane) = self.panes.get_mut(pane_id) {
+                pane.set_pane_busy(prompt_id.clone(), generation, now);
+            }
+        }
 
         let prompt_turn = brehon_types::PromptTurn {
             prompt_id: prompt_id.clone(),
@@ -1263,11 +1295,6 @@ impl Mux {
         })
     }
 
-    /// Attempt a single prompt delivery without mutating mux-owned retry state.
-    ///
-    /// Callers that already have a durable queue on disk should use this API so
-    /// the queue remains the source of truth until the transport actually
-    /// accepts the prompt.
     pub async fn attempt_prompt_delivery(
         &mut self,
         pane_id: &str,
@@ -1319,6 +1346,18 @@ impl Mux {
         }
         if let Some(reason) = self.pane_unavailable_reason(pane_id) {
             return Ok(PromptDeliveryAttempt::Rejected { reason });
+        }
+
+        // Per-endpoint concurrency gate: when several panes share one local
+        // OpenAI-compatible endpoint (a single llama.cpp / llama-swap server),
+        // serialize their requests onto its limited slots. Deferring returns
+        // Queued, which the durable prompt queue retries once a peer frees the
+        // endpoint — mirroring the existing policy-Defer backpressure path.
+        if let Some(ahead_of) = self.endpoint_capacity_backpressure(pane_id) {
+            return Ok(PromptDeliveryAttempt::Queued {
+                prompt_id,
+                ahead_of,
+            });
         }
 
         let pane = self.panes.get(pane_id);

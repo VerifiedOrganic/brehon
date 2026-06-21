@@ -1,0 +1,164 @@
+# Brehon configuration for a fully-local model panel (llama.cpp / llama-swap).
+#
+# Place at `.brehon/config.yaml` in your repo, then:
+#   brehon config validate
+#   brehon doctor          # probes the local endpoint
+#
+# Prereqs (see docs/LOCAL_MODELS.md):
+#   - A local OpenAI-compatible server on http://127.0.0.1:8080/v1
+#     (llama-swap in front of llama.cpp recommended). Start llama-server with
+#     --jinja so tool calling works.
+#   - The `brehon-native-agent` binary installed alongside `brehon`.
+#   - Model ids below (qwen3-coder-30b, devstral-24b, gpt-oss-20b) MUST match
+#     the model names your llama-swap config serves.
+
+version: 1
+
+launchers:
+  # One launcher, reused by every local lane. Because all lanes share this
+  # base_url, `max_concurrency: 1` serializes them onto the single GPU.
+  local:
+    adapter: NativeAgent
+    provider: openai-compatible
+    base_url: http://127.0.0.1:8080/v1
+    # api_key_env: LLAMA_API_KEY   # only if you started the server with --api-key
+    max_concurrency: 1             # one in-flight request to the shared endpoint
+    context_window: 32768          # per-request window; history is trimmed to fit
+    env:
+      # Fail a turn that won't stop calling tools instead of looping forever.
+      BREHON_AGENT_MAX_TOOL_ROUNDS: "40"
+    extra_body:
+      temperature: 0.2             # lower temperature → fewer malformed tool calls
+
+lanes:
+  local-supervisor:
+    launcher: local
+    model:
+      provider: local
+      name: gpt-oss-20b
+    system_prompt: |
+      You are the supervisor for a small local Brehon run.
+      Keep scope tight, split work into small tasks with concrete acceptance
+      criteria, and assign ready tasks to the worker. Workers implement;
+      reviewers judge. Ask the human when scope or risk is unclear.
+
+  local-worker:
+    launcher: local
+    model:
+      provider: local
+      name: qwen3-coder-30b
+    system_prompt: |
+      You are an implementation worker. Complete only the assigned task, keep the
+      diff narrow, preserve existing style and contracts, and update tests when
+      behavior changes. Leave exact verification commands in your handoff. Do not
+      edit .brehon runtime files.
+
+  # Two reviewers on two different models = genuine weight-diversity, but each
+  # review costs a model swap on a single-GPU box. Drop to one reviewer, or use
+  # "easy mode" below, if the swaps are too slow.
+  local-reviewer-a:
+    launcher: local
+    model:
+      provider: local
+      name: devstral-24b
+    system_prompt: |
+      You are a reviewer. Evaluate the submitted work; do not implement it. Check
+      the diff against the task: correctness, integration, tests, maintainability.
+      Treat missing tests as a real gap unless the task waives them. Submit
+      structured findings with severity and concrete file references.
+
+  local-reviewer-b:
+    launcher: local
+    model:
+      provider: local
+      name: gpt-oss-20b
+    system_prompt: |
+      You are a reviewer. Focus on independent confirmation: edge cases,
+      regression risk, unclear requirements, and whether the verification
+      evidence actually covers the change. Submit structured findings with
+      severity and concrete file references.
+
+roles:
+  supervisor:
+    name: local-supervisor
+    kind: Supervisor
+    description: Coordinates a small single-GPU local run.
+    permissions:
+      - CreateTasks
+      - AssignTasks
+      - SendMessage
+      - Broadcast
+      - ContextReadWrite
+      - ManageAgents
+      - ManageRoles
+  workers:
+    - lane: local-worker
+      min: 1
+      max: 1
+  reviewers:
+    - lane: local-reviewer-a
+      min: 1
+      max: 1
+    - lane: local-reviewer-b
+      min: 1
+      max: 1
+
+review:
+  policy:
+    min_average_score: 7
+    min_individual_score: 6
+    blocking_score: 5
+    min_approvals: 2
+    require_blocking_feedback_resolution: true
+    max_review_rounds: 2
+  timeout_minutes: 45            # local inference is slower than hosted APIs
+  auto_assign: true
+  default_reviewers:
+    - local-reviewer-a
+    - local-reviewer-b
+  panel_mode: full_council
+  lease_mode: exclusive
+  panels:
+    - id: primary
+      reviewers:
+        - local-reviewer-a
+        - local-reviewer-b
+  max_diff_tokens: 6000          # keep review prompts inside a small context window
+  chunk_strategy: ByDirectory
+  stale_detection:
+    enabled: true
+    ignore_files:
+      - Cargo.lock
+      - package-lock.json
+      - .gitignore
+      - .brehon/**
+    strategy: DeltaReview
+
+orchestration:
+  max_active_workers: 1          # one model in VRAM at a time
+  spawn_workers: 1
+  worker_idle_behavior: Wait
+
+budget:
+  # Local tokens are ~free; the meaningful guard is wall-clock time.
+  max_wall_clock_minutes: 480
+  alert_threshold_percent: 80
+  enforcement: Soft
+
+security:
+  sandbox_profile: OsDefault
+  persist_transcripts: true
+  env_allowlist:
+    - PATH
+    - HOME
+    - USER
+    - SHELL
+    - LLAMA_API_KEY
+
+# ---------------------------------------------------------------------------
+# EASY MODE (zero model swaps): run ONE local model for every role and make the
+# reviewers differ by persona instead of weights. Fast multi-perspective panel
+# with no reloads. To use it, point every lane above at the same model name,
+# e.g. set all four `model.name` to `qwen3-coder-30b`. The system_prompts above
+# already give each reviewer a distinct lens, so you keep independent opinions.
+# ---------------------------------------------------------------------------

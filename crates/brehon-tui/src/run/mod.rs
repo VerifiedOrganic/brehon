@@ -808,6 +808,7 @@ mod tests {
                 "app-server".to_string(),
             ],
             base_url: None,
+            max_concurrency: None,
             api_key_env: None,
             headers: Vec::new(),
             capabilities: brehon_mux::HarnessCapabilities {
@@ -837,6 +838,7 @@ mod tests {
             command: Some(command.to_string()),
             args: args.iter().map(|arg| arg.to_string()).collect(),
             base_url: None,
+            max_concurrency: None,
             api_key_env: None,
             headers: Vec::new(),
             capabilities: brehon_mux::HarnessCapabilities {
@@ -883,6 +885,7 @@ mod tests {
             command: Some(cli.as_str().to_string()),
             args: vec![],
             base_url: None,
+            max_concurrency: None,
             api_key_env: None,
             headers: Vec::new(),
             capabilities: cli.capabilities(),

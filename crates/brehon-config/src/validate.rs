@@ -1970,6 +1970,30 @@ mod tests {
     mod worktree_root_tests;
 
     use super::*;
+
+    #[test]
+    fn shipped_local_models_example_config_validates() {
+        // The local-models guide ships a copy-pasteable config. Mirror real
+        // loading: it is an OVERLAY merged over defaults.yaml, not a standalone
+        // file, so a user following the docs gets exactly this result.
+        let mut merged = crate::parse_defaults_value().expect("defaults must parse");
+        let overlay: serde_yaml::Value =
+            serde_yaml::from_str(include_str!("../../../docs/brehon-local-config.yaml"))
+                .expect("docs/brehon-local-config.yaml must be valid YAML");
+        crate::merge_yaml_overlay(&mut merged, overlay);
+        let config = crate::deserialize_config_value(merged, "local example")
+            .expect("merged local example config must deserialize");
+
+        let fatal: Vec<_> = validate(&config)
+            .into_iter()
+            .filter(|warning| warning.is_fatal)
+            .collect();
+        assert!(
+            fatal.is_empty(),
+            "docs/brehon-local-config.yaml must validate without fatal warnings, got: {fatal:#?}"
+        );
+    }
+
     use brehon_types::{
         AdapterKind, AgentConnectionConfig, AgentsMdMode, AutonomyLevel, BudgetConfig,
         BudgetEnforcement, ChunkStrategy, ContextConfig, CredentialClass, EnvPolicy,
@@ -2003,6 +2027,8 @@ mod tests {
             permission_mode: None,
             profile: None,
             max_parallel_tool_calls: None,
+            max_concurrency: None,
+            context_window: None,
             assistant_message_passthrough_fields: Vec::new(),
             reasoning_effort_param: None,
             extra_body: None,
@@ -2031,6 +2057,8 @@ mod tests {
                 permission_mode: None,
                 profile: None,
                 max_parallel_tool_calls: None,
+                max_concurrency: None,
+                context_window: None,
                 assistant_message_passthrough_fields: Vec::new(),
                 reasoning_effort_param: None,
                 extra_body: None,
@@ -2052,6 +2080,8 @@ mod tests {
                 permission_mode: None,
                 profile: None,
                 max_parallel_tool_calls: None,
+                max_concurrency: None,
+                context_window: None,
                 assistant_message_passthrough_fields: Vec::new(),
                 reasoning_effort_param: None,
                 extra_body: None,
@@ -2840,6 +2870,8 @@ rooms:
                 permission_mode: None,
                 profile: None,
                 max_parallel_tool_calls: None,
+                max_concurrency: None,
+                context_window: None,
                 assistant_message_passthrough_fields: Vec::new(),
                 reasoning_effort_param: None,
                 extra_body: None,
@@ -2883,6 +2915,8 @@ rooms:
                 permission_mode: None,
                 profile: None,
                 max_parallel_tool_calls: None,
+                max_concurrency: None,
+                context_window: None,
                 assistant_message_passthrough_fields: Vec::new(),
                 reasoning_effort_param: None,
                 extra_body: None,

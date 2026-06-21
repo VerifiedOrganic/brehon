@@ -821,6 +821,7 @@ fn custom_interactive_agent(name: &str, command: &str, args: &[&str]) -> AgentAd
         command: Some(command.to_string()),
         args: args.iter().map(|arg| arg.to_string()).collect(),
         base_url: None,
+        max_concurrency: None,
         api_key_env: None,
         headers: Vec::new(),
         capabilities: HarnessCapabilities {
@@ -848,6 +849,7 @@ fn grok_adapter(name: &str) -> AgentAdapter {
             "stdio".to_string(),
         ],
         base_url: None,
+        max_concurrency: None,
         api_key_env: None,
         headers: Vec::new(),
         capabilities: HarnessCapabilities {
@@ -871,6 +873,7 @@ fn custom_acp_adapter(name: &str) -> AgentAdapter {
         command: Some("my-agent".to_string()),
         args: vec!["--stdio".to_string()],
         base_url: None,
+        max_concurrency: None,
         api_key_env: None,
         headers: Vec::new(),
         capabilities: HarnessCapabilities {
@@ -1538,6 +1541,7 @@ fn terminal_host_agent_factory_plan_from_config_is_plan_only() {
         command: Some("brehon-test-command-that-must-not-exist".to_string()),
         args: vec!["--sentinel".to_string()],
         base_url: None,
+        max_concurrency: None,
         api_key_env: None,
         headers: Vec::new(),
         capabilities: HarnessCapabilities {

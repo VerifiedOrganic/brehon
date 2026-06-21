@@ -616,6 +616,7 @@ fn grok_adapter(name: &str) -> AgentAdapter {
             "stdio".to_string(),
         ],
         base_url: None,
+        max_concurrency: None,
         api_key_env: None,
         headers: Vec::new(),
         capabilities: HarnessCapabilities {
@@ -639,6 +640,7 @@ fn custom_acp_adapter(name: &str) -> AgentAdapter {
         command: Some("my-agent".to_string()),
         args: vec!["--stdio".to_string()],
         base_url: None,
+        max_concurrency: None,
         api_key_env: None,
         headers: Vec::new(),
         capabilities: HarnessCapabilities {
@@ -1520,6 +1522,7 @@ fn test_custom_acp_worker_uses_stdio_gateway_protocol() {
         command: Some("goose".to_string()),
         args: vec!["acp".to_string(), "--stdio".to_string()],
         base_url: None,
+        max_concurrency: None,
         api_key_env: None,
         headers: Vec::new(),
         capabilities: HarnessCapabilities {
@@ -1673,9 +1676,19 @@ fn test_grok_acp_worker_receives_brehon_mcp_server() {
 
 #[test]
 fn test_grok_reviewer_uses_acp_stdio_gateway_protocol() {
+    // Use an isolated, freshly-created cwd rather than bare /tmp: the grok
+    // sandbox profile is "workspace" only when the cwd has no git metadata, and
+    // on a developer box /tmp is often itself a git working tree (or contains a
+    // stray /tmp/.git), which would flip the profile to a custom per-repo one
+    // and fail this assertion. A unique temp subdir keeps the test hermetic.
+    let cwd = std::env::temp_dir().join(format!("brehon-grok-pane-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&cwd).expect("create grok pane cwd");
+    let cwd = std::fs::canonicalize(&cwd).expect("canonicalize grok pane cwd");
+    let cwd_str = cwd.to_string_lossy().to_string();
+
     let pane = Pane::reviewer_with_agent_type(
         "reviewer-1",
-        PathBuf::from("/tmp"),
+        cwd.clone(),
         None,
         None,
         24,
@@ -1701,14 +1714,20 @@ fn test_grok_reviewer_uses_acp_stdio_gateway_protocol() {
         config
             .args
             .windows(2)
-            .any(|window| window == ["--cwd", "/tmp"])
+            .any(|window| window == ["--cwd", cwd_str.as_str()]),
+        "expected --cwd {cwd_str} in args: {:?}",
+        config.args
     );
     assert!(
         config
             .args
             .windows(2)
-            .any(|window| window == ["--sandbox", "workspace"])
+            .any(|window| window == ["--sandbox", "workspace"]),
+        "expected --sandbox workspace in args: {:?}",
+        config.args
     );
+
+    let _ = std::fs::remove_dir_all(&cwd);
     let mcp_servers = config
         .env
         .iter()
@@ -1740,6 +1759,7 @@ fn test_custom_codex_app_server_worker_uses_codex_ws_gateway_protocol() {
             "app-server".to_string(),
         ],
         base_url: None,
+        max_concurrency: None,
         api_key_env: None,
         headers: Vec::new(),
         capabilities: HarnessCapabilities {
@@ -1806,6 +1826,64 @@ fn test_custom_codex_app_server_worker_uses_codex_ws_gateway_protocol() {
 }
 
 #[test]
+fn test_custom_acp_agent_carries_endpoint_base_url_and_max_concurrency() {
+    // Regression guard: a custom ACP agent (the shape NativeAgent local lanes
+    // resolve to) must propagate base_url + max_concurrency into its
+    // GatewaySpawnConfig so the per-endpoint concurrency gate can serialize
+    // lanes that share one local server. The ACP spawn path previously
+    // hardcoded these to None, silently disabling the gate.
+    let cwd = std::env::temp_dir().join(format!("brehon-local-acp-pane-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&cwd).expect("create pane cwd");
+
+    let adapter = AgentAdapter::Custom(CustomAgentConfig {
+        name: "local-worker".to_string(),
+        command: Some("brehon-native-agent".to_string()),
+        args: vec!["--worker".to_string()],
+        base_url: Some("http://127.0.0.1:8080/v1".to_string()),
+        max_concurrency: Some(1),
+        api_key_env: None,
+        headers: Vec::new(),
+        capabilities: HarnessCapabilities {
+            supports_hooks: false,
+            supports_subagents: false,
+            supports_textbox_submit: false,
+            supports_teams: false,
+            one_shot: false,
+            uses_ink_prompt: false,
+            prompt_injection_strategy: PromptInjectionStrategy::ImmediateSubmit,
+            tool_prefix: std::borrow::Cow::Borrowed("mcp_brehon_"),
+            transport: HarnessTransport::AppServer,
+            preferred_control_plane: HarnessControlPlane::Acp,
+        },
+    });
+
+    let pane = Pane::worker(
+        "local-worker-1",
+        cwd.clone(),
+        None,
+        "supervisor",
+        &adapter,
+        None,
+        None,
+        24,
+        80,
+        None,
+        None,
+        None,
+    )
+    .expect("create custom ACP local worker pane");
+
+    assert!(pane.is_gateway_backed());
+    let config = pane
+        .gateway_spawn_config()
+        .expect("gateway config should exist");
+    assert_eq!(config.base_url.as_deref(), Some("http://127.0.0.1:8080/v1"));
+    assert_eq!(config.max_concurrency, Some(1));
+
+    let _ = std::fs::remove_dir_all(cwd);
+}
+
+#[test]
 fn test_custom_codex_app_server_worker_accepts_long_form_safe_bootstrap() {
     let cwd = std::env::temp_dir().join(format!(
         "brehon-custom-codex-pane-long-safe-{}",
@@ -1831,6 +1909,7 @@ fn test_custom_codex_app_server_worker_accepts_long_form_safe_bootstrap() {
             "app-server".to_string(),
         ],
         base_url: None,
+        max_concurrency: None,
         api_key_env: None,
         headers: Vec::new(),
         capabilities: HarnessCapabilities {
@@ -1908,6 +1987,7 @@ fn test_custom_codex_app_server_worker_accepts_short_form_safe_bootstrap() {
             "app-server".to_string(),
         ],
         base_url: None,
+        max_concurrency: None,
         api_key_env: None,
         headers: Vec::new(),
         capabilities: HarnessCapabilities {
@@ -1977,6 +2057,7 @@ fn test_custom_codex_app_server_worker_requires_instructions_bootstrap() {
             "app-server".to_string(),
         ],
         base_url: None,
+        max_concurrency: None,
         api_key_env: None,
         headers: Vec::new(),
         capabilities: HarnessCapabilities {
@@ -2025,6 +2106,7 @@ fn test_custom_acp_reviewer_uses_stdio_gateway_protocol() {
         command: Some("goose".to_string()),
         args: vec!["acp".to_string()],
         base_url: None,
+        max_concurrency: None,
         api_key_env: None,
         headers: Vec::new(),
         capabilities: HarnessCapabilities {
@@ -2089,6 +2171,7 @@ fn test_custom_acp_supervisor_is_rejected_without_pty_contract() {
         command: Some("goose".to_string()),
         args: vec!["acp".to_string()],
         base_url: None,
+        max_concurrency: None,
         api_key_env: None,
         headers: Vec::new(),
         capabilities: HarnessCapabilities {
@@ -2141,6 +2224,7 @@ fn test_custom_pty_supervisor_uses_pty_launch_contract() {
         command: Some("sh".to_string()),
         args: vec!["-lc".to_string(), "cat".to_string()],
         base_url: None,
+        max_concurrency: None,
         api_key_env: None,
         headers: Vec::new(),
         capabilities: HarnessCapabilities {
@@ -2226,6 +2310,7 @@ fn test_custom_acp_sidecar_supervisor_has_pty_and_gateway_contract() {
         command: Some("sh".to_string()),
         args: vec!["-lc".to_string(), "cat".to_string()],
         base_url: None,
+        max_concurrency: None,
         api_key_env: None,
         headers: Vec::new(),
         capabilities: HarnessCapabilities {
@@ -2320,6 +2405,7 @@ fn test_native_agent_acp_reviewer_passes_model_as_env_and_arg() {
         command: Some("agora-native-agent".to_string()),
         args: vec!["--worker".to_string()],
         base_url: None,
+        max_concurrency: None,
         api_key_env: None,
         headers: Vec::new(),
         capabilities: HarnessCapabilities {
@@ -2388,6 +2474,7 @@ fn test_custom_acp_sidecar_supervisor_rejects_non_interactive_transport() {
         command: Some("native-agent".to_string()),
         args: vec![],
         base_url: None,
+        max_concurrency: None,
         api_key_env: None,
         headers: Vec::new(),
         capabilities: HarnessCapabilities {
@@ -2446,6 +2533,7 @@ fn test_custom_openai_worker_uses_managed_api_gateway_protocol() {
         command: None,
         args: vec![],
         base_url: Some("https://ollama.example/v1".to_string()),
+        max_concurrency: None,
         api_key_env: Some("OLLAMA_API_KEY".to_string()),
         headers: vec![("x-provider".to_string(), "ollama-cloud".to_string())],
         capabilities: HarnessCapabilities {
@@ -2503,6 +2591,7 @@ fn test_custom_openai_supervisor_is_rejected_without_pty_command() {
         command: None,
         args: vec![],
         base_url: Some("https://api.openai.example/v1".to_string()),
+        max_concurrency: None,
         api_key_env: Some("OPENAI_API_KEY".to_string()),
         headers: Vec::new(),
         capabilities: HarnessCapabilities {

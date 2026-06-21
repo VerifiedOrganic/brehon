@@ -40,6 +40,8 @@ mod tests {
                 permission_mode: None,
                 profile: None,
                 max_parallel_tool_calls: None,
+                max_concurrency: None,
+                context_window: None,
                 assistant_message_passthrough_fields: Vec::new(),
                 reasoning_effort_param: None,
                 extra_body: None,

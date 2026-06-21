@@ -144,6 +144,7 @@ fn custom_with_strategy(
         command: Some(name.to_string()),
         args: vec![],
         base_url: None,
+        max_concurrency: None,
         api_key_env: None,
         headers: Vec::new(),
         capabilities: HarnessCapabilities {
