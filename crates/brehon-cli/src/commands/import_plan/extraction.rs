@@ -4,11 +4,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
-use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 
+pub(crate) use super::output::json_from_text_output;
 use super::parsing::*;
 use super::types::*;
 use super::ExtractMode;
@@ -380,63 +380,6 @@ Current task section:\n\
         task.heading,
         task.body
     )
-}
-
-pub(crate) fn json_from_text_output<T: DeserializeOwned>(output: &str) -> Result<T> {
-    if let Ok(value) = serde_json::from_str::<T>(output) {
-        return Ok(value);
-    }
-
-    if let Ok(value) = serde_json::from_str::<Value>(output) {
-        match value {
-            Value::Object(_) => {
-                return serde_json::from_value(value)
-                    .context("Failed to parse extractor JSON object as structured output");
-            }
-            Value::Array(events) => {
-                for event in events.iter().rev() {
-                    if let Some(structured) = event.get("structured_output") {
-                        return serde_json::from_value(structured.clone())
-                            .context("Failed to parse Claude structured_output payload");
-                    }
-
-                    if let Some(contents) = event
-                        .get("message")
-                        .and_then(|message| message.get("content"))
-                        .and_then(|content| content.as_array())
-                    {
-                        for content in contents.iter().rev() {
-                            if content.get("type").and_then(|value| value.as_str())
-                                != Some("tool_use")
-                                || content.get("name").and_then(|value| value.as_str())
-                                    != Some("StructuredOutput")
-                            {
-                                continue;
-                            }
-                            if let Some(input) = content.get("input") {
-                                return serde_json::from_value(input.clone()).context(
-                                    "Failed to parse Claude StructuredOutput tool payload",
-                                );
-                            }
-                        }
-                    }
-                }
-
-                bail!("Extractor JSON output did not contain a structured plan payload");
-            }
-            _ => {}
-        }
-    }
-
-    let start = output
-        .find('{')
-        .ok_or_else(|| anyhow!("Extractor output did not contain a JSON object"))?;
-    let end = output
-        .rfind('}')
-        .ok_or_else(|| anyhow!("Extractor output did not contain a closing JSON object"))?;
-    let slice = &output[start..=end];
-    serde_json::from_str::<T>(slice)
-        .with_context(|| format!("Failed to parse extracted JSON payload: {slice}"))
 }
 
 fn summarize_extractor_output(output: &[u8]) -> Option<String> {

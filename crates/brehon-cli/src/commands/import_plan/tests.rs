@@ -14,6 +14,11 @@ use tempfile::TempDir;
 
 use crate::commands::TEST_ENV_LOCK as IMPORT_PLAN_TEST_LOCK;
 
+#[path = "tests/extraction_output.rs"]
+mod extraction_output;
+#[path = "tests/import_regressions.rs"]
+mod import_regressions;
+
 fn sample_plan() -> &'static str {
     r#"# Sample Plan
 
@@ -290,32 +295,6 @@ fn extracted_phase_id_matches_accepts_phase_slug_aliases() {
     assert!(extracted_phase_id_matches("10", "Phase 10"));
     assert!(extracted_phase_id_matches("4", "phase_4"));
     assert!(!extracted_phase_id_matches("4", "phase-5"));
-}
-
-#[test]
-fn parse_claude_json_output_extracts_structured_output() {
-    let payload = serde_json::json!([
-        {
-            "type": "assistant",
-            "message": {
-                "content": [
-                    {
-                        "type": "tool_use",
-                        "name": "StructuredOutput",
-                        "input": serde_json::from_str::<Value>(&normalized_plan_json()).unwrap()
-                    }
-                ]
-            }
-        },
-        {
-            "type": "result",
-            "structured_output": serde_json::from_str::<Value>(&normalized_plan_json()).unwrap()
-        }
-    ]);
-
-    let plan: PlanDocument = json_from_text_output(&payload.to_string()).unwrap();
-    assert_eq!(plan.title, "Normalized Plan");
-    assert_eq!(plan.phases.len(), 1);
 }
 
 #[test]
