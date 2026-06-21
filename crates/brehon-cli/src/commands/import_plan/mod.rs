@@ -2,6 +2,7 @@ use clap::ValueEnum;
 
 mod dispatch;
 mod extraction;
+mod output;
 mod parsing;
 mod types;
 
