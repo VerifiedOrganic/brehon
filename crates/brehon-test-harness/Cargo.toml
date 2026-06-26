@@ -1,6 +1,6 @@
 [package]
 name = "brehon-test-harness"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 description = "Test infrastructure and fixtures for the Brehon workspace"
 license = "MIT"

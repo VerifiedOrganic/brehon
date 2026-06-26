@@ -1,6 +1,6 @@
 [package]
 name = "brehon-ports"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 description = "Port trait definitions (hexagonal architecture boundaries) for Brehon"
 license = "MIT"

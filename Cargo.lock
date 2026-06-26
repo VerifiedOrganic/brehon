@@ -212,7 +212,7 @@ dependencies = [
 
 [[package]]
 name = "brehon-acp"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "async-trait",
  "base64",
@@ -243,7 +243,7 @@ dependencies = [
 
 [[package]]
 name = "brehon-adapter-agy"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "async-trait",
  "brehon-adapter-sdk",
@@ -261,7 +261,7 @@ dependencies = [
 
 [[package]]
 name = "brehon-adapter-claude"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "async-trait",
  "brehon-adapter-sdk",
@@ -275,7 +275,7 @@ dependencies = [
 
 [[package]]
 name = "brehon-adapter-codex"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "async-trait",
  "brehon-adapter-sdk",
@@ -294,7 +294,7 @@ dependencies = [
 
 [[package]]
 name = "brehon-adapter-copilot"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "async-trait",
  "brehon-adapter-sdk",
@@ -312,7 +312,7 @@ dependencies = [
 
 [[package]]
 name = "brehon-adapter-gemini"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "async-trait",
  "base64",
@@ -332,7 +332,7 @@ dependencies = [
 
 [[package]]
 name = "brehon-adapter-junie"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "async-trait",
  "brehon-adapter-sdk",
@@ -350,7 +350,7 @@ dependencies = [
 
 [[package]]
 name = "brehon-adapter-kimi"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "async-trait",
  "brehon-adapter-sdk",
@@ -368,7 +368,7 @@ dependencies = [
 
 [[package]]
 name = "brehon-adapter-openai"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "async-trait",
  "brehon-adapter-sdk",
@@ -386,7 +386,7 @@ dependencies = [
 
 [[package]]
 name = "brehon-adapter-opencode"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "async-trait",
  "brehon-adapter-sdk",
@@ -404,7 +404,7 @@ dependencies = [
 
 [[package]]
 name = "brehon-adapter-sdk"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "async-trait",
  "brehon-types",
@@ -422,7 +422,7 @@ dependencies = [
 
 [[package]]
 name = "brehon-cli"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -468,7 +468,7 @@ dependencies = [
 
 [[package]]
 name = "brehon-config"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "brehon-adapter-sdk",
  "brehon-types",
@@ -483,7 +483,7 @@ dependencies = [
 
 [[package]]
 name = "brehon-daemon"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "async-trait",
  "brehon-detect",
@@ -503,7 +503,7 @@ dependencies = [
 
 [[package]]
 name = "brehon-detect"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "async-trait",
  "brehon-ports",
@@ -515,7 +515,7 @@ dependencies = [
 
 [[package]]
 name = "brehon-doctor"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "brehon-config",
@@ -534,7 +534,7 @@ dependencies = [
 
 [[package]]
 name = "brehon-git"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "async-trait",
  "brehon-ports",
@@ -552,7 +552,7 @@ dependencies = [
 
 [[package]]
 name = "brehon-host"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "async-trait",
  "brehon-daemon",
@@ -567,7 +567,7 @@ dependencies = [
 
 [[package]]
 name = "brehon-mcp"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "async-trait",
  "brehon-config",
@@ -599,7 +599,7 @@ dependencies = [
 
 [[package]]
 name = "brehon-mux"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -637,7 +637,7 @@ dependencies = [
 
 [[package]]
 name = "brehon-native-agent"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -665,7 +665,7 @@ dependencies = [
 
 [[package]]
 name = "brehon-notify"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "brehon-types",
  "reqwest",
@@ -680,7 +680,7 @@ dependencies = [
 
 [[package]]
 name = "brehon-orchestrator"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "async-trait",
  "brehon-ports",
@@ -699,7 +699,7 @@ dependencies = [
 
 [[package]]
 name = "brehon-policy"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "async-trait",
  "brehon-ports",
@@ -709,7 +709,7 @@ dependencies = [
 
 [[package]]
 name = "brehon-ports"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "async-trait",
  "brehon-types",
@@ -721,7 +721,7 @@ dependencies = [
 
 [[package]]
 name = "brehon-protocol"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "brehon-types",
  "criterion",
@@ -738,7 +738,7 @@ dependencies = [
 
 [[package]]
 name = "brehon-pty"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "brehon-adapter-agy",
  "brehon-adapter-claude",
@@ -761,7 +761,7 @@ dependencies = [
 
 [[package]]
 name = "brehon-recording"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "bincode",
  "chrono",
@@ -779,7 +779,7 @@ dependencies = [
 
 [[package]]
 name = "brehon-review"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "async-trait",
  "brehon-mux",
@@ -799,7 +799,7 @@ dependencies = [
 
 [[package]]
 name = "brehon-runtime"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "async-trait",
  "brehon-ports",
@@ -810,7 +810,7 @@ dependencies = [
 
 [[package]]
 name = "brehon-search-tantivy"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "async-trait",
  "brehon-ports",
@@ -828,7 +828,7 @@ dependencies = [
 
 [[package]]
 name = "brehon-store-fjall"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "async-trait",
  "brehon-ports",
@@ -849,7 +849,7 @@ dependencies = [
 
 [[package]]
 name = "brehon-supervisor"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "async-trait",
  "brehon-ports",
@@ -869,7 +869,7 @@ dependencies = [
 
 [[package]]
 name = "brehon-test-harness"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "async-trait",
  "brehon-mcp",
@@ -895,7 +895,7 @@ dependencies = [
 
 [[package]]
 name = "brehon-tui"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "async-trait",
  "base64",
@@ -923,7 +923,7 @@ dependencies = [
 
 [[package]]
 name = "brehon-types"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "chrono",
  "directories",
@@ -939,7 +939,7 @@ dependencies = [
 
 [[package]]
 name = "brehon-workflow"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "async-trait",
  "brehon-ports",
@@ -1830,7 +1830,7 @@ dependencies = [
 
 [[package]]
 name = "ghostty_vt"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "ghostty_vt_sys",
  "thiserror 2.0.18",
@@ -1838,7 +1838,7 @@ dependencies = [
 
 [[package]]
 name = "ghostty_vt_sys"
-version = "0.1.4"
+version = "0.1.5"
 
 [[package]]
 name = "git2"
@@ -3978,7 +3978,7 @@ dependencies = [
 
 [[package]]
 name = "splash-demo"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "crossterm 0.29.0",
 ]

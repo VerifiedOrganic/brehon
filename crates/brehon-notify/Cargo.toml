@@ -1,6 +1,6 @@
 [package]
 name = "brehon-notify"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 description = "External operator notification delivery for Brehon"
 license = "MIT"
