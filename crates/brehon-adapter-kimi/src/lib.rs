@@ -7,6 +7,7 @@
 
 pub mod acp_types;
 pub mod kimi;
+mod permission;
 
 pub use kimi::{
     build_kimi_spawn_config, desired_kimi_mcp_config, kimi_share_dir, prepare_local_kimi_runtime,

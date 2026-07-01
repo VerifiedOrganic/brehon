@@ -222,7 +222,7 @@ pub(crate) fn build_task_scoped_self_improvement_prompt(
     let mutation_rule = if mutating {
         "Edits are allowed, but only inside this task's current worktree and only for the same task scope. Do not touch unrelated files, branches, or worktrees. If you make task-scoped edits, checkpoint through Brehon before stopping."
     } else {
-        "Do not edit files, create commits, or change task status during this pass. Keep this self-improvement run non-mutating."
+        "Do not edit files, create commits, or change task status during this pass. Do not create build artifacts. Keep this self-improvement run non-mutating. For Go main packages, do not run bare `go build <package>` because it writes an executable into the current directory; use `go test`, `go build ./...`, or `go build -o /tmp/<name> <package>` instead."
     };
 
     Some(format!(
