@@ -61,16 +61,6 @@ impl PtyConfig {
             config.args.push(startup_prompt);
         }
 
-        if let Some(reasoning_effort) = reasoning_effort {
-            config.args.push(
-                if brehon_adapter_kimi::kimi::kimi_thinking_enabled(reasoning_effort) {
-                    "--thinking".to_string()
-                } else {
-                    "--no-thinking".to_string()
-                },
-            );
-        }
-
         Self {
             command: config.command,
             args: config.args,
