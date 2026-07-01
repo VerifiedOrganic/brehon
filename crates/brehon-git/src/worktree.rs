@@ -144,10 +144,9 @@ impl<'a> WorktreeOps<'a> {
         }
 
         let mut opts = git2::WorktreeAddOptions::new();
-        // Reattach to the target branch instead of coupling git's worktree
+        // Attach HEAD to the target branch without coupling git's worktree
         // registration name to the branch name. This keeps metadata stable and
         // avoids nested `.git/worktrees/<branch/...>` registrations.
-        opts.checkout_existing(true);
         opts.reference(Some(branch_ref.get()));
         let _worktree = self.repo.worktree(&worktree_name, path, Some(&opts))?;
 

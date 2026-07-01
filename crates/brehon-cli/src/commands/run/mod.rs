@@ -17,11 +17,11 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use agent_env::{
-    apply_agent_cargo_target_env, apply_agent_runtime_tmp_env, cleanup_session_runtime_tmp_dir,
-};
+use agent_env::cleanup_session_runtime_tmp_dir;
+use agent_env::{apply_agent_cargo_target_env, apply_agent_runtime_tmp_env, profile_env};
 use anyhow::Result;
 use async_trait::async_trait;
+use brehon_types::PermissionProfileRole as Role;
 use direct_tools::BrehonDirectToolBridgeFactory;
 use review::{
     build_planned_review_panel_seats, build_reviewer_panels, reconcile_review_runtime_for_run,
@@ -1518,7 +1518,7 @@ pub async fn execute(
         .cargo_target_root
         .as_deref()
         .map(PathBuf::from);
-    let launcher_env_pairs = |lane: &str| -> Vec<(String, String)> {
+    let launcher_env_pairs = |role: Role, lane: &str| -> Vec<(String, String)> {
         let mut pairs = config
             .lane_launcher(lane)
             .map(|launcher| {
@@ -1538,6 +1538,7 @@ pub async fn execute(
             "BREHON_WORKTREE_ROOT".to_string(),
             worktree_root_env_value.clone(),
         ));
+        let mut pairs = profile_env(&config, role, lane, pairs);
         pairs.sort_by(|left, right| left.0.cmp(&right.0));
         pairs
     };
@@ -1566,7 +1567,7 @@ pub async fn execute(
             worker_cli_map.insert(name.clone(), agent_to_adapter(&pool.lane, &config));
             worker_agent_type_map.insert(name.clone(), pool.lane.clone());
             worker_model_map.insert(name.clone(), model_str.clone());
-            let mut worker_env = launcher_env_pairs(&pool.lane);
+            let mut worker_env = launcher_env_pairs(Role::Worker, &pool.lane);
             if let Some(policy) = combine_startup_policy(
                 worker_project_policy.as_deref(),
                 config.lane_system_prompt(&pool.lane, None),
@@ -1633,7 +1634,7 @@ pub async fn execute(
             reviewer_cli_map.insert(name.clone(), agent_to_adapter(&pool.lane, &config));
             reviewer_agent_type_map.insert(name.clone(), pool.lane.clone());
             reviewer_model_map.insert(name.clone(), model_str.clone());
-            let mut reviewer_env = launcher_env_pairs(&pool.lane);
+            let mut reviewer_env = launcher_env_pairs(Role::Reviewer, &pool.lane);
             if let Some(policy) = combine_startup_policy(
                 reviewer_project_policy.as_deref(),
                 config.lane_system_prompt(&pool.lane, pool.system_prompt.as_deref()),
@@ -1692,7 +1693,7 @@ pub async fn execute(
                 advisor_cli_map.insert(name.clone(), agent_to_adapter(&pool.lane, &config));
                 advisor_agent_type_map.insert(name.clone(), pool.lane.clone());
                 advisor_model_map.insert(name.clone(), model_str.clone());
-                let mut advisor_env = launcher_env_pairs(&pool.lane);
+                let mut advisor_env = launcher_env_pairs(Role::Advisor, &pool.lane);
                 if let Some(policy) = combine_startup_policy(
                     advisor_project_policy.as_deref(),
                     config.lane_system_prompt(&pool.lane, pool.system_prompt.as_deref()),
@@ -1747,7 +1748,7 @@ pub async fn execute(
                 research_cli_map.insert(name.clone(), agent_to_adapter(&pool.lane, &config));
                 research_agent_type_map.insert(name.clone(), pool.id.clone());
                 research_model_map.insert(name.clone(), model_str.clone());
-                let mut research_env = launcher_env_pairs(&pool.lane);
+                let mut research_env = launcher_env_pairs(Role::Research, &pool.lane);
                 research_env.push(("BREHON_RESEARCH_POOL_ID".to_string(), pool.id.clone()));
                 research_env.push(("BREHON_RESEARCH_POOL_LANE".to_string(), pool.lane.clone()));
                 research_env.push(("BREHON_RESEARCH_ROLE".to_string(), pool.role.clone()));
@@ -2016,7 +2017,7 @@ pub async fn execute(
         }
     };
     let supervisor_cwd = supervisor_cwds.get(&config.roles.supervisor.name).cloned();
-    let mut supervisor_env = launcher_env_pairs(&config.roles.supervisor.name);
+    let mut supervisor_env = launcher_env_pairs(Role::Supervisor, &config.roles.supervisor.name);
     if let Some(policy) = config.project_prompt_for_role_name("supervisor") {
         supervisor_env.push(("BREHON_ROLE_SYSTEM_PROMPT".to_string(), policy));
     }

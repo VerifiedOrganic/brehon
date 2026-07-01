@@ -299,6 +299,70 @@ pub(super) fn task_has_recoverable_environment_limited_checkpoint(
         && has_environment_marker
 }
 
+pub(super) fn task_has_operator_directed_checkpoint_recovery(
+    task: &serde_json::Map<String, Value>,
+) -> bool {
+    let blockers = task
+        .get("blockers")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let notes = task
+        .get("notes")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let text = format!("{blockers}\n{notes}").to_ascii_lowercase();
+    let has_checkpoint_marker = text.contains("checkpoint")
+        || text.contains("latest_commit")
+        || text.contains("latest commit")
+        || text.contains("stale checkpoint");
+    let asks_for_review_recovery = text.contains("recover_handoff")
+        || text.contains("checkpoint-review discharge")
+        || (text.contains("review_ready")
+            && (text.contains("adjudicat") || text.contains("archive")));
+
+    has_checkpoint_marker && asks_for_review_recovery
+}
+
+pub(super) fn task_has_resolved_external_unblock_marker(
+    task: &serde_json::Map<String, Value>,
+    reason: Option<&str>,
+) -> bool {
+    let blockers = task
+        .get("blockers")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let notes = task
+        .get("notes")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let reason = reason.unwrap_or("");
+    let text = format!("{blockers}\n{notes}\n{reason}").to_ascii_lowercase();
+    let resolved = text.contains("resolved")
+        || text.contains("available")
+        || text.contains("re-pinned")
+        || text.contains("repinned")
+        || text.contains("updated")
+        || text.contains("satisfied")
+        || text.contains("cleared");
+    let external = text.contains("external")
+        || text.contains("environment")
+        || text.contains("sdk")
+        || text.contains("pin")
+        || text.contains("client")
+        || text.contains("missing api")
+        || text.contains("tool availability");
+    let worker_frontier = text.contains("worker frontier")
+        || text.contains("rework")
+        || text.contains("reassignment")
+        || text.contains("reassign")
+        || text.contains("normal implementation")
+        || text.contains("return to pending");
+
+    (resolved && external && worker_frontier)
+        || text.contains("external blocker resolved")
+        || text.contains("external prerequisite is now satisfied")
+}
+
 pub(super) fn task_has_recoverable_blocked_review_checkpoint(
     task: &serde_json::Map<String, Value>,
 ) -> bool {

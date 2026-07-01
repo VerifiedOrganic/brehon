@@ -1,6 +1,279 @@
 use super::*;
 
 #[tokio::test]
+async fn test_unblock_returns_external_blocked_task_to_pending_frontier() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let root = make_test_root();
+    let _env = ScopedEnv::set_with_defaults(&[
+        ("BREHON_ROOT", root.path().to_str().unwrap()),
+        ("BREHON_AGENT_ROLE", "supervisor"),
+    ]);
+    let tool = TaskActionsTool::new();
+
+    write_test_task(root.path(), "T-sdk-pin", "blocked", "task");
+    let mut task = read_test_task(root.path(), "T-sdk-pin");
+    task["assignee"] = Value::String("worker-1".to_string());
+    task["percent"] = Value::Number(serde_json::Number::from(20_u64));
+    task["latest_commit"] = Value::String("29ffd473bc583ab12ceb605f5fe9203bb6fe4636".to_string());
+    task["activity"] = Value::String("waiting_on_supervisor".to_string());
+    task["inbox_delivered"] = Value::Bool(true);
+    task["assignment_propagation"] = serde_json::json!({
+        "owner": "worker-1",
+        "prompt_id": "prompt-1",
+        "delivery_method": "direct"
+    });
+    task["blockers"] = Value::String(
+        "Blocked until the SDK pin includes NetconfSshSmokeClientConfig and run_netconf_ssh_smoke."
+            .to_string(),
+    );
+    std::fs::write(
+        root.path()
+            .join("runtime")
+            .join("tasks")
+            .join("T-sdk-pin.json"),
+        serde_json::to_string_pretty(&task).unwrap(),
+    )
+    .unwrap();
+
+    let result = tool
+        .execute(serde_json::json!({
+            "action": "unblock",
+            "id": "T-sdk-pin",
+            "reason": "SDK pin updated to c4b6f2f9 with the NETCONF SSH smoke client available; return to worker frontier."
+        }))
+        .await
+        .unwrap();
+
+    assert!(result.is_error.is_none(), "{}", extract_text(&result));
+    let payload: Value = serde_json::from_str(&extract_text(&result)).unwrap();
+    assert_eq!(payload["action"], "unblock");
+    assert_eq!(payload["from_status"], "blocked");
+    assert_eq!(payload["to_status"], "pending");
+    assert_eq!(payload["cleared_assignee"], "worker-1");
+    assert_eq!(payload["dependencies_blocking"], serde_json::json!([]));
+    assert_eq!(payload["next_action"]["kind"], "refresh_frontier");
+
+    let after = read_test_task(root.path(), "T-sdk-pin");
+    assert_eq!(after["status"], "pending");
+    assert_eq!(after["assignee"], Value::Null);
+    assert_eq!(after["review_owner"], Value::Null);
+    assert_eq!(after["inbox_delivered"], false);
+    assert_eq!(
+        after["latest_commit"],
+        "29ffd473bc583ab12ceb605f5fe9203bb6fe4636"
+    );
+    assert_eq!(after["percent"], 20);
+    assert!(after.get("blockers").is_none());
+    assert!(after.get("activity").is_none());
+    assert!(after.get("assignment_propagation").is_none());
+    assert!(after["unblock_note"]
+        .as_str()
+        .unwrap()
+        .contains("SDK pin updated"));
+}
+
+#[tokio::test]
+async fn test_unblock_rejects_slow_active_task() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let root = make_test_root();
+    let _env = ScopedEnv::set_with_defaults(&[
+        ("BREHON_ROOT", root.path().to_str().unwrap()),
+        ("BREHON_AGENT_ROLE", "supervisor"),
+    ]);
+    let tool = TaskActionsTool::new();
+
+    write_test_task(root.path(), "T-slow", "in_progress", "task");
+    let result = tool
+        .execute(serde_json::json!({
+            "action": "unblock",
+            "id": "T-slow",
+            "reason": "worker appears slow"
+        }))
+        .await
+        .unwrap();
+
+    assert_eq!(result.is_error, Some(true));
+    let payload: Value = serde_json::from_str(&extract_text(&result)).unwrap();
+    assert_eq!(payload["error_code"], "unblock_wrong_status");
+
+    let after = read_test_task(root.path(), "T-slow");
+    assert_eq!(after["status"], "in_progress");
+    assert_eq!(after["assignee"], "worker-1");
+}
+
+#[tokio::test]
+async fn test_unblock_rejects_generic_blocked_task() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let root = make_test_root();
+    let _env = ScopedEnv::set_with_defaults(&[
+        ("BREHON_ROOT", root.path().to_str().unwrap()),
+        ("BREHON_AGENT_ROLE", "supervisor"),
+    ]);
+    let tool = TaskActionsTool::new();
+
+    write_test_task(root.path(), "T-generic", "blocked", "task");
+    let mut task = read_test_task(root.path(), "T-generic");
+    task["blockers"] = Value::String("Worker appears slow; try moving it along.".to_string());
+    std::fs::write(
+        root.path()
+            .join("runtime")
+            .join("tasks")
+            .join("T-generic.json"),
+        serde_json::to_string_pretty(&task).unwrap(),
+    )
+    .unwrap();
+
+    let result = tool
+        .execute(serde_json::json!({
+            "action": "unblock",
+            "id": "T-generic",
+            "reason": "worker appears slow"
+        }))
+        .await
+        .unwrap();
+
+    assert_eq!(result.is_error, Some(true));
+    let payload: Value = serde_json::from_str(&extract_text(&result)).unwrap();
+    assert_eq!(
+        payload["error_code"],
+        "unblock_not_resolved_external_blocker"
+    );
+    assert_eq!(
+        read_test_task(root.path(), "T-generic")["status"],
+        "blocked"
+    );
+}
+
+#[tokio::test]
+async fn test_unblock_requires_reason_and_blocking_evidence() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let root = make_test_root();
+    let _env = ScopedEnv::set_with_defaults(&[
+        ("BREHON_ROOT", root.path().to_str().unwrap()),
+        ("BREHON_AGENT_ROLE", "supervisor"),
+    ]);
+    let tool = TaskActionsTool::new();
+
+    write_test_task(root.path(), "T-no-reason", "blocked", "task");
+    let missing_reason = tool
+        .execute(serde_json::json!({
+            "action": "unblock",
+            "id": "T-no-reason"
+        }))
+        .await
+        .unwrap();
+    assert_eq!(missing_reason.is_error, Some(true));
+    let payload: Value = serde_json::from_str(&extract_text(&missing_reason)).unwrap();
+    assert_eq!(payload["error_code"], "missing_unblock_reason");
+
+    let missing_evidence = tool
+        .execute(serde_json::json!({
+            "action": "unblock",
+            "id": "T-no-reason",
+            "reason": "external blocker resolved"
+        }))
+        .await
+        .unwrap();
+    assert_eq!(missing_evidence.is_error, Some(true));
+    let payload: Value = serde_json::from_str(&extract_text(&missing_evidence)).unwrap();
+    assert_eq!(payload["error_code"], "unblock_missing_blocking_evidence");
+
+    let after = read_test_task(root.path(), "T-no-reason");
+    assert_eq!(after["status"], "blocked");
+}
+
+#[tokio::test]
+async fn test_unblock_does_not_bypass_unmet_dependencies() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let root = make_test_root();
+    let _env = ScopedEnv::set_with_defaults(&[
+        ("BREHON_ROOT", root.path().to_str().unwrap()),
+        ("BREHON_AGENT_ROLE", "supervisor"),
+    ]);
+    let tool = TaskActionsTool::new();
+
+    write_test_task(root.path(), "T-dep", "pending", "task");
+    write_test_task(root.path(), "T-dependent", "blocked", "task");
+    let mut dependent = read_test_task(root.path(), "T-dependent");
+    dependent["blockers"] = Value::String("Waiting for dependency T-dep.".to_string());
+    dependent["dependencies"] = serde_json::json!(["T-dep"]);
+    dependent["blocked_by"] = serde_json::json!(["T-dep"]);
+    std::fs::write(
+        root.path()
+            .join("runtime")
+            .join("tasks")
+            .join("T-dependent.json"),
+        serde_json::to_string_pretty(&dependent).unwrap(),
+    )
+    .unwrap();
+
+    let result = tool
+        .execute(serde_json::json!({
+            "action": "unblock",
+            "id": "T-dependent",
+            "reason": "manual blocker text is stale; dependency reconciliation should decide readiness"
+        }))
+        .await
+        .unwrap();
+
+    assert!(result.is_error.is_none(), "{}", extract_text(&result));
+    let payload: Value = serde_json::from_str(&extract_text(&result)).unwrap();
+    assert_eq!(payload["to_status"], "blocked");
+    assert_eq!(
+        payload["dependencies_blocking"],
+        serde_json::json!(["T-dep"])
+    );
+
+    let after = read_test_task(root.path(), "T-dependent");
+    assert_eq!(after["status"], "blocked");
+    assert_eq!(after["blocked_by"], serde_json::json!(["T-dep"]));
+    assert!(after.get("blockers").is_none());
+}
+
+#[tokio::test]
+async fn test_ready_surfaces_resolved_external_unblock() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let root = make_test_root();
+    let _env = ScopedEnv::set_with_defaults(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
+    let tool = TaskActionsTool::new();
+
+    write_test_task(root.path(), "T-sdk-pin", "blocked", "task");
+    let mut task = read_test_task(root.path(), "T-sdk-pin");
+    task["assignee"] = Value::Null;
+    task["blockers"] = Value::String(
+        "Environment limitation is now resolved: SDK re-pinned to c4b6f2f9 and \
+         the NETCONF SSH smoke client is available. Recover this checkpoint for \
+         rework/reassignment."
+            .to_string(),
+    );
+    std::fs::write(
+        root.path()
+            .join("runtime")
+            .join("tasks")
+            .join("T-sdk-pin.json"),
+        serde_json::to_string_pretty(&task).unwrap(),
+    )
+    .unwrap();
+
+    let ready = tool
+        .execute(serde_json::json!({"action": "ready"}))
+        .await
+        .unwrap();
+    let payload: Value = serde_json::from_str(&extract_text(&ready)).unwrap();
+    assert_eq!(payload["blocked_handoff_count"], 1, "{payload}");
+    assert_eq!(payload["recoverable_blocked_count"], 0, "{payload}");
+    assert_eq!(
+        payload["blocked_handoff_tasks"][0]["recovery_kind"],
+        "resolved_external_unblock"
+    );
+    assert_eq!(
+        payload["blocked_handoff_tasks"][0]["repair_action"]["args"]["action"],
+        "unblock"
+    );
+    assert_eq!(payload["next_action"]["kind"], "unblock");
+}
+
+#[tokio::test]
 async fn test_recover_handoff_action_repairs_empty_assignee_rather_than_blocker() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();

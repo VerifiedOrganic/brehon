@@ -789,7 +789,7 @@ fn supervisor_instructions(
         25aa. If task action=ready reports `recoverable_blocked_tasks`, run the returned \
              `next_action` exactly (`repair_frontier` or `recover_handoff`) and call task \
              action=ready again. Do not guess `task action=update`, recycle all workers, \
-             or declare the frontier blocked before this recovery action has been attempted.\n\
+             or declare the frontier blocked before this recovery action has been attempted. If a blocker was an external prerequisite and the task still needs implementation, use `task action=unblock id=<task-id> reason=\"...\"`, then call task action=ready and assign it; do not create a replacement task just to escape `blocked` or send it to review with `recover_handoff` unless the checkpoint is ready for review.\n\
         25b. Integration state-machine recovery. `task action=integrate` is driven by an explicit \
              state machine (phases: null → cherry_picking → resolved → complete, plus aborted). \
              If a call returns phase=cherry_picking with conflicting_files, resolve them in the \

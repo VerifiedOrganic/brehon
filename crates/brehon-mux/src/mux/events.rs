@@ -712,25 +712,31 @@ impl Mux {
         generation: Generation,
         now: Instant,
     ) {
-        let mut state_change = None;
-        if let Some(pane) = self.panes.get_mut(pane_id)
-            && !matches!(
+        let Some(pane) = self.panes.get_mut(pane_id) else {
+            return;
+        };
+        if pane.current_generation() != generation
+            || matches!(
                 pane.pane_state(),
                 Some(PaneState::Blocked { .. } | PaneState::Dead { .. })
             )
         {
-            let previous = pane.pane_state().map(Self::runtime_pane_state_for_state);
-            pane.set_tool_executing(true);
-            if !matches!(pane.pane_state(), Some(PaneState::Busy { .. })) {
-                pane.set_pane_busy(prompt_id.clone(), generation, now);
-            }
-            state_change = Self::runtime_state_change(
-                previous,
-                pane.pane_state(),
-                "gateway reported active prompt",
-            );
+            return;
         }
-        if let Some((previous, current, reason, blocked)) = state_change {
+        let previous = pane.pane_state().map(Self::runtime_pane_state_for_state);
+        match pane.pane_state() {
+            Some(PaneState::Busy {
+                generation: busy_generation,
+                ..
+            }) if *busy_generation == generation => pane.touch_busy_activity(now),
+            _ => pane.set_pane_busy(prompt_id.clone(), generation, now),
+        }
+        pane.set_tool_executing(true);
+        if let Some((previous, current, reason, blocked)) = Self::runtime_state_change(
+            previous,
+            pane.pane_state(),
+            "gateway reported active prompt",
+        ) {
             self.publish_runtime_pane_state_changed(
                 pane_id,
                 generation,
@@ -740,12 +746,6 @@ impl Mux {
                 blocked,
             );
         }
-        tracing::warn!(
-            pane = %pane_id,
-            prompt_id = %prompt_id,
-            generation = generation.0,
-            "Gateway reported an active prompt while mux had no live turn; marked pane busy"
-        );
     }
 
     fn accept_generation_event(&self, pane_id: &str, event_gen: Generation) -> bool {

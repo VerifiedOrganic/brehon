@@ -27,19 +27,21 @@ Start with:
 - `mcp__brehon__task action=list status=blocked`
 - `mcp__brehon__factory action=worker_status`
 
-`task action=ready` is the main dispatch queue. It can include conflicts, ready worker tasks, review-ready tasks, changes-requested tasks, approved tasks, stalled tasks, and followup source tasks.
+`task action=ready` is the main dispatch queue. It can include conflicts, recoverable blocked handoffs, ready worker tasks, review-ready tasks, changes-requested tasks, approved tasks, stalled tasks, and followup source tasks.
 
 ## Queue Order
 
 Process in this order:
 
 1. `integration_conflict_tasks`: resolve or explicitly triage supervisor-owned conflicts first.
-2. `review_ready_tasks`: call `mcp__brehon__verification action=request_review task_id=<task-id>`.
-3. `approved_tasks`: integrate or close before starting new work.
-4. `changes_requested_tasks`: reassign to a worker; stored `review_feedback` carries prior blockers.
-5. `stalled_tasks`: inspect delivery and worker status before re-nudging. Reassign if the worker acknowledged but did not act.
-6. `followup_source_tasks`: inspect and promote, or waive by explicit id and reason.
-7. `tasks`: assign pending worker tasks to idle workers.
+2. `recoverable_blocked_tasks`: run `ready.next_action` exactly (`repair_frontier` or `recover_handoff`), then refresh `ready`.
+3. Resolved external blockers: if a blocked task was waiting on an external prerequisite and still needs implementation, run `mcp__brehon__task action=unblock id=<task-id> reason="..."`, then refresh `ready` and assign it. Do not create a replacement task just to escape `blocked`.
+4. `review_ready_tasks`: call `mcp__brehon__verification action=request_review task_id=<task-id>`.
+5. `approved_tasks`: integrate or close before starting new work.
+6. `changes_requested_tasks`: reassign to a worker; stored `review_feedback` carries prior blockers.
+7. `stalled_tasks`: inspect delivery and worker status before re-nudging. Reassign if the worker acknowledged but did not act.
+8. `followup_source_tasks`: inspect and promote, or waive by explicit id and reason.
+9. `tasks`: assign pending worker tasks to idle workers.
 
 After any queue-changing action, call `mcp__brehon__task action=ready` again before ending your turn.
 
