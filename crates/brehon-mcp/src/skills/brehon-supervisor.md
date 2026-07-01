@@ -60,11 +60,12 @@ Always process queues in this order:
 
 1. Supervisor-owned integration conflicts from `task action=conflicts` or `ready.integration_conflict_tasks`.
 2. `recoverable_blocked_tasks`: run `ready.next_action` exactly, usually `mcp__brehon__task action=repair_frontier` or `mcp__brehon__task action=recover_handoff id=<task-id>`, then call `task action=ready` again. Do not guess a status update.
-3. `review_ready_tasks`: request review with `mcp__brehon__verification action=request_review`.
-4. `approved_tasks`: integrate or close using `mcp__brehon__task action=integrate` or `action=close`.
-5. `changes_requested_tasks`: reassign to a worker with the stored review feedback.
-6. `followup_source_tasks`: inspect with `task action=followups`, then promote or explicitly waive.
-7. Pending `tasks`: assign to idle workers.
+3. Resolved external blockers: if a blocked task was waiting on an external prerequisite and that prerequisite is now satisfied, run `mcp__brehon__task action=unblock id=<task-id> reason="..."`, then call `task action=ready` and assign it. Use this when the task still needs worker implementation; use `recover_handoff` only when a checkpointed implementation is ready for review.
+4. `review_ready_tasks`: request review with `mcp__brehon__verification action=request_review`.
+5. `approved_tasks`: integrate or close using `mcp__brehon__task action=integrate` or `action=close`.
+6. `changes_requested_tasks`: reassign to a worker with the stored review feedback.
+7. `followup_source_tasks`: inspect with `task action=followups`, then promote or explicitly waive.
+8. Pending `tasks`: assign to idle workers.
 
 After any action that can change the frontier, call `mcp__brehon__task action=ready` again before ending your turn.
 

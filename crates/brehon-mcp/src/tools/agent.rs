@@ -653,6 +653,7 @@ fn supervisor_instructions(
             - `followup_source_tasks`: tasks with open approved-review followups that should usually be promoted into real cleanup tasks\n\
             If `integration_conflict_tasks` is non-empty, resolve or explicitly triage those before requesting review, integrating approved work, or dispatching new worker tasks.\n\
             If `recoverable_blocked_tasks` is non-empty, run `ready.next_action` exactly, usually `task action=repair_frontier`; for a single task, `task action=recover_handoff id=<task-id>` is also valid. Then call `task action=ready` again. Do not guess a status update.\n\
+            If a blocked task was waiting on an external condition that is now resolved and the work still needs normal implementation, run `task action=unblock id=<task-id> reason=\"...\"`; this clears stale blocker/assignee metadata and returns it to the pending frontier. Do not use `recover_handoff` unless the worker already checkpointed completed work that should go to review.\n\
             If `review_ready_tasks` is non-empty, request review for those before treating the frontier as empty.\n\
             If `changes_requested_tasks` is non-empty, reassign those revision tasks to idle workers before pulling new pending work.\n\
             If `stalled_tasks` is non-empty, investigate before re-nudging — call `agent action=delivery_status prompt_id=<id>` with the prompt_id of your last message to that worker to see whether it was injected or dead-lettered, and `factory action=worker_status` to see the worker's `nudge.nudge_delivery_state` (`Delivered` → `Acknowledged` → `ActedOn` or `TimedOut`). If the nudge never acknowledged, the worker never saw it; if acknowledged but not acted on, the worker saw it and ignored it — transfer the task to an idle worker with `factory action=assign_workers task_id=<task_id> worker=<worker_name> force_reassign=true` rather than re-nudging.\n\
@@ -790,6 +791,11 @@ fn supervisor_instructions(
              `next_action` exactly (`repair_frontier` or `recover_handoff`) and call task \
              action=ready again. Do not guess `task action=update`, recycle all workers, \
              or declare the frontier blocked before this recovery action has been attempted.\n\
+        25ab. If a blocker was an external prerequisite and that prerequisite is now satisfied \
+             while the task still needs worker implementation, use `task action=unblock id=<task-id> reason=\"...\"` \
+             to return it to the pending frontier, then call task action=ready and assign it. \
+             Do not create a replacement task just to escape `blocked`, and do not send it to review \
+             with `recover_handoff` unless the existing checkpoint is actually ready for review.\n\
         25b. Integration state-machine recovery. `task action=integrate` is driven by an explicit \
              state machine (phases: null → cherry_picking → resolved → complete, plus aborted). \
              If a call returns phase=cherry_picking with conflicting_files, resolve them in the \

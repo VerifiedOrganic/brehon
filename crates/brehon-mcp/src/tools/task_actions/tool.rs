@@ -64,7 +64,7 @@ impl Tool for TaskActionsTool {
     }
 
     fn description(&self) -> &str {
-        "Task lifecycle management. Supervisors should call action=ready and follow its next_action before guessing workflow steps; workers use checkpoint/complete/progress, supervisors use repair_frontier/recover_handoff/request_review/integrate/close recovery paths."
+        "Task lifecycle management. Supervisors should call action=ready and follow its next_action before guessing workflow steps; workers use checkpoint/complete/progress, supervisors use unblock/repair_frontier/recover_handoff/request_review/integrate/close recovery paths."
     }
 
     fn input_schema(&self) -> Value {
@@ -73,7 +73,7 @@ impl Tool for TaskActionsTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "description": "Action: list, mine, ready, repair_frontier, recover_handoff, checkpoint, complete, close, archive, integrate, abort-integration, progress, update, create, subtasks, children, conflicts, followups, promote_followups, waive_followups, ensure_final_hardening. Supervisors: call ready first; ready returns priority queues plus next_action. If next_action.kind=repair_frontier or recover_handoff, call that exact task action instead of guessing status updates."
+                    "description": "Action: list, mine, ready, unblock, repair_frontier, recover_handoff, checkpoint, complete, close, archive, integrate, abort-integration, progress, update, create, subtasks, children, conflicts, followups, promote_followups, waive_followups, ensure_final_hardening. Supervisors: call ready first; ready returns priority queues plus next_action. If an external blocker has been resolved and the same task should return to worker execution, use action=unblock id=<task-id> reason=<why>. If next_action.kind=repair_frontier or recover_handoff, call that exact task action instead of guessing status updates."
                 },
                 "id": {
                     "type": "string",
@@ -94,7 +94,7 @@ impl Tool for TaskActionsTool {
                 },
                 "status": {
                     "type": "string",
-                    "description": "Task status or filter. Do not guess status transitions. Workers finish with action=complete; supervisors start reviews with verification action=request_review. Use recover_handoff or repair_frontier for blocked worker handoff recovery; supervisor action=update status=review_ready is retained only for backward-compatible integration-conflict recovery."
+                    "description": "Task status or filter. Do not guess status transitions. Workers finish with action=complete; supervisors start reviews with verification action=request_review. Use action=unblock to clear a resolved external blocker and return a task to pending worker execution. Use recover_handoff or repair_frontier for blocked worker handoff recovery; supervisor action=update status=review_ready is retained only for backward-compatible integration-conflict recovery."
                 },
                 "include_closed": {
                     "type": "boolean",
@@ -211,7 +211,7 @@ impl Tool for TaskActionsTool {
                 },
                 "reason": {
                     "type": "string",
-                    "description": "For action=archive or abort-integration: human-readable reason for the change"
+                    "description": "For action=unblock, archive, or abort-integration: human-readable reason for the change"
                 },
                 "recursive": {
                     "type": "boolean",
@@ -248,6 +248,11 @@ impl Tool for TaskActionsTool {
                     "action": "repair_frontier"
                 },
                 {
+                    "action": "unblock",
+                    "id": "T-example",
+                    "reason": "External SDK dependency is now pinned to a build that provides the missing API."
+                },
+                {
                     "action": "recover_handoff",
                     "id": "T-example"
                 },
@@ -278,6 +283,7 @@ impl Tool for TaskActionsTool {
             "mine" => super::action_query::execute_mine(&args).await,
             "conflicts" => super::action_query::execute_conflicts(&args).await,
             "ready" => super::action_query::execute_ready(&args).await,
+            "unblock" => super::action_repair::execute_unblock(&args).await,
             "repair_frontier" => super::action_repair::execute_repair_frontier(&args).await,
             "recover_handoff" => super::action_repair::execute_recover_handoff(&args).await,
             "children" | "subtasks" => super::action_query::execute_children(&args).await,

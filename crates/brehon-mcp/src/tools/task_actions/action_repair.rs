@@ -13,8 +13,11 @@ use super::dependencies::{
     task_has_legacy_completed_worker_status, task_has_recoverable_blocked_review_checkpoint,
     task_has_recoverable_environment_limited_checkpoint,
     task_has_recoverable_worker_state_blocker_text, task_review_feedback_outcome,
+    write_string_list_field,
 };
-use super::lifecycle::{ancestor_chain_has_closed_parent, caller_role};
+use super::lifecycle::{
+    ancestor_chain_has_closed_parent, caller_role, reconcile_dependency_states_with_task_lock,
+};
 use super::locking::acquire_task_lock;
 use super::persistence::{read_all_tasks, read_task, write_task};
 use super::structured_spec::control_plane_scope_issue_for_task;
@@ -26,6 +29,17 @@ struct RecoverOutcome {
     to_status: String,
     latest_commit: String,
     already_recovered: bool,
+}
+
+#[derive(Debug, Clone)]
+struct UnblockOutcome {
+    task_id: String,
+    from_status: String,
+    to_status: String,
+    cleared_assignee: Option<String>,
+    dependencies_blocking: Vec<String>,
+    already_unblocked: bool,
+    reconciled_tasks: Vec<String>,
 }
 
 fn task_id_from_task(task: &serde_json::Map<String, Value>) -> Option<String> {
@@ -88,6 +102,14 @@ fn request_review_next_action(id: &str) -> Value {
         "kind": "request_review",
         "tool": "verification",
         "args": { "action": "request_review", "task_id": id }
+    })
+}
+
+fn unblock_next_action(id: &str) -> Value {
+    serde_json::json!({
+        "kind": "unblock",
+        "tool": "task",
+        "args": { "action": "unblock", "id": id, "reason": "External blocker resolved; return to worker frontier." }
     })
 }
 
@@ -156,6 +178,190 @@ fn apply_recover_handoff(task: &mut serde_json::Map<String, Value>, recovery_not
         "updated_at".into(),
         Value::String(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
     );
+}
+
+fn unblock_reason(args: &Value) -> Result<String, ToolResult> {
+    args.get("reason")
+        .or_else(|| args.get("notes"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            structured_repair_error(
+                "missing_unblock_reason",
+                "Missing required parameter for task action=unblock: reason. Record the resolved external prerequisite before returning a blocked task to the worker frontier.",
+                false,
+                Value::Null,
+                vec![ready_next_action()],
+                ready_next_action(),
+            )
+        })
+}
+
+fn has_blocking_evidence(task: &serde_json::Map<String, Value>) -> bool {
+    task.get("blockers")
+        .and_then(|value| value.as_str())
+        .is_some_and(|value| !value.trim().is_empty())
+        || !super::dependencies::read_string_list_field(task, "blocked_by").is_empty()
+}
+
+fn apply_unblock(task: &mut serde_json::Map<String, Value>, reason: &str) -> Option<String> {
+    let cleared_assignee = task
+        .get("assignee")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+
+    task.remove("blockers");
+    write_string_list_field(task, "blocked_by", &[]);
+    task.insert("status".into(), Value::String("pending".to_string()));
+    task.insert("assignee".into(), Value::Null);
+    task.insert("review_owner".into(), Value::Null);
+    task.remove("activity");
+    task.remove("assignment_propagation");
+    task.remove("orphaned_assignee");
+    task.remove("orphaned_status");
+    task.insert("inbox_delivered".into(), Value::Bool(false));
+    task.insert("unblock_note".into(), Value::String(reason.to_string()));
+    task.insert(
+        "unblocked_at".into(),
+        Value::String(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
+    );
+    task.insert(
+        "updated_at".into(),
+        Value::String(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
+    );
+
+    cleared_assignee
+}
+
+async fn unblock_by_id(id: &str, reason: &str) -> Result<UnblockOutcome, ToolResult> {
+    let _lock = acquire_task_lock(id).await.map_err(|err| {
+        structured_repair_error(
+            "task_lock_failed",
+            format!("Failed to lock task {id}: {err}"),
+            true,
+            serde_json::json!({ "task_id": id }),
+            vec![unblock_next_action(id), ready_next_action()],
+            unblock_next_action(id),
+        )
+    })?;
+
+    let Some(mut task) = read_task(id) else {
+        return Err(structured_repair_error(
+            "task_not_found",
+            format!("Task not found: {id}"),
+            false,
+            repair_current_state(id, None),
+            vec![ready_next_action()],
+            ready_next_action(),
+        ));
+    };
+
+    let current_status = task
+        .get("status")
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let normalized_status = normalize_task_status(&current_status);
+    let task_type = task
+        .get("task_type")
+        .and_then(|value| value.as_str())
+        .unwrap_or("task");
+
+    if is_terminal_task_status(&current_status) {
+        return Err(structured_repair_error(
+            "task_terminal",
+            format!("Task {id} is terminal ({current_status}) and cannot be unblocked."),
+            false,
+            repair_current_state(id, Some(&task)),
+            vec![ready_next_action()],
+            ready_next_action(),
+        ));
+    }
+
+    if task_type != "task" {
+        return Err(structured_repair_error(
+            "unblock_not_worker_task",
+            format!("Task {id} is task_type={task_type}; unblock only returns concrete worker tasks to the assignment frontier."),
+            false,
+            repair_current_state(id, Some(&task)),
+            vec![ready_next_action()],
+            ready_next_action(),
+        ));
+    }
+
+    if normalized_status != Some("blocked") {
+        return Err(structured_repair_error(
+            "unblock_wrong_status",
+            format!(
+                "Task {id} is {current_status}; unblock only clears tasks currently in blocked state."
+            ),
+            false,
+            repair_current_state(id, Some(&task)),
+            vec![ready_next_action()],
+            ready_next_action(),
+        ));
+    }
+
+    if !has_blocking_evidence(&task) {
+        return Err(structured_repair_error(
+            "unblock_missing_blocking_evidence",
+            format!("Task {id} is blocked but has no blockers or blocked_by evidence. Inspect the task before unblocking; do not use unblock as a generic workflow nudge."),
+            false,
+            repair_current_state(id, Some(&task)),
+            vec![ready_next_action()],
+            ready_next_action(),
+        ));
+    }
+
+    let cleared_assignee = apply_unblock(&mut task, reason);
+    if !write_task(id, &task) {
+        return Err(structured_repair_error(
+            "task_write_failed",
+            format!("Failed to persist unblock for task {id}."),
+            true,
+            repair_current_state(id, Some(&task)),
+            vec![unblock_next_action(id), ready_next_action()],
+            unblock_next_action(id),
+        ));
+    }
+
+    let reconciled_tasks = reconcile_dependency_states_with_task_lock(id)
+        .await
+        .map_err(|err| {
+            structured_repair_error(
+                "dependency_reconcile_failed",
+                format!("Task {id} was unblocked, but dependency reconciliation failed: {err}"),
+                true,
+                read_task(id)
+                    .as_ref()
+                    .map(|task| repair_current_state(id, Some(task)))
+                    .unwrap_or_else(|| repair_current_state(id, None)),
+                vec![ready_next_action()],
+                ready_next_action(),
+            )
+        })?;
+
+    let after = read_task(id).unwrap_or(task);
+    let to_status = after
+        .get("status")
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let dependencies_blocking = super::dependencies::read_string_list_field(&after, "blocked_by");
+
+    Ok(UnblockOutcome {
+        task_id: id.to_string(),
+        from_status: current_status,
+        to_status,
+        cleared_assignee,
+        dependencies_blocking,
+        already_unblocked: false,
+        reconciled_tasks,
+    })
 }
 
 async fn recover_handoff_by_id(id: &str) -> Result<RecoverOutcome, ToolResult> {
@@ -392,6 +598,61 @@ pub(super) async fn execute_recover_handoff(args: &Value) -> Result<ToolResult, 
                 "to_status": outcome.to_status,
                 "latest_commit": outcome.latest_commit,
                 "already_recovered": outcome.already_recovered,
+                "next_action": next_action,
+            });
+            Ok(text_result(
+                serde_json::to_string_pretty(&result)
+                    .map_err(|err| McpError::Serialization(err.to_string()))?,
+            ))
+        }
+        Err(result) => Ok(result),
+    }
+}
+
+pub(super) async fn execute_unblock(args: &Value) -> Result<ToolResult, McpError> {
+    let id = match args.get("id").and_then(|value| value.as_str()) {
+        Some(id) if !id.trim().is_empty() => id.trim(),
+        _ => {
+            return Ok(structured_repair_error(
+                "missing_task_id",
+                "Missing required parameter: id",
+                false,
+                Value::Null,
+                vec![ready_next_action()],
+                ready_next_action(),
+            ));
+        }
+    };
+
+    if caller_role(args) != "supervisor" {
+        return Ok(structured_repair_error(
+            "supervisor_required",
+            "Only supervisors can unblock tasks.",
+            false,
+            serde_json::json!({ "task_id": id, "caller_role": caller_role(args) }),
+            vec![ready_next_action()],
+            ready_next_action(),
+        ));
+    }
+
+    let reason = match unblock_reason(args) {
+        Ok(reason) => reason,
+        Err(result) => return Ok(result),
+    };
+    match unblock_by_id(id, &reason).await {
+        Ok(outcome) => {
+            let next_action = ready_next_action();
+            let result = serde_json::json!({
+                "status": "ok",
+                "action": "unblock",
+                "task_id": outcome.task_id,
+                "from_status": outcome.from_status,
+                "to_status": outcome.to_status,
+                "cleared_assignee": outcome.cleared_assignee,
+                "dependencies_blocking": outcome.dependencies_blocking,
+                "already_unblocked": outcome.already_unblocked,
+                "reconciled_tasks": outcome.reconciled_tasks,
+                "reason": reason,
                 "next_action": next_action,
             });
             Ok(text_result(
