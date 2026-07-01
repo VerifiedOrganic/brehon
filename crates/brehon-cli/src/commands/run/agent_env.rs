@@ -190,7 +190,7 @@ mod tests {
             .get_mut("codex-worker")
             .expect("codex worker lane")
             .profile = Some(brehon_types::PermissionProfile::Unsafe);
-        let mut env = vec![
+        let env = vec![
             (
                 "CODEX_PERMISSION_PROFILE".to_string(),
                 "workspace".to_string(),
