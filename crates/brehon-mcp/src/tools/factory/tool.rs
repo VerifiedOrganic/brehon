@@ -31,14 +31,14 @@ use super::git_sync::{
     MergeTargetBaseSyncStatus, MergeTargetSyncStatus,
 };
 use super::paths::{read_all_tasks, read_sessions, read_task, write_task};
+use super::reassignment::{
+    is_live_active_reassignment, live_reassignment_requires_force_message,
+    prepare_previous_worktree_for_reassignment, reassigned_worktree_state, ForcedReassignment,
+};
 use super::workers::{
     active_tasks_for_worker, agent_health, agent_is_unavailable, inspect_worktree,
     live_worker_names, query_nudge_state, require_supervisor_role, FORCE_REASSIGN_PARAM,
     HEARTBEAT_THRESHOLD_SECS, OUTPUT_THRESHOLD_SECS,
-};
-use super::worktree_ops::{
-    archive_worktree_with_git2, check_worktree_state_with_git2, find_worktree_by_worker,
-    remove_worktree_with_git2,
 };
 
 /// MCP tool for factory orchestration: spawning workers, checking status, and assigning tasks.
@@ -423,7 +423,7 @@ impl Tool for FactoryTool {
                 },
                 "force_reassign": {
                     "type": "boolean",
-                    "description": "Force reassignment even if worktree is dirty (archives instead of deleting)"
+                    "description": "Explicitly transfer assigned/in_progress/changes_requested work from a current or dirty owner; dirty previous worktrees are archived"
                 },
                 "force_policy": {
                     "type": "boolean",
@@ -760,6 +760,7 @@ impl Tool for FactoryTool {
                 let mut research_jobs_queued: Vec<Value> = Vec::new();
                 let mut research_warning: Option<String> = None;
                 let mut assignment_propagation: Option<AssignmentPropagation> = None;
+                let mut forced_reassignment = ForcedReassignment::default();
 
                 if let Some(mut task) = read_task(task_id) {
                     let task_type = task
@@ -820,27 +821,32 @@ impl Tool for FactoryTool {
                         )));
                     }
 
-                    if normalized_status == "changes_requested" {
-                        if let Some(existing_owner) = previous_assignee
-                            .as_deref()
-                            .filter(|existing| *existing != assignee)
-                            .filter(|existing| live_workers.contains(*existing))
-                        {
-                            return Ok(error_result(format!(
-                                "Cannot assign task {task_id} to worker '{assignee}': task is already owned by live worker '{existing_owner}' while changes are requested. \
-                                 Transferring a live owner can leave two worker panes acting on the same task. Assign '{existing_owner}' again, or recycle/mark that worker unavailable before assigning another worker."
-                            )));
-                        }
-                    }
-
                     let orphaned_active_reassignment = matches!(
                         recovery_status,
                         "assigned" | "in_progress" | "changes_requested"
                     ) && previous_assignee
                         .as_deref()
                         .is_some_and(|existing| !live_workers.contains(existing));
+                    let live_active_reassignment = is_live_active_reassignment(
+                        normalized_status,
+                        previous_assignee.as_deref(),
+                        assignee,
+                        &live_workers,
+                    );
 
-                    if !matches!(normalized_status, "pending" | "changes_requested")
+                    if live_active_reassignment && !force_reassign {
+                        let existing_owner = previous_assignee.as_deref().unwrap_or("unknown");
+                        return Ok(error_result(live_reassignment_requires_force_message(
+                            task_id,
+                            existing_owner,
+                            assignee,
+                        )));
+                    }
+
+                    if !matches!(
+                        normalized_status,
+                        "pending" | "assigned" | "in_progress" | "changes_requested"
+                    )
                         && !orphaned_active_reassignment
                     {
                         let message = if is_terminal_task_status(normalized_status) {
@@ -849,8 +855,8 @@ impl Tool for FactoryTool {
                             )
                         } else {
                             format!(
-                                "Cannot assign task {task_id}: status must be 'pending' or \
-                                 'changes_requested', got '{normalized_status}'."
+                                "Cannot assign task {task_id}: status must be 'pending', 'assigned', \
+                                 'in_progress', or 'changes_requested', got '{normalized_status}'."
                             )
                         };
                         return Ok(error_result(message));
@@ -913,93 +919,16 @@ impl Tool for FactoryTool {
                         )));
                     }
 
-                    if orphaned_active_reassignment {
-                        if let Some(old_assignee) = &previous_assignee {
-                            // Fail-closed: state check errors block reassignment unless forced
-                            match find_worktree_by_worker(old_assignee) {
-                                Ok(Some((repo, worktree_path))) => {
-                                    match check_worktree_state_with_git2(&repo, &worktree_path) {
-                                        Ok(state) => {
-                                            use brehon_git::WorktreeStateCheck;
-                                            match state {
-                                                WorktreeStateCheck::Clean => {
-                                                    if let Err(e) = remove_worktree_with_git2(
-                                                        &repo,
-                                                        &worktree_path,
-                                                    ) {
-                                                        tracing::warn!(
-                                                            "Failed to remove clean worktree for {}: {}",
-                                                            old_assignee,
-                                                            e
-                                                        );
-                                                    }
-                                                }
-                                                WorktreeStateCheck::Missing => {
-                                                    // No action needed - worktree doesn't exist
-                                                }
-                                                WorktreeStateCheck::Dirty { details }
-                                                | WorktreeStateCheck::MidOperation {
-                                                    operation: details,
-                                                } => {
-                                                    if !force_reassign {
-                                                        return Ok(error_result(format!(
-                                                            "Cannot reassign task {task_id}: old worker '{old_assignee}' has dirty worktree ({}) \
-                                                             Use force_reassign=true to archive the worktree and proceed.",
-                                                            details
-                                                        )));
-                                                    }
-
-                                                    match archive_worktree_with_git2(
-                                                        &repo,
-                                                        &worktree_path,
-                                                        old_assignee,
-                                                        task_id,
-                                                        "reassignment",
-                                                    ) {
-                                                        Ok(archive_path) => {
-                                                            tracing::info!(
-                                                                "Archived dirty worktree for {} at {}",
-                                                                old_assignee,
-                                                                archive_path
-                                                            );
-                                                            task.insert(
-                                                                "worktree_archived".into(),
-                                                                Value::String(archive_path.clone()),
-                                                            );
-                                                        }
-                                                        Err(e) => {
-                                                            return Ok(error_result(format!(
-                                                                "Failed to archive worktree for {}: {}",
-                                                                old_assignee, e
-                                                            )));
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        Err(e) => {
-                                            // State check failed - fail closed unless forced
-                                            if !force_reassign {
-                                                return Ok(error_result(format!(
-                                                    "Cannot reassign task {task_id}: worktree state check failed for '{old_assignee}': {e} \
-                                                     Use force_reassign=true to proceed anyway."
-                                                )));
-                                            }
-                                        }
-                                    }
-                                }
-                                Ok(None) => {
-                                    // No worktree found - continue with reassignment
-                                }
-                                Err(e) => {
-                                    // Ambiguous or other error - fail closed unless forced
-                                    if !force_reassign {
-                                        return Ok(error_result(format!(
-                                            "Cannot reassign task {task_id}: failed to locate worktree for '{old_assignee}': {e} \
-                                             Use force_reassign=true to proceed anyway."
-                                        )));
-                                    }
-                                }
+                    if orphaned_active_reassignment || live_active_reassignment {
+                        if let Some(old_assignee) = previous_assignee.as_deref() {
+                            if let Err(message) = prepare_previous_worktree_for_reassignment(
+                                task_id,
+                                &mut task,
+                                old_assignee,
+                                force_reassign,
+                                orphaned_active_reassignment,
+                            ) {
+                                return Ok(error_result(message));
                             }
                         }
                     }
@@ -1066,6 +995,28 @@ impl Tool for FactoryTool {
                     assignment_propagation =
                         Some(stage_task_assignment_propagation(&mut task, assignee, "task"));
 
+                    if live_active_reassignment {
+                        if let Some(old_assignee) = previous_assignee.as_deref() {
+                            forced_reassignment.record_live_transfer(
+                                &mut task,
+                                old_assignee,
+                                assignee,
+                                normalized_status,
+                            );
+                            self.emit_event(
+                                EventKind::WorkerReassigned {
+                                    old_worker: old_assignee.to_string(),
+                                    new_worker: assignee.to_string(),
+                                    task_id: task_id.to_string(),
+                                    reason: "forced_live_transfer".to_string(),
+                                    worktree_state: reassigned_worktree_state(&task),
+                                },
+                                task_id.to_string(),
+                            )
+                            .await;
+                        }
+                    }
+
                     if orphaned_active_reassignment {
                         let worktree_archived = task
                             .get("worktree_archived")
@@ -1122,6 +1073,8 @@ impl Tool for FactoryTool {
                     )));
                 }
                 increment_assignment_history(1);
+
+                forced_reassignment.queue_previous_worker_recycle(task_id);
 
                 if project_config
                     .as_ref()
@@ -1305,6 +1258,7 @@ impl Tool for FactoryTool {
                     result["prompt_id"] = Value::String(delivery.prompt_id.clone());
                 }
                 if let Some(task) = refreshed_task.as_ref() {
+                    forced_reassignment.append_result_fields(&mut result);
                     if let Some(note) = task.get("recovery_note").and_then(|v| v.as_str()) {
                         result["recovery_note"] = Value::String(note.to_string());
                         result["recovered_orphaned_task"] = Value::Bool(true);

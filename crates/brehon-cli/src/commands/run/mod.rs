@@ -1,4 +1,5 @@
 mod agent_env;
+mod agent_path;
 mod direct_tools;
 mod review;
 mod setup;
@@ -1398,6 +1399,7 @@ pub async fn execute(
     } else {
         None
     };
+    let agent_git_guard_bin = agent_path::ensure_agent_git_guard_bin(&cwd, &config, &mut splash)?;
 
     // Ensure MCP server config exists before spawning agents
     splash.set_stage("Preparing runtime");
@@ -1531,6 +1533,7 @@ pub async fn execute(
         if cargo_target_root.is_some() {
             pairs.retain(|(key, _)| key != "CARGO_TARGET_DIR");
         }
+        agent_path::prepend_optional_launcher_path(&mut pairs, agent_git_guard_bin.as_deref());
         pairs.push((
             "BREHON_WORKTREE_ROOT".to_string(),
             worktree_root_env_value.clone(),

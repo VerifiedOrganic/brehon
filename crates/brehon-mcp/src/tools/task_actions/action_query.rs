@@ -16,11 +16,6 @@ use crate::tools::verification::{
 };
 use crate::tools::{error_result, text_result};
 
-use super::dependencies::{
-    task_has_final_review_feedback, task_has_integrated_record,
-    task_has_legacy_completed_worker_status, task_has_recoverable_worker_state_blocker_text,
-    task_review_feedback_outcome,
-};
 use super::epic::{
     check_child_completion, check_epic_integration_status, task_has_supervisor_integration_conflict,
 };
@@ -37,6 +32,9 @@ use super::structured_spec::control_plane_scope_issue_for_task;
 
 mod ready_closeout;
 mod ready_conflicts;
+mod ready_handoff;
+
+use ready_handoff::blocked_handoff_context;
 
 fn nonempty_json_string(task: &serde_json::Map<String, Value>, key: &str) -> Option<String> {
     task.get(key)
@@ -478,92 +476,6 @@ fn task_liveness_context(task: &serde_json::Map<String, Value>) -> Value {
         "last_seen_at": session.get("last_seen_at").cloned().unwrap_or(Value::Null),
         "registered_at": session.get("registered_at").cloned().unwrap_or(Value::Null),
     })
-}
-
-fn task_has_recorded_handoff_commit(task: &serde_json::Map<String, Value>) -> bool {
-    task.get("latest_commit")
-        .and_then(|value| value.as_str())
-        .is_some_and(|value| !value.trim().is_empty())
-}
-
-fn blocked_handoff_context(
-    task: &serde_json::Map<String, Value>,
-    all_tasks: &[serde_json::Map<String, Value>],
-    config: Option<&brehon_types::BrehonConfig>,
-) -> Option<Value> {
-    let status = task.get("status").and_then(|v| v.as_str()).unwrap_or("");
-    let task_type = task
-        .get("task_type")
-        .and_then(|v| v.as_str())
-        .unwrap_or("task");
-    let recoverable_blocked =
-        status == "blocked" && task_has_recoverable_worker_state_blocker_text(task);
-    let legacy_completed = task_has_legacy_completed_worker_status(task);
-    if task_type != "task" || (!recoverable_blocked && !legacy_completed) {
-        return None;
-    }
-
-    let has_commit = task_has_recorded_handoff_commit(task);
-    let closed_parent = ancestor_chain_has_closed_parent(all_tasks, task);
-    let scope_issue = control_plane_scope_issue_for_task(task);
-    let integrated_record = task_has_integrated_record(task);
-    let final_review_feedback = task_has_final_review_feedback(task);
-    let safe_repair = has_commit
-        && !closed_parent
-        && scope_issue.is_none()
-        && !integrated_record
-        && !final_review_feedback;
-    let mut value = ready_queue_task(task, config);
-    let task_id = queued_task_id(&value).unwrap_or("").to_string();
-    value["safe_repair"] = Value::Bool(safe_repair);
-    value["repair_action"] = if safe_repair {
-        serde_json::json!({
-            "kind": "recover_handoff",
-            "tool": "task",
-            "args": {
-                "action": "recover_handoff",
-                "id": task_id
-            }
-        })
-    } else if !has_commit {
-        serde_json::json!({
-            "kind": "wait_for_worker_checkpoint_or_reassign",
-            "tool": "task",
-            "args": {
-                "action": "ready"
-            }
-        })
-    } else {
-        serde_json::json!({
-            "kind": "inspect_task",
-            "tool": "task",
-            "args": {
-                "action": "list",
-                "status": "blocked"
-            }
-        })
-    };
-    value["repair_blocker"] = if safe_repair {
-        Value::Null
-    } else if !has_commit {
-        Value::String("latest_commit is missing".to_string())
-    } else if integrated_record {
-        Value::String(
-            "task already records integration_status=integrated; reconcile closure instead of re-reviewing"
-                .to_string(),
-        )
-    } else if let Some(outcome) = task_review_feedback_outcome(task) {
-        Value::String(format!(
-            "task has final review_feedback outcome={outcome}; do not requeue the same commit"
-        ))
-    } else if legacy_completed {
-        Value::String("legacy completed handoff state is not safe to repair".to_string())
-    } else if closed_parent {
-        Value::String("task has a closed ancestor".to_string())
-    } else {
-        Value::String(scope_issue.unwrap_or_else(|| "unsafe handoff state".to_string()))
-    };
-    Some(value)
 }
 
 fn queued_task_id(task: &Value) -> Option<&str> {
@@ -1197,7 +1109,7 @@ pub(super) async fn execute_ready(args: &Value) -> Result<ToolResult, McpError> 
     }
     if recoverable_blocked_count > 0 {
         priority_notes.push(format!(
-            "{recoverable_blocked_count} blocked task(s) have recoverable worker handoff state and should be repaired with task action=repair_frontier"
+            "{recoverable_blocked_count} blocked task(s) have recoverable worker handoff or post-review checkpoint state and should be repaired with task action=repair_frontier"
         ));
     }
     if blocked_handoff_count > recoverable_blocked_count {
@@ -1246,7 +1158,7 @@ pub(super) async fn execute_ready(args: &Value) -> Result<ToolResult, McpError> 
         serde_json::json!({
             "kind": "repair_frontier",
             "tool": "task",
-            "description": "Apply deterministic safe repairs from ready.recoverable_blocked_tasks. This recovers blocked worker handoffs with recorded latest_commit, then you must call task action=ready again.",
+            "description": "Apply deterministic safe repairs from ready.recoverable_blocked_tasks. This recovers blocked worker handoffs or fresh post-review checkpoints with recorded latest_commit, then you must call task action=ready again.",
             "args": {
                 "action": "repair_frontier"
             }
@@ -1273,6 +1185,18 @@ pub(super) async fn execute_ready(args: &Value) -> Result<ToolResult, McpError> 
             "args": {
                 "action": "assign_workers",
                 "task_id": task_id
+            },
+            "requires": ["workers"]
+        })
+    } else if let Some(task_id) = stalled_tasks.first().and_then(queued_task_id) {
+        serde_json::json!({
+            "kind": "force_reassign_stalled_revision_worker",
+            "tool": "factory",
+            "description": "Assigned changes_requested task has exceeded the stall threshold. After checking worker_status/delivery_status, transfer it to an idle worker with force_reassign=true.",
+            "args": {
+                "action": "assign_workers",
+                "task_id": task_id,
+                "force_reassign": true
             },
             "requires": ["workers"]
         })

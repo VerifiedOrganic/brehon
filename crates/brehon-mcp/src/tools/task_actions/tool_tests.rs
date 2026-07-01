@@ -33,6 +33,8 @@ use tracing_subscriber::fmt::MakeWriter;
 mod git_patch_id_tests;
 #[path = "tool_tests/integrated_closeout.rs"]
 mod integrated_closeout;
+#[path = "tool_tests/recovery.rs"]
+mod recovery;
 #[derive(Clone, Default)]
 struct SharedLogBuffer(Arc<Mutex<Vec<u8>>>);
 
@@ -2264,50 +2266,6 @@ async fn test_recover_handoff_action_repairs_blocked_worker_handoff() {
 }
 
 #[tokio::test]
-async fn test_recover_handoff_action_repairs_legacy_completed_worker_handoff() {
-    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let root = make_test_root();
-    let _env = ScopedEnv::set_with_defaults(&[
-        ("BREHON_ROOT", root.path().to_str().unwrap()),
-        ("BREHON_AGENT_ROLE", "supervisor"),
-    ]);
-    let tool = TaskActionsTool::new();
-
-    write_test_task(root.path(), "T-completed-action", "completed", "task");
-    let mut task = read_test_task(root.path(), "T-completed-action");
-    task["latest_commit"] = Value::String("feedface".to_string());
-    task["percent"] = Value::Number(serde_json::Number::from(100_u64));
-    std::fs::write(
-        root.path()
-            .join("runtime")
-            .join("tasks")
-            .join("T-completed-action.json"),
-        serde_json::to_string_pretty(&task).unwrap(),
-    )
-    .unwrap();
-
-    let result = tool
-        .execute(serde_json::json!({
-            "action": "recover_handoff",
-            "id": "T-completed-action"
-        }))
-        .await
-        .unwrap();
-
-    assert!(result.is_error.is_none(), "{}", extract_text(&result));
-    let payload: Value = serde_json::from_str(&extract_text(&result)).unwrap();
-    assert_eq!(payload["from_status"], "completed");
-    assert_eq!(payload["to_status"], "review_ready");
-    assert_eq!(payload["next_action"]["kind"], "request_review");
-
-    let after = read_test_task(root.path(), "T-completed-action");
-    assert_eq!(after["status"], "review_ready");
-    assert_eq!(after["latest_commit"], "feedface");
-    assert_eq!(after["assignee"], Value::Null);
-    assert_eq!(after["review_owner"], Value::Null);
-}
-
-#[tokio::test]
 async fn test_repair_frontier_repairs_all_safe_blocked_handoffs() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
@@ -2574,6 +2532,43 @@ async fn test_recover_handoff_reports_structured_errors_for_unsafe_states() {
         .await
         .unwrap();
     assert_error_code(not_recoverable_result, "handoff_not_recoverable");
+
+    write_test_task(root.path(), "T-same-review-commit", "blocked", "task");
+    write_review_metadata_with_commits(
+        root.path(),
+        "T-same-review-commit",
+        "changes_requested",
+        "1111111111111111111111111111111111111111",
+        &["1111111111111111111111111111111111111111"],
+    );
+    let mut same_review_commit = read_test_task(root.path(), "T-same-review-commit");
+    same_review_commit["latest_commit"] =
+        Value::String("1111111111111111111111111111111111111111".to_string());
+    same_review_commit["review_feedback"] = serde_json::json!({
+        "outcome": "changes_requested",
+        "review_id": "REV-same",
+        "round": 1
+    });
+    same_review_commit["blockers"] = Value::String(
+        "Round 1 followups have been addressed and checkpointed, but no fresh review commit exists."
+            .to_string(),
+    );
+    std::fs::write(
+        root.path()
+            .join("runtime")
+            .join("tasks")
+            .join("T-same-review-commit.json"),
+        serde_json::to_string_pretty(&same_review_commit).unwrap(),
+    )
+    .unwrap();
+    let same_review_commit_result = tool
+        .execute(serde_json::json!({
+            "action": "recover_handoff",
+            "id": "T-same-review-commit"
+        }))
+        .await
+        .unwrap();
+    assert_error_code(same_review_commit_result, "handoff_not_recoverable");
 
     write_test_task(root.path(), "T-already-integrated", "blocked", "task");
     let mut already_integrated = read_test_task(root.path(), "T-already-integrated");

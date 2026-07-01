@@ -11,8 +11,11 @@ use crate::commands::serve::{BREHON_MCP_BACKING_ENV, MCP_BACKING_RUNTIME_FILES};
 use std::os::unix::fs::PermissionsExt;
 
 mod adapter_selection;
+mod agent_git_guard;
 #[cfg(test)]
 mod protected_branch_tests;
+
+pub(crate) use agent_git_guard::ensure_agent_git_worktree_guard;
 
 const BREHON_PROTECTED_BRANCH_GUARD_BEGIN: &str = "# BEGIN BREHON PROTECTED BRANCH GUARD";
 const BREHON_PROTECTED_BRANCH_GUARD_END: &str = "# END BREHON PROTECTED BRANCH GUARD";
@@ -1612,7 +1615,7 @@ pub(crate) fn ensure_claude_worktree_hook(cwd: &Path) -> Result<()> {
     let brehon_bin = std::env::current_exe().context(
         "Failed to resolve current brehon binary path; Claude worktree hook cannot be installed",
     )?;
-    let hook_command = format!("{} {}", brehon_bin.display(), "claude-hook");
+    let hook_command = claude_hook_command(cwd, &brehon_bin);
 
     let settings_path = cwd.join(CLAUDE_SETTINGS_RELATIVE);
     if let Some(parent) = settings_path.parent() {
@@ -1699,6 +1702,33 @@ fn entry_contains_brehon_marker(entry: &serde_json::Value) -> bool {
 fn command_contains_brehon_hook_marker(cmd: &str) -> bool {
     cmd.contains(CLAUDE_HOOK_MARKER)
         || (cmd.contains("brehon") && cmd.split_whitespace().last() == Some("claude-hook"))
+}
+
+fn claude_hook_command(cwd: &Path, brehon_bin: &Path) -> String {
+    let brehon_root = cwd.join(".brehon");
+    let mut env = vec![
+        format!("BREHON_ROOT={}", shell_quote(&brehon_root)),
+        format!("BREHON_PROJECT_ROOT={}", shell_quote(cwd)),
+        "BREHON_WORKSPACE_ROOT=\"${BREHON_WORKSPACE_ROOT:-$PWD}\"".to_string(),
+        "BREHON_AGENT_ROLE=\"${BREHON_AGENT_ROLE:-}\"".to_string(),
+        "BREHON_MERGE_TARGET=\"${BREHON_MERGE_TARGET:-}\"".to_string(),
+    ];
+    if let Some(worktree_root) =
+        std::env::var_os("BREHON_WORKTREE_ROOT").filter(|value| !value.is_empty())
+    {
+        env.push(format!(
+            "BREHON_WORKTREE_ROOT={}",
+            shell_quote(Path::new(&worktree_root))
+        ));
+    }
+    env.push(shell_quote(brehon_bin));
+    env.push("claude-hook".to_string());
+    env.join(" ")
+}
+
+fn shell_quote(path: &Path) -> String {
+    let raw = path.to_string_lossy();
+    format!("'{}'", raw.replace('\'', "'\\''"))
 }
 
 /// RAII guard that activates the Claude worktree hook by writing the active
@@ -2727,6 +2757,47 @@ mod tests {
         assert!(entries
             .iter()
             .any(|entry| entry["matcher"].as_str() == Some("Read")));
+
+        let hook_command = entries
+            .iter()
+            .filter(|entry| entry_contains_brehon_marker(entry))
+            .find_map(|entry| {
+                entry
+                    .get("hooks")
+                    .and_then(|hooks| hooks.as_array())
+                    .and_then(|hooks| hooks.first())
+                    .and_then(|hook| hook.get("command"))
+                    .and_then(|command| command.as_str())
+            })
+            .expect("Brehon hook command should be present");
+        assert!(
+            hook_command.contains("BREHON_ROOT="),
+            "hook command should carry BREHON_ROOT explicitly: {hook_command}"
+        );
+        assert!(
+            hook_command.contains("BREHON_PROJECT_ROOT="),
+            "hook command should carry BREHON_PROJECT_ROOT explicitly: {hook_command}"
+        );
+        assert!(
+            hook_command.contains("BREHON_WORKSPACE_ROOT=\"${BREHON_WORKSPACE_ROOT:-$PWD}\""),
+            "hook command should derive missing BREHON_WORKSPACE_ROOT from PWD: {hook_command}"
+        );
+        assert!(
+            command_contains_brehon_hook_marker(hook_command),
+            "hook command should still contain the removable Brehon marker: {hook_command}"
+        );
+    }
+
+    #[test]
+    fn test_claude_hook_command_quotes_paths() {
+        let command = claude_hook_command(
+            Path::new("/tmp/repo with ' quote"),
+            Path::new("/tmp/bin/brehon with ' quote"),
+        );
+
+        assert!(command.contains("BREHON_ROOT='/tmp/repo with '\\'' quote/.brehon'"));
+        assert!(command.contains("BREHON_PROJECT_ROOT='/tmp/repo with '\\'' quote'"));
+        assert!(command.contains("'/tmp/bin/brehon with '\\'' quote' claude-hook"));
     }
 
     #[test]
