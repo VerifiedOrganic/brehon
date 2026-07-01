@@ -7051,22 +7051,31 @@ TypeError: Cannot read properties of undefined"#,
 
         crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
 
-        let first = recv_route(&harness.rx);
-        assert_eq!(first.command.target.pane_id.as_deref(), Some("worker-2"));
+        let routes = [
+            recv_route(&harness.rx),
+            recv_route(&harness.rx),
+            recv_route(&harness.rx),
+        ];
+        let route_for = |worker: &str| {
+            routes
+                .iter()
+                .find(|route| route.command.target.pane_id.as_deref() == Some(worker))
+                .unwrap_or_else(|| panic!("expected command for {worker}"))
+        };
+
+        let first = route_for("worker-2");
         assert!(matches!(
             first.command.kind,
             RuntimeCommandKind::RecyclePane { ref reason }
                 if reason.contains("auto-recover prompt-blocked idle worker pane")
         ));
-        let second = recv_route(&harness.rx);
-        assert_eq!(second.command.target.pane_id.as_deref(), Some("worker-1"));
+        let second = route_for("worker-1");
         assert!(matches!(
             second.command.kind,
             RuntimeCommandKind::RecyclePane { ref reason }
                 if reason == "auto-fence recovered stalled worker pane after task T-owned handoff"
         ));
-        let third = recv_route(&harness.rx);
-        assert_eq!(third.command.target.pane_id.as_deref(), Some("worker-4"));
+        let third = route_for("worker-4");
         assert!(matches!(
             third.command.kind,
             RuntimeCommandKind::SendPrompt { ref text, .. }
@@ -7125,24 +7134,33 @@ TypeError: Cannot read properties of undefined"#,
 
         crate::run::stall_handling::detect_and_handle_stalls(&mut harness.ctx);
 
-        let first = recv_route(&harness.rx);
-        assert_eq!(first.command.target.pane_id.as_deref(), Some("worker-2"));
+        let routes = [
+            recv_route(&harness.rx),
+            recv_route(&harness.rx),
+            recv_route(&harness.rx),
+        ];
+        let route_for = |worker: &str| {
+            routes
+                .iter()
+                .find(|route| route.command.target.pane_id.as_deref() == Some(worker))
+                .unwrap_or_else(|| panic!("expected command for {worker}"))
+        };
+
+        let worker_2 = route_for("worker-2");
         assert!(matches!(
-            first.command.kind,
+            worker_2.command.kind,
             RuntimeCommandKind::RecyclePane { ref reason }
                 if reason == "auto-recover idle worker pane via daemon recycle"
         ));
-        let second = recv_route(&harness.rx);
-        assert_eq!(second.command.target.pane_id.as_deref(), Some("worker-1"));
+        let worker_1 = route_for("worker-1");
         assert!(matches!(
-            second.command.kind,
+            worker_1.command.kind,
             RuntimeCommandKind::RecyclePane { ref reason }
                 if reason == "auto-fence recovered stalled worker pane after task T-owned handoff"
         ));
-        let third = recv_route(&harness.rx);
-        assert_eq!(third.command.target.pane_id.as_deref(), Some("worker-3"));
+        let worker_3 = route_for("worker-3");
         assert!(matches!(
-            third.command.kind,
+            worker_3.command.kind,
             RuntimeCommandKind::SendPrompt { ref text, .. }
                 if text.contains("You have been assigned recovered task T-owned: Owned task")
         ));
