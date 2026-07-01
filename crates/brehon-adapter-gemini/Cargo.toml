@@ -1,6 +1,6 @@
 [package]
 name = "brehon-adapter-gemini"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2021"
 description = "Gemini CLI adapter for Brehon"
 license = "MIT"
