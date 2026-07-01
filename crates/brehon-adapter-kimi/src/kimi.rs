@@ -833,7 +833,7 @@ pub fn build_kimi_spawn_config(
         ));
     }
 
-    let mut args = vec!["--work-dir".to_string(), cwd.to_string_lossy().to_string()];
+    let mut args = Vec::new(); // Kimi uses cwd; there is no --work-dir flag.
     if allow_yolo {
         args.push("--yolo".to_string());
     }

@@ -2325,11 +2325,12 @@ key = "oauth/kimi-code"
             Some("kimi-for-coding"),
             Some("off"),
         );
-
         assert_eq!(config.command, "kimi");
-        assert!(config.args.contains(&"--work-dir".to_string()));
+        assert_eq!(config.cwd.as_ref(), Some(&workdir));
+        assert!(!config.args.contains(&"--work-dir".to_string()));
         assert!(!config.args.contains(&"--yolo".to_string()));
-        assert!(config.args.contains(&"--no-thinking".to_string()));
+        assert!(!config.args.contains(&"--thinking".to_string()));
+        assert!(!config.args.contains(&"--no-thinking".to_string()));
         assert!(config.args.contains(&"--prompt".to_string()));
         let startup_prompt = config
             .args
@@ -2346,7 +2347,6 @@ key = "oauth/kimi-code"
                 .iter()
                 .any(|(k, v)| k == "BREHON_FACTORY_WORKER_CLI" && v == "kimi")
         );
-
         let _ = std::fs::remove_dir_all(workdir);
     }
 
