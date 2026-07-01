@@ -1,6 +1,6 @@
 [package]
 name = "brehon-types"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2021"
 description = "Core domain types and value objects for Brehon"
 license = "MIT"

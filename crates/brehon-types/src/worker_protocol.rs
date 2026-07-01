@@ -82,6 +82,12 @@ pub fn build_worker_protocol(
          120s/300s Cargo timeout is not test evidence and is not a task failure; rerun with a \
          proper timeout or report the real blocker after the longer timeout."
             .to_string(),
+        "Go command rule: do not use bare `go build <package>` as a validation command for a \
+         `main` package, because Go writes the executable into the current directory. Prefer \
+         `go test`, `go vet`, or `go build ./...`; if you must compile a specific command \
+         package, use `go build -o /tmp/<name> <package>` so no repo root or worktree artifact \
+         is left behind."
+            .to_string(),
         "Do NOT use host or built-in task tools such as `TaskList`, `TaskUpdate`, `TaskCreate`, \
          `TaskGet`, or `TaskOutput` for Brehon work. They are not Brehon lifecycle tools and can \
          bypass checkpoint, review, and integration state."

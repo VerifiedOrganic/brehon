@@ -36,6 +36,9 @@ use crate::acp_types::{
     create_prompt_request, parse_new_session_result, parse_prompt_result,
     PromptResult as AcpPromptResult, SessionMetadata,
 };
+use crate::permission::{
+    permission_denial_reason, permission_response_for_approved, permission_response_for_denied,
+};
 
 // =============================================================================
 // Constants
@@ -1884,10 +1887,17 @@ async fn respond_to_raw_kimi_server_request(
 
 fn response_for_kimi_server_request(request: &JsonRpcRequest) -> JsonRpcResponse {
     if is_kimi_permission_request(request) {
+        if let Some(reason) = permission_denial_reason(request.params.as_ref()) {
+            debug!(method = %request.method, request_id = %request.id, reason = %reason, "Rejecting unsafe Kimi permission request");
+            return JsonRpcResponse::success(
+                request.id.clone(),
+                permission_response_for_denied(request.params.as_ref(), &reason),
+            );
+        }
         debug!(method = %request.method, request_id = %request.id, "Auto-approving Kimi permission request");
         return JsonRpcResponse::success(
             request.id.clone(),
-            kimi_permission_response_for_approved(request.params.as_ref()),
+            permission_response_for_approved(request.params.as_ref()),
         );
     }
 
@@ -1897,11 +1907,19 @@ fn response_for_kimi_server_request(request: &JsonRpcRequest) -> JsonRpcResponse
 
 fn response_for_raw_kimi_server_request(request: &KimiRawServerRequest) -> serde_json::Value {
     if is_kimi_permission_method(&request.method) {
+        if let Some(reason) = permission_denial_reason(request.params.as_ref()) {
+            debug!(method = %request.method, request_id = ?request.id, reason = %reason, "Rejecting unsafe raw Kimi permission request");
+            return serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": request.id.clone(),
+                "result": permission_response_for_denied(request.params.as_ref(), &reason),
+            });
+        }
         debug!(method = %request.method, request_id = ?request.id, "Auto-approving raw Kimi permission request");
         return serde_json::json!({
             "jsonrpc": "2.0",
             "id": request.id.clone(),
-            "result": kimi_permission_response_for_approved(request.params.as_ref()),
+            "result": permission_response_for_approved(request.params.as_ref()),
         });
     }
 
@@ -1922,63 +1940,6 @@ fn is_kimi_permission_request(request: &JsonRpcRequest) -> bool {
 
 fn is_kimi_permission_method(method: &str) -> bool {
     matches!(method, "requestPermission" | "session/request_permission")
-}
-
-fn kimi_permission_response_for_approved(params: Option<&serde_json::Value>) -> serde_json::Value {
-    let selected = params
-        .and_then(|params| params.get("options"))
-        .and_then(serde_json::Value::as_array)
-        .and_then(|options| select_kimi_approval_option(options));
-
-    match selected {
-        Some(option_id) => serde_json::json!({
-            "outcome": {
-                "outcome": "selected",
-                "optionId": option_id,
-            }
-        }),
-        None => serde_json::json!({
-            "outcome": {
-                "outcome": "cancelled",
-            }
-        }),
-    }
-}
-
-fn select_kimi_approval_option(options: &[serde_json::Value]) -> Option<String> {
-    options
-        .iter()
-        .find_map(|option| {
-            let kind = option.get("kind").and_then(serde_json::Value::as_str);
-            let name = option.get("name").and_then(serde_json::Value::as_str);
-            let is_approval = kind
-                .map(|kind| kind.starts_with("allow_") || kind == "allow" || kind == "approve")
-                .unwrap_or(false)
-                || name
-                    .map(|name| {
-                        let name = name.to_ascii_lowercase();
-                        name.contains("approve") || name.contains("allow")
-                    })
-                    .unwrap_or(false);
-            if is_approval {
-                option
-                    .get("optionId")
-                    .or_else(|| option.get("id"))
-                    .and_then(serde_json::Value::as_str)
-                    .map(ToOwned::to_owned)
-            } else {
-                None
-            }
-        })
-        .or_else(|| {
-            options.iter().find_map(|option| {
-                option
-                    .get("optionId")
-                    .or_else(|| option.get("id"))
-                    .and_then(serde_json::Value::as_str)
-                    .map(ToOwned::to_owned)
-            })
-        })
 }
 
 async fn forward_kimi_notification(
@@ -2533,38 +2494,6 @@ max_context_size = 262144
         assert_eq!(servers.len(), 1);
         assert_eq!(servers[0]["name"], "brehon");
         assert_eq!(servers[0]["command"], "/tmp/brehon");
-    }
-
-    #[test]
-    fn test_kimi_permission_response_prefers_allow_option() {
-        let request = JsonRpcRequest::new_with_id(
-            "perm-1",
-            "session/request_permission",
-            Some(serde_json::json!({
-                "options": [
-                    {"kind": "reject_once", "name": "Reject", "optionId": "reject"},
-                    {"kind": "allow_once", "name": "Approve once", "optionId": "approve"},
-                    {"kind": "allow_always", "name": "Approve for this session", "optionId": "approve_for_session"}
-                ]
-            })),
-        );
-
-        let response = response_for_kimi_server_request(&request);
-
-        assert!(response.error.is_none());
-        assert_eq!(response.result.unwrap()["outcome"]["optionId"], "approve");
-    }
-
-    #[test]
-    fn test_kimi_permission_response_falls_back_to_first_option_id() {
-        let response = kimi_permission_response_for_approved(Some(&serde_json::json!({
-            "options": [
-                {"kind": "custom", "optionId": "custom-first"},
-                {"kind": "custom", "optionId": "custom-second"}
-            ]
-        })));
-
-        assert_eq!(response["outcome"]["optionId"], "custom-first");
     }
 
     #[test]

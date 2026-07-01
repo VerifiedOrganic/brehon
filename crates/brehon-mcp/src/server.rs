@@ -646,19 +646,14 @@ impl BrehonService {
 
 impl ServerHandler for BrehonService {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            protocol_version: ProtocolVersion::LATEST,
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            server_info: Implementation {
-                name: self.inner.name.clone(),
-                version: self.inner.version.clone(),
-                title: None,
-                description: None,
-                icons: None,
-                website_url: None,
-            },
-            instructions: server_instructions_from_env(),
-        }
+        let mut info = ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_protocol_version(ProtocolVersion::LATEST)
+            .with_server_info(Implementation::new(
+                self.inner.name.clone(),
+                self.inner.version.clone(),
+            ));
+        info.instructions = server_instructions_from_env();
+        info
     }
 
     async fn list_tools(
@@ -670,16 +665,13 @@ impl ServerHandler for BrehonService {
             .inner
             .tool_definitions()
             .into_iter()
-            .map(|tool| RmcpTool {
-                name: tool.name.into(),
-                description: Some(tool.description.into()),
-                input_schema: serde_json::from_value(tool.input_schema).unwrap_or_default(),
-                title: None,
-                annotations: None,
-                icons: None,
-                meta: None,
-                execution: None,
-                output_schema: None,
+            .map(|tool| {
+                RmcpTool::new(
+                    tool.name,
+                    tool.description,
+                    serde_json::from_value::<rmcp::model::JsonObject>(tool.input_schema)
+                        .unwrap_or_default(),
+                )
             })
             .collect();
 
@@ -720,19 +712,13 @@ impl ServerHandler for BrehonService {
                     })
                     .collect();
 
-                Ok(CallToolResult {
-                    content,
-                    is_error: result.is_error,
-                    meta: None,
-                    structured_content: None,
-                })
+                if result.is_error.unwrap_or(false) {
+                    Ok(CallToolResult::error(content))
+                } else {
+                    Ok(CallToolResult::success(content))
+                }
             }
-            Err(e) => Ok(CallToolResult {
-                content: vec![Content::text(e.to_string())],
-                is_error: Some(true),
-                meta: None,
-                structured_content: None,
-            }),
+            Err(e) => Ok(CallToolResult::error(vec![Content::text(e.to_string())])),
         }
     }
 }

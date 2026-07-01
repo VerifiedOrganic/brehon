@@ -1,6 +1,6 @@
 [package]
 name = "brehon-review"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2021"
 description = "Multi-agent code review system with reviewer gates"
 license = "MIT"
