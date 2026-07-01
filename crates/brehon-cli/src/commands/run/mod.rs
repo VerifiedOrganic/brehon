@@ -27,10 +27,11 @@ use review::{
 };
 use setup::{
     activate_claude_worktree_hook, activate_protected_branch_guard, agent_to_adapter,
-    cleanup_scoped_worktrees, ensure_claude_worktree_hook, ensure_codex_instruction_files,
-    ensure_mcp_config, ensure_protected_branch_hooks, ensure_shared_root_on_default_branch,
-    prepare_scoped_worktrees_with_progress, reconcile_initiative_hierarchy_for_run,
-    reconcile_orphaned_worker_assignments_for_run, restore_shared_root_branch,
+    cleanup_scoped_worktrees, ensure_agent_git_worktree_guard, ensure_claude_worktree_hook,
+    ensure_codex_instruction_files, ensure_mcp_config, ensure_protected_branch_hooks,
+    ensure_shared_root_on_default_branch, prepare_scoped_worktrees_with_progress,
+    reconcile_initiative_hierarchy_for_run, reconcile_orphaned_worker_assignments_for_run,
+    restore_shared_root_branch,
 };
 pub(crate) use setup::{
     protected_branch_hooks_installed, remove_claude_worktree_hook, remove_protected_branch_hooks,
@@ -175,6 +176,43 @@ fn runtime_terminal_host_preview_enabled_from_parts(
     env_value: Option<&str>,
 ) -> bool {
     config_preview_pane.unwrap_or(false) || experimental_terminal_host_enabled_from_value(env_value)
+}
+
+fn prepend_launcher_path(pairs: &mut Vec<(String, String)>, dir: &Path) {
+    if let Some((_, value)) = pairs.iter_mut().find(|(key, _)| key == "PATH") {
+        let updated = path_with_prepended_dir(dir, Some(value.as_str()));
+        *value = updated;
+    } else {
+        let inherited_path = std::env::var("PATH").ok();
+        pairs.push((
+            "PATH".to_string(),
+            path_with_prepended_dir(dir, inherited_path.as_deref()),
+        ));
+    }
+}
+
+fn path_with_prepended_dir(dir: &Path, existing: Option<&str>) -> String {
+    if existing
+        .filter(|value| !value.is_empty())
+        .is_some_and(|value| std::env::split_paths(value).any(|part| part == dir))
+    {
+        return existing.unwrap_or_default().to_string();
+    }
+
+    let mut entries = vec![dir.to_path_buf()];
+    if let Some(existing) = existing.filter(|value| !value.is_empty()) {
+        entries.extend(std::env::split_paths(existing));
+    }
+    std::env::join_paths(entries)
+        .map(|value| value.to_string_lossy().to_string())
+        .unwrap_or_else(|_| {
+            let mut value = dir.to_string_lossy().to_string();
+            if let Some(existing) = existing.filter(|value| !value.is_empty()) {
+                value.push(':');
+                value.push_str(existing);
+            }
+            value
+        })
 }
 
 /// Build the loud startup warning when the budget kill-switch is effectively
@@ -1398,6 +1436,12 @@ pub async fn execute(
     } else {
         None
     };
+    let agent_git_guard_bin = if config.orchestration.worktree_isolation {
+        splash.record("Installing agent Git shared-root guard".to_string());
+        Some(ensure_agent_git_worktree_guard(&cwd)?)
+    } else {
+        None
+    };
 
     // Ensure MCP server config exists before spawning agents
     splash.set_stage("Preparing runtime");
@@ -1530,6 +1574,9 @@ pub async fn execute(
         pairs.retain(|(key, _)| key != "BREHON_WORKTREE_ROOT");
         if cargo_target_root.is_some() {
             pairs.retain(|(key, _)| key != "CARGO_TARGET_DIR");
+        }
+        if let Some(guard_bin) = agent_git_guard_bin.as_ref() {
+            prepend_launcher_path(&mut pairs, guard_bin);
         }
         pairs.push((
             "BREHON_WORKTREE_ROOT".to_string(),

@@ -18,8 +18,9 @@ use crate::tools::{error_result, text_result};
 
 use super::dependencies::{
     task_has_final_review_feedback, task_has_integrated_record,
-    task_has_legacy_completed_worker_status, task_has_recoverable_worker_state_blocker_text,
-    task_review_feedback_outcome,
+    task_has_legacy_completed_worker_status, task_has_recoverable_blocked_review_checkpoint,
+    task_has_recoverable_environment_limited_checkpoint,
+    task_has_recoverable_worker_state_blocker_text, task_review_feedback_outcome,
 };
 use super::epic::{
     check_child_completion, check_epic_integration_status, task_has_supervisor_integration_conflict,
@@ -496,10 +497,19 @@ fn blocked_handoff_context(
         .get("task_type")
         .and_then(|v| v.as_str())
         .unwrap_or("task");
-    let recoverable_blocked =
+    let recoverable_blocked_handoff =
         status == "blocked" && task_has_recoverable_worker_state_blocker_text(task);
+    let recoverable_review_checkpoint =
+        status == "blocked" && task_has_recoverable_blocked_review_checkpoint(task);
+    let recoverable_environment_checkpoint =
+        status == "blocked" && task_has_recoverable_environment_limited_checkpoint(task);
     let legacy_completed = task_has_legacy_completed_worker_status(task);
-    if task_type != "task" || (!recoverable_blocked && !legacy_completed) {
+    if task_type != "task"
+        || (!recoverable_blocked_handoff
+            && !recoverable_review_checkpoint
+            && !recoverable_environment_checkpoint
+            && !legacy_completed)
+    {
         return None;
     }
 
@@ -516,6 +526,15 @@ fn blocked_handoff_context(
     let mut value = ready_queue_task(task, config);
     let task_id = queued_task_id(&value).unwrap_or("").to_string();
     value["safe_repair"] = Value::Bool(safe_repair);
+    value["recovery_kind"] = Value::String(if recoverable_review_checkpoint {
+        "review_checkpoint".to_string()
+    } else if recoverable_environment_checkpoint {
+        "environment_limited_checkpoint".to_string()
+    } else if recoverable_blocked_handoff {
+        "worker_handoff".to_string()
+    } else {
+        "legacy_completed".to_string()
+    });
     value["repair_action"] = if safe_repair {
         serde_json::json!({
             "kind": "recover_handoff",
@@ -1197,7 +1216,7 @@ pub(super) async fn execute_ready(args: &Value) -> Result<ToolResult, McpError> 
     }
     if recoverable_blocked_count > 0 {
         priority_notes.push(format!(
-            "{recoverable_blocked_count} blocked task(s) have recoverable worker handoff state and should be repaired with task action=repair_frontier"
+            "{recoverable_blocked_count} blocked task(s) have recoverable worker handoff or post-review checkpoint state and should be repaired with task action=repair_frontier"
         ));
     }
     if blocked_handoff_count > recoverable_blocked_count {
@@ -1246,7 +1265,7 @@ pub(super) async fn execute_ready(args: &Value) -> Result<ToolResult, McpError> 
         serde_json::json!({
             "kind": "repair_frontier",
             "tool": "task",
-            "description": "Apply deterministic safe repairs from ready.recoverable_blocked_tasks. This recovers blocked worker handoffs with recorded latest_commit, then you must call task action=ready again.",
+            "description": "Apply deterministic safe repairs from ready.recoverable_blocked_tasks. This recovers blocked worker handoffs or fresh post-review checkpoints with recorded latest_commit, then you must call task action=ready again.",
             "args": {
                 "action": "repair_frontier"
             }
@@ -1273,6 +1292,18 @@ pub(super) async fn execute_ready(args: &Value) -> Result<ToolResult, McpError> 
             "args": {
                 "action": "assign_workers",
                 "task_id": task_id
+            },
+            "requires": ["workers"]
+        })
+    } else if let Some(task_id) = stalled_tasks.first().and_then(queued_task_id) {
+        serde_json::json!({
+            "kind": "force_reassign_stalled_revision_worker",
+            "tool": "factory",
+            "description": "Assigned changes_requested task has exceeded the stall threshold. After checking worker_status/delivery_status, transfer it to an idle worker with force_reassign=true.",
+            "args": {
+                "action": "assign_workers",
+                "task_id": task_id,
+                "force_reassign": true
             },
             "requires": ["workers"]
         })

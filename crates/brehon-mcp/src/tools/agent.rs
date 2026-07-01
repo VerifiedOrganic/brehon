@@ -655,7 +655,7 @@ fn supervisor_instructions(
             If `recoverable_blocked_tasks` is non-empty, run `ready.next_action` exactly, usually `task action=repair_frontier`; for a single task, `task action=recover_handoff id=<task-id>` is also valid. Then call `task action=ready` again. Do not guess a status update.\n\
             If `review_ready_tasks` is non-empty, request review for those before treating the frontier as empty.\n\
             If `changes_requested_tasks` is non-empty, reassign those revision tasks to idle workers before pulling new pending work.\n\
-            If `stalled_tasks` is non-empty, investigate before re-nudging — call `agent action=delivery_status prompt_id=<id>` with the prompt_id of your last message to that worker to see whether it was injected or dead-lettered, and `factory action=worker_status` to see the worker's `nudge.nudge_delivery_state` (`Delivered` → `Acknowledged` → `ActedOn` or `TimedOut`). If the nudge never acknowledged, the worker never saw it; if acknowledged but not acted on, the worker saw it and ignored it — reassign rather than re-nudging.\n\
+            If `stalled_tasks` is non-empty, investigate before re-nudging — call `agent action=delivery_status prompt_id=<id>` with the prompt_id of your last message to that worker to see whether it was injected or dead-lettered, and `factory action=worker_status` to see the worker's `nudge.nudge_delivery_state` (`Delivered` → `Acknowledged` → `ActedOn` or `TimedOut`). If the nudge never acknowledged, the worker never saw it; if acknowledged but not acted on, the worker saw it and ignored it — transfer the task to an idle worker with `factory action=assign_workers task_id=<task_id> worker=<worker_name> force_reassign=true` rather than re-nudging.\n\
             If `approved_tasks` is non-empty, integrate those before declaring the frontier blocked.\n\
             If `followup_source_tasks` is non-empty, inspect them with `task action=followups id=<task-id>` and default to `task action=promote_followups id=<task-id>`; use `waive_followups` only for explicit no-action-needed items with specific IDs and reasons.\n\
         7a. You may also call task action=list status=review_ready and task action=list status=changes_requested to inspect those queues directly.\n\
@@ -667,7 +667,7 @@ fn supervisor_instructions(
             with new eligible reviewers and re-sends prompts; it does NOT silently shrink \
             the council.\n\
         7c. After any later action that may change the frontier (`close`, `integrate`, \
-            reassignment, unblock, followup promotion/waiver, or any dependency-clearing transition), call \
+            reassignment, forced reassignment, unblock, followup promotion/waiver, or any dependency-clearing transition), call \
             task action=ready again before ending your turn. If `integration_conflict_tasks` appear, \
             resolve or explicitly triage them before anything else. If idle workers exist and \
             `tasks` or unassigned `changes_requested_tasks` appear, dispatch them immediately \

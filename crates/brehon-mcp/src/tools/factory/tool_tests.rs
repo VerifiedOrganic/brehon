@@ -1431,7 +1431,7 @@ async fn test_assign_workers_moves_changes_requested_task_to_assigned() {
 }
 
 #[tokio::test]
-async fn test_assign_workers_rejects_live_changes_requested_transfer() {
+async fn test_assign_workers_force_reassigns_live_changes_requested_transfer() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
     let _env = ScopedEnv::set(&[
@@ -1459,32 +1459,46 @@ async fn test_assign_workers_rejects_live_changes_requested_transfer() {
     );
     let tool = FactoryTool::new();
 
-    for args in [
-        serde_json::json!({
+    let rejected = tool
+        .execute(serde_json::json!({
             "action": "assign_workers",
             "task_id": "T-live-revision",
             "worker": "worker-2"
-        }),
-        serde_json::json!({
+        }))
+        .await
+        .unwrap();
+
+    let task = read_test_task(root.path(), "T-live-revision");
+    assert_eq!(rejected.is_error, Some(true));
+    let text = extract_text(&rejected);
+    assert!(text.contains("without force_reassign=true"), "{text}");
+    assert_eq!(task["status"], "changes_requested");
+    assert_eq!(task["assignee"], "worker-1");
+
+    let accepted = tool
+        .execute(serde_json::json!({
             "action": "assign_workers",
             "task_id": "T-live-revision",
             "worker": "worker-2",
             "force_reassign": true
-        }),
-    ] {
-        let result = tool.execute(args).await.unwrap();
-        assert_eq!(result.is_error, Some(true));
-        let text = extract_text(&result);
-        assert!(
-            text.contains("already owned by live worker 'worker-1'"),
-            "{text}"
-        );
-        assert!(text.contains("two worker panes"), "{text}");
-    }
+        }))
+        .await
+        .unwrap();
+
+    assert!(accepted.is_error.is_none(), "{}", extract_text(&accepted));
+    let payload: Value = serde_json::from_str(&extract_text(&accepted)).unwrap();
+    assert_eq!(payload["force_reassigned"], true);
+    assert_eq!(payload["reassigned_from"], "worker-1");
+    assert_eq!(payload["previous_worker_recycle_target"], "worker-1");
+    assert_eq!(payload["previous_worker_recycle_queued"], true);
 
     let task = read_test_task(root.path(), "T-live-revision");
-    assert_eq!(task["status"], "changes_requested");
-    assert_eq!(task["assignee"], "worker-1");
+    assert_eq!(task["status"], "assigned");
+    assert_eq!(task["assignee"], "worker-2");
+    assert!(task["reassignment_note"]
+        .as_str()
+        .unwrap_or("")
+        .contains("worker-1"));
 }
 
 #[tokio::test]
@@ -1983,7 +1997,7 @@ async fn test_assign_workers_reseeds_changes_requested_task_from_latest_commit()
 }
 
 #[tokio::test]
-async fn test_assign_workers_rejects_non_pending_tasks() {
+async fn test_assign_workers_rejects_review_and_terminal_tasks() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
     let _env = ScopedEnv::set(&[
@@ -1998,7 +2012,7 @@ async fn test_assign_workers_rejects_non_pending_tasks() {
     );
     let tool = FactoryTool::new();
 
-    for status in ["assigned", "in_progress", "in_review", "approved", "merged"] {
+    for status in ["in_review", "approved", "merged"] {
         let task_id = format!("T-{status}");
         write_test_task(root.path(), &task_id, status, "task");
 
@@ -2014,8 +2028,7 @@ async fn test_assign_workers_rejects_non_pending_tasks() {
         assert_eq!(result.is_error, Some(true), "status={status}");
         let text = extract_text(&result);
         assert!(
-            text.contains("status must be 'pending' or 'changes_requested'")
-                || text.contains("is terminal"),
+            text.contains("status must be 'pending', 'assigned',") || text.contains("is terminal"),
             "unexpected error for {status}: {text}"
         );
 
@@ -2198,7 +2211,7 @@ async fn test_assign_workers_recovers_startup_normalized_orphaned_task() {
 }
 
 #[tokio::test]
-async fn test_assign_workers_rejects_live_in_progress_task() {
+async fn test_assign_workers_force_reassigns_live_in_progress_task() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = make_test_root();
     let _env = ScopedEnv::set(&[
@@ -2226,7 +2239,7 @@ async fn test_assign_workers_rejects_live_in_progress_task() {
     );
     let tool = FactoryTool::new();
 
-    let result = tool
+    let rejected = tool
         .execute(serde_json::json!({
             "action": "assign_workers",
             "task_id": "T-live-progress",
@@ -2235,12 +2248,36 @@ async fn test_assign_workers_rejects_live_in_progress_task() {
         .await
         .unwrap();
 
-    assert_eq!(result.is_error, Some(true));
-    assert!(extract_text(&result).contains("status must be 'pending' or 'changes_requested'"));
+    assert_eq!(rejected.is_error, Some(true));
+    assert!(
+        extract_text(&rejected).contains("without force_reassign=true"),
+        "{}",
+        extract_text(&rejected)
+    );
 
     let task = read_test_task(root.path(), "T-live-progress");
     assert_eq!(task["status"], "in_progress");
     assert_eq!(task["assignee"], "worker-1");
+
+    let accepted = tool
+        .execute(serde_json::json!({
+            "action": "assign_workers",
+            "task_id": "T-live-progress",
+            "worker": "worker-2",
+            "force_reassign": true
+        }))
+        .await
+        .unwrap();
+
+    assert!(accepted.is_error.is_none(), "{}", extract_text(&accepted));
+    let payload: Value = serde_json::from_str(&extract_text(&accepted)).unwrap();
+    assert_eq!(payload["force_reassigned"], true);
+    assert_eq!(payload["reassigned_from"], "worker-1");
+    assert_eq!(payload["previous_worker_recycle_target"], "worker-1");
+
+    let task = read_test_task(root.path(), "T-live-progress");
+    assert_eq!(task["status"], "assigned");
+    assert_eq!(task["assignee"], "worker-2");
 }
 
 #[tokio::test]

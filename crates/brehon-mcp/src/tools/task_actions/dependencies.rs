@@ -2,6 +2,8 @@
 
 use serde_json::Value;
 
+use crate::tools::verification::{read_round_request, reviewed_commits};
+
 pub(super) fn normalize_list_item(item: &str) -> Option<String> {
     let trimmed = item
         .trim()
@@ -140,8 +142,11 @@ pub(super) fn task_has_recoverable_worker_state_blocker_text(
         || blockers_lower.contains("reports task assigned to")
         || blockers_lower.contains("assigned to '' not")
         || blockers_lower.contains("assigned to '' instead")
+        || blockers_lower.contains("assigned to '' rather than")
         || blockers_lower.contains("empty string instead")
+        || blockers_lower.contains("pending/unassigned while work was in progress")
         || blockers_lower.contains("cannot checkpoint/complete")
+        || blockers_lower.contains("complete is rejected because")
         || blockers_lower.contains("checkpoint created during pending state")
         || blockers_lower.contains("could not move it to review_ready")
         || blockers_lower.contains("requires supervisor reassignment")
@@ -165,6 +170,162 @@ pub(super) fn task_has_recoverable_worker_state_blocker_text(
         || (blockers_lower.contains("invalid transition")
             && blockers_lower.contains("blocked")
             && blockers_lower.contains("in_progress"))
+}
+
+fn task_id(task: &serde_json::Map<String, Value>) -> Option<&str> {
+    task.get("task_id")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn latest_commit(task: &serde_json::Map<String, Value>) -> Option<&str> {
+    task.get("latest_commit")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn review_feedback_round(task: &serde_json::Map<String, Value>) -> Option<u32> {
+    task.get("review_feedback")
+        .and_then(|value| value.get("round"))
+        .and_then(|value| value.as_u64())
+        .and_then(|round| u32::try_from(round).ok())
+        .filter(|round| *round > 0)
+}
+
+fn commit_text_matches(left: &str, right: &str) -> bool {
+    let left = left.trim();
+    let right = right.trim();
+    if left.is_empty() || right.is_empty() {
+        return false;
+    }
+    left == right
+        || (left.len() >= 12 && right.starts_with(left))
+        || (right.len() >= 12 && left.starts_with(right))
+}
+
+pub(super) fn task_has_recoverable_review_checkpoint_blocker_text(
+    task: &serde_json::Map<String, Value>,
+) -> bool {
+    let blockers = task
+        .get("blockers")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let notes = task
+        .get("notes")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let text = format!("{blockers}\n{notes}").to_ascii_lowercase();
+    let has_checkpoint_marker = text.contains("checkpoint")
+        || text.contains("latest_commit")
+        || text.contains("latest commit")
+        || text.contains("recorded commit");
+    let has_checkpointed_fix_marker = text.contains("checkpoint fix")
+        || text.contains("checkpointed fix")
+        || text.contains("fix is checkpointed");
+    let has_environment_blocked_validation_marker = (text.contains("validation is blocked")
+        || text.contains("validation blocked")
+        || text.contains("phase gate cannot pass")
+        || text.contains("gate cannot pass"))
+        && (text.contains("sandbox")
+            || text.contains("environment")
+            || text.contains("tool availability")
+            || text.contains("restricted"));
+    let has_completion_marker = text.contains("addressed")
+        || text.contains("resolved")
+        || text.contains("fixed")
+        || text.contains("implemented")
+        || text.contains("completed")
+        || text.contains("complete")
+        || text.contains("work is done")
+        || text.contains("ready for review")
+        || text.contains("review_ready")
+        || text.contains("review-ready")
+        || text.contains("re-request review")
+        || text.contains("rerequest review")
+        || has_checkpointed_fix_marker
+        || has_environment_blocked_validation_marker;
+
+    has_checkpoint_marker && has_completion_marker
+}
+
+pub(super) fn task_has_recoverable_environment_limited_checkpoint(
+    task: &serde_json::Map<String, Value>,
+) -> bool {
+    let blockers = task
+        .get("blockers")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let notes = task
+        .get("notes")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let text = format!("{blockers}\n{notes}").to_ascii_lowercase();
+    let has_checkpoint_marker = text.contains("checkpoint")
+        || text.contains("latest_commit")
+        || text.contains("latest commit")
+        || text.contains("recorded commit");
+    let has_completed_work_marker = text.contains("completed checkpoint")
+        || text.contains("checkpoint includes")
+        || text.contains("passing evidence")
+        || text.contains("found and fixed")
+        || text.contains("fixed a")
+        || text.contains("updated")
+        || text.contains("work is done");
+    let has_validation_block_marker = text.contains("validation cannot be completed")
+        || text.contains("final validation cannot be completed")
+        || text.contains("remaining final validation")
+        || text.contains("remaining validation")
+        || text.contains("phase validation is blocked")
+        || text.contains("validation is blocked")
+        || text.contains("environment blockers")
+        || text.contains("local environment blockers");
+    let has_environment_marker = text.contains("sandbox")
+        || text.contains("environment")
+        || text.contains("tooling")
+        || text.contains("toolchain")
+        || text.contains("network/dns")
+        || text.contains("operation not permitted")
+        || text.contains("af_unix")
+        || text.contains("go ")
+        || text.contains("advisory database")
+        || text.contains("advisory db")
+        || text.contains("timed out");
+
+    has_checkpoint_marker
+        && has_completed_work_marker
+        && has_validation_block_marker
+        && has_environment_marker
+}
+
+pub(super) fn task_has_recoverable_blocked_review_checkpoint(
+    task: &serde_json::Map<String, Value>,
+) -> bool {
+    if task_review_feedback_outcome(task).as_deref() != Some("changes_requested") {
+        return false;
+    }
+    if !task_has_recoverable_review_checkpoint_blocker_text(task) {
+        return false;
+    }
+
+    let Some(task_id) = task_id(task) else {
+        return false;
+    };
+    let Some(latest_commit) = latest_commit(task) else {
+        return false;
+    };
+    let Some(round) = review_feedback_round(task) else {
+        return false;
+    };
+    let Some(request) = read_round_request(task_id, round) else {
+        return false;
+    };
+
+    !reviewed_commits(&request)
+        .iter()
+        .any(|commit| commit_text_matches(commit, latest_commit))
+        && !commit_text_matches(&request.commit, latest_commit)
 }
 
 pub(super) fn task_has_integrated_record(task: &serde_json::Map<String, Value>) -> bool {

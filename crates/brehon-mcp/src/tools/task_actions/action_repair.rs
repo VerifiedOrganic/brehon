@@ -10,8 +10,9 @@ use crate::tools::{structured_error_result, text_result};
 
 use super::dependencies::{
     task_has_final_review_feedback, task_has_integrated_record,
-    task_has_legacy_completed_worker_status, task_has_recoverable_worker_state_blocker_text,
-    task_review_feedback_outcome,
+    task_has_legacy_completed_worker_status, task_has_recoverable_blocked_review_checkpoint,
+    task_has_recoverable_environment_limited_checkpoint,
+    task_has_recoverable_worker_state_blocker_text, task_review_feedback_outcome,
 };
 use super::lifecycle::{ancestor_chain_has_closed_parent, caller_role};
 use super::locking::acquire_task_lock;
@@ -125,13 +126,15 @@ fn task_is_safe_handoff_repair_candidate(
         && !task_has_integrated_record(task)
         && !task_has_final_review_feedback(task)
         && (normalize_task_status(status) == Some("blocked")
-            && task_has_recoverable_worker_state_blocker_text(task)
+            && (task_has_recoverable_worker_state_blocker_text(task)
+                || task_has_recoverable_blocked_review_checkpoint(task)
+                || task_has_recoverable_environment_limited_checkpoint(task))
             || task_has_legacy_completed_worker_status(task))
         && !ancestor_chain_has_closed_parent(all_tasks, task)
         && control_plane_scope_issue_for_task(task).is_none()
 }
 
-fn apply_recover_handoff(task: &mut serde_json::Map<String, Value>) {
+fn apply_recover_handoff(task: &mut serde_json::Map<String, Value>, recovery_note: &str) {
     task.remove("blockers");
     task.insert(
         "percent".into(),
@@ -147,10 +150,7 @@ fn apply_recover_handoff(task: &mut serde_json::Map<String, Value>) {
     task.insert("status".into(), Value::String("review_ready".to_string()));
     task.insert(
         "recovery_note".into(),
-        Value::String(
-            "Recovered blocked worker handoff from recorded latest_commit; ready for review."
-                .to_string(),
-        ),
+        Value::String(recovery_note.to_string()),
     );
     task.insert(
         "updated_at".into(),
@@ -188,6 +188,10 @@ async fn recover_handoff_by_id(id: &str) -> Result<RecoverOutcome, ToolResult> {
         .to_string();
     let normalized_status = normalize_task_status(&current_status);
     let legacy_completed = task_has_legacy_completed_worker_status(&task);
+    let review_checkpoint_recovery = normalized_status == Some("blocked")
+        && task_has_recoverable_blocked_review_checkpoint(&task);
+    let environment_checkpoint_recovery = normalized_status == Some("blocked")
+        && task_has_recoverable_environment_limited_checkpoint(&task);
     let task_type = task
         .get("task_type")
         .and_then(|value| value.as_str())
@@ -283,12 +287,12 @@ async fn recover_handoff_by_id(id: &str) -> Result<RecoverOutcome, ToolResult> {
 
     if normalized_status == Some("blocked")
         && !task_has_recoverable_worker_state_blocker_text(&task)
+        && !review_checkpoint_recovery
+        && !environment_checkpoint_recovery
     {
         return Err(structured_repair_error(
             "handoff_not_recoverable",
-            format!(
-                "Task {id} is blocked, but its blocker text is not a recognized recoverable worker handoff."
-            ),
+            format!("Task {id} is blocked, but its blocker text is not a recognized recoverable worker handoff, fresh post-review checkpoint, or environment-limited checkpoint."),
             false,
             repair_current_state(id, Some(&task)),
             vec![ready_next_action()],
@@ -319,7 +323,14 @@ async fn recover_handoff_by_id(id: &str) -> Result<RecoverOutcome, ToolResult> {
         ));
     }
 
-    apply_recover_handoff(&mut task);
+    let recovery_note = if review_checkpoint_recovery {
+        "Recovered blocked post-review checkpoint from recorded latest_commit; ready for re-review."
+    } else if environment_checkpoint_recovery {
+        "Recovered blocked environment-limited checkpoint from recorded latest_commit; ready for review with validation limitations recorded."
+    } else {
+        "Recovered blocked worker handoff from recorded latest_commit; ready for review."
+    };
+    apply_recover_handoff(&mut task, recovery_note);
     if !write_task(id, &task) {
         return Err(structured_repair_error(
             "task_write_failed",

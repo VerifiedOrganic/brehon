@@ -21,7 +21,8 @@ use crate::tools::routing::{resolve_execution_policy, ExecutionPolicySource};
 use crate::tools::stability::increment_assignment_history;
 use crate::tools::task_actions::{
     acquire_task_lock, control_plane_scope_issue_for_task,
-    task_has_active_or_unconsolidated_review, unmet_dependency_ids_for_task,
+    enqueue_worker_session_recycle_surfacing, task_has_active_or_unconsolidated_review,
+    unmet_dependency_ids_for_task,
 };
 use crate::tools::{error_result, text_result, Tool};
 use brehon_mux::PromptQueueEntry;
@@ -423,7 +424,7 @@ impl Tool for FactoryTool {
                 },
                 "force_reassign": {
                     "type": "boolean",
-                    "description": "Force reassignment even if worktree is dirty (archives instead of deleting)"
+                    "description": "Explicitly transfer assigned/in_progress/changes_requested work from a current or dirty owner; dirty previous worktrees are archived"
                 },
                 "force_policy": {
                     "type": "boolean",
@@ -760,6 +761,10 @@ impl Tool for FactoryTool {
                 let mut research_jobs_queued: Vec<Value> = Vec::new();
                 let mut research_warning: Option<String> = None;
                 let mut assignment_propagation: Option<AssignmentPropagation> = None;
+                let mut reassigned_from: Option<String> = None;
+                let mut reassignment_note: Option<String> = None;
+                let mut previous_worker_recycle = None;
+                let mut previous_worker_recycle_warning = None;
 
                 if let Some(mut task) = read_task(task_id) {
                     let task_type = task
@@ -820,27 +825,32 @@ impl Tool for FactoryTool {
                         )));
                     }
 
-                    if normalized_status == "changes_requested" {
-                        if let Some(existing_owner) = previous_assignee
-                            .as_deref()
-                            .filter(|existing| *existing != assignee)
-                            .filter(|existing| live_workers.contains(*existing))
-                        {
-                            return Ok(error_result(format!(
-                                "Cannot assign task {task_id} to worker '{assignee}': task is already owned by live worker '{existing_owner}' while changes are requested. \
-                                 Transferring a live owner can leave two worker panes acting on the same task. Assign '{existing_owner}' again, or recycle/mark that worker unavailable before assigning another worker."
-                            )));
-                        }
-                    }
-
                     let orphaned_active_reassignment = matches!(
                         recovery_status,
                         "assigned" | "in_progress" | "changes_requested"
                     ) && previous_assignee
                         .as_deref()
                         .is_some_and(|existing| !live_workers.contains(existing));
+                    let live_active_reassignment = matches!(
+                        normalized_status,
+                        "assigned" | "in_progress" | "changes_requested"
+                    ) && previous_assignee
+                        .as_deref()
+                        .is_some_and(|existing| existing != assignee && live_workers.contains(existing));
 
-                    if !matches!(normalized_status, "pending" | "changes_requested")
+                    if live_active_reassignment && !force_reassign {
+                        let existing_owner = previous_assignee.as_deref().unwrap_or("unknown");
+                        return Ok(error_result(format!(
+                            "Cannot reassign task {task_id} from live worker '{existing_owner}' to '{assignee}' without force_reassign=true. \
+                             If the worker is stalled, ignored a delivered prompt, or needs replacement, retry with factory action=assign_workers task_id={task_id} worker={assignee} force_reassign=true. \
+                             Brehon will transfer ownership and queue a recycle for the previous worker to clear stale context."
+                        )));
+                    }
+
+                    if !matches!(
+                        normalized_status,
+                        "pending" | "assigned" | "in_progress" | "changes_requested"
+                    )
                         && !orphaned_active_reassignment
                     {
                         let message = if is_terminal_task_status(normalized_status) {
@@ -849,8 +859,8 @@ impl Tool for FactoryTool {
                             )
                         } else {
                             format!(
-                                "Cannot assign task {task_id}: status must be 'pending' or \
-                                 'changes_requested', got '{normalized_status}'."
+                                "Cannot assign task {task_id}: status must be 'pending', 'assigned', \
+                                 'in_progress', or 'changes_requested', got '{normalized_status}'."
                             )
                         };
                         return Ok(error_result(message));
@@ -913,7 +923,7 @@ impl Tool for FactoryTool {
                         )));
                     }
 
-                    if orphaned_active_reassignment {
+                    if orphaned_active_reassignment || live_active_reassignment {
                         if let Some(old_assignee) = &previous_assignee {
                             // Fail-closed: state check errors block reassignment unless forced
                             match find_worktree_by_worker(old_assignee) {
@@ -923,15 +933,17 @@ impl Tool for FactoryTool {
                                             use brehon_git::WorktreeStateCheck;
                                             match state {
                                                 WorktreeStateCheck::Clean => {
-                                                    if let Err(e) = remove_worktree_with_git2(
-                                                        &repo,
-                                                        &worktree_path,
-                                                    ) {
-                                                        tracing::warn!(
-                                                            "Failed to remove clean worktree for {}: {}",
-                                                            old_assignee,
-                                                            e
-                                                        );
+                                                    if orphaned_active_reassignment {
+                                                        if let Err(e) = remove_worktree_with_git2(
+                                                            &repo,
+                                                            &worktree_path,
+                                                        ) {
+                                                            tracing::warn!(
+                                                                "Failed to remove clean worktree for {}: {}",
+                                                                old_assignee,
+                                                                e
+                                                            );
+                                                        }
                                                     }
                                                 }
                                                 WorktreeStateCheck::Missing => {
@@ -1066,6 +1078,38 @@ impl Tool for FactoryTool {
                     assignment_propagation =
                         Some(stage_task_assignment_propagation(&mut task, assignee, "task"));
 
+                    if live_active_reassignment {
+                        if let Some(old_assignee) = previous_assignee.as_deref() {
+                            reassigned_from = Some(old_assignee.to_string());
+                            previous_worker_recycle = Some(old_assignee.to_string());
+                            let note = format!(
+                                "Supervisor force-reassigned active task from {normalized_status}: previous live assignee {old_assignee} was replaced by {assignee}. \
+                                 Previous worker recycle was queued to clear stale assignment context."
+                            );
+                            task.insert("reassignment_note".into(), Value::String(note.clone()));
+                            reassignment_note = Some(note);
+                            self.emit_event(
+                                EventKind::WorkerReassigned {
+                                    old_worker: old_assignee.to_string(),
+                                    new_worker: assignee.to_string(),
+                                    task_id: task_id.to_string(),
+                                    reason: "forced_live_transfer".to_string(),
+                                    worktree_state: if task
+                                        .get("worktree_archived")
+                                        .and_then(|v| v.as_str())
+                                        .is_some()
+                                    {
+                                        "archived".to_string()
+                                    } else {
+                                        "preserved".to_string()
+                                    },
+                                },
+                                task_id.to_string(),
+                            )
+                            .await;
+                        }
+                    }
+
                     if orphaned_active_reassignment {
                         let worktree_archived = task
                             .get("worktree_archived")
@@ -1122,6 +1166,17 @@ impl Tool for FactoryTool {
                     )));
                 }
                 increment_assignment_history(1);
+
+                if let Some(worker) = previous_worker_recycle.as_deref() {
+                    let recycle_outcome = enqueue_worker_session_recycle_surfacing(
+                        task_id,
+                        Some(worker),
+                        "forced live worker reassignment",
+                    );
+                    if let Some(warning) = recycle_outcome.warning {
+                        previous_worker_recycle_warning = Some(warning);
+                    }
+                }
 
                 if project_config
                     .as_ref()
@@ -1305,6 +1360,22 @@ impl Tool for FactoryTool {
                     result["prompt_id"] = Value::String(delivery.prompt_id.clone());
                 }
                 if let Some(task) = refreshed_task.as_ref() {
+                    if let Some(previous) = reassigned_from.as_deref() {
+                        result["reassigned_from"] = Value::String(previous.to_string());
+                        result["force_reassigned"] = Value::Bool(true);
+                    }
+                    if let Some(note) = reassignment_note.as_deref() {
+                        result["reassignment_note"] = Value::String(note.to_string());
+                    }
+                    if let Some(worker) = previous_worker_recycle.as_deref() {
+                        result["previous_worker_recycle_queued"] =
+                            Value::Bool(previous_worker_recycle_warning.is_none());
+                        result["previous_worker_recycle_target"] =
+                            Value::String(worker.to_string());
+                    }
+                    if let Some(warning) = previous_worker_recycle_warning {
+                        result["previous_worker_recycle_warning"] = warning;
+                    }
                     if let Some(note) = task.get("recovery_note").and_then(|v| v.as_str()) {
                         result["recovery_note"] = Value::String(note.to_string());
                         result["recovered_orphaned_task"] = Value::Bool(true);
