@@ -710,7 +710,7 @@ impl Mux {
         pane_id: &str,
         prompt_id: PromptId,
         generation: Generation,
-        now: Instant,
+        _now: Instant,
     ) {
         let mut state_change = None;
         if let Some(pane) = self.panes.get_mut(pane_id)
@@ -720,9 +720,16 @@ impl Mux {
             )
         {
             let previous = pane.pane_state().map(Self::runtime_pane_state_for_state);
-            pane.set_tool_executing(true);
-            if !matches!(pane.pane_state(), Some(PaneState::Busy { .. })) {
-                pane.set_pane_busy(prompt_id.clone(), generation, now);
+            if matches!(pane.pane_state(), Some(PaneState::Busy { .. })) {
+                pane.set_tool_executing(true);
+            } else {
+                tracing::debug!(
+                    pane = %pane_id,
+                    prompt_id = %prompt_id,
+                    generation = generation.0,
+                    "Gateway reported an active prompt while pane was not busy; leaving pane state unchanged"
+                );
+                return;
             }
             state_change = Self::runtime_state_change(
                 previous,

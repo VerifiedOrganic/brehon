@@ -1919,7 +1919,7 @@ fn test_attempt_prompt_delivery_returns_already_present_for_duplicate_queued_pro
 #[test]
 fn test_finalize_async_gateway_prompt_delivery_clears_session_on_recoverable_error() {
     let mut mux = Mux::new(24, 80);
-    let pane = Pane::reviewer(
+    let mut pane = Pane::reviewer(
         "codex-reviewer",
         PathBuf::from("/tmp"),
         None,
@@ -1932,6 +1932,8 @@ fn test_finalize_async_gateway_prompt_delivery_clears_session_on_recoverable_err
         None,
     )
     .expect("create codex reviewer pane");
+    pane.set_external_pane_ready(std::time::Instant::now());
+    pane.set_tool_executing(false);
     mux.add_pane(pane);
 
     let pane = mux.get_mut("codex-reviewer").expect("reviewer pane exists");
@@ -1955,7 +1957,7 @@ fn test_finalize_async_gateway_prompt_delivery_clears_session_on_recoverable_err
 #[test]
 fn test_async_gateway_prompt_delivery_completion_appends_notice() {
     let mut mux = Mux::new(24, 80);
-    let pane = Pane::reviewer(
+    let mut pane = Pane::reviewer(
         "codex-reviewer",
         PathBuf::from("/tmp"),
         None,
@@ -1968,6 +1970,8 @@ fn test_async_gateway_prompt_delivery_completion_appends_notice() {
         None,
     )
     .expect("create codex reviewer pane");
+    pane.set_external_pane_ready(std::time::Instant::now());
+    pane.set_tool_executing(false);
     mux.add_pane(pane);
 
     mux.event_tx
@@ -2138,7 +2142,7 @@ async fn test_async_gateway_prompt_delivery_non_delivered_arms_drop_stale_genera
 #[test]
 fn test_async_gateway_prompt_delivery_busy_error_requeues_prompt() {
     let mut mux = Mux::new(24, 80);
-    let pane = Pane::reviewer(
+    let mut pane = Pane::reviewer(
         "codex-reviewer",
         PathBuf::from("/tmp"),
         None,
@@ -2151,6 +2155,8 @@ fn test_async_gateway_prompt_delivery_busy_error_requeues_prompt() {
         None,
     )
     .expect("create codex reviewer pane");
+    pane.set_external_pane_ready(std::time::Instant::now());
+    pane.set_tool_executing(false);
     mux.add_pane(pane);
 
     mux.event_tx
@@ -2182,10 +2188,10 @@ fn test_async_gateway_prompt_delivery_busy_error_requeues_prompt() {
     );
 
     let pane = mux.get("codex-reviewer").expect("reviewer pane exists");
-    assert!(pane.is_tool_executing());
+    assert!(!pane.is_tool_executing());
     assert!(matches!(
         pane.pane_state(),
-        Some(crate::PaneState::Busy { .. })
+        Some(crate::PaneState::Ready { .. })
     ));
     let viewport = pane.dump_viewport().expect("dump viewport");
     assert!(

@@ -1665,6 +1665,45 @@ fn test_gateway_delivery_busy_does_not_set_tool_flag_on_blocked_pane() {
 }
 
 #[test]
+fn test_gateway_delivery_busy_does_not_make_ready_pane_look_active() {
+    let mut mux = Mux::new(24, 80);
+    let mut pane = Pane::worker(
+        "codex-worker",
+        PathBuf::from("/tmp"),
+        None,
+        "supervisor",
+        &AgentAdapter::BuiltIn(SupervisorCli::Codex),
+        None,
+        None,
+        24,
+        80,
+        None,
+        None,
+        None,
+    )
+    .expect("create codex worker pane");
+    pane.set_external_pane_ready(std::time::Instant::now());
+    pane.set_tool_executing(false);
+    mux.add_pane(pane);
+
+    let generation = mux
+        .get("codex-worker")
+        .expect("worker pane exists")
+        .current_generation();
+
+    mux.mark_gateway_delivery_busy(
+        "codex-worker",
+        brehon_types::PromptId::new("gateway-busy"),
+        generation,
+        std::time::Instant::now(),
+    );
+
+    let pane = mux.get("codex-worker").expect("worker pane exists");
+    assert!(!pane.is_tool_executing());
+    assert!(matches!(pane.pane_state(), Some(PaneState::Ready { .. })));
+}
+
+#[test]
 fn test_gateway_turn_operation_keeps_pane_busy_after_tool_completion() {
     let pane_id = "kimi-worker";
     let mut mux = Mux::new(24, 80);
