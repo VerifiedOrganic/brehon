@@ -17,11 +17,11 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use agent_env::{
-    apply_agent_cargo_target_env, apply_agent_runtime_tmp_env, cleanup_session_runtime_tmp_dir,
-};
+use agent_env::cleanup_session_runtime_tmp_dir;
+use agent_env::{apply_agent_cargo_target_env, apply_agent_runtime_tmp_env, profile_env};
 use anyhow::Result;
 use async_trait::async_trait;
+use brehon_types::PermissionProfileRole as Role;
 use direct_tools::BrehonDirectToolBridgeFactory;
 use review::{
     build_planned_review_panel_seats, build_reviewer_panels, reconcile_review_runtime_for_run,
@@ -106,29 +106,6 @@ fn resolved_supervisor_reasoning_effort(config: &brehon_types::BrehonConfig) -> 
         .lane_reasoning_effort(&config.roles.supervisor.name, None)
         .map(str::to_string)
         .or_else(|| config.supervisor.reasoning_effort.clone())
-}
-
-fn apply_effective_permission_profile_env(
-    config: &brehon_types::BrehonConfig,
-    role: brehon_types::PermissionProfileRole,
-    lane: &str,
-    env: &mut Vec<(String, String)>,
-) {
-    let profile = config
-        .effective_permission_profile(role, Some(lane), None)
-        .profile;
-    let profile_name = profile.as_str();
-
-    env.retain(|(key, _)| key != "BREHON_PERMISSION_PROFILE" && key != "CODEX_PERMISSION_PROFILE");
-    env.push((
-        "BREHON_PERMISSION_PROFILE".to_string(),
-        profile_name.to_string(),
-    ));
-    // The Codex app-server adapter consumes this to choose the thread/turn sandbox.
-    env.push((
-        "CODEX_PERMISSION_PROFILE".to_string(),
-        profile_name.to_string(),
-    ));
 }
 
 fn ensure_runtime_terminal_host_supported(config: &brehon_types::BrehonConfig) -> Result<()> {
@@ -1541,7 +1518,7 @@ pub async fn execute(
         .cargo_target_root
         .as_deref()
         .map(PathBuf::from);
-    let launcher_env_pairs = |lane: &str| -> Vec<(String, String)> {
+    let launcher_env_pairs = |role: Role, lane: &str| -> Vec<(String, String)> {
         let mut pairs = config
             .lane_launcher(lane)
             .map(|launcher| {
@@ -1561,6 +1538,7 @@ pub async fn execute(
             "BREHON_WORKTREE_ROOT".to_string(),
             worktree_root_env_value.clone(),
         ));
+        let mut pairs = profile_env(&config, role, lane, pairs);
         pairs.sort_by(|left, right| left.0.cmp(&right.0));
         pairs
     };
@@ -1589,13 +1567,7 @@ pub async fn execute(
             worker_cli_map.insert(name.clone(), agent_to_adapter(&pool.lane, &config));
             worker_agent_type_map.insert(name.clone(), pool.lane.clone());
             worker_model_map.insert(name.clone(), model_str.clone());
-            let mut worker_env = launcher_env_pairs(&pool.lane);
-            apply_effective_permission_profile_env(
-                &config,
-                brehon_types::PermissionProfileRole::Worker,
-                &pool.lane,
-                &mut worker_env,
-            );
+            let mut worker_env = launcher_env_pairs(Role::Worker, &pool.lane);
             if let Some(policy) = combine_startup_policy(
                 worker_project_policy.as_deref(),
                 config.lane_system_prompt(&pool.lane, None),
@@ -1662,13 +1634,7 @@ pub async fn execute(
             reviewer_cli_map.insert(name.clone(), agent_to_adapter(&pool.lane, &config));
             reviewer_agent_type_map.insert(name.clone(), pool.lane.clone());
             reviewer_model_map.insert(name.clone(), model_str.clone());
-            let mut reviewer_env = launcher_env_pairs(&pool.lane);
-            apply_effective_permission_profile_env(
-                &config,
-                brehon_types::PermissionProfileRole::Reviewer,
-                &pool.lane,
-                &mut reviewer_env,
-            );
+            let mut reviewer_env = launcher_env_pairs(Role::Reviewer, &pool.lane);
             if let Some(policy) = combine_startup_policy(
                 reviewer_project_policy.as_deref(),
                 config.lane_system_prompt(&pool.lane, pool.system_prompt.as_deref()),
@@ -1727,13 +1693,7 @@ pub async fn execute(
                 advisor_cli_map.insert(name.clone(), agent_to_adapter(&pool.lane, &config));
                 advisor_agent_type_map.insert(name.clone(), pool.lane.clone());
                 advisor_model_map.insert(name.clone(), model_str.clone());
-                let mut advisor_env = launcher_env_pairs(&pool.lane);
-                apply_effective_permission_profile_env(
-                    &config,
-                    brehon_types::PermissionProfileRole::Advisor,
-                    &pool.lane,
-                    &mut advisor_env,
-                );
+                let mut advisor_env = launcher_env_pairs(Role::Advisor, &pool.lane);
                 if let Some(policy) = combine_startup_policy(
                     advisor_project_policy.as_deref(),
                     config.lane_system_prompt(&pool.lane, pool.system_prompt.as_deref()),
@@ -1788,13 +1748,7 @@ pub async fn execute(
                 research_cli_map.insert(name.clone(), agent_to_adapter(&pool.lane, &config));
                 research_agent_type_map.insert(name.clone(), pool.id.clone());
                 research_model_map.insert(name.clone(), model_str.clone());
-                let mut research_env = launcher_env_pairs(&pool.lane);
-                apply_effective_permission_profile_env(
-                    &config,
-                    brehon_types::PermissionProfileRole::Research,
-                    &pool.lane,
-                    &mut research_env,
-                );
+                let mut research_env = launcher_env_pairs(Role::Research, &pool.lane);
                 research_env.push(("BREHON_RESEARCH_POOL_ID".to_string(), pool.id.clone()));
                 research_env.push(("BREHON_RESEARCH_POOL_LANE".to_string(), pool.lane.clone()));
                 research_env.push(("BREHON_RESEARCH_ROLE".to_string(), pool.role.clone()));
@@ -2063,13 +2017,7 @@ pub async fn execute(
         }
     };
     let supervisor_cwd = supervisor_cwds.get(&config.roles.supervisor.name).cloned();
-    let mut supervisor_env = launcher_env_pairs(&config.roles.supervisor.name);
-    apply_effective_permission_profile_env(
-        &config,
-        brehon_types::PermissionProfileRole::Supervisor,
-        &config.roles.supervisor.name,
-        &mut supervisor_env,
-    );
+    let mut supervisor_env = launcher_env_pairs(Role::Supervisor, &config.roles.supervisor.name);
     if let Some(policy) = config.project_prompt_for_role_name("supervisor") {
         supervisor_env.push(("BREHON_ROLE_SYSTEM_PROMPT".to_string(), policy));
     }
@@ -4438,48 +4386,6 @@ mod tests {
         config.security.sandbox_profile = brehon_types::config::SandboxProfile::OsDefault;
 
         ensure_worktree_sandbox_enforced(&config).expect("OsDefault sandbox should be allowed");
-    }
-
-    #[test]
-    fn effective_permission_profile_env_overrides_stale_launcher_values() {
-        let mut config = brehon_config::parse_defaults().expect("default config");
-        config
-            .lanes
-            .get_mut("codex-worker")
-            .expect("codex worker lane")
-            .profile = Some(brehon_types::PermissionProfile::Unsafe);
-        let mut env = vec![
-            (
-                "CODEX_PERMISSION_PROFILE".to_string(),
-                "workspace".to_string(),
-            ),
-            (
-                "BREHON_PERMISSION_PROFILE".to_string(),
-                "workspace".to_string(),
-            ),
-        ];
-
-        apply_effective_permission_profile_env(
-            &config,
-            brehon_types::PermissionProfileRole::Worker,
-            "codex-worker",
-            &mut env,
-        );
-
-        assert_eq!(
-            env.iter()
-                .filter(|(key, _)| key == "CODEX_PERMISSION_PROFILE")
-                .map(|(_, value)| value.as_str())
-                .collect::<Vec<_>>(),
-            vec!["unsafe"]
-        );
-        assert_eq!(
-            env.iter()
-                .filter(|(key, _)| key == "BREHON_PERMISSION_PROFILE")
-                .map(|(_, value)| value.as_str())
-                .collect::<Vec<_>>(),
-            vec!["unsafe"]
-        );
     }
 
     #[tokio::test]

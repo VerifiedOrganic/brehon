@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use anyhow::Result;
+use brehon_types::{BrehonConfig, PermissionProfileRole};
 
 fn set_env_pair(pairs: &mut Vec<(String, String)>, key: &str, value: String) {
     if let Some((_, existing)) = pairs.iter_mut().find(|(env_key, _)| env_key == key) {
@@ -50,6 +51,33 @@ pub(super) fn apply_agent_cargo_target_env(
         "CARGO_TARGET_DIR",
         target_dir.to_string_lossy().to_string(),
     );
+}
+
+fn apply_effective_permission_profile_env(
+    config: &BrehonConfig,
+    role: PermissionProfileRole,
+    lane: &str,
+    env: &mut Vec<(String, String)>,
+) {
+    let profile_name = config
+        .effective_permission_profile(role, Some(lane), None)
+        .profile
+        .as_str();
+
+    env.retain(|(key, _)| key != "BREHON_PERMISSION_PROFILE" && key != "CODEX_PERMISSION_PROFILE");
+    set_env_pair(env, "BREHON_PERMISSION_PROFILE", profile_name.to_string());
+    // The Codex app-server adapter consumes this to choose the thread/turn sandbox.
+    set_env_pair(env, "CODEX_PERMISSION_PROFILE", profile_name.to_string());
+}
+
+pub(super) fn profile_env(
+    config: &BrehonConfig,
+    role: PermissionProfileRole,
+    lane: &str,
+    mut env: Vec<(String, String)>,
+) -> Vec<(String, String)> {
+    apply_effective_permission_profile_env(config, role, lane, &mut env);
+    env
 }
 
 fn agent_runtime_tmp_dir(
@@ -152,6 +180,41 @@ mod tests {
                 .find_map(|(key, value)| (key == "CARGO_TARGET_DIR").then_some(value.as_str())),
             Some("/tmp/brehon-cargo-targets/worker/worker-1")
         );
+    }
+
+    #[test]
+    fn effective_permission_profile_env_overrides_stale_launcher_values() {
+        let mut config = brehon_config::parse_defaults().expect("default config");
+        config
+            .lanes
+            .get_mut("codex-worker")
+            .expect("codex worker lane")
+            .profile = Some(brehon_types::PermissionProfile::Unsafe);
+        let mut env = vec![
+            (
+                "CODEX_PERMISSION_PROFILE".to_string(),
+                "workspace".to_string(),
+            ),
+            (
+                "BREHON_PERMISSION_PROFILE".to_string(),
+                "workspace".to_string(),
+            ),
+        ];
+
+        let env = profile_env(
+            &config,
+            brehon_types::PermissionProfileRole::Worker,
+            "codex-worker",
+            env,
+        );
+
+        for key in ["CODEX_PERMISSION_PROFILE", "BREHON_PERMISSION_PROFILE"] {
+            assert_eq!(
+                env.iter()
+                    .find_map(|(env_key, value)| (env_key == key).then_some(value.as_str())),
+                Some("unsafe")
+            );
+        }
     }
 
     #[test]

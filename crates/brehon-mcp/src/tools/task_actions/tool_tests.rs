@@ -33,6 +33,8 @@ use tracing_subscriber::fmt::MakeWriter;
 mod git_patch_id_tests;
 #[path = "tool_tests/integrated_closeout.rs"]
 mod integrated_closeout;
+#[path = "tool_tests/operator_checkpoint_recovery.rs"]
+mod operator_checkpoint_recovery;
 #[path = "tool_tests/recovery.rs"]
 mod recovery;
 #[derive(Clone, Default)]

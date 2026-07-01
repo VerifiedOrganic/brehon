@@ -10,10 +10,11 @@ use crate::tools::{structured_error_result, text_result};
 
 use super::dependencies::{
     task_has_final_review_feedback, task_has_integrated_record,
-    task_has_legacy_completed_worker_status, task_has_recoverable_blocked_review_checkpoint,
+    task_has_legacy_completed_worker_status, task_has_operator_directed_checkpoint_recovery,
+    task_has_recoverable_blocked_review_checkpoint,
     task_has_recoverable_environment_limited_checkpoint,
-    task_has_recoverable_worker_state_blocker_text, task_review_feedback_outcome,
-    write_string_list_field,
+    task_has_recoverable_worker_state_blocker_text, task_has_resolved_external_unblock_marker,
+    task_review_feedback_outcome, write_string_list_field,
 };
 use super::lifecycle::{
     ancestor_chain_has_closed_parent, caller_role, reconcile_dependency_states_with_task_lock,
@@ -150,7 +151,8 @@ fn task_is_safe_handoff_repair_candidate(
         && (normalize_task_status(status) == Some("blocked")
             && (task_has_recoverable_worker_state_blocker_text(task)
                 || task_has_recoverable_blocked_review_checkpoint(task)
-                || task_has_recoverable_environment_limited_checkpoint(task))
+                || task_has_recoverable_environment_limited_checkpoint(task)
+                || task_has_operator_directed_checkpoint_recovery(task))
             || task_has_legacy_completed_worker_status(task))
         && !ancestor_chain_has_closed_parent(all_tasks, task)
         && control_plane_scope_issue_for_task(task).is_none()
@@ -204,6 +206,11 @@ fn has_blocking_evidence(task: &serde_json::Map<String, Value>) -> bool {
         .and_then(|value| value.as_str())
         .is_some_and(|value| !value.trim().is_empty())
         || !super::dependencies::read_string_list_field(task, "blocked_by").is_empty()
+}
+
+fn has_unblock_authorization(task: &serde_json::Map<String, Value>, reason: &str) -> bool {
+    !super::dependencies::read_string_list_field(task, "blocked_by").is_empty()
+        || task_has_resolved_external_unblock_marker(task, Some(reason))
 }
 
 fn apply_unblock(task: &mut serde_json::Map<String, Value>, reason: &str) -> Option<String> {
@@ -317,6 +324,17 @@ async fn unblock_by_id(id: &str, reason: &str) -> Result<UnblockOutcome, ToolRes
         ));
     }
 
+    if !has_unblock_authorization(&task, reason) {
+        return Err(structured_repair_error(
+            "unblock_not_resolved_external_blocker",
+            format!("Task {id} is blocked, but its blocker text/reason does not describe a resolved external prerequisite or dependency unblock. Use reassignment/stall handling for slow work, or recover_handoff for checkpoint review discharge."),
+            false,
+            repair_current_state(id, Some(&task)),
+            vec![ready_next_action()],
+            ready_next_action(),
+        ));
+    }
+
     let cleared_assignee = apply_unblock(&mut task, reason);
     if !write_task(id, &task) {
         return Err(structured_repair_error(
@@ -398,6 +416,8 @@ async fn recover_handoff_by_id(id: &str) -> Result<RecoverOutcome, ToolResult> {
         && task_has_recoverable_blocked_review_checkpoint(&task);
     let environment_checkpoint_recovery = normalized_status == Some("blocked")
         && task_has_recoverable_environment_limited_checkpoint(&task);
+    let operator_checkpoint_recovery = normalized_status == Some("blocked")
+        && task_has_operator_directed_checkpoint_recovery(&task);
     let task_type = task
         .get("task_type")
         .and_then(|value| value.as_str())
@@ -495,10 +515,11 @@ async fn recover_handoff_by_id(id: &str) -> Result<RecoverOutcome, ToolResult> {
         && !task_has_recoverable_worker_state_blocker_text(&task)
         && !review_checkpoint_recovery
         && !environment_checkpoint_recovery
+        && !operator_checkpoint_recovery
     {
         return Err(structured_repair_error(
             "handoff_not_recoverable",
-            format!("Task {id} is blocked, but its blocker text is not a recognized recoverable worker handoff, fresh post-review checkpoint, or environment-limited checkpoint."),
+            format!("Task {id} is blocked, but its blocker text is not a recognized recoverable worker handoff, fresh post-review checkpoint, environment-limited checkpoint, or operator-directed checkpoint recovery."),
             false,
             repair_current_state(id, Some(&task)),
             vec![ready_next_action()],
@@ -533,6 +554,8 @@ async fn recover_handoff_by_id(id: &str) -> Result<RecoverOutcome, ToolResult> {
         "Recovered blocked post-review checkpoint from recorded latest_commit; ready for re-review."
     } else if environment_checkpoint_recovery {
         "Recovered blocked environment-limited checkpoint from recorded latest_commit; ready for review with validation limitations recorded."
+    } else if operator_checkpoint_recovery {
+        "Recovered blocked operator-directed checkpoint from recorded latest_commit; ready for review/adjudication."
     } else {
         "Recovered blocked worker handoff from recorded latest_commit; ready for review."
     };

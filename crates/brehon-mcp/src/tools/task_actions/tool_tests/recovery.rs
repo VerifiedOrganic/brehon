@@ -39,7 +39,7 @@ async fn test_unblock_returns_external_blocked_task_to_pending_frontier() {
         .execute(serde_json::json!({
             "action": "unblock",
             "id": "T-sdk-pin",
-            "reason": "SDK pin updated to c4b6f2f9 with the NETCONF SSH smoke client available."
+            "reason": "SDK pin updated to c4b6f2f9 with the NETCONF SSH smoke client available; return to worker frontier."
         }))
         .await
         .unwrap();
@@ -99,6 +99,49 @@ async fn test_unblock_rejects_slow_active_task() {
     let after = read_test_task(root.path(), "T-slow");
     assert_eq!(after["status"], "in_progress");
     assert_eq!(after["assignee"], "worker-1");
+}
+
+#[tokio::test]
+async fn test_unblock_rejects_generic_blocked_task() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let root = make_test_root();
+    let _env = ScopedEnv::set_with_defaults(&[
+        ("BREHON_ROOT", root.path().to_str().unwrap()),
+        ("BREHON_AGENT_ROLE", "supervisor"),
+    ]);
+    let tool = TaskActionsTool::new();
+
+    write_test_task(root.path(), "T-generic", "blocked", "task");
+    let mut task = read_test_task(root.path(), "T-generic");
+    task["blockers"] = Value::String("Worker appears slow; try moving it along.".to_string());
+    std::fs::write(
+        root.path()
+            .join("runtime")
+            .join("tasks")
+            .join("T-generic.json"),
+        serde_json::to_string_pretty(&task).unwrap(),
+    )
+    .unwrap();
+
+    let result = tool
+        .execute(serde_json::json!({
+            "action": "unblock",
+            "id": "T-generic",
+            "reason": "worker appears slow"
+        }))
+        .await
+        .unwrap();
+
+    assert_eq!(result.is_error, Some(true));
+    let payload: Value = serde_json::from_str(&extract_text(&result)).unwrap();
+    assert_eq!(
+        payload["error_code"],
+        "unblock_not_resolved_external_blocker"
+    );
+    assert_eq!(
+        read_test_task(root.path(), "T-generic")["status"],
+        "blocked"
+    );
 }
 
 #[tokio::test]
@@ -185,6 +228,49 @@ async fn test_unblock_does_not_bypass_unmet_dependencies() {
     assert_eq!(after["status"], "blocked");
     assert_eq!(after["blocked_by"], serde_json::json!(["T-dep"]));
     assert!(after.get("blockers").is_none());
+}
+
+#[tokio::test]
+async fn test_ready_surfaces_resolved_external_unblock() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let root = make_test_root();
+    let _env = ScopedEnv::set_with_defaults(&[("BREHON_ROOT", root.path().to_str().unwrap())]);
+    let tool = TaskActionsTool::new();
+
+    write_test_task(root.path(), "T-sdk-pin", "blocked", "task");
+    let mut task = read_test_task(root.path(), "T-sdk-pin");
+    task["assignee"] = Value::Null;
+    task["blockers"] = Value::String(
+        "Environment limitation is now resolved: SDK re-pinned to c4b6f2f9 and \
+         the NETCONF SSH smoke client is available. Recover this checkpoint for \
+         rework/reassignment."
+            .to_string(),
+    );
+    std::fs::write(
+        root.path()
+            .join("runtime")
+            .join("tasks")
+            .join("T-sdk-pin.json"),
+        serde_json::to_string_pretty(&task).unwrap(),
+    )
+    .unwrap();
+
+    let ready = tool
+        .execute(serde_json::json!({"action": "ready"}))
+        .await
+        .unwrap();
+    let payload: Value = serde_json::from_str(&extract_text(&ready)).unwrap();
+    assert_eq!(payload["blocked_handoff_count"], 1, "{payload}");
+    assert_eq!(payload["recoverable_blocked_count"], 0, "{payload}");
+    assert_eq!(
+        payload["blocked_handoff_tasks"][0]["recovery_kind"],
+        "resolved_external_unblock"
+    );
+    assert_eq!(
+        payload["blocked_handoff_tasks"][0]["repair_action"]["args"]["action"],
+        "unblock"
+    );
+    assert_eq!(payload["next_action"]["kind"], "unblock");
 }
 
 #[tokio::test]

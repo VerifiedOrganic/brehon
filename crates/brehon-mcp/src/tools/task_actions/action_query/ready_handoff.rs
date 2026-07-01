@@ -1,8 +1,10 @@
 use super::super::dependencies::{
     task_has_final_review_feedback, task_has_integrated_record,
-    task_has_legacy_completed_worker_status, task_has_recoverable_blocked_review_checkpoint,
+    task_has_legacy_completed_worker_status, task_has_operator_directed_checkpoint_recovery,
+    task_has_recoverable_blocked_review_checkpoint,
     task_has_recoverable_environment_limited_checkpoint,
-    task_has_recoverable_worker_state_blocker_text, task_review_feedback_outcome,
+    task_has_recoverable_worker_state_blocker_text, task_has_resolved_external_unblock_marker,
+    task_review_feedback_outcome,
 };
 use super::*;
 
@@ -28,11 +30,17 @@ pub(super) fn blocked_handoff_context(
         status == "blocked" && task_has_recoverable_blocked_review_checkpoint(task);
     let recoverable_environment_checkpoint =
         status == "blocked" && task_has_recoverable_environment_limited_checkpoint(task);
+    let operator_checkpoint_recovery =
+        status == "blocked" && task_has_operator_directed_checkpoint_recovery(task);
+    let resolved_external_unblock =
+        status == "blocked" && task_has_resolved_external_unblock_marker(task, None);
     let legacy_completed = task_has_legacy_completed_worker_status(task);
     if task_type != "task"
         || (!recoverable_blocked_handoff
             && !recoverable_review_checkpoint
             && !recoverable_environment_checkpoint
+            && !operator_checkpoint_recovery
+            && !resolved_external_unblock
             && !legacy_completed)
     {
         return None;
@@ -43,7 +51,8 @@ pub(super) fn blocked_handoff_context(
     let scope_issue = control_plane_scope_issue_for_task(task);
     let integrated_record = task_has_integrated_record(task);
     let final_review_feedback = task_has_final_review_feedback(task);
-    let safe_repair = has_commit
+    let safe_repair = !resolved_external_unblock
+        && has_commit
         && !closed_parent
         && scope_issue.is_none()
         && !integrated_record
@@ -55,12 +64,26 @@ pub(super) fn blocked_handoff_context(
         "review_checkpoint".to_string()
     } else if recoverable_environment_checkpoint {
         "environment_limited_checkpoint".to_string()
+    } else if operator_checkpoint_recovery {
+        "operator_checkpoint_recovery".to_string()
+    } else if resolved_external_unblock {
+        "resolved_external_unblock".to_string()
     } else if recoverable_blocked_handoff {
         "worker_handoff".to_string()
     } else {
         "legacy_completed".to_string()
     });
-    value["repair_action"] = if safe_repair {
+    value["repair_action"] = if resolved_external_unblock {
+        serde_json::json!({
+            "kind": "unblock",
+            "tool": "task",
+            "args": {
+                "action": "unblock",
+                "id": task_id,
+                "reason": "External blocker is recorded as resolved; return task to worker frontier."
+            }
+        })
+    } else if safe_repair {
         serde_json::json!({
             "kind": "recover_handoff",
             "tool": "task",
@@ -87,7 +110,7 @@ pub(super) fn blocked_handoff_context(
             }
         })
     };
-    value["repair_blocker"] = if safe_repair {
+    value["repair_blocker"] = if safe_repair || resolved_external_unblock {
         Value::Null
     } else if !has_commit {
         Value::String("latest_commit is missing".to_string())
