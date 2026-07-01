@@ -2400,6 +2400,20 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_codex_launch_config_uses_unsafe_profile_defaults() {
+        let env = vec![(
+            CODEX_PERMISSION_PROFILE_ENV.to_string(),
+            "unsafe".to_string(),
+        )];
+
+        let config = extract_codex_launch_config(&[], &env);
+
+        assert_eq!(config.approval_policy, "never");
+        assert_eq!(config.thread_sandbox, "danger-full-access");
+        assert_eq!(config.turn_sandbox_policy["type"], "dangerFullAccess");
+    }
+
+    #[test]
     fn test_extract_codex_launch_config_falls_back_to_role_defaults() {
         let env = vec![("BREHON_AGENT_ROLE".to_string(), "advisor".to_string())];
 

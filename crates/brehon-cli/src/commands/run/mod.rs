@@ -108,6 +108,29 @@ fn resolved_supervisor_reasoning_effort(config: &brehon_types::BrehonConfig) -> 
         .or_else(|| config.supervisor.reasoning_effort.clone())
 }
 
+fn apply_effective_permission_profile_env(
+    config: &brehon_types::BrehonConfig,
+    role: brehon_types::PermissionProfileRole,
+    lane: &str,
+    env: &mut Vec<(String, String)>,
+) {
+    let profile = config
+        .effective_permission_profile(role, Some(lane), None)
+        .profile;
+    let profile_name = profile.as_str();
+
+    env.retain(|(key, _)| key != "BREHON_PERMISSION_PROFILE" && key != "CODEX_PERMISSION_PROFILE");
+    env.push((
+        "BREHON_PERMISSION_PROFILE".to_string(),
+        profile_name.to_string(),
+    ));
+    // The Codex app-server adapter consumes this to choose the thread/turn sandbox.
+    env.push((
+        "CODEX_PERMISSION_PROFILE".to_string(),
+        profile_name.to_string(),
+    ));
+}
+
 fn ensure_runtime_terminal_host_supported(config: &brehon_types::BrehonConfig) -> Result<()> {
     let host = &config.runtime.terminal_host;
     let kind = host.effective_kind();
@@ -1567,6 +1590,12 @@ pub async fn execute(
             worker_agent_type_map.insert(name.clone(), pool.lane.clone());
             worker_model_map.insert(name.clone(), model_str.clone());
             let mut worker_env = launcher_env_pairs(&pool.lane);
+            apply_effective_permission_profile_env(
+                &config,
+                brehon_types::PermissionProfileRole::Worker,
+                &pool.lane,
+                &mut worker_env,
+            );
             if let Some(policy) = combine_startup_policy(
                 worker_project_policy.as_deref(),
                 config.lane_system_prompt(&pool.lane, None),
@@ -1634,6 +1663,12 @@ pub async fn execute(
             reviewer_agent_type_map.insert(name.clone(), pool.lane.clone());
             reviewer_model_map.insert(name.clone(), model_str.clone());
             let mut reviewer_env = launcher_env_pairs(&pool.lane);
+            apply_effective_permission_profile_env(
+                &config,
+                brehon_types::PermissionProfileRole::Reviewer,
+                &pool.lane,
+                &mut reviewer_env,
+            );
             if let Some(policy) = combine_startup_policy(
                 reviewer_project_policy.as_deref(),
                 config.lane_system_prompt(&pool.lane, pool.system_prompt.as_deref()),
@@ -1693,6 +1728,12 @@ pub async fn execute(
                 advisor_agent_type_map.insert(name.clone(), pool.lane.clone());
                 advisor_model_map.insert(name.clone(), model_str.clone());
                 let mut advisor_env = launcher_env_pairs(&pool.lane);
+                apply_effective_permission_profile_env(
+                    &config,
+                    brehon_types::PermissionProfileRole::Advisor,
+                    &pool.lane,
+                    &mut advisor_env,
+                );
                 if let Some(policy) = combine_startup_policy(
                     advisor_project_policy.as_deref(),
                     config.lane_system_prompt(&pool.lane, pool.system_prompt.as_deref()),
@@ -1748,6 +1789,12 @@ pub async fn execute(
                 research_agent_type_map.insert(name.clone(), pool.id.clone());
                 research_model_map.insert(name.clone(), model_str.clone());
                 let mut research_env = launcher_env_pairs(&pool.lane);
+                apply_effective_permission_profile_env(
+                    &config,
+                    brehon_types::PermissionProfileRole::Research,
+                    &pool.lane,
+                    &mut research_env,
+                );
                 research_env.push(("BREHON_RESEARCH_POOL_ID".to_string(), pool.id.clone()));
                 research_env.push(("BREHON_RESEARCH_POOL_LANE".to_string(), pool.lane.clone()));
                 research_env.push(("BREHON_RESEARCH_ROLE".to_string(), pool.role.clone()));
@@ -2017,6 +2064,12 @@ pub async fn execute(
     };
     let supervisor_cwd = supervisor_cwds.get(&config.roles.supervisor.name).cloned();
     let mut supervisor_env = launcher_env_pairs(&config.roles.supervisor.name);
+    apply_effective_permission_profile_env(
+        &config,
+        brehon_types::PermissionProfileRole::Supervisor,
+        &config.roles.supervisor.name,
+        &mut supervisor_env,
+    );
     if let Some(policy) = config.project_prompt_for_role_name("supervisor") {
         supervisor_env.push(("BREHON_ROLE_SYSTEM_PROMPT".to_string(), policy));
     }
@@ -4385,6 +4438,48 @@ mod tests {
         config.security.sandbox_profile = brehon_types::config::SandboxProfile::OsDefault;
 
         ensure_worktree_sandbox_enforced(&config).expect("OsDefault sandbox should be allowed");
+    }
+
+    #[test]
+    fn effective_permission_profile_env_overrides_stale_launcher_values() {
+        let mut config = brehon_config::parse_defaults().expect("default config");
+        config
+            .lanes
+            .get_mut("codex-worker")
+            .expect("codex worker lane")
+            .profile = Some(brehon_types::PermissionProfile::Unsafe);
+        let mut env = vec![
+            (
+                "CODEX_PERMISSION_PROFILE".to_string(),
+                "workspace".to_string(),
+            ),
+            (
+                "BREHON_PERMISSION_PROFILE".to_string(),
+                "workspace".to_string(),
+            ),
+        ];
+
+        apply_effective_permission_profile_env(
+            &config,
+            brehon_types::PermissionProfileRole::Worker,
+            "codex-worker",
+            &mut env,
+        );
+
+        assert_eq!(
+            env.iter()
+                .filter(|(key, _)| key == "CODEX_PERMISSION_PROFILE")
+                .map(|(_, value)| value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["unsafe"]
+        );
+        assert_eq!(
+            env.iter()
+                .filter(|(key, _)| key == "BREHON_PERMISSION_PROFILE")
+                .map(|(_, value)| value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["unsafe"]
+        );
     }
 
     #[tokio::test]
