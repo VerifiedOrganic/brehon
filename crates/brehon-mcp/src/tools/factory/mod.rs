@@ -6,6 +6,7 @@
 
 mod git_sync;
 mod paths;
+mod reassignment;
 mod tool;
 mod workers;
 mod worktree_ops;

@@ -21,8 +21,7 @@ use crate::tools::routing::{resolve_execution_policy, ExecutionPolicySource};
 use crate::tools::stability::increment_assignment_history;
 use crate::tools::task_actions::{
     acquire_task_lock, control_plane_scope_issue_for_task,
-    enqueue_worker_session_recycle_surfacing, task_has_active_or_unconsolidated_review,
-    unmet_dependency_ids_for_task,
+    task_has_active_or_unconsolidated_review, unmet_dependency_ids_for_task,
 };
 use crate::tools::{error_result, text_result, Tool};
 use brehon_mux::PromptQueueEntry;
@@ -32,14 +31,14 @@ use super::git_sync::{
     MergeTargetBaseSyncStatus, MergeTargetSyncStatus,
 };
 use super::paths::{read_all_tasks, read_sessions, read_task, write_task};
+use super::reassignment::{
+    is_live_active_reassignment, live_reassignment_requires_force_message,
+    prepare_previous_worktree_for_reassignment, reassigned_worktree_state, ForcedReassignment,
+};
 use super::workers::{
     active_tasks_for_worker, agent_health, agent_is_unavailable, inspect_worktree,
     live_worker_names, query_nudge_state, require_supervisor_role, FORCE_REASSIGN_PARAM,
     HEARTBEAT_THRESHOLD_SECS, OUTPUT_THRESHOLD_SECS,
-};
-use super::worktree_ops::{
-    archive_worktree_with_git2, check_worktree_state_with_git2, find_worktree_by_worker,
-    remove_worktree_with_git2,
 };
 
 /// MCP tool for factory orchestration: spawning workers, checking status, and assigning tasks.
@@ -761,10 +760,7 @@ impl Tool for FactoryTool {
                 let mut research_jobs_queued: Vec<Value> = Vec::new();
                 let mut research_warning: Option<String> = None;
                 let mut assignment_propagation: Option<AssignmentPropagation> = None;
-                let mut reassigned_from: Option<String> = None;
-                let mut reassignment_note: Option<String> = None;
-                let mut previous_worker_recycle = None;
-                let mut previous_worker_recycle_warning = None;
+                let mut forced_reassignment = ForcedReassignment::default();
 
                 if let Some(mut task) = read_task(task_id) {
                     let task_type = task
@@ -831,19 +827,19 @@ impl Tool for FactoryTool {
                     ) && previous_assignee
                         .as_deref()
                         .is_some_and(|existing| !live_workers.contains(existing));
-                    let live_active_reassignment = matches!(
+                    let live_active_reassignment = is_live_active_reassignment(
                         normalized_status,
-                        "assigned" | "in_progress" | "changes_requested"
-                    ) && previous_assignee
-                        .as_deref()
-                        .is_some_and(|existing| existing != assignee && live_workers.contains(existing));
+                        previous_assignee.as_deref(),
+                        assignee,
+                        &live_workers,
+                    );
 
                     if live_active_reassignment && !force_reassign {
                         let existing_owner = previous_assignee.as_deref().unwrap_or("unknown");
-                        return Ok(error_result(format!(
-                            "Cannot reassign task {task_id} from live worker '{existing_owner}' to '{assignee}' without force_reassign=true. \
-                             If the worker is stalled, ignored a delivered prompt, or needs replacement, retry with factory action=assign_workers task_id={task_id} worker={assignee} force_reassign=true. \
-                             Brehon will transfer ownership and queue a recycle for the previous worker to clear stale context."
+                        return Ok(error_result(live_reassignment_requires_force_message(
+                            task_id,
+                            existing_owner,
+                            assignee,
                         )));
                     }
 
@@ -924,94 +920,15 @@ impl Tool for FactoryTool {
                     }
 
                     if orphaned_active_reassignment || live_active_reassignment {
-                        if let Some(old_assignee) = &previous_assignee {
-                            // Fail-closed: state check errors block reassignment unless forced
-                            match find_worktree_by_worker(old_assignee) {
-                                Ok(Some((repo, worktree_path))) => {
-                                    match check_worktree_state_with_git2(&repo, &worktree_path) {
-                                        Ok(state) => {
-                                            use brehon_git::WorktreeStateCheck;
-                                            match state {
-                                                WorktreeStateCheck::Clean => {
-                                                    if orphaned_active_reassignment {
-                                                        if let Err(e) = remove_worktree_with_git2(
-                                                            &repo,
-                                                            &worktree_path,
-                                                        ) {
-                                                            tracing::warn!(
-                                                                "Failed to remove clean worktree for {}: {}",
-                                                                old_assignee,
-                                                                e
-                                                            );
-                                                        }
-                                                    }
-                                                }
-                                                WorktreeStateCheck::Missing => {
-                                                    // No action needed - worktree doesn't exist
-                                                }
-                                                WorktreeStateCheck::Dirty { details }
-                                                | WorktreeStateCheck::MidOperation {
-                                                    operation: details,
-                                                } => {
-                                                    if !force_reassign {
-                                                        return Ok(error_result(format!(
-                                                            "Cannot reassign task {task_id}: old worker '{old_assignee}' has dirty worktree ({}) \
-                                                             Use force_reassign=true to archive the worktree and proceed.",
-                                                            details
-                                                        )));
-                                                    }
-
-                                                    match archive_worktree_with_git2(
-                                                        &repo,
-                                                        &worktree_path,
-                                                        old_assignee,
-                                                        task_id,
-                                                        "reassignment",
-                                                    ) {
-                                                        Ok(archive_path) => {
-                                                            tracing::info!(
-                                                                "Archived dirty worktree for {} at {}",
-                                                                old_assignee,
-                                                                archive_path
-                                                            );
-                                                            task.insert(
-                                                                "worktree_archived".into(),
-                                                                Value::String(archive_path.clone()),
-                                                            );
-                                                        }
-                                                        Err(e) => {
-                                                            return Ok(error_result(format!(
-                                                                "Failed to archive worktree for {}: {}",
-                                                                old_assignee, e
-                                                            )));
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        Err(e) => {
-                                            // State check failed - fail closed unless forced
-                                            if !force_reassign {
-                                                return Ok(error_result(format!(
-                                                    "Cannot reassign task {task_id}: worktree state check failed for '{old_assignee}': {e} \
-                                                     Use force_reassign=true to proceed anyway."
-                                                )));
-                                            }
-                                        }
-                                    }
-                                }
-                                Ok(None) => {
-                                    // No worktree found - continue with reassignment
-                                }
-                                Err(e) => {
-                                    // Ambiguous or other error - fail closed unless forced
-                                    if !force_reassign {
-                                        return Ok(error_result(format!(
-                                            "Cannot reassign task {task_id}: failed to locate worktree for '{old_assignee}': {e} \
-                                             Use force_reassign=true to proceed anyway."
-                                        )));
-                                    }
-                                }
+                        if let Some(old_assignee) = previous_assignee.as_deref() {
+                            if let Err(message) = prepare_previous_worktree_for_reassignment(
+                                task_id,
+                                &mut task,
+                                old_assignee,
+                                force_reassign,
+                                orphaned_active_reassignment,
+                            ) {
+                                return Ok(error_result(message));
                             }
                         }
                     }
@@ -1080,29 +997,19 @@ impl Tool for FactoryTool {
 
                     if live_active_reassignment {
                         if let Some(old_assignee) = previous_assignee.as_deref() {
-                            reassigned_from = Some(old_assignee.to_string());
-                            previous_worker_recycle = Some(old_assignee.to_string());
-                            let note = format!(
-                                "Supervisor force-reassigned active task from {normalized_status}: previous live assignee {old_assignee} was replaced by {assignee}. \
-                                 Previous worker recycle was queued to clear stale assignment context."
+                            forced_reassignment.record_live_transfer(
+                                &mut task,
+                                old_assignee,
+                                assignee,
+                                normalized_status,
                             );
-                            task.insert("reassignment_note".into(), Value::String(note.clone()));
-                            reassignment_note = Some(note);
                             self.emit_event(
                                 EventKind::WorkerReassigned {
                                     old_worker: old_assignee.to_string(),
                                     new_worker: assignee.to_string(),
                                     task_id: task_id.to_string(),
                                     reason: "forced_live_transfer".to_string(),
-                                    worktree_state: if task
-                                        .get("worktree_archived")
-                                        .and_then(|v| v.as_str())
-                                        .is_some()
-                                    {
-                                        "archived".to_string()
-                                    } else {
-                                        "preserved".to_string()
-                                    },
+                                    worktree_state: reassigned_worktree_state(&task),
                                 },
                                 task_id.to_string(),
                             )
@@ -1167,16 +1074,7 @@ impl Tool for FactoryTool {
                 }
                 increment_assignment_history(1);
 
-                if let Some(worker) = previous_worker_recycle.as_deref() {
-                    let recycle_outcome = enqueue_worker_session_recycle_surfacing(
-                        task_id,
-                        Some(worker),
-                        "forced live worker reassignment",
-                    );
-                    if let Some(warning) = recycle_outcome.warning {
-                        previous_worker_recycle_warning = Some(warning);
-                    }
-                }
+                forced_reassignment.queue_previous_worker_recycle(task_id);
 
                 if project_config
                     .as_ref()
@@ -1360,22 +1258,7 @@ impl Tool for FactoryTool {
                     result["prompt_id"] = Value::String(delivery.prompt_id.clone());
                 }
                 if let Some(task) = refreshed_task.as_ref() {
-                    if let Some(previous) = reassigned_from.as_deref() {
-                        result["reassigned_from"] = Value::String(previous.to_string());
-                        result["force_reassigned"] = Value::Bool(true);
-                    }
-                    if let Some(note) = reassignment_note.as_deref() {
-                        result["reassignment_note"] = Value::String(note.to_string());
-                    }
-                    if let Some(worker) = previous_worker_recycle.as_deref() {
-                        result["previous_worker_recycle_queued"] =
-                            Value::Bool(previous_worker_recycle_warning.is_none());
-                        result["previous_worker_recycle_target"] =
-                            Value::String(worker.to_string());
-                    }
-                    if let Some(warning) = previous_worker_recycle_warning {
-                        result["previous_worker_recycle_warning"] = warning;
-                    }
+                    forced_reassignment.append_result_fields(&mut result);
                     if let Some(note) = task.get("recovery_note").and_then(|v| v.as_str()) {
                         result["recovery_note"] = Value::String(note.to_string());
                         result["recovered_orphaned_task"] = Value::Bool(true);
