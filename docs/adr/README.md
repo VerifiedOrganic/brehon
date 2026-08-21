@@ -30,8 +30,9 @@ Each ADR uses this structure:
 | [0002](0002-acp-and-mcp.md) | ACP for agent lifecycle, MCP for shared context tools | Accepted |
 | [0003](0003-rust-native-supervisor.md) | A deterministic Rust supervisor reading an event store, not an LLM | Accepted |
 | [0004](0004-reviewer-panel.md) | Multi-reviewer panel with explicit scoring policy | Accepted |
-| [0005](0005-git-worktrees.md) | Git worktree per worker for isolation | Accepted |
+| [0005](0005-git-worktrees.md) | Git worktree per worker for isolation | Superseded by [0010](0010-clone-isolation-and-confinement.md) |
 | [0006](0006-fjall-tantivy.md) | Fjall as the only event store, Tantivy as the derived index | Accepted |
 | [0007](0007-in-process-multiplexer.md) | In-process PTY multiplexer with ghostty_vt, not tmux/Zellij | Accepted |
 | [0008](0008-local-first.md) | Local-first operation; no cloud dependencies, no telemetry | Accepted |
 | [0009](0009-panic-unwind-firewalls.md) | panic=unwind is load-bearing; panic="abort" is forbidden | Accepted |
+| [0010](0010-clone-isolation-and-confinement.md) | Per-agent `file://` clones and kernel confinement, not worktrees | Accepted |

@@ -1,6 +1,6 @@
 # ADR-0005: Git worktree per worker for isolation
 
-**Status**: Accepted
+**Status**: Superseded by [ADR-0010](0010-clone-isolation-and-confinement.md)
 **Date**: 2026-04-12
 **Deciders**: project founders
 
