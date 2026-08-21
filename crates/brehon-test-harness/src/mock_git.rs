@@ -314,6 +314,14 @@ impl GitOperations for FakeGitOperations {
         Ok(Diff { files })
     }
 
+    /// Coarse over-approximation: any path present on both branches counts as
+    /// a conflict.
+    ///
+    /// The real implementation runs `git merge-tree` (ORT), so it reports
+    /// *nothing* when two branches edit disjoint hunks of the same file. This
+    /// mock stores whole-file content and cannot model that, so a test must
+    /// not read a conflict from this fake as a guarantee that the real merge
+    /// conflicts — only the other direction holds.
     async fn has_conflicts(&self, branch: &str, base: &str) -> Result<Vec<String>, PortError> {
         let inner = self.inner.read();
 

@@ -1,10 +1,26 @@
 //! Integration worktree operations for preflight checks.
 
+use std::process::Command;
+
 use git2::Repository;
 use tracing::debug;
 
 use crate::error::GitError;
 use crate::rebase::RebaseOps;
+
+/// Extract the conflicted paths from `git merge-tree --write-tree --name-only -z`.
+///
+/// The NUL-separated layout is: result tree OID, then one field per conflicted
+/// path, then an empty field terminating that section, then informational
+/// messages we do not need.
+fn parse_merge_tree_conflicts(stdout: &[u8]) -> Vec<String> {
+    String::from_utf8_lossy(stdout)
+        .split('\0')
+        .skip(1)
+        .take_while(|field| !field.is_empty())
+        .map(str::to_string)
+        .collect()
+}
 
 /// Integration operations.
 pub struct IntegrationOps<'a> {
@@ -16,83 +32,55 @@ impl<'a> IntegrationOps<'a> {
         Self { repo }
     }
 
-    fn path_to_string(path: &std::path::Path) -> String {
-        path.to_string_lossy().to_string()
-    }
-
     /// Preview merge conflicts without modifying anything.
     ///
-    /// Returns files that WOULD conflict if `branch` were merged into `base`.
-    /// This is computed by analyzing diffs from merge base.
+    /// Returns the paths that would conflict if `branch` were merged into
+    /// `base`.
+    ///
+    /// Shells out to `git merge-tree --write-tree`, which runs the same ORT
+    /// strategy `git merge` will — fidelity to what the real merge does is the
+    /// entire point of a preflight check. `git2::Repository::merge_commits` is
+    /// deliberately not used: libgit2's merge is not ORT and has no
+    /// directory-rename detection, so it answers a different question.
     pub fn preview_conflicts(&self, branch: &str, base: &str) -> Result<Vec<String>, GitError> {
         debug!("Previewing conflicts between '{}' and '{}'", branch, base);
 
-        let branch_ref = format!("refs/heads/{branch}");
-        let base_ref = format!("refs/heads/{base}");
+        let cwd = self.repo.workdir().unwrap_or_else(|| self.repo.path());
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args([
+                "merge-tree",
+                "--write-tree",
+                "--name-only",
+                "-z",
+                base,
+                branch,
+            ])
+            .output()
+            .map_err(|err| {
+                GitError::GitOperationFailed(format!(
+                    "failed to run git merge-tree for '{branch}' into '{base}': {err}"
+                ))
+            })?;
 
-        let branch_commit = self.repo.find_reference(&branch_ref)?.peel_to_commit()?;
-        let base_commit = self.repo.find_reference(&base_ref)?.peel_to_commit()?;
-
-        let merge_base = self.repo.merge_base(branch_commit.id(), base_commit.id())?;
-
-        let base_commit_obj = self.repo.find_commit(base_commit.id())?;
-        let branch_commit_obj = self.repo.find_commit(branch_commit.id())?;
-
-        let base_tree = base_commit_obj.tree()?;
-        let branch_tree = branch_commit_obj.tree()?;
-        let merge_base_tree = self.repo.find_commit(merge_base)?.tree()?;
-
-        let base_diff =
-            self.repo
-                .diff_tree_to_tree(Some(&merge_base_tree), Some(&base_tree), None)?;
-        let branch_diff =
-            self.repo
-                .diff_tree_to_tree(Some(&merge_base_tree), Some(&branch_tree), None)?;
-
-        let mut base_changed_files = std::collections::HashSet::new();
-        let mut branch_changed_files = std::collections::HashSet::new();
-
-        base_diff.foreach(
-            &mut |delta, _| {
-                if let Some(path) = delta.new_file().path() {
-                    base_changed_files.insert(Self::path_to_string(path));
-                } else if let Some(path) = delta.old_file().path() {
-                    base_changed_files.insert(Self::path_to_string(path));
-                }
-                true
-            },
-            None,
-            None,
-            None,
-        )?;
-
-        branch_diff.foreach(
-            &mut |delta, _| {
-                if let Some(path) = delta.new_file().path() {
-                    branch_changed_files.insert(Self::path_to_string(path));
-                } else if let Some(path) = delta.old_file().path() {
-                    branch_changed_files.insert(Self::path_to_string(path));
-                }
-                true
-            },
-            None,
-            None,
-            None,
-        )?;
-
-        let conflicts: Vec<String> = base_changed_files
-            .intersection(&branch_changed_files)
-            .cloned()
-            .collect();
-
-        debug!("Found {} potential conflicts", conflicts.len());
-        Ok(conflicts)
+        // Exit 1 means "conflicts" *or* "bad input" — an unknown ref exits 1
+        // with empty stdout, so the code alone cannot tell them apart. On a
+        // real conflict stdout always carries at least the result tree OID.
+        match output.status.code() {
+            Some(0) => Ok(Vec::new()),
+            Some(1) if !output.stdout.is_empty() => Ok(parse_merge_tree_conflicts(&output.stdout)),
+            _ => Err(GitError::GitOperationFailed(format!(
+                "git merge-tree failed for '{branch}' into '{base}': {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ))),
+        }
     }
 
-    /// Test if a merge can be performed cleanly in isolation.
+    /// Whether merging `branch` into `base` would be conflict-free.
     ///
-    /// Creates a temporary worktree, attempts the merge there,
-    /// and returns whether conflicts were found.
+    /// Nothing is written and no worktree is created; this is
+    /// [`Self::preview_conflicts`] reduced to a yes/no.
     pub fn test_merge_clean(&self, branch: &str, base: &str) -> Result<bool, GitError> {
         debug!("Testing merge of '{}' into '{}' in isolation", branch, base);
 
@@ -100,10 +88,10 @@ impl<'a> IntegrationOps<'a> {
         Ok(conflicts.is_empty())
     }
 
-    /// Test if a rebase can be performed cleanly in isolation.
+    /// Whether rebasing `branch` onto `onto` would be conflict-free.
     ///
-    /// Creates a temporary worktree, attempts the rebase there,
-    /// and returns whether conflicts were found.
+    /// Nothing is written and no worktree is created; this delegates to
+    /// [`RebaseOps::preview_rebase_conflicts`].
     pub fn test_rebase_clean(&self, branch: &str, onto: &str) -> Result<bool, GitError> {
         debug!(
             "Testing rebase of '{}' onto '{}' in isolation",
@@ -217,6 +205,90 @@ mod tests {
             .expect("preview should work");
 
         assert!(conflicts.contains(&"file.txt".to_string()));
+    }
+
+    /// Commit `content` as `file.txt` on `branch`, parented on `parent`.
+    fn commit_file(
+        repo: &Repository,
+        branch: &str,
+        content: &[u8],
+        parent: Option<git2::Oid>,
+    ) -> git2::Oid {
+        let sig = Signature::now("Test", "test@example.com").expect("failed");
+        let tree = {
+            let mut builder = repo.treebuilder(None).expect("failed");
+            let blob = repo.blob(content).expect("failed");
+            builder.insert("file.txt", blob, 0o100644).expect("failed");
+            repo.find_tree(builder.write().expect("failed"))
+                .expect("failed")
+        };
+        let parents: Vec<git2::Commit> = parent
+            .map(|oid| repo.find_commit(oid).expect("failed"))
+            .into_iter()
+            .collect();
+        let parent_refs: Vec<&git2::Commit> = parents.iter().collect();
+        repo.commit(
+            Some(&format!("refs/heads/{branch}")),
+            &sig,
+            &sig,
+            branch,
+            &tree,
+            &parent_refs,
+        )
+        .expect("failed")
+    }
+
+    /// T4: the old implementation intersected changed-file sets, so two
+    /// branches that both touched a file — anywhere in it — were reported as
+    /// conflicting. On real project branches that produced 215 false
+    /// conflicts where `git merge-tree` reported 0.
+    #[test]
+    fn preview_conflicts_ignores_non_overlapping_edits_to_the_same_file() {
+        let (_temp_dir, repo) = create_test_repo();
+        let base = commit_file(&repo, "main", b"line1\nline2\nline3\nline4\nline5\n", None);
+        commit_file(
+            &repo,
+            "main",
+            b"MAIN\nline2\nline3\nline4\nline5\n",
+            Some(base),
+        );
+        repo.branch("feature", &repo.find_commit(base).expect("failed"), false)
+            .expect("failed");
+        commit_file(
+            &repo,
+            "feature",
+            b"line1\nline2\nline3\nline4\nFEATURE\n",
+            Some(base),
+        );
+
+        let ops = IntegrationOps::new(&repo);
+        let conflicts = ops
+            .preview_conflicts("feature", "main")
+            .expect("preview should work");
+
+        assert!(
+            conflicts.is_empty(),
+            "both branches touched file.txt but in disjoint hunks, so git merges \
+             them cleanly; reported: {conflicts:?}"
+        );
+    }
+
+    /// A bad ref exits 1 with empty stdout, exactly as a real conflict exits 1
+    /// — so the exit code alone cannot distinguish them.
+    #[test]
+    fn preview_conflicts_rejects_an_unknown_ref() {
+        let (_temp_dir, repo) = create_test_repo();
+        commit_file(&repo, "main", b"seed\n", None);
+
+        let ops = IntegrationOps::new(&repo);
+        let err = ops
+            .preview_conflicts("no-such-branch", "main")
+            .expect_err("an unknown ref must not be reported as a clean merge");
+
+        assert!(
+            !matches!(err, GitError::MergeConflict(_)),
+            "invalid input must not masquerade as a conflict: {err}"
+        );
     }
 
     #[test]
