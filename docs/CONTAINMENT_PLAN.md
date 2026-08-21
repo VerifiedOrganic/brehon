@@ -191,6 +191,15 @@ prohibition folded into the existing closing REMINDER rather than appended as
 a new trailing step, so the ordering test keeps holding. Nothing in the tree
 told agents to rebase, so this was an addition, not a contradiction to remove.
 
+**Instructing `git merge` required a change to the review path** (`e0d5bb5`).
+`resolve_review_commit_set` enumerated `rev-list merge_target..reviewed_commit`
+with no `--no-merges`, so a sync merge entered the reviewed set — and
+`cherry-pick -x` refuses a merge commit outright ("is a merge but no -m option
+was given"). **[v]** Following T5's own instruction would have made integration
+unrunnable for that task. Merges are now excluded, which is also the correct
+set: a sync merge's content is the base branch's, which the merge target
+already has.
+
 **One correction worth carrying into T6's premise**: the first cut claimed
 "if your branch tip changes after approval, the reviewed commit no longer
 exists and Brehon refuses to integrate your work." **[v]** That is false in
@@ -251,10 +260,20 @@ against it and refuses on mismatch. Roughly 10 lines plus the persisted field,
 needs no worker-branch name (`task["branch"]` is read in four places and
 written nowhere), and is topology-independent so it survives P1.
 
-The record is best-effort: the cherry-pick has already landed by the time it is
-written, so failing the integration there would be worse than losing the
-expectation. The gate is skipped when nothing was recorded, so containers
-integrated before the field existed keep closing.
+The record is best-effort: the branch has already moved by the time it is
+written, so failing the caller there would be worse than losing the
+expectation. It is therefore written *before* the caller marks its own work
+durable — a crash in between must leave the operation repeatable, or the
+container strands on a stale expectation the idempotent early exit will never
+let anything re-record. The gate is skipped when nothing was recorded, so
+containers closed before the field existed keep closing.
+
+Two gaps in the first cut, both found by review and fixed in `e0d5bb5`: the
+tip was recorded *after* the child was marked integrated (the unrecoverable
+ordering), and the gate never applied to **initiatives** at all, because epics
+reach an initiative's branch through `action=close`, not `action=integrate` —
+the very container whose close is the public-history boundary. The recorder is
+shared and called from both paths now.
 
 **Verify**: a recorded tip closes cleanly; a hand-made commit in the integration
 worktree is refused naming the expected tip; an absent or blank record does not
