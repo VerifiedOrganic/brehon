@@ -38,8 +38,8 @@ use super::integration_proof::{IntegrationProofRecorder, IntegrationSuccessProof
 
 use super::epic::{
     check_epic_completion, continue_cherry_pick, ensure_epic_integration_worktree,
-    read_current_review_request, read_parent_task, start_cherry_pick, verify_applied,
-    EXPECTED_INTEGRATION_TIP,
+    read_current_review_request, record_container_integration_tip, start_cherry_pick,
+    verify_applied,
 };
 use super::followups::resolve_promoted_followups_for_terminal_task;
 use super::git_ops::{
@@ -984,36 +984,6 @@ use super::git_ops::git_stdout_in;
 // Finalize
 // ---------------------------------------------------------------------------
 
-/// Stamp the integration-branch tip Brehon just produced onto the container
-/// task, so container close can refuse to merge a tip Brehon did not create.
-///
-/// Nothing ever merges *into* an integration branch — it only advances through
-/// this cherry-pick path — so a tip that differs from the last recorded one is
-/// content that reached the branch outside review.
-///
-/// Best-effort by design: the cherry-pick has already landed by the time this
-/// runs, so failing the integration here would be worse than losing the
-/// expectation. A missing record simply means the gate has nothing to check.
-fn record_container_integration_tip(task: &serde_json::Map<String, Value>, tip: &str) {
-    let Some(parent_id) = task.get("parent_id").and_then(Value::as_str) else {
-        return;
-    };
-    let Some(mut parent) = read_parent_task(task) else {
-        return;
-    };
-    parent.insert(
-        EXPECTED_INTEGRATION_TIP.into(),
-        Value::String(tip.to_string()),
-    );
-    if !write_task(parent_id, &parent) {
-        tracing::warn!(
-            parent_id,
-            tip,
-            "Failed to record container integration tip; container close cannot verify it"
-        );
-    }
-}
-
 async fn finalize_integration(
     id: &str,
     task: &mut serde_json::Map<String, Value>,
@@ -1076,14 +1046,21 @@ async fn finalize_integration(
     final_state.resolution = None;
     write_integration_state(task, &final_state);
 
+    // Before the child is marked integrated, not after. A crash between the
+    // two writes must leave the child re-integratable so the next run
+    // re-stamps the same tip; the other order strands the container on a stale
+    // expectation that no action can repair, because the idempotent early exit
+    // refuses to re-run integrate on an already-integrated child.
+    if let Some(parent_id) = task.get("parent_id").and_then(Value::as_str) {
+        record_container_integration_tip(parent_id, &integrated_commit);
+    }
+
     if !write_task(id, task) {
         return Ok(error_result(format!(
             "Integrated reviewed commit into '{merge_target}', but failed to persist task {id}. \
              Re-run task action=integrate id={id} to record the integrated state."
         )));
     }
-
-    record_container_integration_tip(task, &integrated_commit);
 
     let recycle_outcome = enqueue_worker_session_recycle_surfacing(
         id,

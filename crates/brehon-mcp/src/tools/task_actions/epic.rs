@@ -1000,8 +1000,36 @@ pub(super) async fn container_target_worktree_for_task(
 /// Verify container branch is ready for merge into its base branch.
 /// Returns Ok(branch_name) if the container branch exists and is a descendant of the base branch.
 /// Task field holding the integration-branch tip Brehon last produced for a
-/// container, written by `action=integrate` and checked at container close.
+/// container, checked at that container's close.
+///
+/// Written from both paths that advance a container branch: `action=integrate`
+/// cherry-picking a reviewed subtask onto an epic branch, and `action=close`
+/// merging an epic branch into its initiative's branch.
 pub(super) const EXPECTED_INTEGRATION_TIP: &str = "expected_integration_tip";
+
+/// Record the integration-branch tip Brehon just produced for `container_id`.
+///
+/// Best-effort by design: the branch has already moved by the time this runs,
+/// so failing the caller here would be worse than losing the expectation. It
+/// must therefore be called *before* the caller marks its own work durable, so
+/// that a crash in between leaves the operation repeatable rather than
+/// stranding the container on a tip nobody will re-record.
+pub(super) fn record_container_integration_tip(container_id: &str, tip: &str) {
+    let Some(mut container) = read_task(container_id) else {
+        return;
+    };
+    container.insert(
+        EXPECTED_INTEGRATION_TIP.into(),
+        Value::String(tip.to_string()),
+    );
+    if !write_task(container_id, &container) {
+        tracing::warn!(
+            container_id,
+            tip,
+            "Failed to record container integration tip; close cannot verify it"
+        );
+    }
+}
 
 pub(super) fn verify_container_branch_ready(
     container_id: &str,
@@ -1070,13 +1098,15 @@ pub(super) fn verify_container_branch_ready(
     }
 
     // The close path merges this branch's LIVE tip into the base branch, and
-    // ancestry alone says nothing about what is on it. Everything Brehon puts
-    // there arrives through `action=integrate`, which records the resulting
-    // tip — so a tip Brehon did not produce is content no panel reviewed,
-    // typically a commit made by hand in the integration worktree.
+    // ancestry alone says nothing about what is on it. Every way Brehon
+    // advances a container branch records the resulting tip — cherry-picks
+    // onto an epic branch via `action=integrate`, epic merges onto an
+    // initiative branch via `action=close` — so a tip Brehon did not produce
+    // is content no panel reviewed, typically a commit made by hand in the
+    // integration worktree.
     //
-    // Skipped when nothing was recorded: containers integrated before this
-    // field existed, and containers with no integrated children, have no
+    // Skipped when nothing was recorded: containers whose branch Brehon has
+    // never advanced, and containers closed before this field existed, have no
     // expectation to check.
     if let Some(expected_tip) = expected_tip.map(str::trim).filter(|tip| !tip.is_empty()) {
         let actual_tip = git_stdout_in(integration_worktree, &["rev-parse", integration_branch])

@@ -16,8 +16,8 @@ use super::epic::{
     check_initiative_epic_integration_status, container_base_branch_for_task,
     container_target_worktree_for_task, ensure_container_integration_worktree,
     merge_container_branch_into_target_with_strategy, read_current_review_request,
-    read_parent_task, verify_container_branch_ready, verify_merge_ready, ContainerMergeStrategy,
-    EXPECTED_INTEGRATION_TIP,
+    read_parent_task, record_container_integration_tip, verify_container_branch_ready,
+    verify_merge_ready, ContainerMergeStrategy, EXPECTED_INTEGRATION_TIP,
 };
 use super::followups::{
     collect_container_open_followup_blockers, resolve_promoted_followups_for_terminal_task,
@@ -419,6 +419,18 @@ pub(super) async fn execute(args: &Value) -> Result<ToolResult, McpError> {
                                 "integration_status".into(),
                                 Value::String("integrated".to_string()),
                             );
+                        }
+                    }
+
+                    // An epic branch merging into its initiative's branch is
+                    // the other way Brehon advances a container branch, and
+                    // the initiative's own close is the public-history
+                    // boundary. Record it before persisting this epic, so a
+                    // crash in between leaves the close repeatable.
+                    if merged_into_parent_branch {
+                        if let Some(parent_id) = task_data.get("parent_id").and_then(|v| v.as_str())
+                        {
+                            record_container_integration_tip(parent_id, &merge_commit);
                         }
                     }
 

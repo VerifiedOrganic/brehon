@@ -53,16 +53,29 @@ which is why inspection must go through it.
 Phases are ordered by dependency. **P0 is independent of the topology change and
 should land first** — it contains live bugs that cost agent-time today.
 
-### P0 — Immediate fixes, independent of topology
+### P0 — Immediate fixes, independent of topology — **complete**
+
+T1–T6 landed hand-executed (no brehon run against brehon), `make ci` green
+before each commit. Every ticket's file path needed correcting against the tree;
+the line numbers were consistently right and the crate names consistently wrong.
+T6 was re-aimed — see its entry.
 
 ---
 
-#### T1 · Gemini receives no autonomy flag under worktree isolation
+#### T1 · Gemini receives no autonomy flag under worktree isolation — **done** (`72f5a71`)
 
-**Why**: with `worktree_isolation: true`, `crates/brehon-adapter-gemini/src/gemini.rs:277-283`
-gates the approval flag on `allow_privileged_mode`, so an unattended run parks
-at an interactive prompt indefinitely. This is costing agent-days now and is
-unrelated to containment.
+**Path correction**: the site is `crates/brehon-pty/src/pty/agents/gemini.rs:277-283`,
+not `crates/brehon-adapter-gemini/…` — the line numbers were right, the crate
+was not. The ACP path had the identical bug via the same
+`BREHON_GEMINI_ALLOW_YOLO` env contract and is fixed by the same change.
+`--approval-mode yolo` is now unconditional; only the sandbox override stays
+gated on the profile. **[v]** Gemini overrides yolo to `default` in an
+untrusted folder rather than failing, so the `prepare_local_gemini_home`
+fallback path is unchanged.
+
+**Why**: with `worktree_isolation: true`, that gate hangs the approval flag off
+`allow_privileged_mode`, so an unattended run parks at an interactive prompt
+indefinitely. This is costing agent-days now and is unrelated to containment.
 
 **Approach**: decouple the autonomy flag from `allow_privileged_mode`; select it
 from the resolved permission profile the same way the other adapters do. Compare
@@ -75,7 +88,22 @@ single-agent Gemini task that reaches `complete` without operator input.
 
 ---
 
-#### T2 · Denial messages leak the protected path
+#### T2 · Denial messages leak the protected path — **done** (`7c19cec`)
+
+Both citations were exact. `validate_mutating_path` also echoed the *resolved*
+path, which was the sharper leak — a relative `../../../src/lib.rs` came back
+as an absolute path under a root the model had never seen — so it now echoes
+only the token the model supplied. `check_shared_root_reference` was de-pathed
+too, for consistent vocabulary.
+
+**Still open, same class, out of the ticket's stated scope**: the same
+protected root is printed to the model by MCP tool errors at
+`task_actions/git_ops.rs:309` and `:439`, `paths.rs:117`, and
+`build_artifact_cleanup.rs:235`. `git_ops.rs:309` is reached from task
+`complete`, `close`, status updates and review approval. Note also that
+`claude_hook` cannot keep the path "in brehon's log only": `Commands::ClaudeHook`
+falls through to `tracing_subscriber::fmt()`, whose writer is stdout, which
+Claude Code captures.
 
 **Why**: `agent_git_guard.rs:195` and `claude_hook.rs:297-302` print the
 protected absolute path back to the model at the precise moment it is looking
@@ -89,7 +117,22 @@ string contains no `/`.
 
 ---
 
-#### T3 · Repository hygiene
+#### T3 · Repository hygiene — **done** (`a504b40`, fixed in `accf6a5`)
+
+Session close prunes stale registrations via libgit2 (reusing
+`WorktreeOps::cleanup_stale_metadata`, which was tested but had no production
+caller) and sweeps its own empty run directories. `gc.auto` was set explicitly
+to 6700 — **not** 0 — and one deliberate `git gc` ran.
+
+Two defects in the first cut, both found by review and fixed in `accf6a5`:
+the sweep recursed unbounded into live checkouts and deleted empty directories
+git cannot restore (no race needed — just `auto_cleanup_worktrees: false`), and
+it swept the shared `runs/` root, which could delete a concurrent session's
+pre-created worktree parent and abort that run with ENOENT. It is now bounded
+to the two levels the `runs/<session>/<scope>/<agent>` layout occupies and
+scoped to the closing session. Wiring in `cleanup_stale_metadata` also made a
+latent bug live: its `remove_dir_all` fallback deleted *locked* registrations
+that `git worktree prune` deliberately keeps.
 
 **Why**: **[v]** 76 of 81 worktree registrations in the reference project are
 `prunable`; 1572 leaked worktree directories; the object store is 701 MB with
@@ -109,7 +152,16 @@ session close.
 
 ---
 
-#### T4 · `preview_conflicts` reports false conflicts
+#### T4 · `preview_conflicts` reports false conflicts — **done** (`ed8c02a`)
+
+**Path corrections**: the site is `crates/brehon-git/src/integration.rs:27`
+(line right, crate wrong); `has_conflicts` is at `ops.rs:163`, not `:152`; the
+mock is `crates/brehon-test-harness/src/mock_git.rs:317`; the trait is
+`GitOperations`, not `GitPort`. The doc-comment citations at `:94` and `:105`
+were exact. **[v]** The exit-code warning was right: a bad ref exits 1 with
+empty stdout, exactly as a conflict exits 1. Unrelated histories exit 128.
+The three harness call sites all use whole-file-replacement fixtures, which
+genuinely conflict under ORT, so none needed changing.
 
 **Why**: `crates/brehon-mcp/src/tools/task_actions/integration.rs:27` intersects
 changed-file sets. **[v]** On two real project branches it reported 215
@@ -132,7 +184,20 @@ exits 0 and proves nothing) and a known-disjoint pair.
 
 ---
 
-#### T5 · Worker protocol: merge, never rebase
+#### T5 · Worker protocol: merge, never rebase — **done** (`de28283`, corrected in `3fc5349`)
+
+Landed as a HISTORY RULE in the leading containment block, with the
+prohibition folded into the existing closing REMINDER rather than appended as
+a new trailing step, so the ordering test keeps holding. Nothing in the tree
+told agents to rebase, so this was an addition, not a contradiction to remove.
+
+**One correction worth carrying into T6's premise**: the first cut claimed
+"if your branch tip changes after approval, the reviewed commit no longer
+exists and Brehon refuses to integrate your work." **[v]** That is false in
+this topology — after a rebase the reviewed commit is dangling but still in
+the shared object store, and `git cherry-pick -x <sha>` succeeds against it.
+The real consequence is the opposite shape: integration applies exactly the
+reviewed SHAs, so the rewritten work is silently dropped.
 
 **Why**: rebase rewrites SHAs. Agent commits X → panel approves X → base
 advances → agent rebases → tip is X′ → brehon integrates a commit no panel ever
@@ -154,13 +219,53 @@ present and the rebase prohibition appears in the trailing block.
 **Why**: belt and braces for T5. If the branch tip moved after approval,
 integration must refuse rather than silently ship an unreviewed commit.
 
-**Approach**: record the tip SHA when the panel approves (alongside the existing
-review record in `crates/brehon-mcp/src/tools/verification/`), and check it in
-the integration path before cherry-pick. Roughly 10 lines plus the persisted
-field.
+**As written this ticket was redundant, and was re-aimed one level up.** Three
+findings, each verified against the tree:
 
-**Verify**: test that integration returns a blocking error when the recorded SHA
-and the current tip differ.
+1. The gate it describes already ships **twice** — `action_integrate.rs:295-356`
+   and `action_close.rs:600-657` compare `task.latest_commit` against the
+   approved review commit via `commits_refer_to_same_oid`, demote to
+   `review_ready`, and return `stale_review_approval`. Its Verify criterion is
+   already met by `tool_tests.rs:9482` and `:7247`.
+2. Its threat model is unreachable through `integrate`, which cherry-picks the
+   frozen SHA set from the review request and never resolves a ref. A moved
+   worker tip cannot ship unreviewed code. **[v]** empirically.
+3. The persisted field it asks for exists: `latest_commit` *is* the worker tip
+   as of the worker's last brehon call (`action_update.rs:893-902`, from
+   `current_git_head()`), and `request.commit` is pinned to it at request time.
+   T6 collapses to zero lines, not ten.
+
+**The unchecked tip is the container's, not the worker's.** Container close
+merges the **live** integration-branch tip into the base branch
+(`action_close.rs:340` → `epic.rs` `merge --squash` / `--no-ff` / `-s ours`),
+and `verify_container_branch_ready` checked only branch-exists,
+worktree-is-on-it and base-is-an-ancestor — never *what* was on it. Anything
+committed into the integration worktree outside `action=integrate` shipped
+unreviewed.
+
+**Approach as built** (`7cfd7c8`): nothing ever merges *into* an integration
+branch — it only advances through the cherry-pick path — so `finalize_integration`
+records the tip it already computes onto the container task, and
+`verify_container_branch_ready` compares `rev-parse <integration_branch>`
+against it and refuses on mismatch. Roughly 10 lines plus the persisted field,
+needs no worker-branch name (`task["branch"]` is read in four places and
+written nowhere), and is topology-independent so it survives P1.
+
+The record is best-effort: the cherry-pick has already landed by the time it is
+written, so failing the integration there would be worse than losing the
+expectation. The gate is skipped when nothing was recorded, so containers
+integrated before the field existed keep closing.
+
+**Verify**: a recorded tip closes cleanly; a hand-made commit in the integration
+worktree is refused naming the expected tip; an absent or blank record does not
+block close.
+
+**Related, not built** — `integration_closeout.rs:20-36` substitutes the live
+`task.latest_commit` as the reviewed set when the round-request file is
+unreadable (`read_round_request` swallows parse errors with `.ok()?`) and the
+task is aborted or already integrated. The staleness gate at `:301` is
+conditioned on `from_review_request`, so that path has no approval check at
+all. Disk-corruption-gated, but it fails open.
 
 ---
 

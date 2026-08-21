@@ -52,6 +52,14 @@ pub(super) fn resolve_review_commit_set(
         &[
             "rev-list",
             "--reverse",
+            // Integration replays this set with `cherry-pick -x`, and
+            // cherry-pick refuses a merge commit outright ("is a merge but no
+            // -m option was given"). The worker protocol tells workers to sync
+            // with `git merge`, so sync merges are expected on a worker
+            // branch; their content is the base branch's, which the merge
+            // target already has. Replaying only the worker's own commits is
+            // both what cherry-pick can do and what is wanted.
+            "--no-merges",
             &format!("{merge_target}..{reviewed_commit}"),
         ],
     )
@@ -445,4 +453,81 @@ pub(super) fn preview_commit_integration_conflicts(
     remove_git_worktree_force(&repo_root, &temp_worktree);
     remove_preflight_lease(&preflight_base, temp_entry_name);
     result
+}
+
+#[cfg(test)]
+mod merge_commit_tests {
+    use super::*;
+    use crate::tools::{ScopedEnv, TEST_ENV_LOCK};
+    use std::path::Path;
+
+    fn git(cwd: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .unwrap_or_else(|e| panic!("git {}: {e}", args.join(" ")));
+        assert!(
+            out.status.success(),
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// The worker protocol tells workers to sync with `git merge`, so a sync
+    /// merge is expected on a worker branch. `cherry-pick -x` refuses a merge
+    /// commit outright ("is a merge but no -m option was given"), so a
+    /// reviewed set containing one would make integration unrunnable.
+    #[test]
+    fn reviewed_commit_set_excludes_sync_merges() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let root = repo.path();
+        git(root, &["init", "-b", "main"]);
+        git(root, &["config", "user.email", "brehon@example.invalid"]);
+        git(root, &["config", "user.name", "Brehon Test"]);
+        std::fs::write(root.join("base.txt"), "base\n").unwrap();
+        git(root, &["add", "-A"]);
+        git(root, &["commit", "-m", "base"]);
+
+        git(root, &["checkout", "-b", "worker"]);
+        std::fs::write(root.join("w1.txt"), "w1\n").unwrap();
+        git(root, &["add", "-A"]);
+        git(root, &["commit", "-m", "w1"]);
+        let w1 = git(root, &["rev-parse", "HEAD"]);
+
+        git(root, &["checkout", "main"]);
+        std::fs::write(root.join("m1.txt"), "m1\n").unwrap();
+        git(root, &["add", "-A"]);
+        git(root, &["commit", "-m", "m1"]);
+
+        git(root, &["checkout", "worker"]);
+        git(root, &["merge", "--no-edit", "-m", "sync merge", "main"]);
+        let sync_merge = git(root, &["rev-parse", "HEAD"]);
+        std::fs::write(root.join("w2.txt"), "w2\n").unwrap();
+        git(root, &["add", "-A"]);
+        git(root, &["commit", "-m", "w2"]);
+        let w2 = git(root, &["rev-parse", "HEAD"]);
+
+        let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env =
+            ScopedEnv::set_with_defaults(&[("BREHON_WORKSPACE_ROOT", root.to_str().unwrap())]);
+        let resolved =
+            resolve_review_commit_set("T-merge", "main", &w2).expect("commit set resolves");
+
+        assert!(resolved.commit_set_resolved);
+        assert!(
+            !resolved.commits.contains(&sync_merge),
+            "a sync merge must not enter the reviewed set: {:?}",
+            resolved.commits
+        );
+        assert_eq!(
+            resolved.commits,
+            vec![w1, w2],
+            "the worker's own commits, in order, are what integration replays"
+        );
+    }
 }
