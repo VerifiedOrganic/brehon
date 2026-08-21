@@ -293,6 +293,83 @@ all. Disk-corruption-gated, but it fails open.
 Land T7 and T8 together; the fetch-back (T10) must land in the same change or
 integration breaks.
 
+**T9 has landed** (`96d2a65`) — the inventory exists and reconciles at session
+close, but nothing reads it yet; the readers move over with T8.
+
+---
+
+#### P1.0 · Two subsystems this phase depends on, which the tickets above do not cover
+
+Found while scoping T8. Both are load-bearing, both are verified, and neither
+is a port — they are redesigns. **[v]** on every citation.
+
+**Scoping decision.** Agent directories are created through exactly one
+primitive — `WorktreeOps::create_worktree` (`crates/brehon-git/src/worktree.rs:91`)
+via `Git2Operations::create_worktree` (`ops.rs:86`) — with three production
+callers. Only one makes *agent* directories:
+
+| caller | makes | under P1 |
+|---|---|---|
+| `prepare_scoped_worktrees_with_progress` (`setup.rs:2552`) | all five agent roles | **becomes clones** |
+| `reconcile_initiative_hierarchy` (`setup.rs:2416`) | initiative integration | stays a worktree |
+| `ensure_container_integration_worktree` (`epic.rs:682`) | epic/initiative integration | stays a worktree |
+| `verification/commits.rs:194`, `:304` (shell `worktree add --detach`) | review preflight | stays a worktree |
+
+Integration and preflight worktrees are Brehon-owned and never agent-writable,
+so the ADR's dilemma does not apply to them. Only the agent lane migrates.
+
+**(a) The review pipeline is built on the shared object store, explicitly.**
+`crates/brehon-mcp/src/tools/verification/review_prompt.rs:155` states it as an
+invariant and the prompt text at `:161` tells every reviewer "All Brehon
+worktrees share one .git object database. The commit is reachable from your
+current worktree by SHA." A test at `:336` asserts that string, and it is
+duplicated in `brehon-tui/src/run/stall_handling.rs:184` and
+`event_loop.rs:4719`. Under T8 a reviewer holds its own clone and
+`git show <worker-sha>` fails.
+
+Consequence: **the fetch-back is a review-time operation, not an
+integration-time one.** The order becomes
+
+```
+worker `task action=complete`
+  └─ brehon: git -C $CANONICAL fetch $AGENTDIR \
+       'refs/heads/brehon/*:refs/heads/brehon/<agent-id>/*'      (T10)
+  └─ brehon: publish the ref under review into base.git as
+       refs/brehon/review/<task>                                  (narrow —
+       does not expose peers' branches, which is why T7 dropped origin)
+  └─ reviewer: git fetch origin && git show <sha>
+```
+
+`resolve_review_commit_set` (`verification/commits.rs:19`) additionally runs
+`rev-parse` / `merge-base` / `rev-list` in `workspace_root()` — the *caller's*
+own agent directory. It must be re-pointed at canonical. The three prompt
+strings and the test at `:336` change with it.
+
+**(b) Brehon mutates the worker repository on every assignment.**
+`sync_worker_worktree_to_assignment_seed`
+(`crates/brehon-mcp/src/tools/factory/git_sync.rs:315`, called from
+`factory/tool.rs:977`) opens the worker's repo with git2, writes
+`refs/brehon/archive/{worker}/{sha}` **into** it (`:478`, `:491`), and runs
+`git reset --hard <target_ref>` inside it (`:508`). That is exactly what
+ADR-0010 forbids.
+
+It should not be ported — it should disappear. Under P1 the clone *is* the
+seed: destroy the directory and re-clone from `base.git` at the required ref
+rather than resetting in place. The archive ref becomes unnecessary because the
+fetch-back has already put the worker's commits in canonical under
+`refs/heads/brehon/<agent-id>/*` before the directory is destroyed. The
+`changes_requested` case, which seeds from `latest_commit` rather than
+`merge_target`, works the same way once that commit has been published into
+`base.git`.
+
+Cost: one clone per assignment instead of one reset — **[v]** ~0.47 s and 22 MB,
+which §Consequences already accepts.
+
+**File-size blocks to plan around**: `crates/brehon-git/src/worktree.rs`
+(1452) and `task_actions/epic.rs` (2403) are at their baseline caps exactly;
+`setup.rs` has 32 lines. The clone implementation needs a new module
+(`crates/brehon-git/src/clone.rs`) regardless of taste.
+
 ---
 
 #### T7 · `base.git` — brehon-writable, agent-read-only base mirror
