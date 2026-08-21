@@ -243,9 +243,16 @@ impl PtyConfig {
                 trusted_folders_path.to_string_lossy().to_string(),
             ),
         ];
+        // Autonomy is not privilege. Brehon factory agents are unattended, so
+        // the provider approval prompt must never block a run regardless of
+        // sandbox profile — the same call Codex makes with
+        // `--ask-for-approval never` and Claude with `--permission-mode
+        // dontAsk`. Gemini has no "never ask" short of yolo, so yolo is
+        // unconditional and only the sandbox override stays gated below.
+        // The ACP path replaces argv wholesale, so it reads this env contract.
+        env.push(("BREHON_GEMINI_ALLOW_YOLO".to_string(), "1".to_string()));
         if allow_privileged_mode {
             env.push(("GEMINI_SANDBOX".to_string(), "false".to_string()));
-            env.push(("BREHON_GEMINI_ALLOW_YOLO".to_string(), "1".to_string()));
         }
         prepend_current_exe_dir_to_path(&mut env);
         push_workspace_root_env(&mut env, &cwd);
@@ -274,10 +281,8 @@ impl PtyConfig {
             ));
         }
 
-        let mut args = Vec::new();
+        let mut args = vec!["--approval-mode".to_string(), "yolo".to_string()];
         if allow_privileged_mode {
-            args.push("--approval-mode".to_string());
-            args.push("yolo".to_string());
             args.push("--sandbox".to_string());
             args.push("false".to_string());
         }

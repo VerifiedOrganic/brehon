@@ -63,6 +63,38 @@ mod tests {
         .unwrap();
     }
 
+    /// The configuration the T1 bug fires on: isolated worktrees with the OS
+    /// sandbox on, i.e. every ordinary unattended run.
+    fn write_isolated_sandbox_profile(project_root: &std::path::Path) {
+        let brehon_dir = project_root.join(".brehon");
+        std::fs::create_dir_all(&brehon_dir).unwrap();
+        std::fs::write(
+            brehon_dir.join("config.yaml"),
+            "orchestration:\n  worktree_isolation: true\nsecurity:\n  sandbox_profile: OsDefault\n",
+        )
+        .unwrap();
+    }
+
+    /// Gemini has no "approve nothing, ask nobody" mode short of `yolo`, so
+    /// autonomy for an unattended agent means `--approval-mode yolo` — the
+    /// peer of Codex's `--ask-for-approval never` and Claude's `dontAsk`.
+    fn assert_gemini_unattended_autonomy_args(config: &PtyConfig) {
+        assert!(
+            config
+                .args
+                .windows(2)
+                .any(|window| window[0] == "--approval-mode" && window[1] == "yolo"),
+            "unattended Gemini agents must not park at the provider approval prompt"
+        );
+        assert!(
+            config
+                .env
+                .iter()
+                .any(|(k, v)| k == "BREHON_GEMINI_ALLOW_YOLO" && v == "1"),
+            "the ACP path reads the env contract instead of argv"
+        );
+    }
+
     fn assert_claude_unattended_permission_args(config: &PtyConfig) {
         assert!(
             config
@@ -994,7 +1026,7 @@ mod tests {
             None,
         );
         assert_eq!(config.command, "gemini");
-        assert!(!config.args.contains(&"--approval-mode".to_string()));
+        assert_gemini_unattended_autonomy_args(&config);
         assert!(!config.args.contains(&"--sandbox".to_string()));
         assert!(config.args.contains(&"--model".to_string()));
         assert!(config.args.contains(&"pro".to_string()));
@@ -1006,12 +1038,6 @@ mod tests {
                 .any(|(k, v)| k == "BREHON_AGENT_NAME" && v == "test-worker")
         );
         assert!(!config.env.iter().any(|(k, _)| k == "GEMINI_SANDBOX"));
-        assert!(
-            !config
-                .env
-                .iter()
-                .any(|(k, _)| k == "BREHON_GEMINI_ALLOW_YOLO")
-        );
         assert!(
             config
                 .env
@@ -1078,6 +1104,70 @@ mod tests {
         let _ = std::fs::remove_dir_all(workdir);
     }
 
+    /// T1 regression: with `worktree_isolation: true` and a real sandbox
+    /// profile — the shape of every ordinary unattended run — Gemini used to
+    /// receive no autonomy flag at all, because the flag was gated on
+    /// `allow_privileged_mode`. The agent then sat at the provider approval
+    /// prompt until the run timed out. Autonomy and privilege are separate
+    /// decisions: only the sandbox override may depend on the profile.
+    #[tokio::test]
+    async fn test_pty_config_gemini_worker_isolated_profile_keeps_autonomy_without_privilege() {
+        let workdir = fresh_temp_dir("brehon-gemini-worker-isolated");
+        write_isolated_sandbox_profile(&workdir);
+        let brehon_root = workdir.join(".brehon");
+        let config = PtyConfig::gemini(
+            "test-worker",
+            "worker",
+            workdir.clone(),
+            Some(&brehon_root),
+            Some("test-supervisor"),
+            None,
+            Some("pro"),
+            None,
+            None,
+        );
+
+        assert_gemini_unattended_autonomy_args(&config);
+        assert!(
+            !config.args.contains(&"--sandbox".to_string()),
+            "a sandboxed profile must not disable Gemini's own sandbox"
+        );
+        assert!(!config.env.iter().any(|(k, _)| k == "GEMINI_SANDBOX"));
+
+        let _ = std::fs::remove_dir_all(workdir);
+    }
+
+    /// Same decoupling on the ACP path, which replaces argv wholesale and so
+    /// depends entirely on the env contract.
+    #[tokio::test]
+    async fn test_pty_config_gemini_acp_isolated_profile_propagates_yolo_env() {
+        let workdir = fresh_temp_dir("brehon-gemini-acp-isolated");
+        write_isolated_sandbox_profile(&workdir);
+        let brehon_root = workdir.join(".brehon");
+        let config = PtyConfig::gemini_acp(
+            "test-worker",
+            "worker",
+            workdir.clone(),
+            Some(&brehon_root),
+            Some("test-supervisor"),
+            None,
+            Some("pro"),
+            Some("medium"),
+            None,
+        );
+
+        assert_eq!(config.args.first().map(String::as_str), Some("--acp"));
+        assert!(
+            config
+                .env
+                .iter()
+                .any(|(k, v)| k == "BREHON_GEMINI_ALLOW_YOLO" && v == "1")
+        );
+        assert!(!config.env.iter().any(|(k, _)| k == "GEMINI_SANDBOX"));
+
+        let _ = std::fs::remove_dir_all(workdir);
+    }
+
     /// Regression test: the ACP path (`gemini_acp`) delegates to `gemini` internally,
     /// so env-var gating is preserved by construction. This test guards against a
     /// future refactoring that decouples the two paths and accidentally drops the
@@ -1116,10 +1206,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(workdir);
     }
 
-    /// Defense-in-depth: verify that gemini_acp does NOT propagate the yolo env
-    /// contract when the sandbox profile is NOT None.
+    /// Defense-in-depth: a safe profile keeps the autonomy contract — the run
+    /// is still unattended — but must never carry the privilege escalation.
     #[tokio::test]
-    async fn test_pty_config_gemini_acp_safe_profile_omits_yolo_env() {
+    async fn test_pty_config_gemini_acp_safe_profile_keeps_yolo_env_without_sandbox_override() {
         let workdir = fresh_temp_dir("brehon-gemini-acp-safe");
         let config = PtyConfig::gemini_acp(
             "test-worker",
@@ -1135,10 +1225,10 @@ mod tests {
 
         assert_eq!(config.args.first().map(String::as_str), Some("--acp"));
         assert!(
-            !config
+            config
                 .env
                 .iter()
-                .any(|(k, _)| k == "BREHON_GEMINI_ALLOW_YOLO")
+                .any(|(k, v)| k == "BREHON_GEMINI_ALLOW_YOLO" && v == "1")
         );
         assert!(!config.env.iter().any(|(k, _)| k == "GEMINI_SANDBOX"));
 
@@ -1160,7 +1250,7 @@ mod tests {
             None,
         );
         assert_eq!(config.command, "gemini");
-        assert!(!config.args.contains(&"--approval-mode".to_string()));
+        assert_gemini_unattended_autonomy_args(&config);
         assert!(config.args.contains(&"-i".to_string()));
         assert!(config.args.iter().any(|arg| {
             arg.contains("action=session_start name=supervisor agent_type=supervisor")
