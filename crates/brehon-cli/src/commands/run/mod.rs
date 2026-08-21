@@ -30,8 +30,9 @@ use setup::{
     activate_claude_worktree_hook, activate_protected_branch_guard, agent_to_adapter,
     cleanup_scoped_worktrees, ensure_claude_worktree_hook, ensure_codex_instruction_files,
     ensure_mcp_config, ensure_protected_branch_hooks, ensure_shared_root_on_default_branch,
-    prepare_scoped_worktrees_with_progress, reconcile_initiative_hierarchy_for_run,
-    reconcile_orphaned_worker_assignments_for_run, restore_shared_root_branch,
+    prepare_scoped_worktrees_with_progress, prune_session_worktrees,
+    reconcile_initiative_hierarchy_for_run, reconcile_orphaned_worker_assignments_for_run,
+    restore_shared_root_branch,
 };
 pub(crate) use setup::{
     protected_branch_hooks_installed, remove_claude_worktree_hook, remove_protected_branch_hooks,
@@ -3114,6 +3115,8 @@ pub async fn execute(
         cleanup_scoped_worktrees(&cwd, &research_cwds).await;
     }
 
+    progress.step("Pruning stale worktree registrations...");
+    prune_session_worktrees(&cwd, &runtime_worktree_root);
     progress.step("Cleaning up runtime temp files...");
     cleanup_session_runtime_tmp_dir(&runtime_worktree_root, &session_name).await;
 

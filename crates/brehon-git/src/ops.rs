@@ -68,6 +68,17 @@ impl Git2Operations {
         let ops = WorktreeOps::new(&repo);
         ops.validate_worktree(path)
     }
+
+    /// Drop registrations whose worktree directory is gone, returning the
+    /// pruned worktree names. Equivalent to `git worktree prune`, but through
+    /// libgit2 so no hooks, filters or fsmonitor can fire.
+    pub fn prune_stale_worktrees(&self) -> Result<Vec<String>, GitError> {
+        let repo = self
+            .repo
+            .lock()
+            .map_err(|_| GitError::WorktreeRemovalFailed("lock error".into()))?;
+        WorktreeOps::new(&repo).cleanup_stale_metadata()
+    }
 }
 
 #[async_trait]

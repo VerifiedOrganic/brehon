@@ -20,7 +20,7 @@
 1839 crates/brehon-cli/src/commands/import_plan/tests.rs
 1615 crates/brehon-cli/src/commands/init.rs
 2250 crates/brehon-cli/src/commands/maintenance.rs
-4529 crates/brehon-cli/src/commands/run/mod.rs
+4532 crates/brehon-cli/src/commands/run/mod.rs
 1981 crates/brehon-cli/src/commands/run/review.rs
 5582 crates/brehon-cli/src/commands/run/setup.rs
 1242 crates/brehon-cli/src/ui.rs

@@ -14,8 +14,10 @@ mod adapter_selection;
 mod agent_git_guard;
 #[cfg(test)]
 mod protected_branch_tests;
+mod session_hygiene;
 
 pub(crate) use agent_git_guard::ensure_agent_git_worktree_guard;
+pub(crate) use session_hygiene::prune_session_worktrees;
 
 const BREHON_PROTECTED_BRANCH_GUARD_BEGIN: &str = "# BEGIN BREHON PROTECTED BRANCH GUARD";
 const BREHON_PROTECTED_BRANCH_GUARD_END: &str = "# END BREHON PROTECTED BRANCH GUARD";
