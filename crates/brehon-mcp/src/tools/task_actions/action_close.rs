@@ -17,6 +17,7 @@ use super::epic::{
     container_target_worktree_for_task, ensure_container_integration_worktree,
     merge_container_branch_into_target_with_strategy, read_current_review_request,
     read_parent_task, verify_container_branch_ready, verify_merge_ready, ContainerMergeStrategy,
+    EXPECTED_INTEGRATION_TIP,
 };
 use super::followups::{
     collect_container_open_followup_blockers, resolve_promoted_followups_for_terminal_task,
@@ -137,6 +138,9 @@ pub(super) async fn execute(args: &Value) -> Result<ToolResult, McpError> {
                         branch,
                         &integration_worktree,
                         &base_branch,
+                        task_data
+                            .get(EXPECTED_INTEGRATION_TIP)
+                            .and_then(|v| v.as_str()),
                     ) {
                         return Ok(error_result(err));
                     }

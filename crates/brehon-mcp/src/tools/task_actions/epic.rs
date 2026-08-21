@@ -999,12 +999,17 @@ pub(super) async fn container_target_worktree_for_task(
 
 /// Verify container branch is ready for merge into its base branch.
 /// Returns Ok(branch_name) if the container branch exists and is a descendant of the base branch.
+/// Task field holding the integration-branch tip Brehon last produced for a
+/// container, written by `action=integrate` and checked at container close.
+pub(super) const EXPECTED_INTEGRATION_TIP: &str = "expected_integration_tip";
+
 pub(super) fn verify_container_branch_ready(
     container_id: &str,
     container_type: &str,
     integration_branch: &str,
     integration_worktree: &Path,
     base_branch: &str,
+    expected_tip: Option<&str>,
 ) -> Result<String, String> {
     let workspace = project_root().ok_or_else(|| {
         "No project root available for container branch verification.".to_string()
@@ -1062,6 +1067,34 @@ pub(super) fn verify_container_branch_ready(
             container_type,
             container_type
         ));
+    }
+
+    // The close path merges this branch's LIVE tip into the base branch, and
+    // ancestry alone says nothing about what is on it. Everything Brehon puts
+    // there arrives through `action=integrate`, which records the resulting
+    // tip — so a tip Brehon did not produce is content no panel reviewed,
+    // typically a commit made by hand in the integration worktree.
+    //
+    // Skipped when nothing was recorded: containers integrated before this
+    // field existed, and containers with no integrated children, have no
+    // expectation to check.
+    if let Some(expected_tip) = expected_tip.map(str::trim).filter(|tip| !tip.is_empty()) {
+        let actual_tip = git_stdout_in(integration_worktree, &["rev-parse", integration_branch])
+            .map_err(|err| {
+                format!(
+                    "{container_type} {container_id} could not resolve integration_branch \
+                     '{integration_branch}': {err}"
+                )
+            })?;
+        if !crate::tools::verification::commits_refer_to_same_oid(&actual_tip, expected_tip) {
+            return Err(format!(
+                "{container_type} {container_id} branch '{integration_branch}' is at \
+                 {actual_tip}, but Brehon last integrated {expected_tip}. Commits reached the \
+                 branch outside review and would ship to '{base_branch}' unreviewed. Review \
+                 them through a task before closing the {container_type}, or reset the branch \
+                 to {expected_tip}."
+            ));
+        }
     }
 
     Ok(integration_branch.to_string())

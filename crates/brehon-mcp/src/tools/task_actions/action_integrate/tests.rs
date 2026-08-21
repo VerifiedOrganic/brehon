@@ -267,3 +267,112 @@ fn execute_cherry_picks_skips_commit_with_trailer_and_continues_remaining() {
         "second commit should still be cherry-picked after skipping trailer-proven first"
     );
 }
+
+/// T6 (re-scoped): container close merges the LIVE integration-branch tip into
+/// the base branch, and `verify_container_branch_ready` previously checked only
+/// that the branch existed, that the worktree was on it, and that base was an
+/// ancestor — never *what* was on it. Nothing merges into an integration
+/// branch, so a tip Brehon did not produce is content that reached the branch
+/// outside review and would ship unreviewed.
+mod container_tip_gate {
+    use super::*;
+    use crate::tools::task_actions::epic::verify_container_branch_ready;
+    use crate::tools::{ScopedEnv, TEST_ENV_LOCK};
+
+    struct Fixture {
+        _repo: tempfile::TempDir,
+        root: std::path::PathBuf,
+        worktree: std::path::PathBuf,
+    }
+
+    /// A repo with `main`, an `epic/t6` integration branch carrying one
+    /// integrated commit, and a real worktree checked out on that branch.
+    fn fixture() -> (Fixture, String) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let root = repo.path().to_path_buf();
+        run_git_ok(&root, &["init", "-b", "main"]);
+        run_git_ok(&root, &["config", "user.email", "brehon@example.invalid"]);
+        run_git_ok(&root, &["config", "user.name", "Brehon Test"]);
+        std::fs::write(root.join("README.md"), "seed\n").unwrap();
+        run_git_ok(&root, &["add", "README.md"]);
+        run_git_ok(&root, &["commit", "-m", "seed"]);
+
+        run_git_ok(&root, &["branch", "epic/t6"]);
+        let worktree = root.join("wt-epic");
+        run_git_ok(
+            &root,
+            &[
+                "worktree",
+                "add",
+                worktree.to_string_lossy().as_ref(),
+                "epic/t6",
+            ],
+        );
+        std::fs::write(worktree.join("reviewed.txt"), "reviewed\n").unwrap();
+        run_git_ok(&worktree, &["add", "reviewed.txt"]);
+        run_git_ok(&worktree, &["commit", "-m", "integrated reviewed commit"]);
+        let integrated_tip = run_git_ok(&worktree, &["rev-parse", "HEAD"]);
+
+        (
+            Fixture {
+                _repo: repo,
+                root,
+                worktree,
+            },
+            integrated_tip,
+        )
+    }
+
+    fn verify(fx: &Fixture, expected_tip: Option<&str>) -> Result<String, String> {
+        let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = ScopedEnv::set_with_defaults(&[
+            ("BREHON_PROJECT_ROOT", fx.root.to_str().unwrap()),
+            ("BREHON_WORKSPACE_ROOT", fx.root.to_str().unwrap()),
+        ]);
+        verify_container_branch_ready(
+            "T-epic",
+            "epic",
+            "epic/t6",
+            &fx.worktree,
+            "main",
+            expected_tip,
+        )
+    }
+
+    #[test]
+    fn accepts_the_tip_brehon_last_integrated() {
+        let (fx, integrated_tip) = fixture();
+        verify(&fx, Some(&integrated_tip)).expect("the recorded tip must close cleanly");
+    }
+
+    #[test]
+    fn refuses_a_commit_made_outside_integration() {
+        let (fx, integrated_tip) = fixture();
+
+        // A hand-made commit in the integration worktree — the shape a
+        // conflict resolution or a stray supervisor edit takes.
+        std::fs::write(fx.worktree.join("sneaked.txt"), "never reviewed\n").unwrap();
+        run_git_ok(&fx.worktree, &["add", "sneaked.txt"]);
+        run_git_ok(&fx.worktree, &["commit", "-m", "unreviewed"]);
+
+        let err = verify(&fx, Some(&integrated_tip))
+            .expect_err("a tip Brehon did not produce must not merge into main");
+        assert!(
+            err.contains("outside review"),
+            "refusal must say why: {err}"
+        );
+        assert!(
+            err.contains(&integrated_tip),
+            "refusal must name the expected tip: {err}"
+        );
+    }
+
+    /// Containers integrated before this field existed have no expectation to
+    /// check, and must keep closing.
+    #[test]
+    fn skips_when_no_tip_was_recorded() {
+        let (fx, _) = fixture();
+        verify(&fx, None).expect("an absent record must not block close");
+        verify(&fx, Some("  ")).expect("a blank record must not block close");
+    }
+}
