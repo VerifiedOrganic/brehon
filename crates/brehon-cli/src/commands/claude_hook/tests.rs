@@ -440,3 +440,43 @@ fn allows_when_no_worktree_root_set() {
         Decision::Block(_)
     ));
 }
+
+/// T2: the denial fires at the exact moment the model is looking for a way
+/// around it, so it must not hand over the protected root. A relative path is
+/// the case that matters — resolving it reveals a root the model never typed.
+#[test]
+fn shared_root_denial_does_not_leak_the_protected_path() {
+    let decision = evaluate(
+        "Write",
+        &json!({ "file_path": "../../../src/lib.rs", "content": "oops" }),
+        &ctx_with_project("/repo/.brehon/worktrees/runs/session/worker-1", "/repo"),
+    );
+    let Decision::Block(reason) = decision else {
+        panic!("expected a block, got {decision:?}");
+    };
+    assert!(
+        reason.contains("shared repo root"),
+        "the model still needs to know why: {reason}"
+    );
+    assert!(
+        !reason.contains("/repo"),
+        "denial leaked the protected path: {reason}"
+    );
+}
+
+/// Same for the Bash-segment guard, which names the root in its own message.
+#[test]
+fn shared_root_reference_denial_does_not_leak_the_protected_path() {
+    let decision = evaluate(
+        "Bash",
+        &bash("echo hi > /repo/src/lib.rs"),
+        &ctx_with_project("/repo/.brehon/worktrees/runs/session/worker-1", "/repo"),
+    );
+    let Decision::Block(reason) = decision else {
+        panic!("expected a block, got {decision:?}");
+    };
+    assert!(
+        !reason.contains("/repo"),
+        "denial leaked the protected path: {reason}"
+    );
+}

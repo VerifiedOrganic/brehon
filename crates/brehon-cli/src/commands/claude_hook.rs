@@ -294,11 +294,13 @@ fn validate_mutating_path(
         .as_ref()
         .is_some_and(|root| path.starts_with(root))
     {
+        // Name neither the protected root nor the resolved path: this fires at
+        // the moment the model is hunting for a way around the denial, and a
+        // relative `raw_path` resolves to an absolute one that would teach it
+        // the root it never knew. Echo back only what it supplied.
         return Decision::Block(format!(
-            "`{tool_name}` attempted to mutate `{}` under the shared repo root `{}`. \
-             Write only inside your assigned worktree.",
-            path.display(),
-            shared_root.unwrap().display()
+            "`{tool_name}` attempted to mutate `{raw_path}`, which is under the shared repo root. \
+             Write only inside your assigned worktree."
         ));
     }
 
@@ -580,11 +582,11 @@ fn check_shared_root_reference(segment: &str, ctx: &PolicyContext) -> Decision {
         .filter(|path| path.starts_with(&project_root))
         .any(|path| !path_allowed_for_mutation(&path, ctx))
     {
-        return Decision::Block(format!(
-            "Bash command references the protected shared repo root `{}`. \
-             Use only your assigned worktree or an allowed supervisor integration worktree.",
-            project_root.display()
-        ));
+        return Decision::Block(
+            "Bash command references the protected shared repo root. \
+             Use only your assigned worktree or an allowed supervisor integration worktree."
+                .to_string(),
+        );
     }
 
     Decision::Allow

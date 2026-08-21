@@ -101,6 +101,9 @@ fn shell_quote(path: &Path) -> String {
     format!("'{}'", raw.replace('\'', "'\\''"))
 }
 
+/// The denial the shim prints reaches the agent model, so it names no path —
+/// `ensure_agent_git_worktree_guard` logs the full `project_root` Brehon-side
+/// at install time instead.
 fn agent_git_worktree_guard_script(real_git: &Path, project_root: &Path) -> String {
     format!(
         r#"#!/usr/bin/env bash
@@ -192,7 +195,7 @@ if [[ "$repo_root" == "$project_root" && -n "$subcommand" ]]; then
   case "$subcommand" in
     add|am|apply|checkout|cherry-pick|clean|commit|merge|mv|pull|rebase|reset|restore|revert|rm|stash|switch|update-index)
       if [[ "$brehon_git_guard_bypass_valid" != "1" ]]; then
-        echo "Brehon git guard denied mutating git command '$subcommand' inside protected shared repo root: $project_root" >&2
+        echo "Brehon git guard denied mutating git command '$subcommand' inside the protected shared repo root." >&2
         echo "Use the assigned isolated worktree for mutating Git operations during this run." >&2
         exit 2
       fi
@@ -331,6 +334,14 @@ mod tests {
             String::from_utf8_lossy(&denied.stderr)
                 .contains("Brehon git guard denied mutating git command 'checkout'"),
             "stderr: {}",
+            String::from_utf8_lossy(&denied.stderr)
+        );
+        // T2: the denial reaches the model at the moment it is looking for a
+        // way around it, so it must not name the protected path. No path can
+        // survive without a separator.
+        assert!(
+            !String::from_utf8_lossy(&denied.stderr).contains('/'),
+            "denial leaked a path: {}",
             String::from_utf8_lossy(&denied.stderr)
         );
 
