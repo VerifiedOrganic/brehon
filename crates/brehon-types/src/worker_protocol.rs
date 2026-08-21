@@ -63,10 +63,10 @@ pub fn build_worker_protocol(
         "HISTORY RULE: To pick up changes from the base branch, run `git merge origin/main` — \
          or merge the task's `merge_target`. NEVER run `git rebase`, `git commit --amend`, or \
          `git reset` on your worker branch. Those rewrite commit SHAs, and a reviewer panel \
-         approves one specific SHA: if your branch tip changes after approval, the reviewed \
-         commit no longer exists and Brehon refuses to integrate your work. Merge commits on \
-         a worker branch are expected and correct — never \"clean up\" history. To undo \
-         something, add a new commit."
+         approves one specific SHA. Brehon integrates exactly the SHAs that were reviewed, so \
+         anything you rewrite on top of them is silently dropped — the rewritten work never \
+         ships and nothing warns you. Merge commits on a worker branch are expected and \
+         correct — never \"clean up\" history. To undo something, add a new commit."
             .to_string(),
         // ── Bootstrap and task lifecycle ──────────────────────────────────
         bootstrap_step,
