@@ -526,7 +526,11 @@ impl<'a> WorktreeOps<'a> {
                 if let Ok(WorktreeMetadata { worktree_path }) =
                     self.read_worktree_metadata(&metadata_path)
                 {
-                    if !worktree_path.exists() {
+                    // `git worktree prune` deliberately keeps a locked
+                    // registration whose directory is gone (removable media,
+                    // offline mount) and libgit2 refuses to prune one, so the
+                    // fallback below must never see it.
+                    if !worktree_path.exists() && !metadata_path.join("locked").exists() {
                         let worktree_name = self.reconstruct_worktree_name(&metadata_path);
 
                         // Try to prune via git2 first (cleans up branch refs)

@@ -3116,7 +3116,7 @@ pub async fn execute(
     }
 
     progress.step("Pruning stale worktree registrations...");
-    prune_session_worktrees(&cwd, &runtime_worktree_root);
+    prune_session_worktrees(&cwd, &runtime_worktree_root, &session_name);
     progress.step("Cleaning up runtime temp files...");
     cleanup_session_runtime_tmp_dir(&runtime_worktree_root, &session_name).await;
 

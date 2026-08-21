@@ -31,7 +31,7 @@
 935 crates/brehon-doctor/src/checkers/store_search.rs
 973 crates/brehon-git/src/rebase.rs
 1117 crates/brehon-git/src/recovery.rs
-1450 crates/brehon-git/src/worktree.rs
+1452 crates/brehon-git/src/worktree.rs
 1797 crates/brehon-host/src/lib.rs
 2737 crates/brehon-mcp/src/tools/agent.rs
 1458 crates/brehon-mcp/src/tools/factory/tool.rs

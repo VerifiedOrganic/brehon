@@ -8,12 +8,17 @@
 
 use std::path::Path;
 
+/// Run directories are `runs/<session>/<scope>/<agent>` — see
+/// `scoped_worktree_path`. Two levels below the session directory, and
+/// `<agent>` is a worktree root, so the sweep stops at the checkout boundary.
+const RUN_DIR_DEPTH: usize = 2;
+
 /// Drop worktree registrations whose directory is gone, then remove the run
 /// directories they leave behind.
 ///
 /// Best-effort: a session that has already finished its work must not fail
 /// because a cleanup step did, so every error is logged and swallowed.
-pub(crate) fn prune_session_worktrees(cwd: &Path, worktrees_root: &Path) {
+pub(crate) fn prune_session_worktrees(cwd: &Path, worktrees_root: &Path, session_name: &str) {
     match brehon_git::Git2Operations::open(cwd) {
         Ok(git) => match git.prune_stale_worktrees() {
             Ok(pruned) if !pruned.is_empty() => tracing::info!(
@@ -34,7 +39,15 @@ pub(crate) fn prune_session_worktrees(cwd: &Path, worktrees_root: &Path) {
         ),
     }
 
-    let swept = sweep_empty_dirs(&worktrees_root.join("runs"));
+    // Only this session's own run directory. A concurrent session creates its
+    // `runs/<session>/<scope>` parent *before* asking libgit2 to add the
+    // worktree into it, and libgit2 does not recreate a missing parent — so
+    // sweeping the shared `runs/` root would abort a peer run with ENOENT.
+    let session_runs = worktrees_root.join("runs").join(session_name);
+    let mut swept = sweep_empty_dirs(&session_runs, RUN_DIR_DEPTH);
+    if std::fs::remove_dir(&session_runs).is_ok() {
+        swept += 1;
+    }
     if swept > 0 {
         tracing::info!(
             count = swept,
@@ -43,14 +56,19 @@ pub(crate) fn prune_session_worktrees(cwd: &Path, worktrees_root: &Path) {
     }
 }
 
-/// Depth-first removal of empty directories beneath `root`; `root` itself is
-/// kept. Returns how many were removed.
+/// Depth-first removal of empty directories at most `depth` levels beneath
+/// `root`; `root` itself is left to the caller. Returns how many were removed.
 ///
-/// `remove_dir` refuses a non-empty directory, so a live worktree — or a
-/// concurrent session's run directory — can never be swept and no separate
-/// emptiness check is needed. `file_type()` does not follow symlinks, so a
-/// symlinked directory is left alone.
-fn sweep_empty_dirs(root: &Path) -> usize {
+/// The depth bound is load-bearing, not a micro-optimisation. `<agent>` is a
+/// worktree root, so an unbounded walk would descend into live checkouts —
+/// which are kept whenever `auto_cleanup_worktrees` is false — and delete
+/// empty directories git neither tracks nor can restore. `remove_dir` refuses
+/// a non-empty directory, so a live worktree root is itself never removed, and
+/// `file_type()` does not follow symlinks.
+fn sweep_empty_dirs(root: &Path, depth: usize) -> usize {
+    if depth == 0 {
+        return 0;
+    }
     let Ok(entries) = std::fs::read_dir(root) else {
         return 0;
     };
@@ -64,7 +82,7 @@ fn sweep_empty_dirs(root: &Path) -> usize {
             continue;
         }
         let path = entry.path();
-        swept += sweep_empty_dirs(&path);
+        swept += sweep_empty_dirs(&path, depth - 1);
         if std::fs::remove_dir(&path).is_ok() {
             swept += 1;
         }
@@ -142,7 +160,7 @@ mod tests {
             "fixture should leave a prunable registration behind"
         );
 
-        prune_session_worktrees(temp.path(), &worktrees_root);
+        prune_session_worktrees(temp.path(), &worktrees_root, "session-a");
 
         assert!(
             !run_git(temp.path(), &["worktree", "list", "--porcelain"]).contains("prunable"),
@@ -165,11 +183,21 @@ mod tests {
         let worktrees_root = temp.path().join("worktrees-root");
         let worktree_path = add_run_worktree(temp.path(), &worktrees_root, "session-live");
 
-        prune_session_worktrees(temp.path(), &worktrees_root);
+        // A retained worktree — `auto_cleanup_worktrees = false` — must come
+        // through untouched, including empty directories inside its checkout,
+        // which git neither tracks nor can restore.
+        let scratch = worktree_path.join("build/scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+
+        prune_session_worktrees(temp.path(), &worktrees_root, "session-live");
 
         assert!(
             worktree_path.exists(),
             "a live worktree must survive session-close hygiene"
+        );
+        assert!(
+            scratch.exists(),
+            "the sweep must not descend into a live checkout"
         );
         assert!(
             run_git(temp.path(), &["worktree", "list", "--porcelain"])
@@ -178,8 +206,25 @@ mod tests {
         );
     }
 
-    /// A concurrent session's run directory is non-empty, so `remove_dir`
-    /// refuses it — the sweep can never race a live run.
+    /// A peer session creates `runs/<session>/<scope>` before libgit2 adds the
+    /// worktree into it, and libgit2 will not recreate a missing parent — so a
+    /// closing session must not touch anyone else's run directory.
+    #[test]
+    fn prune_session_worktrees_leaves_other_sessions_alone() {
+        let temp = tempfile::tempdir().unwrap();
+        init_git_repo(temp.path());
+        let worktrees_root = temp.path().join("worktrees-root");
+        let peer_parent = worktrees_root.join("runs/session-peer/worker");
+        std::fs::create_dir_all(&peer_parent).unwrap();
+
+        prune_session_worktrees(temp.path(), &worktrees_root, "session-mine");
+
+        assert!(
+            peer_parent.exists(),
+            "a peer session's pre-created worktree parent must survive"
+        );
+    }
+
     #[test]
     fn sweep_empty_dirs_leaves_non_empty_trees_alone() {
         let temp = tempfile::tempdir().unwrap();
@@ -188,7 +233,7 @@ mod tests {
         std::fs::write(runs.join("live/worker/w1/file.txt"), "in use\n").unwrap();
         std::fs::create_dir_all(runs.join("dead/worker/w1")).unwrap();
 
-        let swept = sweep_empty_dirs(&runs);
+        let swept = sweep_empty_dirs(&runs, RUN_DIR_DEPTH + 1);
 
         assert_eq!(
             swept, 3,
@@ -196,5 +241,18 @@ mod tests {
         );
         assert!(runs.join("live/worker/w1/file.txt").exists());
         assert!(!runs.join("dead").exists());
+    }
+
+    /// The depth bound is what stops the sweep at the checkout boundary.
+    #[test]
+    fn sweep_empty_dirs_stops_at_the_depth_bound() {
+        let temp = tempfile::tempdir().unwrap();
+        let session = temp.path().join("session");
+        std::fs::create_dir_all(session.join("worker/w1/inside/checkout")).unwrap();
+
+        let swept = sweep_empty_dirs(&session, RUN_DIR_DEPTH);
+
+        assert_eq!(swept, 0, "w1/ is non-empty and nothing below it is visited");
+        assert!(session.join("worker/w1/inside/checkout").exists());
     }
 }
