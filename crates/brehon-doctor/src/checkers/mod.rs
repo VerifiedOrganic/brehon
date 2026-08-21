@@ -1,5 +1,6 @@
 //! Diagnostic checkers for different aspects of Brehon state.
 
+pub mod base_mirror;
 pub mod budget;
 pub mod review;
 pub mod runtime;
@@ -49,6 +50,11 @@ pub fn run_all_checks(
     // Budget enforcement policy check (kill-switch effectively off).
     let budget_checker = budget::BudgetChecker::new(brehon_root);
     findings.extend(budget_checker.check()?);
+
+    // Base-mirror staleness: agents clone from it, so a frozen base has to be
+    // visible before a run rather than inferred from rising conflict rates.
+    let base_mirror_checker = base_mirror::BaseMirrorChecker::new(brehon_root);
+    findings.extend(base_mirror_checker.check()?);
 
     Ok(findings)
 }

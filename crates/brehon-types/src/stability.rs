@@ -245,6 +245,21 @@ fn acquire_file_lock(path: &Path) -> IoResult<FileLock> {
         }
     }
 }
+/// Filename Brehon stamps inside the base mirror after each refresh.
+///
+/// Lives here rather than in brehon-git because brehon-doctor reads it to
+/// report staleness and may only depend on brehon-types — one definition, so
+/// the writer and the checker cannot drift apart. See ADR-0010 T7.
+pub const BASE_REFRESHED_AT: &str = "BREHON_REFRESHED_AT";
+
+/// Runtime file in which Brehon publishes where the base mirror lives.
+///
+/// The mirror sits under the worktree root, which is resolved from config and
+/// a repo-identity hash that only brehon-cli computes. Rather than duplicate
+/// that derivation, the code that creates the mirror records its path and
+/// `brehon doctor` reads it — a checker that guessed wrong would silently
+/// never fire, which is worse than no checker at all.
+pub const BASE_MIRROR_POINTER: &str = "runtime/base-mirror-path";
 
 /// Atomically and durably persist `value` as pretty-printed JSON at `path`.
 ///

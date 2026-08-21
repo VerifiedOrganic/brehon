@@ -13,6 +13,7 @@ use std::os::unix::fs::PermissionsExt;
 mod adapter_selection;
 mod agent_git_guard;
 pub(crate) mod agent_inventory;
+pub(crate) mod base_mirror;
 #[cfg(test)]
 mod protected_branch_tests;
 mod session_hygiene;
@@ -2506,6 +2507,17 @@ where
     // What the directories are seeded from — the base branch today, the
     // `base.git` ref once T8 lands.
     let base_ref = detect_default_branch(&project_root).unwrap_or_else(|_| "main".to_string());
+    // Agents clone from the mirror, never from canonical (ADR-0010 T7). Kept
+    // current here because this is the one path every agent directory is born
+    // on; a refresh failure is logged, not fatal.
+    if let Err(err) = base_mirror::ensure_base_mirror(
+        &project_root,
+        &worktrees_dir,
+        &base_ref,
+        chrono::Utc::now(),
+    ) {
+        tracing::warn!(error = %err, "Failed to prepare the base mirror");
+    }
     for name in names {
         report(format!("Preparing {scope_label} workspace for {name}"));
         let branch = match scope {

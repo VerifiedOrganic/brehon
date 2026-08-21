@@ -40,8 +40,9 @@ use crate::error::GitError;
 /// If the refresh dies at hour 6 of a 72-hour run every agent silently
 /// develops against a frozen base and conflict rates climb with no signal, so
 /// this is surfaced in `brehon doctor` and run status rather than kept
-/// internal.
-pub const BASE_REFRESHED_AT: &str = "BREHON_REFRESHED_AT";
+/// internal. Defined in brehon-types so the checker that reads it cannot drift
+/// from the code that writes it.
+pub use brehon_types::BASE_REFRESHED_AT;
 
 fn git(args: &[&str], cwd: Option<&Path>) -> Result<String, GitError> {
     let mut command = Command::new("git");
