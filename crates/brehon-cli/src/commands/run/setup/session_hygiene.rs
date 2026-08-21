@@ -54,6 +54,19 @@ pub(crate) fn prune_session_worktrees(cwd: &Path, worktrees_root: &Path, session
             "Swept empty run directories at session close"
         );
     }
+
+    // Reconcile Brehon's own inventory against the filesystem. A killed run
+    // leaves entries whose directory is gone; under ADR-0010 this inventory
+    // replaces `git worktree list` as the answer to what exists, so it has to
+    // stay honest without asking git anything.
+    let dropped = super::agent_inventory::reconcile(&cwd.join(".brehon"));
+    if !dropped.is_empty() {
+        tracing::info!(
+            count = dropped.len(),
+            agents = ?dropped.iter().map(|e| e.agent_id.as_str()).collect::<Vec<_>>(),
+            "Dropped agent inventory entries whose directory is gone"
+        );
+    }
 }
 
 /// Depth-first removal of empty directories at most `depth` levels beneath

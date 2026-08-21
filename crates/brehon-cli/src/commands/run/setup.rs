@@ -12,6 +12,7 @@ use std::os::unix::fs::PermissionsExt;
 
 mod adapter_selection;
 mod agent_git_guard;
+pub(crate) mod agent_inventory;
 #[cfg(test)]
 mod protected_branch_tests;
 mod session_hygiene;
@@ -2502,6 +2503,9 @@ where
 
     let mut role_cwds = HashMap::new();
     let scope_label = scope.unwrap_or("worker");
+    // What the directories are seeded from — the base branch today, the
+    // `base.git` ref once T8 lands.
+    let base_ref = detect_default_branch(&project_root).unwrap_or_else(|_| "main".to_string());
     for name in names {
         report(format!("Preparing {scope_label} workspace for {name}"));
         let branch = match scope {
@@ -2578,6 +2582,18 @@ where
             name,
             &config.roles.supervisor.name,
         )?;
+        agent_inventory::record(
+            &project_root.join(".brehon"),
+            &agent_inventory::AgentDirEntry {
+                agent_id: name.clone(),
+                session: session_scope.unwrap_or_default().to_string(),
+                role: scope_label.to_string(),
+                path: worktree_path.clone(),
+                branch: branch.clone(),
+                base_ref: base_ref.clone(),
+                created_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            },
+        );
         report(format!(
             "{scope_label} {name} ready at {}",
             worktree_path.display()
@@ -2686,7 +2702,7 @@ mod tests {
         String::from_utf8_lossy(&output.stdout).trim().to_string()
     }
 
-    fn init_git_repo(path: &Path) {
+    pub(super) fn init_git_repo(path: &Path) {
         run_git(path, &["init", "-b", "main"]);
         run_git(path, &["config", "user.email", "brehon@example.invalid"]);
         run_git(path, &["config", "user.name", "Brehon Test"]);
