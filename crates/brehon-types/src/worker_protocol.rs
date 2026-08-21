@@ -56,6 +56,18 @@ pub fn build_worker_protocol(
          blocked and message the supervisor with the denied command and why you thought it \
          was needed."
             .to_string(),
+        // ── History immutability (rule 4) ─────────────────────────────────
+        // Sits with the containment rules because the failure mode is the
+        // same shape: silent, invisible to the worker, and only detectable
+        // after review has already happened.
+        "HISTORY RULE: To pick up changes from the base branch, run `git merge origin/main` — \
+         or merge the task's `merge_target`. NEVER run `git rebase`, `git commit --amend`, or \
+         `git reset` on your worker branch. Those rewrite commit SHAs, and a reviewer panel \
+         approves one specific SHA: if your branch tip changes after approval, the reviewed \
+         commit no longer exists and Brehon refuses to integrate your work. Merge commits on \
+         a worker branch are expected and correct — never \"clean up\" history. To undo \
+         something, add a new commit."
+            .to_string(),
         // ── Bootstrap and task lifecycle ──────────────────────────────────
         bootstrap_step,
         format!(
@@ -148,9 +160,11 @@ pub fn build_worker_protocol(
         // worktree rules state the same thing; this is intentional repetition.
         "REMINDER: every command you run executes in your dedicated worktree. Never `cd` out of \
          it. Never `git checkout main` (or master / develop / trunk / the task's merge_target). \
-         If you do work on the wrong branch, your commit will be empty and your progress will \
-         silently disappear. When in doubt, run `git rev-parse --abbrev-ref HEAD` and confirm \
-         you are on your worker branch before editing."
+         Never rewrite history on your worker branch — no `git rebase`, no `git commit --amend`, \
+         no `git reset`; sync with `git merge origin/main` instead. If you do work on the wrong \
+         branch, or rewrite a commit a reviewer already approved, your progress will silently \
+         disappear. When in doubt, run `git rev-parse --abbrev-ref HEAD` and confirm you are on \
+         your worker branch before editing."
             .to_string(),
     ];
 
@@ -218,5 +232,33 @@ mod tests {
         assert!(protocol.contains("`main`, `master`, `develop`, `trunk`"));
         assert!(protocol.contains("`merge_target`"));
         assert!(protocol.contains("git reset --hard"));
+
+        // T5: the history rule must also land in the trailing block, for the
+        // same recency reason — rewriting a reviewed SHA is silent and
+        // unrecoverable, so it cannot rely on the model remembering rule 4.
+        assert!(
+            last_line.contains("git rebase")
+                && last_line.contains("git commit --amend")
+                && last_line.contains("git merge origin/main"),
+            "the closing reminder must repeat the merge-not-rebase rule, got: {last_line}"
+        );
+    }
+
+    /// T5: rebase rewrites SHAs, so an approved commit can be replaced by one
+    /// no reviewer ever saw while `cherry-pick -x` records provenance that
+    /// looks legitimate. The protocol must name the alternative, not just the
+    /// prohibition — a worker still has to sync somehow.
+    #[test]
+    fn worker_protocol_requires_merge_and_forbids_history_rewriting() {
+        let protocol = build_worker_protocol(
+            WorkerBootstrapMode::IdleStartup,
+            "agent",
+            "task",
+            "supervisor",
+        );
+
+        assert!(protocol.contains("git merge origin/main"));
+        assert!(protocol.contains("NEVER run `git rebase`, `git commit --amend`, or `git reset`"));
+        assert!(protocol.contains("Merge commits on a worker branch are expected and correct"));
     }
 }
