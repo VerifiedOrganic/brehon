@@ -1998,9 +1998,14 @@ fn test_factory_rejects_worker_cwd_that_is_not_linked_worktree() {
         Err(err) => err,
     };
 
+    // A plain directory is neither a clone nor a linked worktree, so it is
+    // still rejected — the message widened when clones became valid.
     assert!(
         err.to_string().contains("worker 'worker-1' cwd")
-            && err.to_string().contains("linked git worktree")
+            && err
+                .to_string()
+                .contains("neither a git clone nor a linked worktree"),
+        "{err}"
     );
 }
 

@@ -31,8 +31,11 @@ pub fn probe() -> ConfineSupport {
         }
     } else if cfg!(target_os = "linux") {
         ConfineSupport {
-            backend: Some(SandboxBackend::Bubblewrap),
-            detail: "Landlock".to_string(),
+            // Deliberately None: T14 was never built, and reporting a backend
+            // that does not exist reads as coverage while providing none.
+            backend: None,
+            detail: "Landlock (NOT IMPLEMENTED — T14 is unbuilt, so spawning fails closed)"
+                .to_string(),
             unenforceable: vec![
                 "Landlock never restricts chmod, chown, utime or setxattr",
                 "signal scoping needs ABI v6 (kernel 6.12); below that a confined agent can signal outside its sandbox",

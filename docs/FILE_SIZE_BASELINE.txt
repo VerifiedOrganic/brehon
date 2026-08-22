@@ -54,7 +54,7 @@
 3800 crates/brehon-mux/src/mux_tests/activity.rs
 1237 crates/brehon-mux/src/mux_tests/basic.rs
 2347 crates/brehon-mux/src/mux_tests/delivery.rs
-2087 crates/brehon-mux/src/mux_tests/factory.rs
+2092 crates/brehon-mux/src/mux_tests/factory.rs
 1120 crates/brehon-mux/src/pane/activity.rs
 3035 crates/brehon-mux/src/pane/spawn.rs
 1437 crates/brehon-mux/src/pane/terminal.rs

@@ -606,9 +606,18 @@ pub(super) fn ensure_isolated_cwd_is_not_shared_root(
         )));
     }
     let git_file = pane_cwd.join(".git");
+
+    // Under ADR-0010 an isolated agent directory is a *clone*, whose `.git` is
+    // a directory. It used to be a linked worktree, whose `.git` is a file
+    // containing `gitdir:`. Both are isolated; only the shared root is not,
+    // and that is what the check above already rejects.
+    if git_file.is_dir() {
+        return Ok(());
+    }
+
     let git_contents = std::fs::read_to_string(&git_file).map_err(|_| {
         Error::terminal(format!(
-            "Worktree isolation is enabled, but {role} '{name}' cwd '{}' is not a linked git worktree.",
+            "Worktree isolation is enabled, but {role} '{name}' cwd '{}' is neither a git clone nor a linked worktree.",
             pane_cwd.display()
         ))
     })?;
@@ -619,7 +628,7 @@ pub(super) fn ensure_isolated_cwd_is_not_shared_root(
         .filter(|value| !value.is_empty())
         .ok_or_else(|| {
             Error::terminal(format!(
-                "Worktree isolation is enabled, but {role} '{name}' cwd '{}' is not a linked git worktree.",
+                "Worktree isolation is enabled, but {role} '{name}' cwd '{}' is neither a git clone nor a linked worktree.",
                 pane_cwd.display()
             ))
         })?;

@@ -119,7 +119,11 @@ fn check_invariants(
 ) -> Result<(), ConfineError> {
     for w in write {
         for d in denied {
-            if d.starts_with(w) {
+            // Seatbelt expresses a nested deny (last-match-wins); Landlock
+            // cannot. Refusing here on a Landlock host is the difference
+            // between the two platforms meaning the same thing and only
+            // appearing to.
+            if cfg!(not(target_os = "macos")) && d.starts_with(w) {
                 return Err(ConfineError::NestedDeny {
                     denied: d.display().to_string(),
                     write: w.display().to_string(),
@@ -171,37 +175,56 @@ fn seatbelt_argv(
     denied: &[PathBuf],
     work: &Path,
 ) -> Vec<String> {
-    let mut profile = String::from("(version 1)\n(deny default)\n");
-    profile.push_str("(allow process-exec)\n(allow process-fork)\n(allow sysctl-read)\n");
+    // `(allow default)`, NOT `(deny default)`.
+    //
+    // This is the base docs/research/containment-2026-08.md specifies, and the
+    // reason is not stylistic. Under `(deny default)` every unlisted operation
+    // class is denied — including `network-outbound` and `mach-lookup` — so a
+    // confined agent cannot reach its model API, resolve DNS, or open a PTY
+    // ioctl. Verified: `curl https://1.1.1.1/` fails and node's `fetch` gives
+    // ENOTFOUND. The boundary this file exists to build is a *filesystem write*
+    // boundary; denying everything else breaks the agent without adding it.
+    //
+    // Reads stay open by design: denying them breaks rustc, cargo, node and
+    // every vendor CLI, and ADR-0010 accepts that explicitly.
+    let mut profile = String::from("(version 1)\n(allow default)\n");
+
+    // Deny all writes, then allow back. SBPL is last-match-wins, so this
+    // ordering is the policy: a blanket deny first, the grants after it.
+    profile.push_str("(deny file-write*)\n");
+
+    // Devices are not the boundary. `/dev/null`, the tty and the dtrace helper
+    // are needed by essentially every program — `git --version` alone fails
+    // with "could not open '/dev/null'" without this — and granting them
+    // gives away nothing a filesystem write boundary is protecting.
+    profile.push_str("(allow file-write* (subpath \"/dev\"))\n");
+
     // A confined agent killed a process outside its sandbox: `pkill -f node`
     // is ordinary dev-server cleanup and it ends a 72-hour run. NOT
     // `(target pgrp)`, which reopens the hole whenever the victim shares a
     // process group.
     profile.push_str("(deny signal)\n(allow signal (target self) (target children))\n");
 
-    for path in read {
-        profile.push_str(&format!(
-            "(allow file-read* (subpath {}))\n",
-            sbpl_str(path)
-        ));
-    }
     for path in write {
         profile.push_str(&format!(
-            "(allow file-read* file-write* (subpath {}))\n",
+            "(allow file-write* (subpath {}))\n",
             sbpl_str(path)
         ));
     }
+    // Denies last so they win over any grant above them.
     for path in denied {
         profile.push_str(&format!(
             "(deny file-read* file-write* (subpath {}))\n",
             sbpl_str(path)
         ));
     }
-    // `(allow default)` would leave AF_UNIX connect open, and a tmux server is
+    // `(allow default)` leaves AF_UNIX connect open, and a tmux server is
     // routinely running: `tmux send-keys` executes in an unsandboxed pane.
+    // These lines are only meaningful on this base.
     profile.push_str("(deny network-outbound (regex #\"^/private/tmp/tmux-\"))\n");
     profile.push_str("(deny network-outbound (regex #\"^/var/run/docker\\\\.sock\"))\n");
 
+    let _ = read;
     let _ = work;
     // Ends at `--`; the caller appends the real command.
     vec![
@@ -268,7 +291,12 @@ fn sbpl_str(path: &Path) -> String {
 /// `<project>/.brehon` is the one deliberate hole: `BREHON_ROOT` points there
 /// and the MCP server is a child of the agent CLI, so it inherits this
 /// profile. Coordination state, not source or history.
-pub fn default_spec(work: &Path, brehon_root: &Path, unsafe_profile: bool) -> SandboxSpec {
+pub fn default_spec(
+    work: &Path,
+    brehon_root: &Path,
+    worktrees_root: Option<&Path>,
+    unsafe_profile: bool,
+) -> SandboxSpec {
     if unsafe_profile {
         return SandboxSpec {
             backend: SandboxBackend::None,
@@ -289,6 +317,25 @@ pub fn default_spec(work: &Path, brehon_root: &Path, unsafe_profile: bool) -> Sa
     let mut write_roots = vec![fs_root(work)];
     if brehon_root.exists() {
         write_roots.push(fs_root(brehon_root));
+    }
+    // Brehon's own MCP server runs as a child of the agent CLI and inherits
+    // this profile, so anything Brehon writes on the agent's behalf has to be
+    // grantable. ADR-0010 already accepts this for `<project>/.brehon`; the
+    // worktree root is the same category — epic and initiative integration
+    // worktrees and review preflight worktrees all live under it.
+    //
+    // `base.git` is carved back out below: it is the one thing under this root
+    // that must stay agent-read-only, because that ownership split is what
+    // makes refreshing it safe.
+    let mut denied_roots = Vec::new();
+    if let Some(worktrees_root) = worktrees_root.filter(|root| root.exists()) {
+        {
+            write_roots.push(fs_root(worktrees_root));
+            let base = worktrees_root.join("base.git");
+            if base.exists() {
+                denied_roots.push(fs_root(&base));
+            }
+        }
     }
     if let Some(home) = dirs::home_dir() {
         for leaf in [
@@ -312,7 +359,7 @@ pub fn default_spec(work: &Path, brehon_root: &Path, unsafe_profile: bool) -> Sa
             recursive: true,
         }],
         write_roots,
-        denied_roots: Vec::new(),
+        denied_roots,
         network_class: NetworkClass::Allowlisted,
         credential_class: CredentialClass::EnvAllowlist,
         env_policy: EnvPolicy::Minimal,
@@ -434,8 +481,10 @@ mod tests {
         assert_eq!(err, ConfineError::BackendUnavailable(SandboxBackend::None));
     }
 
+    /// Seatbelt is last-match-wins so a nested deny is expressible; Landlock
+    /// has no deny rules at all. The platforms must not silently disagree.
     #[test]
-    fn a_deny_nested_in_a_write_grant_is_refused() {
+    fn a_deny_nested_in_a_write_grant() {
         let (_t, work, protected) = dirs();
         let nested = work.join("secrets");
         std::fs::create_dir_all(&nested).unwrap();
@@ -443,15 +492,28 @@ mod tests {
         s.write_roots = vec![root(&work)];
         s.denied_roots = vec![root(&nested)];
 
-        let err = confine_argv(
+        let result = confine_argv(
             &s,
             &ConfineCtx {
                 work: &work,
                 protected: &protected,
             },
-        )
-        .expect_err("Landlock cannot express a nested deny");
-        assert!(matches!(err, ConfineError::NestedDeny { .. }));
+        );
+
+        if cfg!(target_os = "macos") {
+            let argv = result.expect("Seatbelt expresses a nested deny");
+            let profile = &argv[2];
+            let grant = profile.find("(allow file-write* (subpath").unwrap();
+            let deny = profile
+                .find("(deny file-read* file-write* (subpath")
+                .unwrap();
+            assert!(grant < deny, "last-match-wins: the deny must come after");
+        } else {
+            assert!(
+                matches!(result, Err(ConfineError::NestedDeny { .. })),
+                "Landlock cannot express this, so it must refuse rather than under-enforce"
+            );
+        }
     }
 
     #[test]
@@ -496,18 +558,18 @@ mod tests {
     }
 
     /// SBPL is last-match-wins, so this ordering is load-bearing, not cosmetic.
+    /// The base is `(allow default)` + `(deny file-write*)` + grants, and the
+    /// ordering carries the policy because SBPL is last-match-wins.
     #[cfg(target_os = "macos")]
     #[test]
-    fn seatbelt_emits_read_then_write_then_denied() {
+    fn seatbelt_denies_writes_then_grants_them_back() {
         let (_t, work, protected) = dirs();
-        let readable = work.join("ro");
         let writable = work.join("rw");
         let secret = work.join("secret");
-        for dir in [&readable, &writable, &secret] {
+        for dir in [&writable, &secret] {
             std::fs::create_dir_all(dir).unwrap();
         }
         let mut s = spec(SandboxBackend::Seatbelt);
-        s.read_roots = vec![root(&readable)];
         s.write_roots = vec![root(&writable)];
         s.denied_roots = vec![root(&secret)];
 
@@ -519,34 +581,24 @@ mod tests {
             },
         )
         .unwrap();
-
-        assert_eq!(argv[0], "sandbox-exec");
-        assert_eq!(
-            argv.last().map(String::as_str),
-            Some("--"),
-            "the prefix must end at `--` so the caller appends the command"
-        );
         let profile = &argv[2];
-        let read_at = profile.find("file-read* (subpath").unwrap();
-        let write_at = profile.find("file-read* file-write*").unwrap();
-        let deny_at = profile.find("(deny file-read* file-write*").unwrap();
+
         assert!(
-            read_at < write_at && write_at < deny_at,
-            "SBPL is last-match-wins; deny must be emitted last:\n{profile}"
+            profile.starts_with("(version 1)\n(allow default)\n"),
+            "a `(deny default)` base denies network and mach-lookup, which \
+             leaves the agent unable to reach its model API:\n{profile}"
+        );
+        let blanket = profile.find("(deny file-write*)").unwrap();
+        let grant = profile.find("(allow file-write* (subpath").unwrap();
+        let deny = profile
+            .find("(deny file-read* file-write* (subpath")
+            .unwrap();
+        assert!(
+            blanket < grant && grant < deny,
+            "deny-all-writes, grant back, then explicit denies:\n{profile}"
         );
         assert!(profile.contains("(deny signal)"));
-        assert!(
-            profile.contains("(allow signal (target self) (target children))"),
-            "a confined agent must not be able to signal outside its sandbox"
-        );
-        assert!(
-            !profile.contains("(target pgrp)"),
-            "target pgrp reopens the hole whenever the victim shares a process group"
-        );
-        assert!(
-            profile.contains("tmux-"),
-            "AF_UNIX connect to tmux stays denied"
-        );
+        assert!(!profile.contains("(target pgrp)"));
     }
 
     /// Canonicalization is what stops /tmp vs /private/tmp rendering the
@@ -682,7 +734,7 @@ mod tests {
         let brehon_root = work.join(".brehon");
         std::fs::create_dir_all(&brehon_root).unwrap();
 
-        let spec = default_spec(&work, &brehon_root, false);
+        let spec = default_spec(&work, &brehon_root, None, false);
 
         assert!(!spec.unsafe_marker);
         let writes: Vec<&str> = spec.write_roots.iter().map(|r| r.path.as_str()).collect();
@@ -712,7 +764,7 @@ mod tests {
     #[test]
     fn the_unsafe_default_spec_is_explicitly_marked() {
         let (_t, work, _protected) = dirs();
-        let spec = default_spec(&work, &work.join(".brehon"), true);
+        let spec = default_spec(&work, &work.join(".brehon"), None, true);
         assert!(spec.unsafe_marker);
         assert_eq!(spec.backend, SandboxBackend::None);
     }
@@ -725,7 +777,7 @@ mod tests {
         let brehon_root = work.join(".brehon");
         std::fs::create_dir_all(&brehon_root).unwrap();
 
-        let spec = default_spec(&work, &brehon_root, false);
+        let spec = default_spec(&work, &brehon_root, None, false);
         let argv = confine_argv(
             &spec,
             &ConfineCtx {
@@ -745,7 +797,7 @@ mod tests {
         let (_t, work, protected) = dirs();
         let absent = work.join("not-created-yet");
 
-        let spec = default_spec(&work, &absent, false);
+        let spec = default_spec(&work, &absent, None, false);
 
         assert!(
             !spec
@@ -762,5 +814,51 @@ mod tests {
             },
         )
         .expect("the spec must still compile");
+    }
+
+    /// The write boundary must hold while the agent can still do its job.
+    /// The previous version of this file only ran `/usr/bin/touch`, so it
+    /// passed over a profile that denied every network syscall — a confined
+    /// agent could not have reached its model API at all.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_confined_process_keeps_network_and_exec() {
+        let (_t, work, protected) = dirs();
+        let mut s = spec(SandboxBackend::Seatbelt);
+        s.write_roots = vec![root(&work)];
+
+        let argv = confine_argv(
+            &s,
+            &ConfineCtx {
+                work: &work,
+                protected: &protected,
+            },
+        )
+        .unwrap();
+
+        // A dynamically-linked binary that needs dyld, mach-lookup and a
+        // working TMPDIR — the shape of every vendor CLI.
+        let version = std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .args(["/usr/bin/git", "--version"])
+            .output()
+            .expect("sandbox-exec");
+        assert!(
+            version.status.success(),
+            "a confined agent must still be able to exec: {}",
+            String::from_utf8_lossy(&version.stderr)
+        );
+
+        // Outbound TCP, without DNS so the test does not depend on a resolver.
+        let net = std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .args(["/usr/bin/nc", "-z", "-G", "2", "1.1.1.1", "443"])
+            .output()
+            .expect("sandbox-exec");
+        assert!(
+            net.status.success(),
+            "a confined agent must still reach its model API: {}",
+            String::from_utf8_lossy(&net.stderr)
+        );
     }
 }

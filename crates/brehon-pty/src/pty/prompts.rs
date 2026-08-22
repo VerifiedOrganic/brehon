@@ -34,7 +34,13 @@ pub(crate) fn sandbox_profile_allows_privileged_mode(brehon_root: Option<&PathBu
 pub(crate) fn agent_confinement(cwd: &Path, brehon_root: Option<&PathBuf>) -> SandboxSpec {
     let unsafe_profile = sandbox_profile_allows_privileged_mode(brehon_root);
     let root = brehon_root.cloned().unwrap_or_else(|| cwd.join(".brehon"));
-    crate::pty::confine::default_spec(cwd, &root, unsafe_profile)
+    // The worktree root holds integration and preflight worktrees Brehon's
+    // MCP child writes on the agent's behalf.
+    let worktrees_root = std::env::var("BREHON_WORKTREE_ROOT")
+        .ok()
+        .map(std::path::PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty());
+    crate::pty::confine::default_spec(cwd, &root, worktrees_root.as_deref(), unsafe_profile)
 }
 
 pub(crate) fn provider_cli_allows_privileged_mode(brehon_root: Option<&PathBuf>) -> bool {
