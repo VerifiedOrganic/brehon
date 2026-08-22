@@ -1,6 +1,6 @@
 use super::helpers::{
-    brehon_root, create_preflight_lease, git_output_in, remove_git_worktree_force,
-    remove_preflight_lease, sweep_stale_preflight_worktrees, workspace_root,
+    brehon_root, canonical_root, create_preflight_lease, git_output_in, remove_git_worktree_force,
+    remove_preflight_lease, sweep_stale_preflight_worktrees,
 };
 use crate::tools::git_cherry_pick::can_skip_failed_cherry_pick_as_empty;
 
@@ -21,9 +21,13 @@ pub(super) fn resolve_review_commit_set(
     merge_target: &str,
     reviewed_commit: &str,
 ) -> Result<ResolvedReviewCommitSet, String> {
-    let Some(repo_root) = workspace_root() else {
+    // Canonical, not the caller's own directory. The caller here is the
+    // worker, and under per-agent clones its repository is the one place these
+    // commits already exist — resolving there would answer a question nobody
+    // downstream can act on.
+    let Some(repo_root) = canonical_root() else {
         return Err(format!(
-            "Cannot resolve reviewed commit set for task {task_id}: no git workspace is available."
+            "Cannot resolve reviewed commit set for task {task_id}: no project repository is available."
         ));
     };
 
@@ -47,41 +51,52 @@ pub(super) fn resolve_review_commit_set(
             repo_root.display()
         )
     })?;
-    let commits_result = git_output_in(
-        &repo_root,
-        &[
-            "rev-list",
-            "--reverse",
-            // Integration replays this set with `cherry-pick -x`, and
-            // cherry-pick refuses a merge commit outright ("is a merge but no
-            // -m option was given"). The worker protocol tells workers to sync
-            // with `git merge`, so sync merges are expected on a worker
-            // branch; their content is the base branch's, which the merge
-            // target already has. Replaying only the worker's own commits is
-            // both what cherry-pick can do and what is wanted.
-            "--no-merges",
-            &format!("{merge_target}..{reviewed_commit}"),
-        ],
-    )
-    .and_then(|stdout| -> Result<Vec<String>, String> {
-        let mut commits = Vec::new();
-        for commit in stdout
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-        {
-            if commit_is_empty(&repo, commit)? {
-                continue;
+    // The assignment floor, when one was recorded. A worker branch is
+    // per-session, not per-task, so without it a second task on the same
+    // branch would put the first task's commits back into review.
+    //
+    // `base_commit` moves with it or the reviewer's diff base describes a
+    // wider range than the commit list shipped alongside it — and it feeds
+    // `diff_stat_fingerprint`, which the reviewer panel is keyed on.
+    let floor = assignment_floor(task_id, &repo_root);
+    let base_commit = floor.clone().unwrap_or(base_commit);
+
+    let mut rev_list: Vec<String> = vec![
+        "rev-list".into(),
+        "--reverse".into(),
+        // Integration replays this set with `cherry-pick -x`, and cherry-pick
+        // refuses a merge commit outright ("is a merge but no -m option was
+        // given"). The worker protocol tells workers to sync with `git merge`,
+        // so sync merges are expected on a worker branch; their content is the
+        // base branch's, which the merge target already has.
+        "--no-merges".into(),
+        format!("{merge_target}..{reviewed_commit}"),
+    ];
+    if let Some(ref floor) = floor {
+        rev_list.push(format!("^{floor}"));
+    }
+    let rev_list: Vec<&str> = rev_list.iter().map(String::as_str).collect();
+
+    let commits_result =
+        git_output_in(&repo_root, &rev_list).and_then(|stdout| -> Result<Vec<String>, String> {
+            let mut commits = Vec::new();
+            for commit in stdout
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+            {
+                if commit_is_empty(&repo, commit)? {
+                    continue;
+                }
+                commits.push(commit.to_string());
             }
-            commits.push(commit.to_string());
-        }
-        Ok(filter_commits_that_become_empty_when_replayed(
-            task_id,
-            &repo_root,
-            merge_target,
-            &commits,
-        ))
-    });
+            Ok(filter_commits_that_become_empty_when_replayed(
+                task_id,
+                &repo_root,
+                merge_target,
+                &commits,
+            ))
+        });
     if let Err(err) = commits_result.as_ref() {
         tracing::warn!(
             task_id = %task_id,
@@ -100,6 +115,26 @@ pub(super) fn resolve_review_commit_set(
         commits,
         commit_set_resolved,
     })
+}
+
+/// The commit an assignment floored this task's review at, if it resolves.
+///
+/// Degrades silently when the floor is absent or unknown to canonical:
+/// dropping it widens the review, while letting it fail would empty the set
+/// and silently approve nothing.
+fn assignment_floor(task_id: &str, repo_root: &std::path::Path) -> Option<String> {
+    let task = super::tasks::read_task(task_id)?;
+    let floor = task
+        .get("assignment_base_commit")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())?
+        .to_string();
+    let repo = git2::Repository::open(repo_root).ok()?;
+    git2::Oid::from_str(&floor)
+        .ok()
+        .and_then(|oid| repo.find_commit(oid).ok())
+        .map(|_| floor)
 }
 
 fn commit_is_empty(repo: &git2::Repository, commit: &str) -> Result<bool, String> {
@@ -258,7 +293,10 @@ pub(super) fn preview_commit_integration_conflicts(
     reviewed_commit_set_resolved: bool,
     reviewed_tip: &str,
 ) -> Result<Vec<String>, String> {
-    let Some(repo_root) = workspace_root() else {
+    // Canonical for the same reason as above: the reviewed commits are
+    // published there, and the preflight worktree it creates has to be able to
+    // replay them.
+    let Some(repo_root) = canonical_root() else {
         return Ok(Vec::new());
     };
     let Ok(repo_probe) = git2::Repository::discover(&repo_root) else {
@@ -513,8 +551,10 @@ mod merge_commit_tests {
         let w2 = git(root, &["rev-parse", "HEAD"]);
 
         let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let _env =
-            ScopedEnv::set_with_defaults(&[("BREHON_WORKSPACE_ROOT", root.to_str().unwrap())]);
+        let _env = ScopedEnv::set_with_defaults(&[
+            ("BREHON_WORKSPACE_ROOT", root.to_str().unwrap()),
+            ("BREHON_PROJECT_ROOT", root.to_str().unwrap()),
+        ]);
         let resolved =
             resolve_review_commit_set("T-merge", "main", &w2).expect("commit set resolves");
 

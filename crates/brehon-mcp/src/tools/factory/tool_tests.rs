@@ -988,11 +988,20 @@ async fn test_assign_workers_syncs_worker_branch_to_merge_target() {
 
     assert!(result.is_error.is_none(), "{}", extract_text(&result));
     let json: Value = serde_json::from_str(&extract_text(&result)).unwrap();
-    assert_eq!(json["merge_target_sync"]["status"], "reset");
+    assert_eq!(json["merge_target_sync"]["status"], "published");
     assert_eq!(json["merge_target_sync"]["merge_target"], "epic/test");
 
+    // ADR-0010: Brehon publishes the seed, it does not reset the worker.
     let worker_head = run_git(&worktree_path, &["rev-parse", "HEAD"]);
-    assert_eq!(worker_head, merge_target_head);
+    assert_ne!(
+        worker_head, merge_target_head,
+        "Brehon must not move the worker's branch"
+    );
+    assert_eq!(json["merge_target_sync"]["seed_commit"], merge_target_head);
+    // This fixture's worker shares an object store with canonical, so the seed
+    // is already reachable and nothing needs publishing. The publish path is
+    // covered against a real clone in brehon-git's `clone` tests.
+    assert_eq!(json["merge_target_sync"]["seed_ref"], "");
     let task = read_test_task(&brehon_root, "T-merge-target");
     assert_eq!(task["status"], "assigned");
     assert_eq!(task["assignee"], "worker-1");
@@ -1133,12 +1142,13 @@ async fn test_assign_workers_syncs_epic_merge_target_branch_from_default_before_
     assert_eq!(json["merge_target_base_sync"]["status"], "merged");
     assert_eq!(json["merge_target_base_sync"]["merge_target"], epic_branch);
     assert_eq!(json["merge_target_base_sync"]["base_branch"], "main");
-    assert_eq!(json["merge_target_sync"]["status"], "reset");
+    assert_eq!(json["merge_target_sync"]["status"], "published");
 
     let epic_head_after = run_git(&epic_worktree, &["rev-parse", "HEAD"]);
     let worker_head_after = run_git(&worker_worktree, &["rev-parse", "HEAD"]);
     assert_eq!(epic_head_after, main_head);
-    assert_eq!(worker_head_after, main_head);
+    // The worker is told to merge the seed; Brehon does not move its branch.
+    assert_ne!(worker_head_after, main_head);
 }
 
 #[tokio::test]
@@ -1244,12 +1254,12 @@ async fn test_assign_workers_syncs_epic_merge_target_branch_from_initiative_bran
         json["merge_target_base_sync"]["base_branch"],
         initiative_branch
     );
-    assert_eq!(json["merge_target_sync"]["status"], "reset");
+    assert_eq!(json["merge_target_sync"]["status"], "published");
 
     let epic_head_after = run_git(&epic_worktree, &["rev-parse", "HEAD"]);
     let worker_head_after = run_git(&worker_worktree, &["rev-parse", "HEAD"]);
     assert_eq!(epic_head_after, initiative_head);
-    assert_eq!(worker_head_after, initiative_head);
+    assert_ne!(worker_head_after, initiative_head);
 }
 
 #[tokio::test]
@@ -1330,7 +1340,8 @@ async fn test_assign_workers_resolves_relative_epic_integration_worktree_from_no
     let epic_head_after = run_git(&epic_worktree, &["rev-parse", "HEAD"]);
     let worker_head_after = run_git(&worker_worktree, &["rev-parse", "HEAD"]);
     assert_eq!(epic_head_after, main_head);
-    assert_eq!(worker_head_after, main_head);
+    // The worker is told to merge the seed; Brehon does not move its branch.
+    assert_ne!(worker_head_after, main_head);
 }
 
 #[tokio::test]
@@ -1350,7 +1361,8 @@ async fn test_assign_workers_resets_contaminated_worker_branch_and_preserves_old
     std::fs::write(worktree_path.join("worker-only.txt"), "stray\n").unwrap();
     run_git(&worktree_path, &["add", "worker-only.txt"]);
     run_git(&worktree_path, &["commit", "-m", "worker only"]);
-    let stray_head = run_git(&worktree_path, &["rev-parse", "HEAD"]);
+    let contaminated_head = run_git(&worktree_path, &["rev-parse", "HEAD"]);
+    let _stray_head = run_git(&worktree_path, &["rev-parse", "HEAD"]);
 
     let _env = ScopedEnv::set(&[
         ("BREHON_ROOT", brehon_root.to_str().unwrap()),
@@ -1386,19 +1398,16 @@ async fn test_assign_workers_resets_contaminated_worker_branch_and_preserves_old
 
     assert!(result.is_error.is_none(), "{}", extract_text(&result));
     let json: Value = serde_json::from_str(&extract_text(&result)).unwrap();
-    assert_eq!(json["merge_target_sync"]["status"], "reset");
-    let preserved_ref = json["merge_target_sync"]["preserved_ref"]
-        .as_str()
-        .expect("preserved ref");
-    assert!(preserved_ref.contains("refs/brehon/archive/worker-1/"));
+    assert_eq!(json["merge_target_sync"]["status"], "published");
+    // Nothing is archived because nothing is destroyed: the contaminated head
+    // stays exactly where it is and the worker merges the seed onto it.
+    let head_after = run_git(&worktree_path, &["rev-parse", "HEAD"]);
     assert_eq!(
-        run_git(&worktree_path, &["rev-parse", "HEAD"]),
-        merge_target_head
+        head_after, contaminated_head,
+        "Brehon must not rewind a contaminated worker branch; rewinding makes the \
+         next publish-to-canonical a non-fast-forward"
     );
-    assert_eq!(
-        run_git(repo_root.path(), &["rev-parse", preserved_ref]),
-        stray_head
-    );
+    assert_eq!(json["merge_target_sync"]["seed_commit"], merge_target_head);
 }
 
 #[tokio::test]
@@ -1903,24 +1912,29 @@ async fn test_assign_workers_reseeds_changes_requested_task_from_latest_commit()
 
     assert!(result.is_error.is_none(), "{}", extract_text(&result));
     let json: Value = serde_json::from_str(&extract_text(&result)).unwrap();
-    assert_eq!(json["assignment_seed_sync"]["status"], "reset");
+    assert_eq!(json["assignment_seed_sync"]["status"], "published");
     assert_eq!(json["assignment_seed_sync"]["kind"], "latest_commit");
     assert_eq!(json["assignment_seed_sync"]["target_ref"], reviewed_head);
     assert!(json.get("merge_target_sync").is_none());
-    assert_eq!(
+    assert_eq!(json["assignment_seed_sync"]["seed_commit"], reviewed_head);
+    // Brehon publishes the reviewed head as the seed; the worker merges it.
+    // Moving the branch here would rewind it and make the next
+    // publish-to-canonical a non-fast-forward.
+    assert_ne!(
         run_git(&rework_worker_worktree, &["rev-parse", "HEAD"]),
         reviewed_head
     );
-    assert_eq!(
-        std::fs::read_to_string(
-            rework_worker_worktree
-                .join("internal")
-                .join("engine")
-                .join("gnmi")
-                .join("running_cache.go")
-        )
-        .unwrap(),
-        "package gnmi\n"
+    // The reviewed content arrives when the worker merges the seed, not
+    // because Brehon checked it out into the worker's tree. Asserting its
+    // absence here is asserting the ADR-0010 boundary.
+    assert!(
+        !rework_worker_worktree
+            .join("internal")
+            .join("engine")
+            .join("gnmi")
+            .join("running_cache.go")
+            .exists(),
+        "Brehon must not write the seed's content into the worker's tree"
     );
 
     let task = read_test_task(&brehon_root, "T-revision-seed");

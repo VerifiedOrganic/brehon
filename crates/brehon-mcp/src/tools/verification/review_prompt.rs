@@ -152,14 +152,17 @@ pub(crate) fn build_review_request_prompt(input: &ReviewRequestPromptInput<'_>) 
     // produced the failure mode where a reviewer with a SHA but no path
     // hint cd's to the wrong directory and thrashes for several commands.
     //
-    // Invariant: every Brehon worktree shares one .git object database, so
-    // any commit is reachable from any worktree by SHA without changing
-    // directories. This block tells the reviewer that explicitly.
+    // Under ADR-0010 each agent holds its own clone, so the commit is NOT
+    // reachable until the reviewer fetches it. Brehon publishes the worker's
+    // commits into the project repository at `complete` and the reviewer's
+    // `origin` serves them from the base mirror, so one fetch is enough — and
+    // the reviewer still never needs to leave its own directory, which is the
+    // failure mode this block exists to prevent.
     if !commit.is_empty() {
         out.push_str("\nInspecting the commit:\n");
         out.push_str(
-            "- All Brehon worktrees share one .git object database. \
-             The commit is reachable from your current worktree by SHA.\n",
+            "- Run `git fetch origin` first. Your repository is a clone, so a commit made by \
+             another agent is not present until you fetch it.\n",
         );
         out.push_str(&format!("- git show {commit} --stat\n"));
         out.push_str(&format!("- git show {commit}\n"));
@@ -171,8 +174,9 @@ pub(crate) fn build_review_request_prompt(input: &ReviewRequestPromptInput<'_>) 
         out.push_str(&format!("- {diff_range}\n"));
         out.push_str(&format!("- git log {commit} -1\n"));
         out.push_str(
-            "- Do NOT cd to other worktrees, the main repository, or your home directory. \
-             The shared object database makes the commit visible from where you already are.\n",
+            "- Do NOT cd to other agent directories, the main repository, or your home \
+             directory. After `git fetch origin` the commit is visible from where you already \
+             are, and those paths are outside your sandbox.\n",
         );
         out.push_str(
             "- Do NOT review local staged, unstaged, or uncommitted working-tree changes. \
@@ -333,7 +337,7 @@ mod tests {
     fn states_shared_object_db_invariant() {
         let prompt = build_review_request_prompt(&base_input());
         assert!(
-            prompt.contains("All Brehon worktrees share one .git object database"),
+            prompt.contains("Run `git fetch origin` first"),
             "prompt must teach the shared-object-DB invariant or reviewers thrash"
         );
     }
@@ -342,7 +346,7 @@ mod tests {
     fn names_the_anti_pattern_explicitly() {
         let prompt = build_review_request_prompt(&base_input());
         assert!(
-            prompt.contains("Do NOT cd to other worktrees"),
+            prompt.contains("Do NOT cd to other agent directories"),
             "prompt must explicitly disallow cd; the failure mode in the wild was cd to home dir"
         );
     }

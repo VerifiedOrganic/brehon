@@ -7,6 +7,25 @@ pub(crate) fn brehon_root() -> Option<PathBuf> {
         .or_else(|| std::env::current_dir().ok().map(|cwd| cwd.join(".brehon")))
 }
 
+/// Canonical — the project repository, never an agent's clone.
+///
+/// Under ADR-0010 `workspace_root()` resolves to the *caller's* own directory,
+/// which for a worker is its clone. Anything that has to see every agent's
+/// commits — commit-set resolution, the reviewer panel, integration — must ask
+/// canonical instead, which is where the fetch-back publishes them.
+pub(crate) fn canonical_root() -> Option<PathBuf> {
+    if let Ok(root) = std::env::var("BREHON_PROJECT_ROOT") {
+        let root = root.trim();
+        if !root.is_empty() {
+            return Some(PathBuf::from(root));
+        }
+    }
+    let brehon_root = brehon_root()?;
+    (brehon_root.file_name().and_then(|name| name.to_str()) == Some(".brehon"))
+        .then(|| brehon_root.parent().map(PathBuf::from))
+        .flatten()
+}
+
 pub(crate) fn workspace_root() -> Option<PathBuf> {
     if let Ok(root) = std::env::var("BREHON_WORKSPACE_ROOT") {
         let root = root.trim();
