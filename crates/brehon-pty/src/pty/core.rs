@@ -117,8 +117,42 @@ impl Pty {
             })
             .map_err(|e| Error::pty(format!("Failed to open PTY: {e}")))?;
 
+        // Confinement (ADR-0010 T15). Compiled here rather than at any call
+        // site so a new spawn path cannot miss it: `apply_grok_acp_hardening`
+        // had two call sites and a third would silently have been unconfined.
+        //
+        // `Err` refuses the spawn. Isolation is a kernel property or the run
+        // does not start; there is no degraded mode.
+        let work = config
+            .cwd
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let ctx = crate::pty::confine::ConfineCtx {
+            work: &work,
+            protected: &[],
+        };
+        let prefix = crate::pty::confine::confine_argv(&config.confine, &ctx).map_err(|err| {
+            Error::pty(format!(
+                "Refusing to spawn '{}' unconfined: {err}",
+                config.command
+            ))
+        })?;
+        let confine_env = if prefix.is_empty() {
+            Vec::new()
+        } else {
+            crate::pty::confine::confine_env(&ctx)
+        };
+
         // Build command
-        let mut cmd = CommandBuilder::new(&config.command);
+        let (program, leading) = match prefix.split_first() {
+            Some((program, rest)) => (program.clone(), rest.to_vec()),
+            None => (config.command.clone(), Vec::new()),
+        };
+        let mut cmd = CommandBuilder::new(&program);
+        cmd.args(&leading);
+        if !prefix.is_empty() {
+            cmd.arg(&config.command);
+        }
         cmd.args(&config.args);
 
         if let Some(cwd) = &config.cwd {
@@ -126,6 +160,10 @@ impl Pty {
         }
 
         for (key, value) in &config.env {
+            cmd.env(key, value);
+        }
+        // After config.env, so a per-agent TMPDIR wins over an inherited one.
+        for (key, value) in &confine_env {
             cmd.env(key, value);
         }
         let explicit_env_keys: HashSet<&str> =

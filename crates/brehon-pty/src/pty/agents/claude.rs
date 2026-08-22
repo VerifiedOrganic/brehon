@@ -4,6 +4,7 @@ use brehon_types::config::SandboxProfile;
 
 use crate::pty::config::{PtyConfig, TeamsSpawnConfig};
 use crate::pty::filesystem::write_json_config;
+use crate::pty::prompts::agent_confinement;
 use crate::pty::prompts::provider_cli_allows_privileged_mode;
 
 use super::brehon_skills::{builtin_skill_names_for_role, write_builtin_skills};
@@ -414,6 +415,7 @@ impl PtyConfig {
         Self {
             command: "claude".to_string(),
             args,
+            confine: agent_confinement(&cwd, brehon_root),
             cwd: Some(cwd),
             env,
             rows: 24,

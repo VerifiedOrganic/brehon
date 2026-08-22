@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use crate::pty::config::PtyConfig;
+use crate::pty::prompts::agent_confinement;
 use crate::pty::prompts::{
     build_reviewer_startup_prompt, build_supervisor_startup_prompt, build_worker_startup_prompt,
     project_policy_for_role, sandbox_profile_allows_privileged_mode,
@@ -20,6 +21,8 @@ impl PtyConfig {
         reasoning_effort: Option<&str>,
     ) -> Self {
         let allow_privileged_mode = sandbox_profile_allows_privileged_mode(brehon_root);
+        // Snapshot before `cwd` is moved into the spawn config.
+        let confine = agent_confinement(&cwd, brehon_root);
         let mut config = brehon_adapter_kimi::build_kimi_spawn_config(
             name,
             role,
@@ -64,6 +67,7 @@ impl PtyConfig {
         Self {
             command: config.command,
             args: config.args,
+            confine,
             cwd: config.cwd,
             env: config.env,
             rows: config.rows,

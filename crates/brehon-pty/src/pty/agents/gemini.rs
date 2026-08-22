@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 use crate::pty::config::{PtyConfig, TeamsSpawnConfig};
 use crate::pty::filesystem::{copy_dir_recursive, load_json_config, write_json_config};
 use crate::pty::prompts::{
-    build_reviewer_startup_prompt, build_supervisor_startup_prompt, build_worker_startup_prompt,
-    project_policy_for_role, sandbox_profile_allows_privileged_mode,
+    agent_confinement, build_reviewer_startup_prompt, build_supervisor_startup_prompt,
+    build_worker_startup_prompt, project_policy_for_role, sandbox_profile_allows_privileged_mode,
 };
 
 use super::brehon_skills::builtin_skill_names_for_role;
@@ -330,6 +330,7 @@ impl PtyConfig {
         Self {
             command: "gemini".to_string(),
             args,
+            confine: agent_confinement(&cwd, brehon_root),
             cwd: Some(cwd),
             env,
             rows: 24,

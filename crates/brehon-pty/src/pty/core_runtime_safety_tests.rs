@@ -189,6 +189,7 @@ async fn shutdown_kill_reaps_reader_handle() {
         env: vec![],
         rows: 24,
         cols: 80,
+        confine: crate::pty::config::unsafe_spec(),
     };
     let mut pty = Pty::spawn("test-kill-reap", config).expect("spawn test pty");
     assert!(pty.reader_handle.is_some());
@@ -210,6 +211,7 @@ async fn shutdown_drop_kills_child_and_reaps_reader() {
         env: vec![],
         rows: 24,
         cols: 80,
+        confine: crate::pty::config::unsafe_spec(),
     };
     let pty = Pty::spawn("test-drop", config).expect("spawn test pty");
     drop(pty);
@@ -227,6 +229,7 @@ async fn shutdown_kill_on_already_exited_process_reaps_handle() {
         env: vec![],
         rows: 24,
         cols: 80,
+        confine: crate::pty::config::unsafe_spec(),
     };
     let mut pty = Pty::spawn("test-kill-exited", config).expect("spawn test pty");
 

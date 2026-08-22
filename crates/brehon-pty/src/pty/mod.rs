@@ -7,12 +7,16 @@
 
 mod agents;
 pub(crate) mod config;
+pub mod confine;
 mod core;
 mod dump;
 pub(crate) mod filesystem;
 pub(crate) mod prompts;
 
-pub use config::{LaunchPolicy, PtyConfig, TeamsSpawnConfig};
+pub use config::{LaunchPolicy, PtyConfig, TeamsSpawnConfig, unsafe_spec};
+pub use confine::{
+    ConfineCtx, ConfineError, ConfineSupport, confine_argv, confine_env, default_spec, probe,
+};
 pub use core::{Pty, PtyEvent, format_cursor_position_report};
 pub use prompts::{
     build_advisor_startup_prompt, build_research_startup_prompt, build_reviewer_startup_prompt,
@@ -348,7 +352,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_pty_config_default() {
-        let config = PtyConfig::default();
+        let config = PtyConfig::unconfined_shell();
         assert_eq!(config.command, "bash");
         assert_eq!(config.rows, 24);
         assert_eq!(config.cols, 80);

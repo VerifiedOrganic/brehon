@@ -136,6 +136,7 @@ fn terminal_launch_plan_from_pty_config_maps_spawn_spec() {
         ],
         rows: 31,
         cols: 101,
+        confine: brehon_pty::unsafe_spec(),
     };
 
     let plan = AgentTerminalLaunchPlan::from_pty_config(
@@ -197,6 +198,7 @@ fn pty_backed_pane_reports_terminal_host_launch_plan() {
         env: vec![("READY".to_string(), "1".to_string())],
         rows: 24,
         cols: 80,
+        confine: brehon_pty::unsafe_spec(),
     });
 
     let plan = pane.terminal_host_launch_plan("session-2");

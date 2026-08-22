@@ -482,6 +482,7 @@ mod tests {
             env: vec![("TEST_KEY".to_string(), "TEST_VALUE".to_string())],
             rows: 9,
             cols: 31,
+            confine: brehon_pty::unsafe_spec(),
         }
     }
 

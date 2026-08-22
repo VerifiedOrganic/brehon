@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use crate::pty::config::{PtyConfig, TeamsSpawnConfig};
+use crate::pty::prompts::agent_confinement;
 
 impl PtyConfig {
     /// Create config for a Junie CLI instance.
@@ -34,6 +35,7 @@ impl PtyConfig {
         Self {
             command: config.command,
             args: config.args,
+            confine: agent_confinement(&params.cwd, brehon_root),
             cwd: config.cwd,
             env: config.env,
             rows: config.rows,

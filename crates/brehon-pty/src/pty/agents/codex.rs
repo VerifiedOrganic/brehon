@@ -3,7 +3,9 @@ use std::path::{Path, PathBuf};
 
 use crate::pty::config::{PtyConfig, TeamsSpawnConfig};
 use crate::pty::filesystem::linked_worktree_gitdir;
-use crate::pty::prompts::{build_supervisor_startup_prompt, project_policy_for_role};
+use crate::pty::prompts::{
+    agent_confinement, build_supervisor_startup_prompt, project_policy_for_role,
+};
 
 use super::brehon_skills::{builtin_skill_names_for_role, write_builtin_skills};
 use super::opencode::shell_single_quote;
@@ -474,6 +476,7 @@ impl PtyConfig {
         Self {
             command: "codex".to_string(),
             args,
+            confine: agent_confinement(&cwd, brehon_root),
             cwd: Some(cwd),
             env,
             rows: 24,

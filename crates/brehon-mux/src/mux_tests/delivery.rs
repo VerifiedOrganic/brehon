@@ -181,6 +181,7 @@ fn test_flush_pending_inbox_nudges_does_not_inject_claude_mcp_manager() {
         env: vec![],
         rows: 24,
         cols: 80,
+        confine: brehon_pty::unsafe_spec(),
     };
     let pty = Pty::spawn("reviewer-1", config).expect("spawn test pty");
     let pane = Pane::with_pty_cli(
@@ -269,6 +270,7 @@ fn setup_claude_supervisor(home_label: &str) -> (Mux, PathBuf, tokio::runtime::R
         env: vec![],
         rows: 24,
         cols: 80,
+        confine: brehon_pty::unsafe_spec(),
     };
     let pty = Pty::spawn("claude-code", config).expect("spawn test supervisor pty");
     let pane = Pane::with_pty_cli(
@@ -646,6 +648,7 @@ fn test_kimi_like_output_only_startup_prompt_recovers_and_accepts_followup_withi
         env: vec![],
         rows: 24,
         cols: 80,
+        confine: brehon_pty::unsafe_spec(),
     };
     let pty = Pty::spawn("kimi-worker", config).expect("spawn test pty");
     let pane = Pane::with_pty_cli(
@@ -1684,6 +1687,7 @@ async fn test_deliver_prompt_buffers_second_codex_pty_prompt_until_first_submits
         env: vec![],
         rows: 24,
         cols: 80,
+        confine: brehon_pty::unsafe_spec(),
     };
     let pty = Pty::spawn("codex-supervisor", config).expect("spawn test pty");
     let mut pane = Pane::with_pty_cli(
@@ -2206,6 +2210,7 @@ fn test_state_machine_dispatch_does_not_write_synthetic_queued_prompt_id() {
         env: vec![],
         rows: 24,
         cols: 80,
+        confine: brehon_pty::unsafe_spec(),
     };
     let pty = Pty::spawn("kimi-worker", config).expect("spawn test pty");
     let pane = Pane::with_pty_cli(

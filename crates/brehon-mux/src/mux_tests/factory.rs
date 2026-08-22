@@ -61,6 +61,7 @@ fn test_pane_backend_ownership_status_api() {
         env: vec![],
         rows: 24,
         cols: 80,
+        confine: brehon_pty::unsafe_spec(),
     };
     let pty = Pty::spawn("ghostty-pane", config).expect("spawn test pty");
     let pane = Pane::with_pty_cli(
@@ -954,6 +955,7 @@ fn terminal_host_agent_factory_plan_aggregates_pane_launch_contracts() {
         env: vec![("READY".to_string(), "1".to_string())],
         rows: 24,
         cols: 80,
+        confine: brehon_pty::unsafe_spec(),
     });
     mux.add_pane(pty_pane);
     mux.add_pane(Pane::director("director", 24, 80).expect("create director pane"));
