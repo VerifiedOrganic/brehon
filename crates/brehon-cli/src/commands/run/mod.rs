@@ -983,6 +983,8 @@ pub(crate) async fn run_runtime_terminal_host_wiring_smoke(
                 env: vec![("BREHON_TEST_PANE".to_string(), launch_pane_id.to_string())],
                 rows: 24,
                 cols: 80,
+                // A wiring smoke pane running `cat`, not an agent.
+                confine: brehon_pty::unsafe_spec(),
             },
         ) {
             brehon_mux::AgentTerminalLaunchPlan::TerminalHost(launch) => launch,
@@ -3805,6 +3807,7 @@ mod tests {
                     env: vec![("BREHON_TEST_PANE".to_string(), pane_id.to_string())],
                     rows: 24,
                     cols: 80,
+                    confine: brehon_pty::unsafe_spec(),
                 },
             ) {
                 brehon_mux::AgentTerminalLaunchPlan::TerminalHost(launch) => launch,
@@ -3927,6 +3930,7 @@ mod tests {
                 env: Vec::new(),
                 rows: 24,
                 cols: 80,
+                confine: brehon_pty::unsafe_spec(),
             },
         ) {
             brehon_mux::AgentTerminalLaunchPlan::TerminalHost(launch) => launch,

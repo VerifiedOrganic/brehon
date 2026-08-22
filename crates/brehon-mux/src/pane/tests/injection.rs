@@ -54,6 +54,7 @@ fn test_codex_ink_prompt_detection_blocks_on_nonempty_draft() {
         env: vec![],
         rows: 24,
         cols: 80,
+        confine: brehon_pty::unsafe_spec(),
     };
     let pty = Pty::spawn("codex-supervisor", config).expect("spawn test pty");
     let mut pane = Pane::with_pty_cli(
@@ -83,6 +84,7 @@ fn test_codex_ink_prompt_detection_blocks_on_active_turn_marker() {
         env: vec![],
         rows: 4,
         cols: 80,
+        confine: brehon_pty::unsafe_spec(),
     };
     let pty = Pty::spawn("codex-supervisor", config).expect("spawn test pty");
     let mut pane = Pane::with_pty_cli(

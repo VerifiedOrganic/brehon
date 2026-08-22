@@ -404,6 +404,7 @@ async fn test_reset_reviewer_session_restarts_claude_pty_reviewer() {
         )],
         rows: 24,
         cols: 80,
+        confine: brehon_pty::unsafe_spec(),
     };
     let pty = Pty::spawn("claude-reviewer", config.clone()).expect("spawn test reviewer pty");
     let mut pane = Pane::with_pty_cli(
@@ -456,6 +457,7 @@ async fn test_reset_supervisor_session_restarts_claude_pty_supervisor() {
         )],
         rows: 24,
         cols: 80,
+        confine: brehon_pty::unsafe_spec(),
     };
     let pty = Pty::spawn("claude-supervisor", config.clone()).expect("spawn test supervisor pty");
     let mut pane = Pane::with_pty_cli(
@@ -2859,6 +2861,7 @@ fn test_local_pty_exit_marks_pane_dead_and_idle() {
         env: vec![],
         rows: 24,
         cols: 80,
+        confine: brehon_pty::unsafe_spec(),
     };
     let pty = Pty::spawn("exiting-worker", config).expect("spawn exiting pty");
     let pane = Pane::with_pty_cli(

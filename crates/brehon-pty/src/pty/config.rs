@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+use brehon_types::config::SandboxSpec;
+
 /// Provider-neutral launch policy derived from the resolved permission profile.
 ///
 /// Carries sandbox intent so that each provider launcher can map it to its
@@ -47,6 +49,14 @@ pub struct PtyConfig {
     /// Initial terminal size
     pub rows: u16,
     pub cols: u16,
+    /// How this process is confined (ADR-0010 T15).
+    ///
+    /// Required and non-`Option` on purpose: the compiler forces every present
+    /// and future spawn path to make a choice, so a new one cannot silently
+    /// miss confinement the way `apply_grok_acp_hardening` could. Opting out
+    /// means constructing a spec with `unsafe_marker` set, which is visible in
+    /// the diff.
+    pub confine: SandboxSpec,
 }
 
 /// Configuration for spawning an agent with native Claude Code Agent Teams flags.
@@ -66,8 +76,15 @@ pub struct TeamsSpawnConfig {
     pub parent_session_id: Option<String>,
 }
 
-impl Default for PtyConfig {
-    fn default() -> Self {
+impl PtyConfig {
+    /// A deliberately unconfined shell, for the operator's own terminal and
+    /// for tests.
+    ///
+    /// This replaces `impl Default`. A `Default` would let any call site write
+    /// `..Default::default()` and silently inherit an unconfined spec, which
+    /// is exactly the hole T15 exists to close — the opt-out has to be a
+    /// visible choice, so it has a name that says what it does.
+    pub fn unconfined_shell() -> Self {
         Self {
             command: "bash".to_string(),
             args: vec![],
@@ -75,6 +92,22 @@ impl Default for PtyConfig {
             env: vec![],
             rows: 24,
             cols: 80,
+            confine: unsafe_spec(),
         }
+    }
+}
+
+/// An explicitly unconfined spec. The only thing `confine_argv` accepts as a
+/// reason to emit no prefix.
+pub fn unsafe_spec() -> SandboxSpec {
+    SandboxSpec {
+        backend: brehon_types::config::SandboxBackend::None,
+        read_roots: Vec::new(),
+        write_roots: Vec::new(),
+        denied_roots: Vec::new(),
+        network_class: brehon_types::config::NetworkClass::Unrestricted,
+        credential_class: brehon_types::config::CredentialClass::Unrestricted,
+        env_policy: brehon_types::config::EnvPolicy::Inherit,
+        unsafe_marker: true,
     }
 }

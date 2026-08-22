@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use crate::pty::config::PtyConfig;
+use crate::pty::prompts::agent_confinement;
 
 use super::{prepend_current_exe_dir_to_path, push_brehon_root_env, push_workspace_root_env};
 
@@ -64,6 +65,7 @@ impl PtyConfig {
         Self {
             command: command.to_string(),
             args: args.to_vec(),
+            confine: agent_confinement(&cwd, brehon_root),
             cwd: Some(cwd),
             env,
             rows: 24,

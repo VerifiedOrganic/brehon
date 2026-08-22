@@ -290,7 +290,14 @@ pub fn default_spec(work: &Path, brehon_root: &Path, unsafe_profile: bool) -> Sa
         };
     }
 
-    let mut write_roots = vec![fs_root(work), fs_root(brehon_root)];
+    // Only roots that exist. `canonicalize` refuses an unresolvable path — it
+    // has to, or `/tmp` vs `/private/tmp` renders the whole profile inert —
+    // and granting a directory that is not there grants nothing anyway. This
+    // is the same rule already applied to the cache leaves below.
+    let mut write_roots = vec![fs_root(work)];
+    if brehon_root.exists() {
+        write_roots.push(fs_root(brehon_root));
+    }
     if let Some(home) = dirs::home_dir() {
         for leaf in [
             ".cargo/registry",
@@ -724,5 +731,32 @@ mod tests {
         )
         .expect("the shipped default must compile on a supported host");
         assert!(!argv.is_empty());
+    }
+
+    /// A grant for a directory that does not exist grants nothing, and
+    /// `canonicalize` would refuse it — which would fail every spawn closed
+    /// before `.brehon` had been created.
+    #[test]
+    fn the_default_spec_skips_roots_that_do_not_exist() {
+        let (_t, work, protected) = dirs();
+        let absent = work.join("not-created-yet");
+
+        let spec = default_spec(&work, &absent, false);
+
+        assert!(
+            !spec
+                .write_roots
+                .iter()
+                .any(|r| r.path == absent.display().to_string()),
+            "an absent root must not be granted"
+        );
+        confine_argv(
+            &spec,
+            &ConfineCtx {
+                work: &work,
+                protected: &protected,
+            },
+        )
+        .expect("the spec must still compile");
     }
 }

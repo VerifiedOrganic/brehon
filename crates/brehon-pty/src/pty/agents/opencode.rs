@@ -5,8 +5,8 @@ use crate::pty::filesystem::{
     linked_worktree_gitdir, load_json_config, mirror_path, write_json_config,
 };
 use crate::pty::prompts::{
-    build_reviewer_startup_prompt, build_supervisor_startup_prompt, build_worker_startup_prompt,
-    project_policy_for_role,
+    agent_confinement, build_reviewer_startup_prompt, build_supervisor_startup_prompt,
+    build_worker_startup_prompt, project_policy_for_role,
 };
 
 use super::brehon_skills::write_builtin_skills;
@@ -629,6 +629,7 @@ impl PtyConfig {
         Self {
             command: "opencode".to_string(),
             args,
+            confine: agent_confinement(&cwd, brehon_root),
             cwd: Some(cwd),
             env,
             rows: 24,
@@ -677,6 +678,7 @@ impl PtyConfig {
                 "--cwd".to_string(),
                 cwd.to_string_lossy().to_string(),
             ],
+            confine: agent_confinement(&cwd, brehon_root),
             cwd: Some(cwd),
             env,
             rows: 24,
@@ -727,6 +729,7 @@ impl PtyConfig {
         Self {
             command: "zsh".to_string(),
             args: vec!["-lc".to_string(), script],
+            confine: agent_confinement(&cwd, brehon_root),
             cwd: Some(cwd),
             env,
             rows: 24,
@@ -773,6 +776,7 @@ impl PtyConfig {
                 "--port".to_string(),
                 server_port.to_string(),
             ],
+            confine: agent_confinement(&cwd, brehon_root),
             cwd: Some(cwd),
             env,
             rows: 24,

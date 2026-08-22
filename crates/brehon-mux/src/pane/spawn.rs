@@ -817,6 +817,10 @@ impl Pane {
             env: vec![],
             rows,
             cols,
+            // The operator's own terminal, deliberately unconfined. This is
+            // the one opt-out ADR-0010 sanctions, and T15 makes it explicit
+            // rather than inherited from a Default so it shows up in a diff.
+            confine: brehon_pty::unsafe_spec(),
         };
         let mut pane = Self::pty_pane_from_config(
             name,

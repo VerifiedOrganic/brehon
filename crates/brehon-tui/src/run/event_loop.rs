@@ -4405,8 +4405,25 @@ mod tests {
         .expect("reviewer pane")
     }
 
+    /// A temp directory that outlives the function that made it.
+    struct PersistedTempDir(std::path::PathBuf);
+
+    impl PersistedTempDir {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().expect("tempdir");
+            Self(dir.keep())
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
     fn make_supervisor_pane(name: &str) -> brehon_mux::Pane {
-        let dir = tempfile::tempdir().expect("tempdir");
+        // Persist it: the guard used to drop here, leaving the pane's cwd
+        // pointing at an already-deleted directory. Harmless until spawning
+        // began resolving that path, which confinement now does.
+        let dir = PersistedTempDir::new();
         let adapter = brehon_mux::AgentAdapter::BuiltIn(brehon_mux::SupervisorCli::Claude);
         brehon_mux::Pane::supervisor(
             name,
