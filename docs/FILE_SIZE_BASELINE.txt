@@ -40,13 +40,13 @@
 2656 crates/brehon-mcp/src/tools/research.rs
 1370 crates/brehon-mcp/src/tools/task_actions/action_integrate.rs
 1381 crates/brehon-mcp/src/tools/task_actions/action_query.rs
-1494 crates/brehon-mcp/src/tools/task_actions/action_update.rs
+1502 crates/brehon-mcp/src/tools/task_actions/action_update.rs
 2403 crates/brehon-mcp/src/tools/task_actions/epic.rs
 13287 crates/brehon-mcp/src/tools/task_actions/tool_tests.rs
 1037 crates/brehon-mcp/src/tools/tasks.rs
 2861 crates/brehon-mcp/src/tools/verification/actions.rs
 2645 crates/brehon-mcp/src/tools/verification/tool.rs
-3193 crates/brehon-mcp/src/tools/verification/tool_tests.rs
+3209 crates/brehon-mcp/src/tools/verification/tool_tests.rs
 5625 crates/brehon-mcp/tests/review_flow.rs
 2280 crates/brehon-mux/src/mux/dispatch.rs
 1925 crates/brehon-mux/src/mux/events.rs

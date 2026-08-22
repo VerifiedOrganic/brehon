@@ -4716,7 +4716,7 @@ Recorded proof of work so far:\n\
   Commands: 1\n\
 \n\
 Inspecting the commit:\n\
-- All Brehon worktrees share one .git object database. The commit is reachable from your current worktree by SHA.\n\
+- Run `git fetch origin` first. Your repository is a clone, so a commit made by another agent is not present until you fetch it.\n\
 - git show abc1234 --stat\n\
 - git show abc1234\n\
 - git diff def5678..abc1234\n\

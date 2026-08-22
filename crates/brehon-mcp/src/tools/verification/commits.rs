@@ -1,6 +1,6 @@
 use super::helpers::{
-    brehon_root, create_preflight_lease, git_output_in, remove_git_worktree_force,
-    remove_preflight_lease, sweep_stale_preflight_worktrees, workspace_root,
+    brehon_root, canonical_root, create_preflight_lease, git_output_in, remove_git_worktree_force,
+    remove_preflight_lease, sweep_stale_preflight_worktrees,
 };
 use crate::tools::git_cherry_pick::can_skip_failed_cherry_pick_as_empty;
 
@@ -21,9 +21,13 @@ pub(super) fn resolve_review_commit_set(
     merge_target: &str,
     reviewed_commit: &str,
 ) -> Result<ResolvedReviewCommitSet, String> {
-    let Some(repo_root) = workspace_root() else {
+    // Canonical, not the caller's own directory. The caller here is the
+    // worker, and under per-agent clones its repository is the one place these
+    // commits already exist — resolving there would answer a question nobody
+    // downstream can act on.
+    let Some(repo_root) = canonical_root() else {
         return Err(format!(
-            "Cannot resolve reviewed commit set for task {task_id}: no git workspace is available."
+            "Cannot resolve reviewed commit set for task {task_id}: no project repository is available."
         ));
     };
 
@@ -258,7 +262,10 @@ pub(super) fn preview_commit_integration_conflicts(
     reviewed_commit_set_resolved: bool,
     reviewed_tip: &str,
 ) -> Result<Vec<String>, String> {
-    let Some(repo_root) = workspace_root() else {
+    // Canonical for the same reason as above: the reviewed commits are
+    // published there, and the preflight worktree it creates has to be able to
+    // replay them.
+    let Some(repo_root) = canonical_root() else {
         return Ok(Vec::new());
     };
     let Ok(repo_probe) = git2::Repository::discover(&repo_root) else {
@@ -513,8 +520,10 @@ mod merge_commit_tests {
         let w2 = git(root, &["rev-parse", "HEAD"]);
 
         let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let _env =
-            ScopedEnv::set_with_defaults(&[("BREHON_WORKSPACE_ROOT", root.to_str().unwrap())]);
+        let _env = ScopedEnv::set_with_defaults(&[
+            ("BREHON_WORKSPACE_ROOT", root.to_str().unwrap()),
+            ("BREHON_PROJECT_ROOT", root.to_str().unwrap()),
+        ]);
         let resolved =
             resolve_review_commit_set("T-merge", "main", &w2).expect("commit set resolves");
 

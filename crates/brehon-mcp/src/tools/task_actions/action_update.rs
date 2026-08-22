@@ -200,6 +200,14 @@ async fn execute_checkpoint_inner(
         )));
     }
 
+    // Under per-agent clones this commit exists only in the worker's own
+    // repository. Review reads canonical, so publish before the task is
+    // allowed to look complete — a green status over commits nobody else can
+    // see strands the work.
+    if let Err(err) = super::fetch_back::publish_agent_commits() {
+        return Ok(error_result(err));
+    }
+
     task.insert("latest_commit".into(), Value::String(commit.clone()));
     if let Some(warning) = primary_checkout_warning.as_ref() {
         task.insert(

@@ -927,6 +927,10 @@ async fn test_request_review_rejects_new_commit_after_total_review_livelock() {
     let _env = ScopedEnv::set(&[
         ("BREHON_ROOT", brehon_root.to_str().unwrap()),
         ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
+        // Canonical. Production always exports this; these fixtures deliberately
+        // put BREHON_ROOT on a different temp dir from the git repo, so without
+        // it canonical resolves to something that is not a repository.
+        ("BREHON_PROJECT_ROOT", workspace.path().to_str().unwrap()),
         ("BREHON_AGENT_NAME", "supervisor-1"),
         ("BREHON_AGENT_ROLE", "supervisor"),
     ]);
@@ -1008,6 +1012,7 @@ async fn test_request_review_defaults_merge_mode_commit_to_head() {
     let _env = ScopedEnv::set(&[
         ("BREHON_ROOT", brehon_root.to_str().unwrap()),
         ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
+        ("BREHON_PROJECT_ROOT", workspace.path().to_str().unwrap()),
         ("BREHON_AGENT_NAME", "supervisor-1"),
         ("BREHON_AGENT_ROLE", "supervisor"),
     ]);
@@ -1074,6 +1079,7 @@ async fn test_request_review_uses_task_recorded_commit_when_commit_arg_missing()
     let _env = ScopedEnv::set(&[
         ("BREHON_ROOT", brehon_root.to_str().unwrap()),
         ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
+        ("BREHON_PROJECT_ROOT", workspace.path().to_str().unwrap()),
         ("BREHON_AGENT_NAME", "supervisor-1"),
         ("BREHON_AGENT_ROLE", "supervisor"),
     ]);
@@ -1173,6 +1179,7 @@ async fn test_request_review_rejects_stale_commit_arg_when_latest_commit_recorde
     let _env = ScopedEnv::set(&[
         ("BREHON_ROOT", brehon_root.to_str().unwrap()),
         ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
+        ("BREHON_PROJECT_ROOT", workspace.path().to_str().unwrap()),
         ("BREHON_AGENT_NAME", "supervisor-1"),
         ("BREHON_AGENT_ROLE", "supervisor"),
     ]);
@@ -1244,6 +1251,7 @@ async fn test_request_review_accepts_short_commit_arg_matching_latest_commit() {
     let _env = ScopedEnv::set(&[
         ("BREHON_ROOT", brehon_root.to_str().unwrap()),
         ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
+        ("BREHON_PROJECT_ROOT", workspace.path().to_str().unwrap()),
         ("BREHON_AGENT_NAME", "supervisor-1"),
         ("BREHON_AGENT_ROLE", "supervisor"),
     ]);
@@ -1313,6 +1321,7 @@ async fn test_request_review_enriches_handoff_context_from_task_and_prior_feedba
     let _env = ScopedEnv::set(&[
         ("BREHON_ROOT", brehon_root.to_str().unwrap()),
         ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
+        ("BREHON_PROJECT_ROOT", workspace.path().to_str().unwrap()),
         ("BREHON_AGENT_NAME", "supervisor-1"),
         ("BREHON_AGENT_ROLE", "supervisor"),
     ]);
@@ -1482,6 +1491,7 @@ async fn test_request_review_rejects_commit_that_conflicts_with_merge_target() {
     let _env = ScopedEnv::set(&[
         ("BREHON_ROOT", brehon_root.to_str().unwrap()),
         ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
+        ("BREHON_PROJECT_ROOT", workspace.path().to_str().unwrap()),
         ("BREHON_AGENT_NAME", "supervisor-1"),
         ("BREHON_AGENT_ROLE", "supervisor"),
     ]);
@@ -1586,6 +1596,7 @@ async fn test_request_review_conflict_releases_stale_panel_lease() {
     let _env = ScopedEnv::set(&[
         ("BREHON_ROOT", brehon_root.to_str().unwrap()),
         ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
+        ("BREHON_PROJECT_ROOT", workspace.path().to_str().unwrap()),
         ("BREHON_AGENT_NAME", "supervisor-1"),
         ("BREHON_AGENT_ROLE", "supervisor"),
     ]);
@@ -1829,6 +1840,7 @@ async fn test_request_review_records_full_reviewed_commit_set() {
     let _env = ScopedEnv::set(&[
         ("BREHON_ROOT", brehon_root.to_str().unwrap()),
         ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
+        ("BREHON_PROJECT_ROOT", workspace.path().to_str().unwrap()),
         ("BREHON_AGENT_NAME", "supervisor-1"),
         ("BREHON_AGENT_ROLE", "supervisor"),
     ]);
@@ -1908,6 +1920,7 @@ async fn test_request_review_skips_empty_resubmission_commits_in_reviewed_set() 
     let _env = ScopedEnv::set(&[
         ("BREHON_ROOT", brehon_root.to_str().unwrap()),
         ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
+        ("BREHON_PROJECT_ROOT", workspace.path().to_str().unwrap()),
         ("BREHON_AGENT_NAME", "supervisor-1"),
         ("BREHON_AGENT_ROLE", "supervisor"),
     ]);
@@ -1983,6 +1996,7 @@ async fn test_request_review_treats_empty_tip_commit_as_noop_preflight() {
     let _env = ScopedEnv::set(&[
         ("BREHON_ROOT", brehon_root.to_str().unwrap()),
         ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
+        ("BREHON_PROJECT_ROOT", workspace.path().to_str().unwrap()),
         ("BREHON_AGENT_NAME", "supervisor-1"),
         ("BREHON_AGENT_ROLE", "supervisor"),
     ]);
@@ -2074,6 +2088,7 @@ async fn test_request_review_filters_already_applied_prior_commit_from_reviewed_
     let _env = ScopedEnv::set(&[
         ("BREHON_ROOT", brehon_root.to_str().unwrap()),
         ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
+        ("BREHON_PROJECT_ROOT", workspace.path().to_str().unwrap()),
         ("BREHON_AGENT_NAME", "supervisor-1"),
         ("BREHON_AGENT_ROLE", "supervisor"),
     ]);
@@ -2170,6 +2185,7 @@ async fn test_request_review_keeps_ordered_chain_when_later_commit_reuses_prior_
     let _env = ScopedEnv::set(&[
         ("BREHON_ROOT", brehon_root.to_str().unwrap()),
         ("BREHON_WORKSPACE_ROOT", workspace.path().to_str().unwrap()),
+        ("BREHON_PROJECT_ROOT", workspace.path().to_str().unwrap()),
         ("BREHON_AGENT_NAME", "supervisor-1"),
         ("BREHON_AGENT_ROLE", "supervisor"),
     ]);

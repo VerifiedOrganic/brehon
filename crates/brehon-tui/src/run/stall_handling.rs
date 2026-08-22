@@ -181,7 +181,7 @@ fn build_review_obligation_recovery_prompt(
         let commit = request.commit.trim();
         if !commit.is_empty() {
             out.push_str("\nInspecting the commit:\n");
-            out.push_str("- All Brehon worktrees share one .git object database. The commit is reachable from your current worktree by SHA.\n");
+            out.push_str("- Run `git fetch origin` first. Your repository is a clone, so a commit made by another agent is not present until you fetch it.\n");
             out.push_str(&format!("- git show {commit} --stat\n"));
             out.push_str(&format!("- git show {commit}\n"));
             let base = request.base_commit.trim();
