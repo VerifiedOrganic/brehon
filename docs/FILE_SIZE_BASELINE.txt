@@ -67,7 +67,7 @@
 1482 crates/brehon-native-agent/src/tools.rs
 1629 crates/brehon-orchestrator/src/orchestrator.rs
 950 crates/brehon-pty/src/pty/core.rs
-3646 crates/brehon-pty/src/pty/mod.rs
+3648 crates/brehon-pty/src/pty/mod.rs
 916 crates/brehon-recording/src/reader.rs
 1053 crates/brehon-review/src/coordinator.rs
 2967 crates/brehon-store-fjall/src/store.rs

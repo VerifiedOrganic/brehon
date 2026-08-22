@@ -14,7 +14,9 @@ pub(crate) mod filesystem;
 pub(crate) mod prompts;
 
 pub use config::{LaunchPolicy, PtyConfig, TeamsSpawnConfig};
-pub use confine::{ConfineCtx, ConfineError, ConfineSupport, confine_argv, confine_env, probe};
+pub use confine::{
+    ConfineCtx, ConfineError, ConfineSupport, confine_argv, confine_env, default_spec, probe,
+};
 pub use core::{Pty, PtyEvent, format_cursor_position_report};
 pub use prompts::{
     build_advisor_startup_prompt, build_research_startup_prompt, build_reviewer_startup_prompt,
