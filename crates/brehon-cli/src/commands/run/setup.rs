@@ -2485,13 +2485,6 @@ where
         return Ok(HashMap::new());
     }
 
-    let git = brehon_git::Git2Operations::open(cwd).map_err(|err| {
-        anyhow::anyhow!(
-            "Worktree isolation is enabled, but '{}' is not a usable git repository: {err}",
-            cwd.display()
-        )
-    })?;
-
     let project_root = normalize_project_root(cwd);
     ensure_brehon_ignored_in_repo(&project_root)?;
     let worktrees_dir = effective_worktree_root(&project_root, config);
@@ -2510,14 +2503,18 @@ where
     // Agents clone from the mirror, never from canonical (ADR-0010 T7). Kept
     // current here because this is the one path every agent directory is born
     // on; a refresh failure is logged, not fatal.
-    if let Err(err) = base_mirror::ensure_base_mirror(
+    let base_mirror = base_mirror::ensure_base_mirror(
         &project_root,
         &worktrees_dir,
         &base_ref,
         chrono::Utc::now(),
-    ) {
-        tracing::warn!(error = %err, "Failed to prepare the base mirror");
-    }
+    )
+    .map_err(|err| {
+        anyhow::anyhow!(
+            "Cannot isolate agents: failed to prepare the base mirror for '{}': {err}",
+            project_root.display()
+        )
+    })?;
     for name in names {
         report(format!("Preparing {scope_label} workspace for {name}"));
         let branch = match scope {
@@ -2553,9 +2550,10 @@ where
                 "Removing stale {scope_label} worktree {}",
                 worktree_path.display()
             ));
-            git.remove_worktree(&worktree_path).await.map_err(|err| {
-                anyhow::anyhow!(
-                    "Failed to remove stale {} worktree '{}' before startup: {err}",
+            // A clone has no parent registration, so removal is just removal.
+            std::fs::remove_dir_all(&worktree_path).with_context(|| {
+                format!(
+                    "Failed to remove stale {} directory '{}' before startup",
                     scope_label,
                     worktree_path.display()
                 )
@@ -2565,21 +2563,13 @@ where
         report(format!(
             "Creating {scope_label} worktree {name} on branch {branch}"
         ));
-        git.create_worktree(&branch, &worktree_path)
-            .await
-            .map_err(|err| {
-                anyhow::anyhow!(
-                    "Failed to create isolated {} worktree for '{}' at '{}': {err}. \
-                     Brehon will not fall back to the shared repo root while worktree isolation is enabled.",
-                    scope_label,
-                    name,
-                    worktree_path.display()
-                )
-            })?;
-        git.validate_worktree(&worktree_path).map_err(|err| {
+        // ADR-0010: a real repository seeded over `file://`, not a linked
+        // worktree. `clone_agent_repo` asserts the object store is disjoint
+        // before returning, so a hardlinked clone can never reach an agent.
+        brehon_git::clone_agent_repo(&base_mirror, &worktree_path, &branch).map_err(|err| {
             anyhow::anyhow!(
-                "Created {} worktree for '{}' at '{}' but validation failed: {err}. \
-                 Brehon will not start with an invalid isolated worktree.",
+                "Failed to clone an isolated {} repository for '{}' at '{}': {err}. \
+                 Brehon will not fall back to the shared repo root while worktree isolation is enabled.",
                 scope_label,
                 name,
                 worktree_path.display()
@@ -2617,47 +2607,39 @@ where
     Ok(role_cwds)
 }
 
+/// Remove agent directories at session close.
+///
+/// Under ADR-0010 an agent directory is a clone, so there is no parent
+/// registration to unregister and removal is `rm -rf`. The inventory entry
+/// goes with it — Brehon's own record is what tracks these now, so leaving an
+/// entry behind for a directory it just deleted would be the same staleness
+/// `git worktree list` used to accumulate.
 pub(crate) async fn cleanup_scoped_worktrees(cwd: &Path, role_cwds: &HashMap<String, PathBuf>) {
     if role_cwds.is_empty() {
         return;
     }
+    let brehon_root = normalize_project_root(cwd).join(".brehon");
 
-    let Ok(git) = brehon_git::Git2Operations::open(cwd) else {
-        tracing::warn!(
-            "Could not reopen git repository at '{}' to clean role worktrees",
-            cwd.display()
-        );
-        return;
-    };
-
-    for (agent_name, worktree_path) in role_cwds {
-        if !worktree_path.exists() {
-            continue;
-        }
-
-        if let Err(err) = git.remove_worktree(worktree_path).await {
-            tracing::warn!(
-                agent = %agent_name,
-                path = %worktree_path.display(),
-                "Failed to auto-clean role worktree: {}",
-                err
-            );
-            continue;
-        }
-
-        if worktree_path.exists() {
-            let cleanup_result = if worktree_path.is_dir() {
-                std::fs::remove_dir_all(worktree_path)
+    for (agent_name, agent_path) in role_cwds {
+        if agent_path.exists() {
+            let removal = if agent_path.is_dir() {
+                std::fs::remove_dir_all(agent_path)
             } else {
-                std::fs::remove_file(worktree_path)
+                std::fs::remove_file(agent_path)
             };
-            if let Err(err) = cleanup_result {
+            if let Err(err) = removal {
                 tracing::warn!(
                     agent = %agent_name,
-                    path = %worktree_path.display(),
-                    "Worktree metadata was removed, but deleting the path failed: {}",
+                    path = %agent_path.display(),
+                    "Failed to auto-clean agent directory: {}",
                     err
                 );
+                continue;
+            }
+        }
+        for entry in agent_inventory::list(&brehon_root) {
+            if &entry.path == agent_path {
+                agent_inventory::forget(&brehon_root, &entry.session, &entry.agent_id);
             }
         }
     }
@@ -4444,15 +4426,12 @@ mod tests {
         let role_cwds = HashMap::from([("worker-legacy".to_string(), legacy_path.clone())]);
         cleanup_scoped_worktrees(temp.path(), &role_cwds).await;
 
-        let worktree_list = run_git(temp.path(), &["worktree", "list", "--porcelain"]);
-        assert!(
-            !worktree_list.contains(&legacy_path.to_string_lossy().to_string()),
-            "legacy worktree should be unregistered: {}",
-            legacy_path.display()
-        );
+        // Under ADR-0010 an agent directory is a clone, so cleanup is removal
+        // and there is no registration to unregister. A legacy in-repo
+        // worktree left over from the old topology must still be deleted.
         assert!(
             !legacy_path.exists(),
-            "legacy worktree directory should be removed: {}",
+            "legacy agent directory should be removed: {}",
             legacy_path.display()
         );
     }

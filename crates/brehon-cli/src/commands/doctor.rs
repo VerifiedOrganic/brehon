@@ -158,7 +158,12 @@ fn is_loopback_http_url(base_url: &str) -> bool {
     if host.eq_ignore_ascii_case("localhost") {
         return true;
     }
-    host.parse::<std::net::IpAddr>()
+    // `host_str()` keeps the brackets on an IPv6 host (`[::1]`), and a
+    // bracketed literal never parses as an IpAddr — so a local IPv6 endpoint
+    // was being treated as remote.
+    host.trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<std::net::IpAddr>()
         .is_ok_and(|addr| addr.is_loopback())
 }
 

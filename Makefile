@@ -112,7 +112,7 @@ uninstall:
 
 ## test           — Run unit tests
 test:
-	$(CARGO) test --workspace --lib
+	$(CARGO) test --workspace --lib --bins
 
 ## test-integration — Run integration tests
 test-integration:
