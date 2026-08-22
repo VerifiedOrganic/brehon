@@ -34,7 +34,7 @@
 1452 crates/brehon-git/src/worktree.rs
 1797 crates/brehon-host/src/lib.rs
 2737 crates/brehon-mcp/src/tools/agent.rs
-1458 crates/brehon-mcp/src/tools/factory/tool.rs
+1463 crates/brehon-mcp/src/tools/factory/tool.rs
 2962 crates/brehon-mcp/src/tools/factory/tool_tests.rs
 1160 crates/brehon-mcp/src/tools/memory.rs
 2656 crates/brehon-mcp/src/tools/research.rs

@@ -83,10 +83,67 @@ pub(super) fn expected_worktree_branch() -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+/// Refuse to record progress until the worker has merged the assignment seed.
+///
+/// Brehon publishes the seed and asks the worker to merge it; nothing forces
+/// the merge, so this is what makes "asked" into "required". Placed here
+/// because both the progress path (`action_update.rs:901`) and the checkpoint
+/// path (`action_update.rs:174`) already route through this function, and
+/// `complete` is implemented on top of checkpoint — so a worker that ignores
+/// the instruction fails at its first progress report rather than at
+/// integration.
+///
+/// libgit2, not the git binary: ADR-0010 sanctions libgit2 inspection
+/// explicitly, and it keeps the check correct in gateway mode where this code
+/// runs inside the TUI process rather than the agent's own.
+fn ensure_assignment_seed_merged(
+    task_id: &str,
+    task_data: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), String> {
+    let Some(seed) = task_data
+        .get("assignment_seed_commit")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    else {
+        return Ok(());
+    };
+    let Some(workspace) = super::paths::workspace_root() else {
+        return Ok(());
+    };
+    let Ok(repo) = git2::Repository::open(&workspace) else {
+        return Ok(());
+    };
+    let Some(head) = repo.head().ok().and_then(|head| head.target()) else {
+        return Ok(());
+    };
+    let Ok(seed_oid) = git2::Oid::from_str(seed) else {
+        return Ok(());
+    };
+
+    // An absent object means the seed was never fetched, which is itself the
+    // failure this refuses.
+    let merged = repo.find_commit(seed_oid).is_ok()
+        && (head == seed_oid || repo.graph_descendant_of(head, seed_oid).unwrap_or(false));
+    if merged {
+        return Ok(());
+    }
+
+    Err(format!(
+        "Task {task_id} was assigned on seed {seed}, which is not in this branch yet. \
+         Run exactly these two commands, then retry:\n\n  git fetch origin \
+         refs/brehon/seed/{task_id}\n  git merge --no-edit FETCH_HEAD\n\n\
+         Do NOT use git reset, git rebase, or git commit --amend — Brehon refuses work on a \
+         rewound branch."
+    ))
+}
+
 pub(super) fn ensure_worker_branch_safe_for_task(
     task_id: &str,
     task_data: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<(), String> {
+    ensure_assignment_seed_merged(task_id, task_data)?;
+
     let Some(current_branch) = current_git_branch() else {
         return Ok(());
     };

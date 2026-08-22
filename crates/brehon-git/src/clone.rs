@@ -121,7 +121,15 @@ pub fn refresh_base_mirror(
     }
 
     let url = file_url(canonical);
-    let mut args: Vec<String> = vec!["fetch".into(), "--prune".into(), "--no-tags".into(), url];
+    // `--no-write-fetch-head`: FETCH_HEAD records the URL fetched from, and
+    // canonical's path must not survive anywhere an agent can read (I7).
+    let mut args: Vec<String> = vec![
+        "fetch".into(),
+        "--prune".into(),
+        "--no-tags".into(),
+        "--no-write-fetch-head".into(),
+        url,
+    ];
     for branch in base_branches {
         args.push(format!("+refs/heads/{branch}:refs/heads/{branch}"));
     }
@@ -236,6 +244,52 @@ pub fn assert_disjoint_object_store(_repo: &Path) -> Result<(), GitError> {
     Err(GitError::GitOperationFailed(
         "clone isolation is unsupported on this platform; use WSL2 or a container".to_string(),
     ))
+}
+
+/// Where the base mirror lives, as published by the code that created it.
+///
+/// The mirror sits under the worktree root, derived from config and a
+/// repo-identity hash that only brehon-cli computes, so its location is
+/// recorded rather than re-derived.
+pub fn base_mirror_path(brehon_root: &Path) -> Option<PathBuf> {
+    let raw = std::fs::read_to_string(brehon_root.join(brehon_types::BASE_MIRROR_POINTER)).ok()?;
+    let trimmed = raw.trim();
+    (!trimmed.is_empty()).then(|| PathBuf::from(trimmed))
+}
+
+/// Make a canonical-only commit reachable from every agent's `origin`.
+///
+/// A task's assignment seed is either the epic's integration branch or another
+/// worker's `latest_commit`. Neither exists in an agent's clone, which carries
+/// only base branches — so the seed is published into the mirror the agents
+/// already fetch from, under `refs/brehon/seed/<task-id>`.
+///
+/// The `+` is deliberate and safe here where it is not on the fetch-back: the
+/// mirror is Brehon-owned, and reassigning a task must be able to re-point its
+/// seed. Returns the ref that was written.
+pub fn publish_seed_ref(
+    canonical: &Path,
+    base: &Path,
+    seed_sha: &str,
+    task_id: &str,
+) -> Result<String, GitError> {
+    if task_id.is_empty() || task_id.contains(['/', '*', '~', '^', ':', '\\', ' ']) {
+        return Err(GitError::InvalidReferenceName(format!(
+            "task id '{task_id}' cannot be used as a seed ref name"
+        )));
+    }
+    let seed_ref = format!("refs/brehon/seed/{task_id}");
+    git(
+        &[
+            "fetch",
+            "--no-tags",
+            "--no-write-fetch-head",
+            &file_url(canonical),
+            &format!("+{seed_sha}:{seed_ref}"),
+        ],
+        Some(base),
+    )?;
+    Ok(seed_ref)
 }
 
 /// Object-store size, as `git count-objects -v` reports it.

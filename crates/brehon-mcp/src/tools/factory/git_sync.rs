@@ -9,7 +9,9 @@ use super::worktree_ops::candidate_worker_worktree_paths;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum MergeTargetSyncStatus {
     AlreadyCurrent,
-    Reset,
+    /// The seed was published for the worker to merge. Brehon wrote nothing
+    /// inside the worker's repository — see ADR-0010.
+    Published,
 }
 
 #[derive(Debug, Clone)]
@@ -20,8 +22,10 @@ pub(super) struct AssignmentSeedSyncResult {
     pub target_ref: String,
     pub target_kind: AssignmentSeedKind,
     pub head_before: String,
-    pub head_after: String,
-    pub preserved_ref: Option<String>,
+    /// The seed commit published for the worker to merge.
+    pub seed_commit: String,
+    /// Ref in the base mirror the worker fetches the seed from.
+    pub seed_ref: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -313,6 +317,7 @@ pub(super) fn sync_merge_target_branch_to_parent_base(
 }
 
 pub(super) fn sync_worker_worktree_to_assignment_seed(
+    task_id: &str,
     worker_name: &str,
     target_ref: &str,
     target_kind: AssignmentSeedKind,
@@ -401,26 +406,54 @@ pub(super) fn sync_worker_worktree_to_assignment_seed(
         })?
         .to_string();
 
-    let head_before = run_git_in(&worktree_path, &["rev-parse", "HEAD"])?;
-    let target_oid = match target_kind {
-        AssignmentSeedKind::MergeTarget => repo
+    let head_before = repo
+        .head()
+        .ok()
+        .and_then(|head| head.target())
+        .map(|oid| oid.to_string())
+        .unwrap_or_default();
+
+    // Canonical, not the worker's clone. An epic integration branch is not in
+    // a clone of `base.git`, and another worker's `latest_commit` certainly is
+    // not — resolving here is what makes assignment work under ADR-0010.
+    let canonical = project_root()
+        .ok_or_else(|| "No project root available to resolve the assignment seed.".to_string())?;
+    let canonical_repo = git2::Repository::open(&canonical).map_err(|e| {
+        format!(
+            "Cannot open the project repository '{}' to resolve the assignment seed: {e}",
+            canonical.display()
+        )
+    })?;
+    let seed_commit = match target_kind {
+        AssignmentSeedKind::MergeTarget => canonical_repo
             .refname_to_id(&format!("refs/heads/{target_ref}"))
             .map_err(|e| {
                 format!(
-                    "Cannot assign task to worker '{}': merge_target '{}' is not a local branch: {}",
-                    worker_name, target_ref, e
+                    "Cannot assign task to worker '{worker_name}': merge_target '{target_ref}' is \
+                     not a branch in the project repository: {e}"
                 )
             })?,
-        AssignmentSeedKind::LatestCommit => repo
+        AssignmentSeedKind::LatestCommit => canonical_repo
             .revparse_single(target_ref)
             .map_err(|e| {
                 format!(
-                    "Cannot assign task to worker '{}': latest_commit '{}' is not available in repo history: {}",
-                    worker_name, target_ref, e
+                    "Cannot assign task to worker '{worker_name}': latest_commit '{target_ref}' is \
+                     not in the project repository: {e}. It is published there when the worker \
+                     that produced it calls task action=complete."
                 )
             })?
             .id(),
-    };
+    }
+    .to_string();
+
+    // Publishing is only needed when the worker cannot already reach the seed.
+    // A worker that shares an object store with canonical — a non-isolated run,
+    // or the legacy worktree topology — resolves it directly, so there is
+    // nothing to publish and no mirror to publish into.
+    let seed_already_reachable = git2::Oid::from_str(&seed_commit)
+        .ok()
+        .is_some_and(|oid| repo.find_commit(oid).is_ok());
+
     let head_oid = repo
         .head()
         .map_err(|e| format!("Cannot read HEAD for '{}': {}", worktree_path.display(), e))?
@@ -433,98 +466,56 @@ pub(super) fn sync_worker_worktree_to_assignment_seed(
             )
         })?;
 
-    if head_oid == target_oid {
+    if head_oid.to_string() == seed_commit {
         return Ok(AssignmentSeedSyncResult {
             worktree_path,
             worker_branch,
             status: MergeTargetSyncStatus::AlreadyCurrent,
             target_ref: target_ref.to_string(),
             target_kind,
-            head_before: head_before.clone(),
-            head_after: head_before,
-            preserved_ref: None,
+            head_before,
+            seed_commit,
+            seed_ref: String::new(),
         });
     }
 
-    let head_contains_target = repo
-        .graph_descendant_of(head_oid, target_oid)
-        .map_err(|e| {
-            format!(
-                "Cannot compare worker branch '{}' to {} '{}' for '{}': {}",
-                worker_branch,
-                target_kind.display_name(),
-                target_ref,
-                worker_name,
-                e
-            )
-        })?;
+    // Publish, do not impose. Brehon makes the seed reachable from the mirror
+    // the agent already has as `origin`; the agent merges it forward itself.
+    //
+    // Resetting the branch here would be an ADR-0010 violation twice over —
+    // Brehon running git inside a live agent repository — and it would also
+    // rewind a branch that is per-session, not per-task, so the next
+    // `fetch_back_from_agent` would be a non-fast-forward and `complete` would
+    // fail blaming the worker for a rebase it never did.
+    let seed_ref = if seed_already_reachable {
+        String::new()
+    } else {
+        let base_mirror =
+            brehon_git::base_mirror_path(&canonical.join(".brehon")).ok_or_else(|| {
+                format!(
+                    "Cannot assign task to worker '{worker_name}': seed {seed_commit} is not in \
+                     the worker's repository and no base mirror is recorded, so there is no \
+                     channel to publish it through."
+                )
+            })?;
+        brehon_git::publish_seed_ref(&canonical, &base_mirror, &seed_commit, task_id).map_err(
+            |err| {
+                format!(
+                    "Cannot assign task to worker '{worker_name}': failed to publish assignment \
+                     seed {seed_commit}: {err}"
+                )
+            },
+        )?
+    };
 
-    let target_contains_head = repo
-        .graph_descendant_of(target_oid, head_oid)
-        .map_err(|e| {
-            format!(
-                "Cannot compare {} '{}' to worker branch '{}' for '{}': {}",
-                target_kind.display_name(),
-                target_ref,
-                worker_branch,
-                worker_name,
-                e
-            )
-        })?;
-
-    let mut preserved_ref = None;
-    if head_contains_target && !target_contains_head {
-        let archive_ref = format!("refs/brehon/archive/{worker_name}/{head_before}");
-        repo.reference(
-            &archive_ref,
-            head_oid,
-            true,
-            "preserve worker head before resetting to merge target",
-        )
-        .map_err(|e| {
-            format!(
-                "Cannot preserve worker branch '{}' for '{}': failed to create archive ref '{}': {}",
-                worker_branch, worker_name, archive_ref, e
-            )
-        })?;
-        preserved_ref = Some(archive_ref);
-    } else if !target_contains_head {
-        let archive_ref = format!("refs/brehon/archive/{worker_name}/{head_before}");
-        repo.reference(
-            &archive_ref,
-            head_oid,
-            true,
-            "preserve diverged worker head before resetting to merge target",
-        )
-        .map_err(|e| {
-            format!(
-                "Cannot preserve diverged worker branch '{}' for '{}': failed to create archive ref '{}': {}",
-                worker_branch, worker_name, archive_ref, e
-            )
-        })?;
-        preserved_ref = Some(archive_ref);
-    }
-
-    if let Err(err) = run_git_in(&worktree_path, &["reset", "--hard", target_ref]) {
-        return Err(format!(
-            "Cannot assign task to worker '{}': failed to reset worker branch '{}' to {} '{}': {}",
-            worker_name,
-            worker_branch,
-            target_kind.display_name(),
-            target_ref,
-            err
-        ));
-    }
-
-    let head_after = run_git_in(&worktree_path, &["rev-parse", "HEAD"])?;
     Ok(AssignmentSeedSyncResult {
         worktree_path,
         worker_branch,
-        status: MergeTargetSyncStatus::Reset,
+        status: MergeTargetSyncStatus::Published,
         target_ref: target_ref.to_string(),
         target_kind,
         head_before,
-        head_after,
-        preserved_ref,
+        seed_commit,
+        seed_ref,
     })
 }

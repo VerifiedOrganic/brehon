@@ -975,11 +975,31 @@ impl Tool for FactoryTool {
 
                     if let Some((target_kind, target_ref)) = assignment_seed {
                         match super::git_sync::sync_worker_worktree_to_assignment_seed(
+                            task_id,
                             assignee,
                             target_ref,
                             target_kind,
                         ) {
                             Ok(sync) => {
+                                task.insert(
+                                    "assignment_seed_commit".into(),
+                                    Value::String(sync.seed_commit.clone()),
+                                );
+                                // The review floor. Everything below it belongs
+                                // to an earlier task and must not reach this
+                                // task's review.
+                                //
+                                // NOT unconditional: on changes_requested back
+                                // to the SAME worker, head_before *is* this
+                                // task's own work, and flooring it would empty
+                                // the review set. The discriminator is
+                                // ancestry, not which seed kind fired.
+                                if !head_belongs_to_task(&sync.head_before, &task) {
+                                    task.insert(
+                                        "assignment_base_commit".into(),
+                                        Value::String(sync.head_before.clone()),
+                                    );
+                                }
                                 assignment_seed_sync = Some(sync);
                             }
                             Err(err) => {
@@ -1128,30 +1148,25 @@ impl Tool for FactoryTool {
                     if let Some(sync) = assignment_seed_sync.as_ref() {
                         let sync_message = match sync.status {
                             MergeTargetSyncStatus::AlreadyCurrent => format!(
-                                "Your worker branch '{}' already matched {} '{}'; no reset was needed.",
+                                "Your worker branch '{}' already matches {} '{}'; nothing to sync.",
                                 sync.worker_branch,
                                 sync.target_kind.as_str(),
                                 sync.target_ref
                             ),
-                            MergeTargetSyncStatus::Reset => match sync.preserved_ref.as_deref() {
-                                Some(preserved_ref) => format!(
-                                    "Your worker branch '{}' was reset to {} '{}' before assignment ({} -> {}). Previous branch head was preserved at '{}'.",
-                                    sync.worker_branch,
-                                    sync.target_kind.as_str(),
-                                    sync.target_ref,
-                                    sync.head_before,
-                                    sync.head_after,
-                                    preserved_ref
-                                ),
-                                None => format!(
-                                    "Your worker branch '{}' was reset to {} '{}' before assignment ({} -> {}).",
-                                    sync.worker_branch,
-                                    sync.target_kind.as_str(),
-                                    sync.target_ref,
-                                    sync.head_before,
-                                    sync.head_after
-                                ),
-                            },
+                            // Merge, never reset. Rewinding this branch would
+                            // make the next publish-to-canonical a
+                            // non-fast-forward, and Brehon would refuse the
+                            // worker's own completed work.
+                            MergeTargetSyncStatus::Published => format!(
+                                "Sync your branch '{}' onto {} '{}' before starting, with exactly these two commands:\n\
+                                 \n  git fetch origin {}\n  git merge --no-edit FETCH_HEAD\n\n\
+                                 Do NOT use git reset, git rebase, or git commit --amend. \
+                                 Brehon will refuse your work if this branch is rewound.",
+                                sync.worker_branch,
+                                sync.target_kind.as_str(),
+                                sync.target_ref,
+                                sync.seed_ref
+                            ),
                         };
                         notification.push_str(&format!(
                             "\n\nIMPORTANT: This task has merge_target='{}'. {} {} Stay on your current dedicated worker branch/worktree at '{}'. \
@@ -1274,28 +1289,28 @@ impl Tool for FactoryTool {
                     result["assignment_seed_sync"] = serde_json::json!({
                         "status": match sync.status {
                             MergeTargetSyncStatus::AlreadyCurrent => "already_current",
-                            MergeTargetSyncStatus::Reset => "reset",
+                            MergeTargetSyncStatus::Published => "published",
                         },
                         "kind": sync.target_kind.as_str(),
                         "worker_branch": sync.worker_branch,
                         "target_ref": sync.target_ref,
                         "head_before": sync.head_before,
-                        "head_after": sync.head_after,
+                        "seed_commit": sync.seed_commit,
                         "worktree_path": sync.worktree_path,
-                        "preserved_ref": sync.preserved_ref,
+                        "seed_ref": sync.seed_ref,
                     });
                     if sync.target_kind == AssignmentSeedKind::MergeTarget {
                         result["merge_target_sync"] = serde_json::json!({
                             "status": match sync.status {
                                 MergeTargetSyncStatus::AlreadyCurrent => "already_current",
-                                MergeTargetSyncStatus::Reset => "reset",
+                                MergeTargetSyncStatus::Published => "published",
                             },
                             "worker_branch": sync.worker_branch,
                             "merge_target": sync.target_ref,
                             "head_before": sync.head_before,
-                            "head_after": sync.head_after,
+                            "seed_commit": sync.seed_commit,
                             "worktree_path": sync.worktree_path,
-                            "preserved_ref": sync.preserved_ref,
+                            "seed_ref": sync.seed_ref,
                         });
                     }
                 }
@@ -1409,4 +1424,40 @@ impl Tool for FactoryTool {
             ))),
         }
     }
+}
+
+/// Whether the worker's current head is already part of this task's history.
+///
+/// True when `changes_requested` comes back to the worker that produced the
+/// work: its head is the task's own `latest_commit` (or an ancestor of it), so
+/// flooring the review there would hide exactly the commits under review.
+fn head_belongs_to_task(head_before: &str, task: &serde_json::Map<String, Value>) -> bool {
+    let Some(latest) = task
+        .get("latest_commit")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    else {
+        return false;
+    };
+    if head_before.is_empty() {
+        return false;
+    }
+    if latest == head_before {
+        return true;
+    }
+    let Some(canonical) = super::paths::project_root() else {
+        return false;
+    };
+    let Ok(repo) = git2::Repository::open(&canonical) else {
+        return false;
+    };
+    let (Ok(head_oid), Ok(latest_oid)) = (
+        git2::Oid::from_str(head_before),
+        git2::Oid::from_str(latest),
+    ) else {
+        return false;
+    };
+    repo.graph_descendant_of(latest_oid, head_oid)
+        .unwrap_or(false)
 }

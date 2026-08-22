@@ -35,9 +35,9 @@ mod worktree;
 
 pub use branch::BranchOps;
 pub use clone::{
-    assert_disjoint_object_store, base_refreshed_at, clone_agent_repo, fetch_back_from_agent,
-    measure_object_store, refresh_base_mirror, seed_base_mirror, FetchBackGrowth, ObjectStoreSize,
-    BASE_REFRESHED_AT,
+    assert_disjoint_object_store, base_mirror_path, base_refreshed_at, clone_agent_repo,
+    fetch_back_from_agent, measure_object_store, publish_seed_ref, refresh_base_mirror,
+    seed_base_mirror, FetchBackGrowth, ObjectStoreSize, BASE_REFRESHED_AT,
 };
 pub use diff::DiffOps;
 pub use error::GitError;
