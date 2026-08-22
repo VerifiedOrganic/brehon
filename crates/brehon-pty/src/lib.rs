@@ -51,7 +51,8 @@ mod pty;
 
 pub use error::{Error, Result};
 pub use pty::{
-    LaunchPolicy, Pty, PtyConfig, PtyEvent, TeamsSpawnConfig, build_advisor_startup_prompt,
-    build_research_startup_prompt, build_reviewer_startup_prompt, build_supervisor_startup_prompt,
-    build_worker_startup_prompt, format_cursor_position_report,
+    ConfineCtx, ConfineError, ConfineSupport, LaunchPolicy, Pty, PtyConfig, PtyEvent,
+    TeamsSpawnConfig, build_advisor_startup_prompt, build_research_startup_prompt,
+    build_reviewer_startup_prompt, build_supervisor_startup_prompt, build_worker_startup_prompt,
+    confine_argv, confine_env, format_cursor_position_report, probe,
 };
