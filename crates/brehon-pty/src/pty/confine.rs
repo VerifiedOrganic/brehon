@@ -24,6 +24,8 @@ use brehon_types::config::{
     CredentialClass, EnvPolicy, FsRootSpec, NetworkClass, SandboxBackend, SandboxSpec,
 };
 
+pub use brehon_types::confine::{ConfineSupport, probe};
+
 /// Everything the compiler needs that is not in the spec.
 pub struct ConfineCtx<'a> {
     /// The agent's own directory — the one place it may freely write.
@@ -64,16 +66,6 @@ pub enum ConfineError {
 
     #[error("sandbox backend {0} is not available on this host")]
     BackendUnavailable(SandboxBackend),
-}
-
-/// What this host can actually enforce, reported *before* a run.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ConfineSupport {
-    pub backend: Option<SandboxBackend>,
-    pub detail: String,
-    /// Things the operator must know are NOT enforced here. Surfaced up front
-    /// rather than discovered in a postmortem.
-    pub unenforceable: Vec<&'static str>,
 }
 
 /// Compile `spec` into an argv prefix.
@@ -346,46 +338,32 @@ fn fs_root(path: &Path) -> FsRootSpec {
 /// Separate from [`confine_argv`] because it is env, not argv — folding it
 /// into the prefix would put a directory path where the command belongs.
 pub fn confine_env(ctx: &ConfineCtx) -> Vec<(String, String)> {
-    let tmp = ctx.work.join(".brehon-tmp");
-    let tmp = tmp.display().to_string();
-    ["TMPDIR", "TEMP", "TMP"]
+    let tmp = ctx.work.join(".brehon-tmp").display().to_string();
+    let mut env: Vec<(String, String)> = ["TMPDIR", "TEMP", "TMP"]
         .into_iter()
         .map(|key| (key.to_string(), tmp.clone()))
-        .collect()
-}
+        .collect();
 
-/// What this host can enforce, for `brehon doctor` and pre-run reporting.
-pub fn probe() -> ConfineSupport {
-    if cfg!(target_os = "macos") {
-        ConfineSupport {
-            backend: Some(SandboxBackend::Seatbelt),
-            detail: "sandbox-exec (Seatbelt)".to_string(),
-            unenforceable: vec![
-                "setuid binaries cannot exec under any profile: ps, top, sudo, su and traceroute fail; pgrep, pkill, lsof and netstat work",
-                "filter.<name>.* and merge.<name>.driver are unkillable by flags",
-                "docker run -v writes as the Docker VM, so confinement is decorative for a lane that needs the socket",
-                "<project>/.brehon is granted: coordination state shared across agents",
-            ],
-        }
-    } else if cfg!(target_os = "linux") {
-        ConfineSupport {
-            backend: Some(SandboxBackend::Bubblewrap),
-            detail: "Landlock".to_string(),
-            unenforceable: vec![
-                "Landlock never restricts chmod, chown, utime or setxattr",
-                "signal scoping needs ABI v6 (kernel 6.12); below that a confined agent can signal outside its sandbox",
-                "unix-socket connect needs ABI v9 (Linux 7.1); no shipping LTS has it",
-                "filter.<name>.* and merge.<name>.driver are unkillable by flags",
-                "<project>/.brehon is granted: coordination state shared across agents",
-            ],
-        }
-    } else {
-        ConfineSupport {
-            backend: None,
-            detail: "no supported confinement backend; use WSL2 or a container".to_string(),
-            unenforceable: vec!["any path confinement"],
-        }
-    }
+    // Redirect the vendor CLIs' own config directories per-agent. This removes
+    // a class rather than defending against it: `~/.claude/settings.json`
+    // carries a live `hooks` key that Claude Code executes, so a shared config
+    // directory is arbitrary code execution in the operator's own session the
+    // moment one agent writes to it. One env var each.
+    env.push((
+        "CLAUDE_CONFIG_DIR".to_string(),
+        ctx.work
+            .join(".brehon-agent-home/claude")
+            .display()
+            .to_string(),
+    ));
+    env.push((
+        "CODEX_HOME".to_string(),
+        ctx.work
+            .join(".brehon-agent-home/codex")
+            .display()
+            .to_string(),
+    ));
+    env
 }
 
 #[cfg(test)]
@@ -661,12 +639,38 @@ mod tests {
             work: &work,
             protected: &protected,
         });
-        assert_eq!(env.len(), 3);
-        for (key, value) in env {
-            assert!(["TMPDIR", "TEMP", "TMP"].contains(&key.as_str()));
+        for (key, value) in &env {
             assert!(
                 value.starts_with(work.display().to_string().as_str()),
-                "a shared temp dir is a cross-agent channel: {value}"
+                "{key} must live under the agent's own directory, not a shared one: {value}"
+            );
+        }
+        let keys: Vec<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
+        for required in ["TMPDIR", "TEMP", "TMP"] {
+            assert!(keys.contains(&required), "missing {required}");
+        }
+    }
+
+    /// `~/.claude/settings.json` has a live `hooks` key that Claude Code
+    /// executes, so a shared vendor config directory is arbitrary code
+    /// execution in the operator's own session. Redirecting removes the class.
+    #[test]
+    fn vendor_config_dirs_are_redirected_per_agent() {
+        let (_t, work, protected) = dirs();
+        let env = confine_env(&ConfineCtx {
+            work: &work,
+            protected: &protected,
+        });
+
+        for key in ["CLAUDE_CONFIG_DIR", "CODEX_HOME"] {
+            let value = env
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.as_str())
+                .unwrap_or_else(|| panic!("{key} must be redirected"));
+            assert!(
+                value.starts_with(work.display().to_string().as_str()),
+                "{key} must not point at the operator's home: {value}"
             );
         }
     }

@@ -2,6 +2,7 @@
 
 pub mod base_mirror;
 pub mod budget;
+pub mod confinement;
 pub mod review;
 pub mod runtime;
 pub mod store_search;
@@ -55,6 +56,11 @@ pub fn run_all_checks(
     // visible before a run rather than inferred from rising conflict rates.
     let base_mirror_checker = base_mirror::BaseMirrorChecker::new(brehon_root);
     findings.extend(base_mirror_checker.check()?);
+
+    // What this host can and cannot enforce, reported before a run rather
+    // than discovered after an incident.
+    let confinement_checker = confinement::ConfinementChecker::new();
+    findings.extend(confinement_checker.check()?);
 
     Ok(findings)
 }

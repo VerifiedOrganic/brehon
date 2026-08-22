@@ -8,6 +8,7 @@ pub mod budget;
 pub mod config;
 #[cfg(test)]
 mod config_tests;
+pub mod confine;
 pub mod context;
 pub mod decision;
 pub mod drain;
